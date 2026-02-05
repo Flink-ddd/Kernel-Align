@@ -74,8 +74,6 @@ class SamplerBackend(nn.Module):
             
             return sampling_from_logits(logits, deterministic=deterministic)
 
-            
-            
         elif self.backend == constants.BackendLib.AITER.value:
             # TODO: Connect to AITER's sampling operator
             # return aiter.ops.sample(logits, ...)
@@ -93,33 +91,22 @@ class SamplerBackend(nn.Module):
     @torch.inference_mode()
     def compute_logp(self, logits, token_ids):
         """
-        Optimized Logprob interface: Supports large vocabularies and large group sizes.
-        Memory optimizations have been implemented for PyTorch 2.8.
+        Pre-allocated block logic for computing log probabilities of selected tokens.
         """
-        if self.backend == constants.BackendLib.FLASHINFER.value:
-            try:
-                from flashinfer.sampling import softmax
-                probs = softmax(logits.float(), temperature=1.0)
-                return torch.log(probs.gather(-1, token_ids.unsqueeze(-1)).squeeze(-1))
-            except (ImportError, RuntimeError):
-                pass
-
         batch_size = logits.shape[0]
-        chunk_size = 4096  # Adjust based on GPU memory constraints
+        out_logp = torch.empty(
+            logits.shape[0], logits.shape[1], 
+            device=logits.device, dtype=logits.dtype
+        )
         
-        if batch_size <= chunk_size:
-            return torch.log_softmax(logits, dim=-1).gather(-1, token_ids.unsqueeze(-1)).squeeze(-1)
+        chunk_size = 4096  # Tune this based on GPU memory and performance characteristics
         
-        logps = []
         for i in range(0, batch_size, chunk_size):
             c_logits = logits[i : i + chunk_size]
             c_token_ids = token_ids[i : i + chunk_size]
-
-            c_logp = torch.log_softmax(c_logits, dim=-1).gather(
+            
+            out_logp[i : i + chunk_size] = torch.log_softmax(c_logits, dim=-1).gather(
                 -1, c_token_ids.unsqueeze(-1)
             ).squeeze(-1)
             
-            logps.append(c_logp.cpu())
-            del c_logp
-            
-        return torch.cat(logps, dim=0).to(logits.device)
+        return out_logp.view(batch_size, -1)

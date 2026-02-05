@@ -6,7 +6,6 @@ import time
 import argparse
 from tabulate import tabulate
 from rl_engine.utils.logger import logger
-from rl_engine.kernels.sampling import SamplerBackend
 from rl_engine.kernels.sampling import SamplerBackend as RL_Sampler
 from rl_engine.platforms.device import device_ctx
 
@@ -25,6 +24,14 @@ def run_benchmark(args):
 
     logger.info(f"Starting Benchmark on {device} with dtype {dtype}")
     logger.info(f"Config: SeqLen={args.seq_len}, VocabSize={args.vocab_size}")
+
+    logger.info("Warming up CUDA kernels...")
+    dummy_logits = torch.randn(16, 128, 4096, device=device, dtype=dtype)
+    dummy_ids = torch.randint(0, 4096, (16, 128), device=device)
+    for _ in range(5):
+        _ = sampler.compute_logp(dummy_logits, dummy_ids)
+    torch.cuda.synchronize()
+    del dummy_logits, dummy_ids
 
     for g in g_sizes:
         logger.info(f"Running iteration for Group Size G={g}...")
@@ -97,6 +104,7 @@ def run_benchmark(args):
     print(tabulate(results, headers=headers, tablefmt="fancy_grid"))
     print("="*115)
     print("Note: VRAM Saved indicates the reduction in peak HBM usage during forward pass.\n")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RL-Engine Operator Benchmark Tool")
