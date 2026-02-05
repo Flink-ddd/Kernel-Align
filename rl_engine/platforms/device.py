@@ -1,9 +1,8 @@
-import torch
-import logging
+# SPDX-License-Identifier: Apache-2.0  
+# Copyright (c) 2026 RL-Engine Contributors
 
-# Configure infrastructure-level logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import torch
+from rl_engine.utils.logger import logger
 
 class DeviceContext:
     """
@@ -16,18 +15,22 @@ class DeviceContext:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.is_rocm = False
         self.backend_version = "N/A"
+        self.device_type = "CPU"
 
         if self.device.type == "cuda":
             # Distinct detection for AMD HIP vs. NVIDIA CUDA
             if hasattr(torch.version, "hip") and torch.version.hip is not None:
                 self.is_rocm = True
+                self.device_type = "ROCm"
                 self.backend_version = torch.version.hip
-                logger.info(f"RL-Engine initialized with AMD ROCm backend (Version: {self.backend_version})")
+                logger.info_once(f"RL-Engine initialized with AMD ROCm backend (Version: {self.backend_version})")
             else:
                 self.is_rocm = False
+                self.device_type = "CUDA"
                 self.backend_version = torch.version.cuda
-                logger.info(f"RL-Engine initialized with NVIDIA CUDA backend (Version: {self.backend_version})")
+                logger.info_once(f"RL-Engine initialized with NVIDIA CUDA backend (Version: {self.backend_version})")
         else:
+            self.device_type = "CPU"
             logger.warning("No GPU detected. RL-Engine is falling back to CPU mode.")
 
     def get_preferred_dtype(self):
@@ -37,5 +40,4 @@ class DeviceContext:
         """
         return torch.bfloat16 if self.is_rocm else torch.float16
 
-# Global singleton for hardware context access
 device_ctx = DeviceContext()
