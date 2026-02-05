@@ -1,4 +1,4 @@
-# RL-Engine-Lab
+# RL-Engine
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Hardware](https://img.shields.io/badge/Hardware-AMD%20ROCm%20%7C%20NVIDIA%20CUDA-orange)](https://github.com/Flink-ddd/RL-Engine-Lab)
