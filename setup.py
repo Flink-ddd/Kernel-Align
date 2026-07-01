@@ -46,6 +46,10 @@ def get_extensions():
         return []
 
     extensions = []
+    torch_lib_dir = os.path.join(os.path.dirname(torch.__file__), "lib")
+    torch_rpath = ["-Wl,-rpath,$ORIGIN/../torch/lib"]
+    if os.environ.get("KERNEL_ALIGN_DEV_RPATH") == "1":
+        torch_rpath.append(f"-Wl,-rpath,{torch_lib_dir}")
     is_rocm = torch.version.hip is not None
 
     if is_rocm:
@@ -66,6 +70,7 @@ def get_extensions():
                     # bucket to hipcc in that case. Keep these flags HIP-safe.
                     "nvcc": ["-O3"],
                 },
+                extra_link_args=list(torch_rpath),
             )
         )
     elif torch.cuda.is_available() or os.environ.get("FORCE_CUDA") == "1":
@@ -123,7 +128,7 @@ def get_extensions():
             nvcc_flags.append("-lineinfo")
 
         cxx_flags = ["-O3", "-std=c++17", "-DKERNEL_ALIGN_WITH_CUDA"]
-        extra_link_args = []
+        extra_link_args = list(torch_rpath)
 
         sm90_srcs = [
             "csrc/cuda/fused_logp_sm90.cu",

@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # When invoked from GitHub Actions (pull_request_target), the workflow checks
-# out the base branch (trusted CI scripts) and passes the fork's coordinates
-# via PR_REPO_URL + PR_SHA.  We clone the PR code into an isolated /tmp
-# workspace here so that untrusted fork code never executes on the self-hosted
-# runner with elevated host privileges.
+# out the base branch (trusted CI scripts) and passes the PR coordinates via
+# PR_REPO_URL + PR_SHA.  We clone the PR code into a temporary workspace so the
+# CI script and tested checkout stay separate. The tests still execute PR code
+# on the ROCm machine, so self-hosted runners should be trusted, ephemeral, or
+# otherwise isolated for that workload.
 if [ -n "${PR_REPO_URL:-}" ] && [ -n "${PR_SHA:-}" ]; then
   ROCM_WORK_DIR="${ROCM_WORK_DIR:-/tmp/rl-kernel-rocm-ci}"
   rm -rf "${ROCM_WORK_DIR}"
@@ -22,6 +23,33 @@ PY="${PYTHON:-$(command -v python3 || command -v python || true)}"
 if [ -z "$PY" ]; then
   echo "[rocm-ci] FATAL: python not found in PATH"
   exit 127
+fi
+
+detect_rocm_arch() {
+  "$PY" - <<'PY' 2>/dev/null || true
+import torch
+
+arches = []
+if getattr(torch.version, "hip", None) is not None and torch.cuda.is_available():
+    for index in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(index)
+        gcn = getattr(props, "gcnArchName", "")
+        arch = gcn.split(":", 1)[0]
+        if arch.startswith("gfx") and arch not in arches:
+            arches.append(arch)
+print(";".join(arches))
+PY
+}
+
+if [ -z "${PYTORCH_ROCM_ARCH:-}" ] || [ "${PYTORCH_ROCM_ARCH}" = "auto" ]; then
+  detected_arch="$(detect_rocm_arch)"
+  if [ -n "$detected_arch" ]; then
+    export PYTORCH_ROCM_ARCH="$detected_arch"
+  else
+    unset PYTORCH_ROCM_ARCH
+  fi
+else
+  export PYTORCH_ROCM_ARCH
 fi
 
 export MAX_JOBS="${MAX_JOBS:-8}"

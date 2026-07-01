@@ -129,6 +129,7 @@ def test_cuda_sm90_backends_are_not_prioritized_on_non_hopper_devices(monkeypatc
 
 
 def test_cuda_sm90_backends_are_prioritized_when_hopper_symbols_exist(monkeypatch):
+    monkeypatch.setenv("RL_KERNEL_ENABLE_EXPERIMENTAL_SM90_LOGP", "1")
     registry = _make_cuda_registry(
         monkeypatch,
         capability=(9, 0),

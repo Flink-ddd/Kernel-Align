@@ -100,8 +100,8 @@ bash ci/run_cuda_tests.sh
 ```
 
 In GitHub Actions, add the label `needs-gpu-ci-self-hosted` to your PR and
-register a runner with the tag `cuda`. In GitLab CI, set `GPU_CI_FORCE=1` in
-the pipeline trigger or add `needs-gpu-ci` to the MR labels.
+register a runner with the tag `cuda`. This path executes the PR commit on the
+self-hosted runner; only use it for PRs that are allowed to run on that machine.
 
 **Path B — hosted CUDA runner**
 
@@ -109,6 +109,11 @@ Add the label `needs-gpu-ci` to the PR on GitHub. This runs
 `ci/run_cuda_tests.sh` on an ephemeral NVIDIA GPU instance via
 `ci/run_gpu_ci.sh`, then releases the instance. Configure the hosted-provider
 API and SSH secrets in GitHub Actions before enabling this path.
+
+For Hopper-specific coverage, add `needs-gpu-ci-sm90`. This runs a separate
+H100 job with `KERNEL_ALIGN_FORCE_SM90=1` so SM90/TMA kernels are compiled and
+the fallback tests run on real Hopper hardware. It is intentionally separate
+from `needs-gpu-ci` because H100 capacity is more expensive and less available.
 
 **Path C — Docker (local validation without GPU CI secrets)**
 
@@ -128,30 +133,23 @@ tag. The script also runs standalone on any ROCm machine:
 ```bash
 bash ci/run_rocm_ci.sh
 
+# Override only for mixed-architecture hosts or explicit cross-builds:
+PYTORCH_ROCM_ARCH=gfx1100 bash ci/run_rocm_ci.sh
+
 # With the FlashAttention ROCm backend:
 RL_KERNEL_ROCM_ATTN_BACKEND=flash_attn bash ci/run_rocm_ci.sh
 ```
 
-### GitLab CI
+When `PYTORCH_ROCM_ARCH` is unset or `auto`, `ci/run_rocm_ci.sh` detects the
+visible ROCm device architectures and scopes HIP extension builds accordingly.
 
-A `.gitlab-ci.yml` at the repository root covers lint, CPU tests, docs, and
-opt-in GPU/ROCm jobs. Register a self-hosted runner:
-
-```bash
-# CUDA runner
-gitlab-runner register --tag-list cuda,linux,x64 ...
-
-# ROCm runner
-gitlab-runner register --tag-list rocm,linux,x64 ...
-```
-
-Trigger GPU jobs by adding `needs-gpu-ci` to MR labels or by setting
-`GPU_CI_FORCE=1` / `ROCM_CI_FORCE=1` as a pipeline variable.
+Like the CUDA self-hosted path, this executes the PR commit on the configured
+ROCm machine; only use it for PRs that are allowed to run on that runner.
 
 ### Required GitHub Actions secrets
 
-The following secrets are only needed for the hosted CUDA path (Path B above).
-The self-hosted and local paths require no secrets.
+The following secrets are only needed for the hosted CUDA paths (`needs-gpu-ci`
+and `needs-gpu-ci-sm90`). The self-hosted and local paths require no secrets.
 
 | Secret | Purpose |
 |--------|---------|

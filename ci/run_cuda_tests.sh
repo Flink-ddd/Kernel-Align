@@ -3,10 +3,12 @@
 #
 # Runs on any machine that already has CUDA and Python. Invoked three ways:
 #
-#   1. Self-hosted GitHub/GitLab runner (security-isolated):
+#   1. Self-hosted GitHub runner (trusted or isolated hardware):
 #        PR_REPO_URL=https://... PR_SHA=<sha> bash ci/run_cuda_tests.sh
-#      The script clones the PR commit into an isolated /tmp workspace so
-#      untrusted fork code never executes with host-level privileges.
+#      The script keeps trusted CI logic separate from the PR checkout by
+#      cloning the PR commit into a temporary workspace. The tests still execute
+#      PR code on the target machine, so self-hosted runners should be trusted,
+#      ephemeral, or otherwise isolated for that workload.
 #
 #   2. Hosted CUDA runner (called from ci/run_gpu_ci.sh; the orchestrator
 #      uploads this script via scp and sets PR_REPO_URL + PR_SHA in the
@@ -20,7 +22,7 @@
 #   PR_REPO_URL           git remote to clone (skip if unset → use cwd)
 #   PR_SHA                commit SHA to detach to after clone
 #   GPU_COUNT             number of GPUs for distributed tests (auto-detected)
-#   TORCH_CUDA_ARCH_LIST  NVCC arch targets  (default: 8.6)
+#   TORCH_CUDA_ARCH_LIST  NVCC arch targets (auto-detected; fallback: 8.6)
 #   FORCE_CUDA            force CUDA ext build (default: 1)
 #   MAX_JOBS              parallel build jobs (default: 8)
 #   KERNEL_ALIGN_FORCE_SM90  build SM90/TMA kernels (default: 0)
@@ -62,7 +64,23 @@ fi
 echo "[cuda-ci] Using interpreter: $PY"
 
 # --- Build env ---------------------------------------------------------------
-export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.6}"
+detect_cuda_arch() {
+  "$PY" - <<'PY' 2>/dev/null || true
+import torch
+
+if torch.cuda.is_available():
+    major, minor = torch.cuda.get_device_capability()
+    print(f"{major}.{minor}")
+PY
+}
+
+if [ -z "${TORCH_CUDA_ARCH_LIST:-}" ] || [ "${TORCH_CUDA_ARCH_LIST}" = "auto" ]; then
+  detected_arch="$(detect_cuda_arch)"
+  export TORCH_CUDA_ARCH_LIST="${detected_arch:-8.6}"
+else
+  export TORCH_CUDA_ARCH_LIST
+fi
+echo "[cuda-ci] TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
 export FORCE_CUDA="${FORCE_CUDA:-1}"
 export MAX_JOBS="${MAX_JOBS:-8}"
 export KERNEL_ALIGN_FORCE_SM90="${KERNEL_ALIGN_FORCE_SM90:-0}"
@@ -138,7 +156,12 @@ if dist.get_rank() == 0:
     print(f"[cuda-ci] NCCL all-reduce smoke passed on {world_size} GPUs")
 dist.destroy_process_group()
 PY
-  "$PY" -m torch.distributed.run --nproc_per_node="$GPU_COUNT" /tmp/rl_kernel_nccl_smoke.py
+  # Correctness smoke only: disable peer-to-peer paths that can hang on cloud
+  # PCIe topologies, and bound the check so cleanup still runs on failure.
+  export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+  NCCL_SMOKE_TIMEOUT="${NCCL_SMOKE_TIMEOUT:-120s}"
+  timeout "$NCCL_SMOKE_TIMEOUT" \
+    "$PY" -m torch.distributed.run --nproc_per_node="$GPU_COUNT" /tmp/rl_kernel_nccl_smoke.py
 fi
 
 # --- Test suite --------------------------------------------------------------
