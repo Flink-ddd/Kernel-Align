@@ -2,19 +2,42 @@
 # build: docker build -f docker/Dockerfile.cuda -t <registry>/rl-kernel-ci:cuda .
 # push: docker push <registry>/rl-kernel-ci:cuda
 
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+ARG BASE_IMAGE=pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel@sha256:9859f8978cdfad549d72baa41d0b0bb7a5b46210a1446e09bf32600a968badb8
+FROM ${BASE_IMAGE}
 
-# A4000 = Ampere = sm_86. Multi-GPU support: "8.0;8.6;9.0"
-ENV TORCH_CUDA_ARCH_LIST="8.6"
 ENV FORCE_CUDA=1
 ENV MAX_JOBS=8
+# Default to Ampere (sm_86 = A4000/A40). Override at build time:
+#   docker build --build-arg TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0" ...
+ARG TORCH_CUDA_ARCH_LIST=8.6
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+ENV PIP_NO_CACHE_DIR=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /opt/rl-kernel
 
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    ninja-build \
+    pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml setup.py* requirements*.txt ./
 
-RUN pip install --no-cache-dir -U pip \
- && pip install --no-cache-dir -r requirements.txt \
- && pip install --no-cache-dir pytest
+RUN python -m pip install -U pip setuptools wheel \
+ && python -m pip install -r requirements.txt \
+ && python -m pip install flashinfer-python nvidia-ml-py -f https://flashinfer.ai/whl/cu124/torch2.4/index.html \
+ && python -m pip install \
+    black \
+    isort \
+    mypy \
+    packaging \
+    pre-commit \
+    psutil \
+    pytest \
+    ruff
 
 WORKDIR /workspace

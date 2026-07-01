@@ -14,17 +14,28 @@ authors = [
 ]
 dependencies = [
     "torch>=2.4.1",
-    "tabulate",
     "numpy",
-    "accelerate",
-    "transformers",
 ]
 
 [project.optional-dependencies]
-cuda = ["flashinfer-python>=0.1.6", "nvidia-ml-py"]
-rocm = ["aiter"]
+cuda = ["flashinfer-python", "nvidia-ml-py"]
+# amd-aiter must be installed from source; see docs/getting_started/installation.md#rocm-backend
+rocm = []
 vllm = ["vllm>=0.6.0"]
-dev = ["pytest", "black", "isort", "ruff", "mypy", "pre-commit"]
+hf = ["accelerate", "transformers"]
+bench = ["tabulate"]
+test = ["pytest", "tabulate"]
+dev = [
+    "pytest",
+    "black",
+    "isort",
+    "ruff",
+    "mypy",
+    "pre-commit",
+    "accelerate",
+    "transformers",
+    "tabulate",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

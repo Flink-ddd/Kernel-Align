@@ -61,12 +61,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e ".[dev]"
+          pip install -e ".[test]"
 
       - name: Run Mocked Hardware Discovery Tests
         run: |
           python -m pytest rl_engine/tests/test_dispatch.py -v
+          python -m pytest tests/test_kernel_registry.py -q
           PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_attention_correctness.py -q -rs
+
+      - name: Run CPU-only Operator Tests
+        run: |
+          python -m pytest tests/test_linear_logp.py -q -rs -k "native"
+          python -m pytest tests/test_cpu_hal.py -q
 
   docs:
     runs-on: ubuntu-latest

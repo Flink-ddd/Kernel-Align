@@ -9,6 +9,7 @@ import json
 import pytest
 import torch
 
+from benchmarks import profiler as profiler_module
 from benchmarks.profiler import (
     GPUProfiler,
     PerformanceProfiler,
@@ -22,6 +23,16 @@ def test_gpu_profiler_cpu_fallback(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
     info = GPUProfiler.get_target_info()
+
+    assert info.name == "CPU"
+    assert info.backend == "cpu"
+    assert info.device_index == -1
+
+
+def test_gpu_profiler_negative_device_index_reports_cpu_even_when_cuda_exists(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    info = GPUProfiler.get_target_info(device_index=-1)
 
     assert info.name == "CPU"
     assert info.backend == "cpu"
@@ -85,6 +96,58 @@ def test_cpu_smoke_suite_collects_metrics():
     assert metrics[0].tokens_per_sec > 0
     assert metrics[1].benchmark_name == "logp_fused"
     assert metrics[1].status == "blocked"
+    assert "logp-fused requires CUDA" in metrics[1].notes
+
+
+def test_fused_logp_fn_rejects_native_dispatch(monkeypatch):
+    from rl_engine.kernels import registry as registry_module
+
+    class NativeLogpOp:
+        def apply_fp32(self, logits, token_ids):
+            return torch.zeros_like(token_ids, dtype=torch.float32)
+
+    class FakeRegistry:
+        def get_op(self, op_type):
+            assert op_type == "logp"
+            return NativeLogpOp()
+
+    monkeypatch.setattr(registry_module, "kernel_registry", FakeRegistry())
+
+    with pytest.raises(RuntimeError, match="kernel dispatch selected NativeLogpOp"):
+        profiler_module._fused_logp_fn(
+            batch_size=1,
+            seq_len=2,
+            vocab_size=4,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            seed=0,
+        )
+
+
+def test_fused_logp_fn_supports_fused_call_without_apply_fp32(monkeypatch):
+    from rl_engine.kernels import registry as registry_module
+
+    class FusedLogpSM90Op:
+        def __call__(self, logits, token_ids):
+            return torch.zeros_like(token_ids, dtype=logits.dtype)
+
+    class FakeRegistry:
+        def get_op(self, op_type):
+            assert op_type == "logp"
+            return FusedLogpSM90Op()
+
+    monkeypatch.setattr(registry_module, "kernel_registry", FakeRegistry())
+
+    fn = profiler_module._fused_logp_fn(
+        batch_size=1,
+        seq_len=2,
+        vocab_size=4,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        seed=0,
+    )
+
+    assert fn().dtype == torch.float32
 
 
 def test_profiler_report_writers(tmp_path):

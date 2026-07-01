@@ -36,6 +36,101 @@ def test_native_logp_op_exposes_full_fused_logp_api():
         assert callable(getattr(op, method_name))
 
 
+def test_sm90_logp_uses_tma_for_bf16_contiguous(monkeypatch):
+    from types import SimpleNamespace
+
+    from rl_engine.kernels.ops.cuda.loss import logp as logp_module
+
+    calls = {"sm90": 0, "generic": 0}
+
+    def fake_sm90(logits, labels):
+        calls["sm90"] += 1
+        assert logits.dtype == torch.bfloat16
+        assert logits.is_contiguous()
+        assert labels.dtype == torch.int32
+        return torch.full(logits.shape[:-1], -1.0, dtype=torch.float32)
+
+    def fake_generic_fp32(logits, token_ids):
+        calls["generic"] += 1
+        return torch.zeros(logits.shape[0], dtype=torch.float32)
+
+    monkeypatch.setattr(logp_module, "_EXT_AVAILABLE", True)
+    monkeypatch.setattr(
+        logp_module,
+        "_C",
+        SimpleNamespace(
+            fused_logp_sm90=fake_sm90,
+            fused_logp=object(),
+            fused_logp_forward_fp32=fake_generic_fp32,
+        ),
+    )
+
+    logits = torch.randn(2, 3, 17, dtype=torch.bfloat16).contiguous()
+    token_ids = torch.randint(0, logits.size(-1), (2, 3))
+    op = logp_module.FusedLogpSM90Op()
+
+    for method_name in (
+        "apply",
+        "out",
+        "apply_fp32",
+        "indexed_out",
+        "indexed_fp32",
+        "online_out",
+        "online_fp32",
+        "online_indexed_out",
+        "online_indexed_fp32",
+    ):
+        assert callable(getattr(op, method_name))
+
+    result = op(logits, token_ids)
+
+    assert calls == {"sm90": 1, "generic": 0}
+    assert result.shape == logits.shape[:-1]
+    assert result.dtype == torch.float32
+
+
+def test_sm90_logp_falls_back_to_generic_fp32_for_fp32_logits(monkeypatch):
+    from types import SimpleNamespace
+
+    from rl_engine.kernels.ops.cuda.loss import logp as logp_module
+
+    calls = {"sm90": 0, "generic": 0}
+
+    def fake_sm90(logits, labels):
+        calls["sm90"] += 1
+        raise AssertionError("fp32 logits must not enter the SM90 TMA kernel")
+
+    def fake_generic_fp32(logits, token_ids):
+        calls["generic"] += 1
+        assert logits.dtype == torch.float32
+        assert token_ids.dtype == torch.long
+        return torch.arange(logits.shape[0], dtype=torch.float32)
+
+    monkeypatch.setattr(logp_module, "_EXT_AVAILABLE", True)
+    monkeypatch.setattr(
+        logp_module,
+        "_C",
+        SimpleNamespace(
+            fused_logp_sm90=fake_sm90,
+            fused_logp=object(),
+            fused_logp_forward_fp32=fake_generic_fp32,
+        ),
+    )
+
+    logits = torch.randn(2, 3, 17, dtype=torch.float32)
+    token_ids = torch.randint(0, logits.size(-1), (2, 3))
+    op = logp_module.FusedLogpSM90Op()
+
+    result = op(logits, token_ids)
+    result_fp32 = op.apply_fp32(logits, token_ids)
+
+    assert calls == {"sm90": 0, "generic": 2}
+    assert result.shape == logits.shape[:-1]
+    assert result_fp32.shape == logits.shape[:-1]
+    assert result.dtype == torch.float32
+    assert result_fp32.dtype == torch.float32
+
+
 def test_native_fused_logp_out_reuses_output_storage_cpu():
     logits = torch.randn(2, 3, 17)
     token_ids = torch.randint(0, logits.size(-1), (2, 3))

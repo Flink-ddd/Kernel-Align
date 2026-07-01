@@ -1,0 +1,134 @@
+# .gitlab-ci.yml — RL-Kernel CI for self-hosted GitLab
+#
+# Default pipeline (every MR and push to main):
+#   lint → unit-tests → docs
+#
+# GPU pipelines (opt-in, triggered manually or by MR label):
+#   cuda-tests   requires a runner tagged 'cuda'
+#   rocm-tests   requires a runner tagged 'rocm'
+#
+# To register a self-hosted runner:
+#   CUDA: gitlab-runner register --tag-list cuda,linux,x64 ...
+#   ROCm: gitlab-runner register --tag-list rocm,linux,x64 ...
+#
+# Required CI/CD variables (Settings → CI/CD → Variables):
+#   None for the default pipeline.
+#   GPU pipelines use whatever env the runner already provides.
+
+stages:
+  - lint
+  - test
+  - docs
+  - gpu
+
+# ── Shared anchors ────────────────────────────────────────────────────────────
+.python_setup: &python_setup
+  image: python:3.10-slim
+  before_script:
+    - pip install --upgrade pip
+
+.gpu_rules: &gpu_rules
+  rules:
+    # Run when the MR has the corresponding label, or when triggered manually.
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /needs-gpu-ci/ || $GPU_CI_FORCE == "1"'
+      when: on_success
+    - when: never
+
+.rocm_rules: &rocm_rules
+  rules:
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /needs-rocm-ci/ || $ROCM_CI_FORCE == "1"'
+      when: on_success
+    - when: never
+
+# ── Lint ──────────────────────────────────────────────────────────────────────
+lint:
+  stage: lint
+  <<: *python_setup
+  script:
+    - pip install pre-commit
+    - pre-commit run --all-files
+    - pip install mypy
+    - mypy --ignore-missing-imports rl_engine/
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# ── CPU unit tests ────────────────────────────────────────────────────────────
+unit-tests:
+  stage: test
+  needs: [lint]
+  <<: *python_setup
+  script:
+    - pip install torch --index-url https://download.pytorch.org/whl/cpu
+    - pip install -e ".[test]"
+    - python -m pytest rl_engine/tests/test_dispatch.py -v
+    - python -m pytest tests/test_kernel_registry.py -q
+    - PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_attention_correctness.py -q -rs
+    - python -m pytest tests/test_linear_logp.py -q -rs -k "native"
+    - python -m pytest tests/test_cpu_hal.py -q
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# ── Docs ──────────────────────────────────────────────────────────────────────
+docs:
+  stage: docs
+  <<: *python_setup
+  script:
+    - pip install -r requirements-docs.txt
+    - mkdocs build --strict -f mkdocs.yaml
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# ── CUDA self-hosted GPU tests ────────────────────────────────────────────────
+# Requires a runner registered with the 'cuda' tag on a machine with NVIDIA
+# drivers and CUDA installed. No cloud account needed.
+#
+# Security: only the base branch's CI scripts are checked out; the MR source
+# code is cloned inside run_cuda_tests.sh into an isolated /tmp directory.
+cuda-tests:
+  stage: gpu
+  tags: [cuda, linux, x64]
+  timeout: 90 minutes
+  <<: *gpu_rules
+  # GIT_STRATEGY: none — start with an empty workspace so the runner never
+  # executes untrusted MR source code. We fetch only the base-branch CI script
+  # ourselves in before_script, then delegate PR isolation to run_cuda_tests.sh.
+  variables:
+    GIT_STRATEGY: none
+    TORCH_CUDA_ARCH_LIST: "8.6"
+    PYTEST_ARGS: "tests/ rl_engine/tests/ -v"
+  before_script:
+    - git init && git remote add origin "$CI_SERVER_PROTOCOL://oauth2:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    - git fetch origin "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-$CI_DEFAULT_BRANCH}" --depth=1
+    - git checkout FETCH_HEAD -- ci/run_cuda_tests.sh
+  script:
+    - |
+      PR_REPO_URL="${CI_MERGE_REQUEST_SOURCE_PROJECT_URL:-$CI_PROJECT_URL}.git" \
+      PR_SHA="${CI_MERGE_REQUEST_SOURCE_BRANCH_SHA:-$CI_COMMIT_SHA}" \
+      TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
+      PYTEST_ARGS="${PYTEST_ARGS}" \
+      bash ci/run_cuda_tests.sh
+
+# ── ROCm self-hosted GPU tests ────────────────────────────────────────────────
+rocm-tests:
+  stage: gpu
+  tags: [rocm, linux, x64]
+  timeout: 90 minutes
+  <<: *rocm_rules
+  variables:
+    GIT_STRATEGY: none
+    RL_KERNEL_ROCM_ATTN_BACKEND: sdpa
+    PYTEST_ARGS: "rl_engine/tests/test_dispatch.py tests/test_kernel_registry.py tests/test_attention_correctness.py tests/test_linear_logp.py tests/test_ratio_kl.py -q -rs"
+  before_script:
+    - git init && git remote add origin "$CI_SERVER_PROTOCOL://oauth2:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    - git fetch origin "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-$CI_DEFAULT_BRANCH}" --depth=1
+    - git checkout FETCH_HEAD -- ci/run_rocm_ci.sh
+  script:
+    - |
+      PR_REPO_URL="${CI_MERGE_REQUEST_SOURCE_PROJECT_URL:-$CI_PROJECT_URL}.git" \
+      PR_SHA="${CI_MERGE_REQUEST_SOURCE_BRANCH_SHA:-$CI_COMMIT_SHA}" \
+      RL_KERNEL_ROCM_ATTN_BACKEND="${RL_KERNEL_ROCM_ATTN_BACKEND}" \
+      PYTEST_ARGS="${PYTEST_ARGS}" \
+      bash ci/run_rocm_ci.sh

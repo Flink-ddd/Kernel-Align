@@ -2,7 +2,13 @@
 // Copyright (c) 2026 RL-Kernel Contributors
 
 #include <torch/extension.h>
+#ifdef __HIP_PLATFORM_AMD__
+#include <hip/hip_bfloat16.h>
+using bf16_t = hip_bfloat16;
+#else
 #include <cuda_bf16.h>
+using bf16_t = __nv_bfloat16;
+#endif
 
 // Fused LogP Declarations
 torch::Tensor fused_logp_forward(torch::Tensor logits, torch::Tensor token_ids);
@@ -28,10 +34,10 @@ torch::Tensor fused_logp_forward_online_indexed_fp32(torch::Tensor logits, torch
 // Prefix-Shared Attention Declarations & Wrappers
 
 void prefix_shared_attention_forward(
-  const __nv_bfloat16 *Q,  // [bs, G, len_q, DIM]
-  const __nv_bfloat16 *K,  // [bs, len_kv, DIM]
-  const __nv_bfloat16 *V,  // [bs, len_kv, DIM]
-  __nv_bfloat16 *O,        // [bs, G, len_q, DIM]
+  const bf16_t *Q,  // [bs, G, len_q, DIM]
+  const bf16_t *K,  // [bs, len_kv, DIM]
+  const bf16_t *V,  // [bs, len_kv, DIM]
+  bf16_t *O,        // [bs, G, len_q, DIM]
   int bs,
   int G,
   int len_q,
@@ -60,10 +66,10 @@ at::Tensor prefix_shared_attention(
 
   at::Tensor O = at::empty_like(Q);
 
-  auto Q_ptr = reinterpret_cast<const __nv_bfloat16 *>(Q.data_ptr());
-  auto K_ptr = reinterpret_cast<const __nv_bfloat16 *>(K.data_ptr());
-  auto V_ptr = reinterpret_cast<const __nv_bfloat16 *>(V.data_ptr());
-  auto O_ptr = reinterpret_cast<__nv_bfloat16 *>(O.data_ptr());
+  auto Q_ptr = reinterpret_cast<const bf16_t *>(Q.data_ptr());
+  auto K_ptr = reinterpret_cast<const bf16_t *>(K.data_ptr());
+  auto V_ptr = reinterpret_cast<const bf16_t *>(V.data_ptr());
+  auto O_ptr = reinterpret_cast<bf16_t *>(O.data_ptr());
 
   prefix_shared_attention_forward(Q_ptr, K_ptr, V_ptr, O_ptr, bs, G, len_q, len_kv, dim);
 
