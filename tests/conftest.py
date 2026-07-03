@@ -5,6 +5,13 @@ import os
 import pathlib
 import sys
 
+# Accuracy tests compare fused kernels against native fp32 PyTorch oracles.
+# NVIDIA_TF32_OVERRIDE=1 (set by some GPU cloud images) forces cuBLAS into
+# TF32 regardless of torch.backends settings, degrading the oracle itself to
+# ~1e-2 absolute error. Pin it off before the first cuBLAS handle is created
+# so fp32 comparisons stay meaningful on every CI machine.
+os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
+
 
 def _add_windows_dll_dirs():
     if sys.platform != "win32" or not hasattr(os, "add_dll_directory"):

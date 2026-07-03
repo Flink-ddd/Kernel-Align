@@ -147,9 +147,10 @@ def _sm90_inputs(seed, *, bias=True, dtype=torch.bfloat16, lead=None):
 _N = 40
 _D = 80
 _V = 300
-# Triton and native PyTorch reduce logsumexp in different orders. These fp32
-# checks use intentionally uneven shapes, and SM89 observes sub-1e-2 absolute drift.
-_TRITON_FP32_ATOL = 1e-2
+# Measured worst-case Triton-vs-native drift is ~2e-5 (reduction order only).
+# Anything near 1e-2 means the native oracle itself degraded — usually
+# NVIDIA_TF32_OVERRIDE=1 forcing cuBLAS into TF32; conftest.py pins it off.
+_TRITON_FP32_ATOL = 1e-3
 
 
 def _inputs(seed, *, device, dtype=torch.float32, bias=True, lead=None):

@@ -55,6 +55,39 @@ def _cpu_fp16_matmul_supported() -> bool:
         return False
 
 
+def _cpu_fp32_gemm_batch_invariant() -> bool:
+    """Probe whether this CPU BLAS keeps fp32 GEMM bitwise batch-invariant.
+
+    Even with a single thread, some BLAS builds (e.g. MKL on AVX2) pick a
+    different K-reduction blocking depending on the M (=batch*seq) dimension,
+    which breaks the bitwise Axis-A property this file checks. Probe with the
+    same shapes the tests use so the skip tracks the real kernel selection.
+    """
+    prev = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        gen = torch.Generator().manual_seed(0)
+        hidden = torch.randn(8 * 32, _HIDDEN, generator=gen)
+        weight = torch.randn(_VOCAB, _HIDDEN, generator=gen)
+        full = hidden @ weight.t()
+        part = hidden[:32] @ weight.t()
+        return torch.equal(part, full[:32])
+    finally:
+        torch.set_num_threads(prev)
+
+
+# fp32 Axis-A is only meaningful where the underlying GEMM is batch-invariant;
+# on other BLAS builds the native op genuinely lacks the property, so the case
+# is skipped (with an explicit reason) rather than failing machine-dependently.
+_FP32_IF_CPU_GEMM_BATCH_INVARIANT = pytest.param(
+    torch.float32,
+    marks=pytest.mark.skipif(
+        not _cpu_fp32_gemm_batch_invariant(),
+        reason="CPU BLAS fp32 GEMM is not bitwise batch-invariant on this backend",
+    ),
+)
+
+
 # CPU half-precision matmul is backend/ISA-dependent (AVX512_FP16, AMX) and may
 # be unimplemented on some runners -- gate the fp16 axis so a missing kernel
 # skips rather than fails the test.
@@ -66,7 +99,11 @@ _FP16_IF_CPU_MATMUL_SUPPORTED = pytest.param(
     ),
 )
 _DTYPES_AXIS_B = (torch.bfloat16, _FP16_IF_CPU_MATMUL_SUPPORTED)
-_DTYPES_AXIS_A = (torch.float32, torch.bfloat16, _FP16_IF_CPU_MATMUL_SUPPORTED)
+_DTYPES_AXIS_A = (
+    _FP32_IF_CPU_GEMM_BATCH_INVARIANT,
+    torch.bfloat16,
+    _FP16_IF_CPU_MATMUL_SUPPORTED,
+)
 
 
 @contextlib.contextmanager
