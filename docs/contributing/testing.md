@@ -103,12 +103,12 @@ In GitHub Actions, add the label `needs-gpu-ci-self-hosted` to your PR and
 register a runner with the tag `cuda`. This path executes the PR commit on the
 self-hosted runner; only use it for PRs that are allowed to run on that machine.
 
-**Path B — hosted CUDA runner**
+**Path B — RunPod CUDA runner**
 
 Add the label `needs-gpu-ci` to the PR on GitHub. This runs
-`ci/run_cuda_tests.sh` on an ephemeral NVIDIA GPU instance via
-`ci/run_gpu_ci.sh`, then releases the instance. Configure the hosted-provider
-API and SSH secrets in GitHub Actions before enabling this path.
+`ci/run_cuda_tests.sh` on an ephemeral RunPod pod via `ci/run_gpu_ci.sh`,
+then removes the pod. Configure the RunPod API and SSH secrets in GitHub
+Actions before enabling this path.
 
 For Hopper-specific coverage, add `needs-gpu-ci-sm90`. This runs a separate
 H100 job with `KERNEL_ALIGN_FORCE_SM90=1` so SM90/TMA kernels are compiled and
@@ -148,13 +148,13 @@ ROCm machine; only use it for PRs that are allowed to run on that runner.
 
 ### Required GitHub Actions secrets
 
-The following secrets are only needed for the hosted CUDA paths (`needs-gpu-ci`
+The following secrets are only needed for the RunPod CUDA paths (`needs-gpu-ci`
 and `needs-gpu-ci-sm90`). The self-hosted and local paths require no secrets.
 
 | Secret | Purpose |
 |--------|---------|
-| `RUNPOD_API_KEY` | Authenticates hosted GPU instance creation/removal for CUDA CI |
-| `RUNPOD_SSH_PRIVATE_KEY` | Ed25519 private key for SSH access to hosted GPU instances |
+| `RUNPOD_API_KEY` | Authenticates RunPod pod creation/removal for CUDA CI |
+| `RUNPOD_SSH_PRIVATE_KEY` | Ed25519 private key for SSH access to RunPod pods |
 
 The **public key** counterpart of `RUNPOD_SSH_PRIVATE_KEY` must be registered
-with the hosted GPU provider before GPU CI can connect to the instance.
+in the RunPod account settings before GPU CI can connect to the pod.

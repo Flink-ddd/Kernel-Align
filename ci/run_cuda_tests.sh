@@ -10,7 +10,7 @@
 #      PR code on the target machine, so self-hosted runners should be trusted,
 #      ephemeral, or otherwise isolated for that workload.
 #
-#   2. Hosted CUDA runner (called from ci/run_gpu_ci.sh; the orchestrator
+#   2. RunPod CUDA runner (called from ci/run_gpu_ci.sh; the orchestrator
 #      uploads this script via scp and sets PR_REPO_URL + PR_SHA in the
 #      environment, so the isolation clone below runs on the remote host):
 #        PR_REPO_URL=... PR_SHA=... bash /tmp/run_cuda_tests.sh

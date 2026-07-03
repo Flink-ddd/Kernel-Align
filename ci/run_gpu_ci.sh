@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# ci/run_gpu_ci.sh — ephemeral CUDA runner orchestration
+# ci/run_gpu_ci.sh — ephemeral RunPod CUDA runner orchestration
 #
-# Starts a temporary hosted GPU instance, runs ci/run_cuda_tests.sh remotely,
-# then releases the instance. All test logic lives in run_cuda_tests.sh, which
-# can also be executed directly on any CUDA machine.
+# Starts a temporary RunPod pod, runs ci/run_cuda_tests.sh remotely, then
+# removes the pod. All test logic lives in run_cuda_tests.sh, which can also
+# be executed directly on any CUDA machine.
 #
-# Requires an authenticated provider CLI and an SSH key authorized for the
-# launched instance.
+# Requires an authenticated runpodctl and an SSH key registered with RunPod.
 #
 # The GitHub workflow overrides GPU selection per matrix row via env vars;
 # defaults below work for ad-hoc local invocation.
@@ -30,14 +29,14 @@ if [ "$PR_SHA" = "main" ]; then
   PR_SHA_FOR_NAME="$(date +%s)"
 fi
 PROFILE_SLUG=$(printf "%s" "${RUNPOD_PROFILE_NAME:-gpu}" | tr -c "[:alnum:]-" "-")
-INSTANCE_NAME="rl-kernel-ci-${PR_SHA_FOR_NAME:0:7}-${PROFILE_SLUG}"
+POD_NAME="rl-kernel-ci-${PR_SHA_FOR_NAME:0:7}-${PROFILE_SLUG}"
 READY_RETRIES="${RUNPOD_READY_RETRIES:-60}"
 SSH_READY_RETRIES="${RUNPOD_SSH_READY_RETRIES:-30}"
 REMOTE_ATTEMPTS="${RUNPOD_REMOTE_ATTEMPTS:-2}"
 RUNPOD_MIN_CUDA_VERSION="${RUNPOD_MIN_CUDA_VERSION:-12.4}"
 RUNPOD_TERMINATE_AFTER="${RUNPOD_TERMINATE_AFTER:-$(date -u -d '+2 hours' '+%Y-%m-%dT%H:%M:%SZ')}"
 
-INSTANCE_ID=""
+POD_ID=""
 RUNPOD_LOCATION_ARGS=()
 if [ -n "${RUNPOD_DATA_CENTER_IDS:-}" ]; then
   RUNPOD_LOCATION_ARGS+=(--data-center-ids "$RUNPOD_DATA_CENTER_IDS")
@@ -51,17 +50,17 @@ cleanup() {
   local exit_code=$?
   [ "$_FINAL_EXIT" -ne 0 ] && exit_code=$_FINAL_EXIT
   trap - EXIT INT TERM
-  if [ -n "$INSTANCE_ID" ]; then
+  if [ -n "$POD_ID" ]; then
     echo ""
     echo "[ci] ========================================================"
-    echo "[ci] === AUTOMATIC CLEANUP: Releasing GPU instance $INSTANCE_ID ==="
+    echo "[ci] === AUTOMATIC CLEANUP: Releasing RunPod pod $POD_ID ==="
     echo "[ci] ========================================================"
-    REMOVE_OUT=$(runpodctl pod remove "$INSTANCE_ID" 2>&1 || true)
+    REMOVE_OUT=$(runpodctl pod remove "$POD_ID" 2>&1 || true)
     if echo "$REMOVE_OUT" | grep -qiE "unknown command|unknown subcommand"; then
-      REMOVE_OUT=$(runpodctl pod delete "$INSTANCE_ID" 2>&1 || true)
+      REMOVE_OUT=$(runpodctl pod delete "$POD_ID" 2>&1 || true)
     fi
     if echo "$REMOVE_OUT" | grep -qi "not found"; then
-      echo "[ci] GPU instance $INSTANCE_ID was already released. Safe to exit."
+      echo "[ci] RunPod pod $POD_ID was already released. Safe to exit."
     else
       echo "$REMOVE_OUT"
     fi
@@ -70,14 +69,14 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# --- GPU instance provisioning ----------------------------------------------
+# --- RunPod pod provisioning ----------------------------------------------
 GPU_ID=$PRIMARY_GPU_ID
 GPU_COUNT=$PRIMARY_GPU_COUNT
 
-echo "[ci] Attempt 1: create GPU instance: ${GPU_COUNT}x ${GPU_ID}"
+echo "[ci] Attempt 1: create RunPod pod: ${GPU_COUNT}x ${GPU_ID}"
 CREATE_STATUS=0
 CREATE_OUT=$(runpodctl pod create \
-  --name "$INSTANCE_NAME" \
+  --name "$POD_NAME" \
   --gpu-id "$GPU_ID" \
   --gpu-count "$GPU_COUNT" \
   --image "$CI_IMAGE" \
@@ -93,10 +92,10 @@ if [ "$CREATE_STATUS" -ne 0 ] || echo "$CREATE_OUT" | grep -qi "no longer any in
   GPU_ID=$FALLBACK_GPU_ID
   GPU_COUNT=$FALLBACK_GPU_COUNT
 
-  echo "[ci] Attempt 2 (fallback): create GPU instance: ${GPU_COUNT}x ${GPU_ID}"
+  echo "[ci] Attempt 2 (fallback): create RunPod pod: ${GPU_COUNT}x ${GPU_ID}"
   CREATE_STATUS=0
   CREATE_OUT=$(runpodctl pod create \
-    --name "$INSTANCE_NAME" \
+    --name "$POD_NAME" \
     --gpu-id "$GPU_ID" \
     --gpu-count "$GPU_COUNT" \
     --image "$CI_IMAGE" \
@@ -114,37 +113,72 @@ if [ "$CREATE_STATUS" -ne 0 ] || echo "$CREATE_OUT" | grep -qi "no longer any in
 fi
 
 if [ "$CREATE_STATUS" -ne 0 ]; then
-  echo "[ci] ERROR: Failed to create GPU instance. Output: $CREATE_OUT"
+  echo "[ci] ERROR: Failed to create RunPod pod. Output: $CREATE_OUT"
   exit "$CREATE_STATUS"
 fi
 
-INSTANCE_ID=$(echo "$CREATE_OUT" | grep -oE '"id":\s*"[a-z0-9]{8,}"' | cut -d '"' -f4 | head -1)
-if [ -z "$INSTANCE_ID" ]; then
-  INSTANCE_ID=$(echo "$CREATE_OUT" | grep -oE '"id":[[:space:]]*"([a-z0-9]{8,})"' | grep -oE '[a-z0-9]{8,}' | head -1)
+# runpodctl may print human-readable text around (or instead of) a JSON
+# payload, so try a structured jq parse first and fall back to pattern
+# matching on the raw output.
+POD_ID=$(printf '%s' "$CREATE_OUT" | jq -r '.id // empty' 2>/dev/null || true)
+if [ -z "$POD_ID" ]; then
+  POD_ID=$(printf '%s' "$CREATE_OUT" | grep -oE '"id":[[:space:]]*"[a-z0-9]{8,}"' | head -1 | cut -d '"' -f4)
 fi
-if [ -z "$INSTANCE_ID" ]; then
-  echo "[ci] ERROR: Unable to resolve GPU instance id. Output: $CREATE_OUT"
+if [ -z "$POD_ID" ]; then
+  # Plain-text form: pod "abc123def456" created ...
+  POD_ID=$(printf '%s' "$CREATE_OUT" | grep -oE 'pod "[a-z0-9]{8,}"' | head -1 | grep -oE '[a-z0-9]{8,}')
+fi
+if [ -z "$POD_ID" ]; then
+  echo "[ci] ERROR: Unable to resolve RunPod pod id. Output: $CREATE_OUT"
   exit 1
 fi
-echo "[ci] GPU instance created: $INSTANCE_ID"
+echo "[ci] RunPod pod created: $POD_ID"
 
 # --- Wait for network --------------------------------------------------------
-echo "[ci] Waiting for GPU instance network routing..."
+# Resolve the pod's public SSH endpoint from `runpodctl pod get -o json`.
+# Layouts differ across runpodctl versions, so try in order:
+#   1. runpodctl >= 2.6: a top-level `.ssh {ip, port}` convenience block.
+#   2. older layouts: a runtime port-mapping object with privatePort == 22.
+#   3. regex fallback for non-JSON / unknown layouts (`"port"` is included
+#      because layout 1 calls the external port just `port`).
+parse_ssh_endpoint() {
+  SSH_IP=$(printf '%s' "$POD_INFO" | jq -r '.ssh.ip // empty' 2>/dev/null || true)
+  SSH_PORT=$(printf '%s' "$POD_INFO" | jq -r '.ssh.port // empty' 2>/dev/null || true)
+  if [ -n "$SSH_IP" ] && [ -n "$SSH_PORT" ]; then
+    return
+  fi
+
+  local ssh_mapping
+  ssh_mapping=$(printf '%s' "$POD_INFO" | jq -c '
+    [.. | objects | select(.privatePort? == 22)]
+    | map(select(.isIpPublic? != false))
+    | first // empty
+  ' 2>/dev/null || true)
+  if [ -n "$ssh_mapping" ]; then
+    SSH_IP=$(printf '%s' "$ssh_mapping" | jq -r '.ip // .publicIp // empty')
+    SSH_PORT=$(printf '%s' "$ssh_mapping" | jq -r '.publicPort // .externalPort // empty')
+    return
+  fi
+
+  SSH_IP=$(printf '%s' "$POD_INFO" | grep -iE '"ip"|"publicIp"|"address"' | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -1 || true)
+  SSH_PORT=$(printf '%s' "$POD_INFO" | grep -iE '"port"|"publicPort"|"externalPort"' | grep -oE '[0-9]+' | grep -v '^22$' | head -1 || true)
+}
+
+echo "[ci] Waiting for RunPod pod network routing..."
 SSH_IP=""
 SSH_PORT=""
 
 for i in $(seq 1 "$READY_RETRIES"); do
-  INSTANCE_INFO=$(runpodctl pod get "$INSTANCE_ID" -o json)
-  SSH_IP=$(echo "$INSTANCE_INFO" | grep -iE '"ip"|"publicIp"|"address"' | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -1 || true)
-  SSH_PORT=$(echo "$INSTANCE_INFO" | grep -iE '"port"|"externalPort"|"publicPort"' | grep -oE '[0-9]+' | grep -v '^22$' | head -1 || true)
+  POD_INFO=$(runpodctl pod get "$POD_ID" -o json)
+  parse_ssh_endpoint
 
-  if [ -n "$SSH_IP" ] && [ -n "$SSH_PORT" ] && ! echo "$INSTANCE_INFO" | grep -qi "not ready"; then
-    echo "[ci] GPU instance network is ready."
+  if [ -n "$SSH_IP" ] && [ -n "$SSH_PORT" ] && ! echo "$POD_INFO" | grep -qi "not ready"; then
+    echo "[ci] RunPod pod network is ready."
     break
   fi
 
   if [ "$i" -eq "$READY_RETRIES" ]; then
-    echo "[ci] ERROR: GPU instance network/SSH initialization timed out."
+    echo "[ci] ERROR: RunPod pod network/SSH initialization timed out."
     exit 1
   fi
 
