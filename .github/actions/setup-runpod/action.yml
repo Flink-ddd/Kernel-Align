@@ -1,0 +1,41 @@
+name: Setup RunPod CLI
+description: >-
+  Install runpodctl, authenticate it, and materialize the SSH private key used
+  to reach hosted GPU instances. Exports RUNPOD_SSH_KEY_PATH for later steps.
+
+inputs:
+  api-key:
+    description: RunPod API key
+    required: true
+  ssh-private-key:
+    description: Ed25519 private key authorized for hosted GPU instances
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install runpodctl
+      shell: bash
+      run: |
+        wget -qO runpodctl https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64
+        chmod +x runpodctl
+        sudo mv runpodctl /usr/local/bin/runpodctl
+        runpodctl version
+
+    - name: Configure runpodctl
+      shell: bash
+      run: runpodctl config --apiKey "${RUNPOD_API_KEY}"
+      env:
+        RUNPOD_API_KEY: ${{ inputs.api-key }}
+
+    - name: Setup SSH key
+      shell: bash
+      run: |
+        mkdir -p ~/.ssh && chmod 700 ~/.ssh
+        KEY_PATH="$RUNNER_TEMP/hosted-gpu-ci-key"
+        printf '%s\n' "$RUNPOD_SSH_PRIVATE_KEY" > "$KEY_PATH"
+        chmod 600 "$KEY_PATH"
+        ssh-keygen -y -f "$KEY_PATH" > /dev/null
+        echo "RUNPOD_SSH_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+      env:
+        RUNPOD_SSH_PRIVATE_KEY: ${{ inputs.ssh-private-key }}

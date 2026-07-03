@@ -16,6 +16,7 @@ on:
       - 'ci/run_rocm_ci.sh'
       - 'ci/run_rocm_container.sh'
       - '.github/workflows/gpu-ci.yml'
+      - '.github/actions/setup-runpod/**'
     types: [ opened, synchronize, reopened, labeled ]
 
 concurrency:
@@ -26,9 +27,9 @@ permissions:
   contents: read
 
 jobs:
-  # ── Option A: hosted CUDA runner ──────────────────────────────────────────
+  # ── Option A: RunPod CUDA runner ──────────────────────────────────────────
   # Triggered by the 'needs-gpu-ci' label. Runs ci/run_cuda_tests.sh on an
-  # ephemeral NVIDIA GPU instance and releases the instance afterwards.
+  # ephemeral RunPod pod and removes the pod afterwards.
   cuda-cloud:
     if: contains(github.event.pull_request.labels.*.name, 'needs-gpu-ci')
     runs-on: ubuntu-latest
@@ -51,29 +52,18 @@ jobs:
             fallback_gpu_count: 1
             torch_cuda_arch_list: "8.6"
     steps:
+      # The checkout uses the base SHA, so both the orchestrator script and the
+      # local setup-runpod action come from trusted (already-merged) code.
       - name: Checkout secure orchestrator script from base branch
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
 
-      - name: Install runpodctl
-        run: |
-          wget -qO runpodctl https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64
-          chmod +x runpodctl
-          sudo mv runpodctl /usr/local/bin/runpodctl
-          runpodctl version
-
-      - name: Configure runpodctl
-        run: runpodctl config --apiKey "${{ secrets.RUNPOD_API_KEY }}"
-
-      - name: Setup SSH key
-        run: |
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          KEY_PATH="$RUNNER_TEMP/hosted-gpu-ci-key"
-          printf '%s\n' "${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}" > "$KEY_PATH"
-          chmod 600 "$KEY_PATH"
-          ssh-keygen -y -f "$KEY_PATH" > /dev/null
-          echo "RUNPOD_SSH_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+      - name: Setup RunPod CLI and SSH key
+        uses: ./.github/actions/setup-runpod
+        with:
+          api-key: ${{ secrets.RUNPOD_API_KEY }}
+          ssh-private-key: ${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}
 
       - name: Run CUDA hardware tests
         env:
@@ -110,7 +100,7 @@ jobs:
           PR_SHA: ${{ github.event.pull_request.head.sha }}
         run: bash ci/run_cuda_tests.sh
 
-  # ── Option C: hosted CUDA SM90 runner ─────────────────────────────────────
+  # ── Option C: RunPod CUDA SM90 runner ─────────────────────────────────────
   # Triggered separately because H100 capacity is expensive and not needed for
   # every GPU label. This validates the Hopper/TMA build path with SM90 enabled.
   cuda-sm90-cloud:
@@ -123,24 +113,11 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha }}
 
-      - name: Install runpodctl
-        run: |
-          wget -qO runpodctl https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64
-          chmod +x runpodctl
-          sudo mv runpodctl /usr/local/bin/runpodctl
-          runpodctl version
-
-      - name: Configure runpodctl
-        run: runpodctl config --apiKey "${{ secrets.RUNPOD_API_KEY }}"
-
-      - name: Setup SSH key
-        run: |
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          KEY_PATH="$RUNNER_TEMP/hosted-gpu-ci-key"
-          printf '%s\n' "${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}" > "$KEY_PATH"
-          chmod 600 "$KEY_PATH"
-          ssh-keygen -y -f "$KEY_PATH" > /dev/null
-          echo "RUNPOD_SSH_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+      - name: Setup RunPod CLI and SSH key
+        uses: ./.github/actions/setup-runpod
+        with:
+          api-key: ${{ secrets.RUNPOD_API_KEY }}
+          ssh-private-key: ${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}
 
       - name: Run SM90 CUDA hardware tests
         env:

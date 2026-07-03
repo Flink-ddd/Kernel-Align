@@ -40,6 +40,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The CUDA/ROCm devel base images are tens of GB; ubuntu-latest only has
+      # ~14 GB free by default. Drop preinstalled toolchains we never use.
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af
+          df -h /
+
       - name: Set lower case image name
         run: |
           REPO="${GITHUB_REPOSITORY,,}"
@@ -76,6 +85,13 @@ jobs:
             tag: rocm
     steps:
       - uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af
+          df -h /
 
       - name: Set lower case image name
         run: |
