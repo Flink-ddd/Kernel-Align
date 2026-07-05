@@ -283,55 +283,22 @@ class _TensorParallelLinearLogpFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_logp):
-        dist = _require_distributed_initialized()
         hidden_2d, weight, bias_t, target_1d, lse = ctx.saved_tensors
-        n, d = hidden_2d.shape
-        local_vocab = weight.shape[0]
-        dt = weight.dtype
-        g = grad_logp.reshape(-1).to(torch.float32)
-
-        grad_h = torch.empty_like(hidden_2d, dtype=torch.float32)
-        grad_w = torch.zeros(local_vocab, d, device=weight.device, dtype=torch.float32)
-        grad_b = (
-            torch.zeros(local_vocab, device=weight.device, dtype=torch.float32)
-            if ctx.has_bias
-            else None
+        grad_hidden, grad_weight, grad_bias = tensor_parallel_chunked_linear_logp_backward(
+            grad_logp,
+            hidden_2d,
+            weight,
+            target_1d,
+            bias_t,
+            lse,
+            has_bias=ctx.has_bias,
+            lead_shape=ctx.lead_shape,
+            hidden_dtype=ctx.hidden_dtype,
+            weight_dtype=ctx.weight_dtype,
+            bias_dtype=ctx.bias_dtype,
+            vocab_start_index=ctx.vocab_start_index,
+            tp_group=ctx.tp_group,
         )
-        use_fp32 = _use_fp32_matmul(hidden_2d, weight)
-
-        chunk = max(1, min(n, BWD_CHUNK_ELEMS // local_vocab))
-        for i0 in range(0, n, chunk):
-            i1 = min(i0 + chunk, n)
-            x = hidden_2d[i0:i1]
-            logits = _linear_logits(
-                x,
-                weight,
-                bias_t if ctx.has_bias else None,
-                use_fp32=use_fp32,
-            )
-
-            dz = -torch.exp(logits.float() - lse[i0:i1].unsqueeze(1))
-            local_idx = target_1d[i0:i1] - ctx.vocab_start_index
-            owns_target = (local_idx >= 0) & (local_idx < local_vocab)
-            if bool(owns_target.any().item()):
-                rows = torch.arange(i1 - i0, device=dz.device)[owns_target]
-                dz[rows, local_idx[owns_target].long()] += 1.0
-            dz *= g[i0:i1].unsqueeze(1)
-
-            if use_fp32:
-                grad_h[i0:i1] = torch.matmul(dz, weight.float()).float()
-                grad_w += torch.matmul(dz.t(), x.float()).float()
-            else:
-                dz_dt = dz.to(dt)
-                grad_h[i0:i1] = torch.matmul(dz_dt, weight).float()
-                grad_w += torch.matmul(dz_dt.t(), x).float()
-            if grad_b is not None:
-                grad_b += dz.sum(0)
-
-        dist.all_reduce(grad_h, op=dist.ReduceOp.SUM, group=ctx.tp_group)
-        grad_hidden = grad_h.to(ctx.hidden_dtype).reshape((*ctx.lead_shape, d))
-        grad_weight = grad_w.to(ctx.weight_dtype)
-        grad_bias = grad_b.to(ctx.bias_dtype) if grad_b is not None else None
         return grad_hidden, grad_weight, grad_bias, None, None, None, None
 
 
@@ -434,6 +401,80 @@ def chunked_linear_logp_backward(
             grad_b += dz.sum(0)
 
     grad_hidden = grad_h.to(hidden_dtype).reshape(tuple(lead_shape) + (d,))
+    grad_weight = grad_w.to(weight_dtype)
+    grad_bias = grad_b.to(bias_dtype) if grad_b is not None else None
+    return grad_hidden, grad_weight, grad_bias
+
+
+def tensor_parallel_chunked_linear_logp_backward(
+    grad_logp: torch.Tensor,
+    hidden_2d: torch.Tensor,
+    weight: torch.Tensor,
+    target_1d: torch.Tensor,
+    bias_t: torch.Tensor,
+    lse: torch.Tensor,
+    *,
+    has_bias: bool,
+    lead_shape,
+    hidden_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    bias_dtype,
+    vocab_start_index: int,
+    tp_group: Any,
+    chunk_elems: int = BWD_CHUNK_ELEMS,
+):
+    """Chunked backward for the vocab-sharded (tensor-parallel) linear_logp.
+
+    Shared by the native, Triton and SM90 TP paths: each rank recomputes its
+    local logit tiles, forms ``dz = g * (onehot_local - softmax_global)`` using
+    the forward-saved global ``lse``, and accumulates the local weight/bias
+    gradients plus its contribution to ``grad_hidden``. ``grad_hidden`` is
+    all-reduced across the TP group since every rank sees the full hidden.
+    """
+    dist = _require_distributed_initialized()
+    n, d = hidden_2d.shape
+    local_vocab = weight.shape[0]
+    dt = weight.dtype
+    g = grad_logp.reshape(-1).to(torch.float32)
+
+    grad_h = torch.empty_like(hidden_2d, dtype=torch.float32)
+    grad_w = torch.zeros(local_vocab, d, device=weight.device, dtype=torch.float32)
+    grad_b = (
+        torch.zeros(local_vocab, device=weight.device, dtype=torch.float32) if has_bias else None
+    )
+    use_fp32 = _use_fp32_matmul(hidden_2d, weight)
+
+    chunk = max(1, min(n, chunk_elems // local_vocab))
+    for i0 in range(0, n, chunk):
+        i1 = min(i0 + chunk, n)
+        x = hidden_2d[i0:i1]
+        logits = _linear_logits(
+            x,
+            weight,
+            bias_t if has_bias else None,
+            use_fp32=use_fp32,
+        )
+
+        dz = -torch.exp(logits.float() - lse[i0:i1].unsqueeze(1))
+        local_idx = target_1d[i0:i1] - vocab_start_index
+        owns_target = (local_idx >= 0) & (local_idx < local_vocab)
+        if bool(owns_target.any().item()):
+            rows = torch.arange(i1 - i0, device=dz.device)[owns_target]
+            dz[rows, local_idx[owns_target].long()] += 1.0
+        dz *= g[i0:i1].unsqueeze(1)
+
+        if use_fp32:
+            grad_h[i0:i1] = torch.matmul(dz, weight.float()).float()
+            grad_w += torch.matmul(dz.t(), x.float()).float()
+        else:
+            dz_dt = dz.to(dt)
+            grad_h[i0:i1] = torch.matmul(dz_dt, weight).float()
+            grad_w += torch.matmul(dz_dt.t(), x).float()
+        if grad_b is not None:
+            grad_b += dz.sum(0)
+
+    dist.all_reduce(grad_h, op=dist.ReduceOp.SUM, group=tp_group)
+    grad_hidden = grad_h.to(hidden_dtype).reshape((*lead_shape, d))
     grad_weight = grad_w.to(weight_dtype)
     grad_bias = grad_b.to(bias_dtype) if grad_b is not None else None
     return grad_hidden, grad_weight, grad_bias

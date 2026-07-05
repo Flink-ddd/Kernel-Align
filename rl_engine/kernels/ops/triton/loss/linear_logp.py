@@ -9,10 +9,14 @@ import triton
 import triton.language as tl
 
 from rl_engine.kernels.ops.pytorch.loss.linear_logp import (
+    _require_distributed_initialized,
+    _validate_global_targets,
+    _validate_tp_vocab_partition,
     chunked_linear_logp_backward,
     should_use_tensor_parallel_linear_logp,
-    tensor_parallel_linear_logp,
+    tensor_parallel_chunked_linear_logp_backward,
 )
+from rl_engine.utils.logger import logger
 
 # Token / vocab / hidden tile sizes (forward Triton kernel).
 _BLOCK_N = 32
@@ -89,6 +93,42 @@ def _linear_logp_fwd_kernel(
     tl.store(lse_ptr + rows, lse, mask=row_mask)
 
 
+def _run_forward_kernel(
+    hidden_2d: torch.Tensor,
+    weight: torch.Tensor,
+    bias_t: torch.Tensor,
+    target_1d: torch.Tensor,
+    *,
+    has_bias: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    n, d = hidden_2d.shape
+    v = weight.shape[0]
+    logp = torch.empty(n, device=hidden_2d.device, dtype=torch.float32)
+    lse = torch.empty(n, device=hidden_2d.device, dtype=torch.float32)
+
+    grid = (triton.cdiv(n, _BLOCK_N),)
+    _linear_logp_fwd_kernel[grid](
+        hidden_2d,
+        weight,
+        bias_t,
+        target_1d,
+        logp,
+        lse,
+        n,
+        d,
+        v,
+        hidden_2d.stride(0),
+        hidden_2d.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        HAS_BIAS=has_bias,
+        BLOCK_N=_BLOCK_N,
+        BLOCK_V=_BLOCK_V,
+        BLOCK_D=_BLOCK_D,
+    )
+    return logp, lse
+
+
 class _LinearLogpFunction(torch.autograd.Function):
     """Autograd wrapper: fused forward + recompute-based backward."""
 
@@ -99,32 +139,10 @@ class _LinearLogpFunction(torch.autograd.Function):
         target_1d = (
             target_ids.reshape(-1).to(device=hidden_2d.device, dtype=torch.int32).contiguous()
         )
-        n, d = hidden_2d.shape
-        v = weight.shape[0]
-
-        logp = torch.empty(n, device=hidden_2d.device, dtype=torch.float32)
-        lse = torch.empty(n, device=hidden_2d.device, dtype=torch.float32)
         bias_t = bias.contiguous() if bias is not None else hidden_2d  # dummy ptr when no bias
 
-        grid = (triton.cdiv(n, _BLOCK_N),)
-        _linear_logp_fwd_kernel[grid](
-            hidden_2d,
-            weight,
-            bias_t,
-            target_1d,
-            logp,
-            lse,
-            n,
-            d,
-            v,
-            hidden_2d.stride(0),
-            hidden_2d.stride(1),
-            weight.stride(0),
-            weight.stride(1),
-            HAS_BIAS=bias is not None,
-            BLOCK_N=_BLOCK_N,
-            BLOCK_V=_BLOCK_V,
-            BLOCK_D=_BLOCK_D,
+        logp, lse = _run_forward_kernel(
+            hidden_2d, weight, bias_t, target_1d, has_bias=bias is not None
         )
 
         ctx.save_for_backward(hidden_2d, weight, bias_t, target_1d, lse)
@@ -152,6 +170,119 @@ class _LinearLogpFunction(torch.autograd.Function):
         )
         # Inputs: hidden, lm_head_weight, bias, target_ids.
         return grad_hidden, grad_weight, grad_bias, None
+
+
+_TP_PATH_LOGGED = False
+
+
+class _TensorParallelTritonLinearLogpFunction(torch.autograd.Function):
+    # Triton local-shard forward with a tensor-parallel logsumexp reduction.
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden,
+        lm_head_weight,
+        bias,
+        target_ids,
+        vocab_start_index,
+        global_vocab_size,
+        tp_group,
+    ):
+        dist = _require_distributed_initialized()
+
+        hidden_2d = hidden.reshape(-1, hidden.size(-1)).contiguous()
+        weight = lm_head_weight.contiguous()
+        target_1d = (
+            target_ids.reshape(-1).to(device=hidden_2d.device, dtype=torch.long).contiguous()
+        )
+        bias_t = bias.contiguous() if bias is not None else hidden_2d
+        vocab_start_index = int(vocab_start_index)
+        global_vocab_size = _validate_tp_vocab_partition(
+            tp_group=tp_group,
+            device=hidden_2d.device,
+            vocab_start_index=vocab_start_index,
+            local_vocab_size=weight.size(0),
+            global_vocab_size=global_vocab_size,
+        )
+        _validate_global_targets(target_1d, global_vocab_size, tp_group)
+
+        # Clamp the global target to a valid local column
+        local_vocab = weight.size(0)
+        local_target = target_1d - vocab_start_index
+        owns_target = (local_target >= 0) & (local_target < local_vocab)
+        kernel_target = local_target.clamp_(0, local_vocab - 1).to(torch.int32).contiguous()
+
+        local_logp, local_lse = _run_forward_kernel(
+            hidden_2d, weight, bias_t, kernel_target, has_bias=bias is not None
+        )
+        # logp = target_logit - lse  =>  target_logit = logp + lse
+        local_target_logit = torch.where(
+            owns_target, local_logp + local_lse, torch.zeros_like(local_lse)
+        )
+        target_logit = local_target_logit.clone()
+        dist.all_reduce(target_logit, op=dist.ReduceOp.SUM, group=tp_group)
+
+        global_lse_max = local_lse.clone()
+        dist.all_reduce(global_lse_max, op=dist.ReduceOp.MAX, group=tp_group)
+        global_lse_sum = torch.exp(local_lse - global_lse_max)
+        dist.all_reduce(global_lse_sum, op=dist.ReduceOp.SUM, group=tp_group)
+        global_lse = global_lse_max + torch.log(global_lse_sum)
+
+        ctx.save_for_backward(hidden_2d, weight, bias_t, target_1d, global_lse)
+        ctx.has_bias = bias is not None
+        ctx.lead_shape = hidden.shape[:-1]
+        ctx.hidden_dtype = hidden.dtype
+        ctx.weight_dtype = lm_head_weight.dtype
+        ctx.bias_dtype = bias.dtype if bias is not None else None
+        ctx.vocab_start_index = vocab_start_index
+        ctx.tp_group = tp_group
+        return (target_logit - global_lse).reshape(hidden.shape[:-1])
+
+    @staticmethod
+    def backward(ctx, grad_logp):
+        hidden_2d, weight, bias_t, target_1d, global_lse = ctx.saved_tensors
+        grad_hidden, grad_weight, grad_bias = tensor_parallel_chunked_linear_logp_backward(
+            grad_logp,
+            hidden_2d,
+            weight,
+            target_1d,
+            bias_t,
+            global_lse,
+            has_bias=ctx.has_bias,
+            lead_shape=ctx.lead_shape,
+            hidden_dtype=ctx.hidden_dtype,
+            weight_dtype=ctx.weight_dtype,
+            bias_dtype=ctx.bias_dtype,
+            vocab_start_index=ctx.vocab_start_index,
+            tp_group=ctx.tp_group,
+        )
+        return grad_hidden, grad_weight, grad_bias, None, None, None, None
+
+
+def _triton_tensor_parallel_linear_logp(
+    hidden: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    target_ids: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    *,
+    tp_group: Any,
+    vocab_start_index: int,
+    global_vocab_size: Optional[int],
+) -> torch.Tensor:
+    global _TP_PATH_LOGGED
+    if not _TP_PATH_LOGGED:
+        logger.info("Using Triton linear_logp tensor-parallel local-shard path.")
+        _TP_PATH_LOGGED = True
+    return _TensorParallelTritonLinearLogpFunction.apply(
+        hidden,
+        lm_head_weight,
+        bias,
+        target_ids,
+        int(vocab_start_index),
+        None if global_vocab_size is None else int(global_vocab_size),
+        tp_group,
+    )
 
 
 class TritonLinearLogpOp:
@@ -216,7 +347,7 @@ class TritonLinearLogpOp:
             global_vocab_size,
             lm_head_weight.size(0),
         ):
-            return tensor_parallel_linear_logp(
+            return _triton_tensor_parallel_linear_logp(
                 hidden,
                 lm_head_weight,
                 target_ids,
