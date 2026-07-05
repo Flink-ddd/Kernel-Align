@@ -39,6 +39,8 @@ jobs:
             tag: rocm
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # The CUDA/ROCm devel base images are tens of GB; ubuntu-latest only has
       # ~14 GB free by default. Drop preinstalled toolchains we never use.
@@ -85,6 +87,8 @@ jobs:
             tag: rocm
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Free runner disk space
         run: |

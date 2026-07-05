@@ -16,8 +16,12 @@ runs:
   steps:
     - name: Install runpodctl
       shell: bash
+      env:
+        RUNPODCTL_VERSION: v2.6.1
+        RUNPODCTL_SHA256: eaecd8d7110022b0a8d870b7462628eab4bb47c67947121be7ef201ce914ae4f
       run: |
-        wget -qO runpodctl https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64
+        curl -fsSL -o runpodctl "https://github.com/runpod/runpodctl/releases/download/${RUNPODCTL_VERSION}/runpodctl-linux-amd64"
+        echo "${RUNPODCTL_SHA256}  runpodctl" | sha256sum -c -
         chmod +x runpodctl
         sudo mv runpodctl /usr/local/bin/runpodctl
         runpodctl version

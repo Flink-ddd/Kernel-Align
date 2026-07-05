@@ -17,7 +17,7 @@ on:
       - 'ci/run_rocm_container.sh'
       - '.github/workflows/gpu-ci.yml'
       - '.github/actions/setup-runpod/**'
-    types: [ opened, synchronize, reopened, labeled ]
+    types: [ labeled ]
 
 concurrency:
   group: hardware-gpu-ci
@@ -31,7 +31,7 @@ jobs:
   # Triggered by the 'needs-gpu-ci' label. Runs ci/run_cuda_tests.sh on an
   # ephemeral RunPod pod and removes the pod afterwards.
   cuda-cloud:
-    if: contains(github.event.pull_request.labels.*.name, 'needs-gpu-ci')
+    if: github.event.action == 'labeled' && github.event.label.name == 'needs-gpu-ci'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
@@ -58,6 +58,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
 
       - name: Setup RunPod CLI and SSH key
         uses: ./.github/actions/setup-runpod
@@ -82,7 +83,7 @@ jobs:
   # Triggered by the 'needs-gpu-ci-self-hosted' label. The runner must have
   # CUDA drivers installed and be registered with the label 'cuda'.
   cuda-self-hosted:
-    if: contains(github.event.pull_request.labels.*.name, 'needs-gpu-ci-self-hosted')
+    if: github.event.action == 'labeled' && github.event.label.name == 'needs-gpu-ci-self-hosted'
     runs-on: [ self-hosted, linux, x64, cuda ]
     timeout-minutes: 90
     steps:
@@ -93,6 +94,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
 
       - name: Run CUDA tests
         env:
@@ -104,7 +106,7 @@ jobs:
   # Triggered separately because H100 capacity is expensive and not needed for
   # every GPU label. This validates the Hopper/TMA build path with SM90 enabled.
   cuda-sm90-cloud:
-    if: contains(github.event.pull_request.labels.*.name, 'needs-gpu-ci-sm90')
+    if: github.event.action == 'labeled' && github.event.label.name == 'needs-gpu-ci-sm90'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -112,6 +114,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
 
       - name: Setup RunPod CLI and SSH key
         uses: ./.github/actions/setup-runpod
@@ -135,7 +138,7 @@ jobs:
 
   # ── Option D: self-hosted ROCm runner ─────────────────────────────────────
   rocm-self-hosted:
-    if: contains(github.event.pull_request.labels.*.name, 'needs-rocm-ci')
+    if: github.event.action == 'labeled' && github.event.label.name == 'needs-rocm-ci'
     runs-on: [ self-hosted, linux, x64, rocm ]
     timeout-minutes: 90
     steps:
@@ -146,6 +149,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
 
       - name: Run ROCm hardware tests
         env:

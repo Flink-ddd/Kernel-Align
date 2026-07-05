@@ -137,7 +137,9 @@ PY
 # --- NCCL smoke test (multi-GPU only) ----------------------------------------
 GPU_COUNT="${GPU_COUNT:-$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)}"
 if [ "${GPU_COUNT}" -gt 1 ]; then
-  cat >/tmp/rl_kernel_nccl_smoke.py <<'PY'
+  NCCL_SMOKE_SCRIPT="$(mktemp "${TMPDIR:-/tmp}/rl_kernel_nccl_smoke.XXXXXX.py")"
+  trap 'rm -f "${NCCL_SMOKE_SCRIPT:-}"' EXIT
+  cat >"${NCCL_SMOKE_SCRIPT}" <<'PY'
 import os
 import torch
 import torch.distributed as dist
@@ -161,7 +163,7 @@ PY
   export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
   NCCL_SMOKE_TIMEOUT="${NCCL_SMOKE_TIMEOUT:-120s}"
   timeout "$NCCL_SMOKE_TIMEOUT" \
-    "$PY" -m torch.distributed.run --nproc_per_node="$GPU_COUNT" /tmp/rl_kernel_nccl_smoke.py
+    "$PY" -m torch.distributed.run --nproc_per_node="$GPU_COUNT" "${NCCL_SMOKE_SCRIPT}"
 fi
 
 # --- Test suite --------------------------------------------------------------
