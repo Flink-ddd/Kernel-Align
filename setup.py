@@ -34,7 +34,9 @@ def _cuda_define_from_env(name: str, macro: str) -> list[str]:
 def _sm90_arch_from_env_or_device(cc_major: int, cc_minor: int) -> str:
     override = os.environ.get("KERNEL_ALIGN_SM90_ARCH")
     if override:
-        return override.strip().lower().removeprefix("sm_").removeprefix("compute_").replace(".", "")
+        return (
+            override.strip().lower().removeprefix("sm_").removeprefix("compute_").replace(".", "")
+        )
     if cc_major == 9:
         return f"{cc_major}{cc_minor}a"
     return "90a"

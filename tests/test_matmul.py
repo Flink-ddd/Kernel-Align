@@ -51,9 +51,7 @@ def _cpu_fp32_matmul_padding_batch_invariant() -> bool:
         a_padded = torch.cat([a_valid, padding], dim=0)
         out_valid = op.forward_fp32(a_valid, b)
         out_padded = op.forward_fp32(a_padded, b)
-    return torch.equal(out_valid[0], out_padded[0]) and torch.equal(
-        out_valid[1], out_padded[1]
-    )
+    return torch.equal(out_valid[0], out_padded[0]) and torch.equal(out_valid[1], out_padded[1])
 
 
 def _cpu_fp32_matmul_grad_batch_invariant() -> bool:
@@ -223,8 +221,7 @@ class TestNativeMatmulOpAccuracy:
         out_fp32 = op.forward_fp32(a, b)
         diff = (out_typed - out_fp32).abs().max().item()
         assert torch.allclose(out_typed, out_fp32, atol=atol, rtol=rtol), (
-            f"dtype={dtype}, max_abs_error={diff:.3e} exceeds "
-            f"atol={atol}, rtol={rtol}"
+            f"dtype={dtype}, max_abs_error={diff:.3e} exceeds " f"atol={atol}, rtol={rtol}"
         )
 
 
