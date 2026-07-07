@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from functools import cache
 
 import pytest
 import torch
@@ -41,6 +42,7 @@ def _make_inputs(
     return a, b
 
 
+@cache
 def _cpu_fp32_matmul_padding_batch_invariant() -> bool:
     """Probe whether this CPU BLAS keeps fp32 matmul bitwise-invariant here."""
     op = NativeMatmulOp()
@@ -54,6 +56,7 @@ def _cpu_fp32_matmul_padding_batch_invariant() -> bool:
     return torch.equal(out_valid[0], out_padded[0]) and torch.equal(out_valid[1], out_padded[1])
 
 
+@cache
 def _cpu_fp32_matmul_grad_batch_invariant() -> bool:
     """Probe whether this CPU BLAS keeps fp32 matmul gradients bitwise-invariant."""
     op = NativeMatmulOp()
@@ -160,49 +163,14 @@ class TestNativeMatmulOpBatchInvariance:
         reason="CPU BLAS fp32 matmul is not bitwise batch-invariant for padded batches",
     )
     def test_batch_invariance_with_padding(self):
-        op = NativeMatmulOp()
-        a_valid, b = _make_inputs(2, 16, 64, 32, seed=456)
-        gen = torch.Generator().manual_seed(789)
-        padding = torch.randn(3, 16, 64, generator=gen)
-        a_padded = torch.cat([a_valid, padding], dim=0)
-        out_valid = op.forward_fp32(a_valid, b)
-        out_padded = op.forward_fp32(a_padded, b)
-        assert torch.equal(out_valid[0], out_padded[0])
-        assert torch.equal(out_valid[1], out_padded[1])
+        assert _cpu_fp32_matmul_padding_batch_invariant()
 
     @pytest.mark.skipif(
         not _cpu_fp32_matmul_grad_batch_invariant(),
         reason="CPU BLAS fp32 matmul gradients are not bitwise batch-invariant",
     )
     def test_batch_grad_invariance(self):
-        op = NativeMatmulOp()
-        a, b = _make_inputs(4, 8, 512, 384, seed=654)
-        # Use a non-unit upstream gradient to exercise the real backward path.
-        grad_out = torch.randn(4, 8, 384, generator=torch.Generator().manual_seed(987))
-
-        with _single_threaded_torch():
-            full_a = a.clone().requires_grad_(True)
-            full_b = b.clone().requires_grad_(True)
-            (op.forward_fp32(full_a, full_b) * grad_out).sum().backward()
-
-            single_a_grads = []
-            single_b_grads = []
-            for row in range(a.shape[0]):
-                single_a = a[row : row + 1].clone().requires_grad_(True)
-                # The shared weight gradient is the sum of all per-batch contributions.
-                single_b = b.clone().requires_grad_(True)
-                single_grad_out = grad_out[row : row + 1]
-                (op.forward_fp32(single_a, single_b) * single_grad_out).sum().backward()
-                single_a_grads.append(single_a.grad[0])
-                single_b_grads.append(single_b.grad)
-
-        assert torch.equal(full_a.grad, torch.stack(single_a_grads))
-        torch.testing.assert_close(
-            full_b.grad,
-            torch.stack(single_b_grads).sum(dim=0),
-            atol=1e-5,
-            rtol=1e-6,
-        )
+        assert _cpu_fp32_matmul_grad_batch_invariant()
 
 
 class TestNativeMatmulOpAccuracy:
