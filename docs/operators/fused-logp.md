@@ -13,13 +13,25 @@ logp_op = kernel_registry.get_op("logp")
 output = logp_op(logits, token_ids)
 ```
 
+The PyTorch native reference also exposes the Issue #108 interface:
+
+```python
+from rl_engine.kernels.ops.pytorch.loss.logp import NativeLogpOp
+
+logp_ref = NativeLogpOp()
+output = logp_ref.forward(logits, token_ids)
+reference = logp_ref.forward_fp32(logits, token_ids)
+```
+
+`apply(...)` and `apply_fp32(...)` remain available as backward-compatible aliases.
+
 ## Backends
 
 | Backend | Wrapper | Native symbol | Notes |
 | --- | --- | --- | --- |
 | CUDA SM90 | `FusedLogpSM90Op` | `_C.fused_logp_sm90` | Experimental TMA-oriented path for 2D contiguous bf16 logits on Hopper-class GPUs. It is disabled by default and requires `RL_KERNEL_ENABLE_EXPERIMENTAL_SM90_LOGP=1`; otherwise the wrapper delegates to the CUDA generic fallback. |
 | CUDA generic | `FusedLogpGenericOp` | `_C.fused_logp` | Generic compiled extension fallback. |
-| PyTorch native | `NativeOp` | None | Baseline fallback path. |
+| PyTorch native | `NativeLogpOp` | None | PyTorch baseline/reference path. |
 
 ## Tensor Contract
 
@@ -39,16 +51,20 @@ ref = torch.gather(ref, dim=-1, index=token_ids.unsqueeze(-1).long()).squeeze(-1
 ## Tests
 
 ```bash
-python tests/test_op_accuracy.py
+python -m pytest tests/test_logp.py -q
+python -m pytest tests/test_op_accuracy.py -q
 ```
 
-The current accuracy test compares the dispatched operator with a PyTorch reference and
-uses a dtype-dependent threshold.
+`tests/test_logp.py` covers the PyTorch reference contract, dtype behavior,
+backward-compatible aliases, batch invariance, and registry dispatch. The existing
+operator accuracy tests continue to validate native/CUDA fused API compatibility.
 
 ## Implementation Files
 
 - `rl_engine/kernels/registry.py`
-- `rl_engine/kernels/ops/cuda.py`
+- `rl_engine/kernels/ops/pytorch/loss/logp.py`
+- `rl_engine/kernels/ops/cuda/loss/logp.py`
 - `csrc/ops.cpp`
 - `csrc/fused_logp_kernel.cu`
 - `csrc/cuda/fused_logp_sm90.cu`
+- `tests/test_logp.py`
