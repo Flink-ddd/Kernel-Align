@@ -9,11 +9,19 @@ import torch
 import triton
 import triton.language as tl
 
-from rl_engine.kernels.ops.pytorch.sampling.gumbel_softmax import (
-    _validate_gumbel_softmax_inputs,
-)
+from rl_engine.kernels.ops.pytorch.sampling.gumbel_softmax import _validate_gumbel_softmax_inputs
 
 _MAX_BLOCK_V = 131072
+
+
+def _launch_config(vocab_size: int) -> tuple[int, int]:
+    block_v = triton.next_power_of_2(vocab_size)
+    if block_v > _MAX_BLOCK_V:
+        raise ValueError(
+            f"vocab size {vocab_size} exceeds TritonGumbelSoftmaxOp limit {_MAX_BLOCK_V}"
+        )
+    num_warps = 32 if block_v >= 65536 else 16 if block_v >= 32768 else 8
+    return block_v, num_warps
 
 
 @triton.jit
@@ -51,7 +59,10 @@ def _gumbel_softmax_fwd_kernel(
 
     tl.store(y_soft_ptr + row_off + cols, y, mask=mask)
     if HARD:
-        out = tl.where(z == z_max, 1.0, 0.0)
+        # Tie-break to the first maximum so each row is exactly one-hot.
+        is_max = z == z_max
+        first_max = tl.min(tl.where(is_max, cols, BLOCK_V), axis=0)
+        out = tl.where(cols == first_max, 1.0, 0.0)
         tl.store(out_ptr + row_off + cols, out, mask=mask)
     else:
         tl.store(out_ptr + row_off + cols, y, mask=mask)
@@ -83,7 +94,9 @@ def _gumbel_softmax_hard_nograd_kernel(
 
     z = tl.where(mask, logits + gumbels, -float("inf"))
     z_max = tl.max(z, axis=0)
-    out = tl.where(z == z_max, 1.0, 0.0)
+    is_max = z == z_max
+    first_max = tl.min(tl.where(is_max, cols, BLOCK_V), axis=0)
+    out = tl.where(cols == first_max, 1.0, 0.0)
     tl.store(out_ptr + row_off + cols, out, mask=mask)
 
 
@@ -93,14 +106,9 @@ class _GumbelSoftmaxFunction(torch.autograd.Function):
         V = logits.shape[-1]
         lead_shape = logits.shape[:-1]
         logits_2d = logits.contiguous().view(-1, V)
-        gumbels_2d = (
-            gumbels.contiguous().view(-1, V) if gumbels is not None else logits_2d
-        )
+        gumbels_2d = gumbels.contiguous().view(-1, V) if gumbels is not None else logits_2d
         n_rows = logits_2d.shape[0]
-        block_v = triton.next_power_of_2(V)
-        if block_v > _MAX_BLOCK_V:
-            raise ValueError(f"vocab size {V} exceeds TritonGumbelSoftmaxOp limit {_MAX_BLOCK_V}")
-        num_warps = 32 if block_v >= 65536 else 16 if block_v >= 32768 else 8
+        block_v, num_warps = _launch_config(V)
 
         y_soft = torch.empty_like(logits_2d)
         out = torch.empty_like(logits_2d) if hard else y_soft
@@ -149,10 +157,7 @@ def _hard_gumbel_softmax_nograd(
     lead_shape = logits.shape[:-1]
     logits_2d = logits.contiguous().view(-1, V)
     gumbels_2d = gumbels.contiguous().view(-1, V) if gumbels is not None else logits_2d
-    block_v = triton.next_power_of_2(V)
-    if block_v > _MAX_BLOCK_V:
-        raise ValueError(f"vocab size {V} exceeds TritonGumbelSoftmaxOp limit {_MAX_BLOCK_V}")
-    num_warps = 32 if block_v >= 65536 else 16 if block_v >= 32768 else 8
+    block_v, num_warps = _launch_config(V)
 
     out = torch.empty_like(logits_2d)
     _gumbel_softmax_hard_nograd_kernel[(logits_2d.shape[0],)](

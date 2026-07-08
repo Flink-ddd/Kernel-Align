@@ -18,7 +18,6 @@ from rl_engine.kernels.ops.triton.sampling.gumbel_softmax import TritonGumbelSof
 from rl_engine.platforms.device import device_ctx
 from rl_engine.utils.logger import logger
 
-
 DEFAULT_CONFIGS = [
     (1, 512, 32000),
     (4, 512, 32000),
@@ -31,9 +30,7 @@ def _make_inputs(batch, seq, vocab, device, dtype, internal_gumbels):
     gumbels = None
     if not internal_gumbels:
         gumbels = (
-            -torch.empty(batch, seq, vocab, device=device, dtype=torch.float32)
-            .exponential_()
-            .log()
+            -torch.empty(batch, seq, vocab, device=device, dtype=torch.float32).exponential_().log()
         )
     return logits, gumbels
 
@@ -83,19 +80,21 @@ def run_benchmark(args):
     for batch, seq, vocab in args.configs:
         logits, gumbels = _make_inputs(batch, seq, vocab, device, dtype, args.internal_gumbels)
         upstream = torch.randn_like(logits)
+        native_leaf = logits.detach().clone().requires_grad_(True)
+        triton_leaf = logits.detach().clone().requires_grad_(True)
 
         def fwd(op, x=logits, g=gumbels):
             with torch.no_grad():
                 op(x, tau=args.tau, hard=args.hard, gumbels=g)
 
-        def fwd_bwd(op, x_src=logits, g=gumbels, grad=upstream):
-            x = x_src.detach().clone().requires_grad_(True)
+        def fwd_bwd(op, x, g=gumbels, grad=upstream):
+            x.grad = None
             op(x, tau=args.tau, hard=args.hard, gumbels=g).backward(grad)
 
         n_fwd = _time_ms(lambda: fwd(native), args.warmup, args.iters)
         t_fwd = _time_ms(lambda: fwd(triton_op), args.warmup, args.iters)
-        n_fb = _time_ms(lambda: fwd_bwd(native), args.warmup, args.iters)
-        t_fb = _time_ms(lambda: fwd_bwd(triton_op), args.warmup, args.iters)
+        n_fb = _time_ms(lambda: fwd_bwd(native, native_leaf), args.warmup, args.iters)
+        t_fb = _time_ms(lambda: fwd_bwd(triton_op, triton_leaf), args.warmup, args.iters)
         n_vram = _peak_vram_mb(lambda: fwd(native))
         t_vram = _peak_vram_mb(lambda: fwd(triton_op))
 

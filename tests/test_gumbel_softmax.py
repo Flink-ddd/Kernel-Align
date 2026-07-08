@@ -23,9 +23,9 @@ def _inputs(seed, *, device="cpu", dtype=torch.float32, shape=(4, 17)):
     gen = torch.Generator(device=device).manual_seed(seed)
     logits = torch.randn(*shape, generator=gen, device=device, dtype=dtype)
     # Keep deterministic test noise in fp32, then let each backend cast as needed.
-    gumbels = -torch.empty(*shape, device=device, dtype=torch.float32).exponential_(
-        generator=gen
-    ).log()
+    gumbels = (
+        -torch.empty(*shape, device=device, dtype=torch.float32).exponential_(generator=gen).log()
+    )
     return logits, gumbels
 
 
@@ -152,3 +152,16 @@ def test_triton_generated_noise_smoke():
     assert out.shape == logits.shape
     assert torch.isfinite(out).all()
     assert torch.allclose(out.sum(dim=-1), torch.ones(8, device="cuda"), atol=1e-5)
+
+
+@requires_triton_cuda
+def test_triton_hard_nograd_generated_noise_fast_path():
+    from rl_engine.kernels.ops.triton.sampling.gumbel_softmax import TritonGumbelSoftmaxOp
+
+    logits = torch.randn(3, 5, 1024, device="cuda")
+    with torch.no_grad():
+        out = TritonGumbelSoftmaxOp()(logits, tau=0.7, hard=True, seed=2027)
+    assert out.shape == logits.shape
+    assert out.dtype == logits.dtype
+    assert torch.allclose(out.sum(dim=-1), torch.ones(3, 5, device="cuda"))
+    assert torch.all((out == 0.0) | (out == 1.0))
