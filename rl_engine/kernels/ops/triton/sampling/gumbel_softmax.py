@@ -13,7 +13,7 @@ from rl_engine.kernels.ops.pytorch.sampling.gumbel_softmax import (
     _validate_gumbel_softmax_inputs,
 )
 
-_BLOCK_V = 1024
+_MAX_BLOCK_V = 131072
 
 
 @triton.jit
@@ -32,61 +32,59 @@ def _gumbel_softmax_fwd_kernel(
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_V)
+    mask = cols < V
     row_off = row.to(tl.int64) * V
 
-    z_max = -float("inf")
-    for start in range(0, V, BLOCK_V):
-        offs = start + cols
-        mask = offs < V
-        logits = tl.load(logits_ptr + row_off + offs, mask=mask, other=-float("inf")).to(
-            tl.float32
-        )
-        if HAS_GUMBELS:
-            gumbels = tl.load(gumbels_ptr + row_off + offs, mask=mask, other=0.0).to(tl.float32)
-        else:
-            u = tl.rand(seed, row_off + offs)
-            u = tl.minimum(tl.maximum(u, 1.0e-20), 1.0 - 1.0e-7)
-            gumbels = -tl.log(-tl.log(u))
-        z = tl.where(mask, (logits + gumbels) / tau, -float("inf"))
-        z_max = tl.maximum(z_max, tl.max(z, axis=0))
+    logits = tl.load(logits_ptr + row_off + cols, mask=mask, other=-float("inf")).to(tl.float32)
+    if HAS_GUMBELS:
+        gumbels = tl.load(gumbels_ptr + row_off + cols, mask=mask, other=0.0).to(tl.float32)
+    else:
+        u = tl.rand(seed, row_off + cols)
+        u = tl.minimum(tl.maximum(u, 1.0e-20), 1.0 - 1.0e-7)
+        gumbels = -tl.log(-tl.log(u))
 
-    denom = 0.0
-    for start in range(0, V, BLOCK_V):
-        offs = start + cols
-        mask = offs < V
-        logits = tl.load(logits_ptr + row_off + offs, mask=mask, other=-float("inf")).to(
-            tl.float32
-        )
-        if HAS_GUMBELS:
-            gumbels = tl.load(gumbels_ptr + row_off + offs, mask=mask, other=0.0).to(tl.float32)
-        else:
-            u = tl.rand(seed, row_off + offs)
-            u = tl.minimum(tl.maximum(u, 1.0e-20), 1.0 - 1.0e-7)
-            gumbels = -tl.log(-tl.log(u))
-        z = tl.where(mask, (logits + gumbels) / tau, -float("inf"))
-        denom += tl.sum(tl.exp(z - z_max), axis=0)
+    z = tl.where(mask, (logits + gumbels) / tau, -float("inf"))
+    z_max = tl.max(z, axis=0)
+    exp_z = tl.exp(z - z_max)
+    denom = tl.sum(exp_z, axis=0)
+    y = tl.where(mask, exp_z / denom, 0.0)
 
-    for start in range(0, V, BLOCK_V):
-        offs = start + cols
-        mask = offs < V
-        logits = tl.load(logits_ptr + row_off + offs, mask=mask, other=-float("inf")).to(
-            tl.float32
-        )
-        if HAS_GUMBELS:
-            gumbels = tl.load(gumbels_ptr + row_off + offs, mask=mask, other=0.0).to(tl.float32)
-        else:
-            u = tl.rand(seed, row_off + offs)
-            u = tl.minimum(tl.maximum(u, 1.0e-20), 1.0 - 1.0e-7)
-            gumbels = -tl.log(-tl.log(u))
-        z = tl.where(mask, (logits + gumbels) / tau, -float("inf"))
-        y = tl.exp(z - z_max) / denom
-        y = tl.where(mask, y, 0.0)
-        tl.store(y_soft_ptr + row_off + offs, y, mask=mask)
-        if HARD:
-            out = tl.where(z == z_max, 1.0, 0.0)
-            tl.store(out_ptr + row_off + offs, out, mask=mask)
-        else:
-            tl.store(out_ptr + row_off + offs, y, mask=mask)
+    tl.store(y_soft_ptr + row_off + cols, y, mask=mask)
+    if HARD:
+        out = tl.where(z == z_max, 1.0, 0.0)
+        tl.store(out_ptr + row_off + cols, out, mask=mask)
+    else:
+        tl.store(out_ptr + row_off + cols, y, mask=mask)
+
+
+@triton.jit
+def _gumbel_softmax_hard_nograd_kernel(
+    logits_ptr,
+    gumbels_ptr,
+    out_ptr,
+    seed,
+    n_rows,
+    V: tl.constexpr,
+    HAS_GUMBELS: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_V)
+    mask = cols < V
+    row_off = row.to(tl.int64) * V
+
+    logits = tl.load(logits_ptr + row_off + cols, mask=mask, other=-float("inf")).to(tl.float32)
+    if HAS_GUMBELS:
+        gumbels = tl.load(gumbels_ptr + row_off + cols, mask=mask, other=0.0).to(tl.float32)
+    else:
+        u = tl.rand(seed, row_off + cols)
+        u = tl.minimum(tl.maximum(u, 1.0e-20), 1.0 - 1.0e-7)
+        gumbels = -tl.log(-tl.log(u))
+
+    z = tl.where(mask, logits + gumbels, -float("inf"))
+    z_max = tl.max(z, axis=0)
+    out = tl.where(z == z_max, 1.0, 0.0)
+    tl.store(out_ptr + row_off + cols, out, mask=mask)
 
 
 class _GumbelSoftmaxFunction(torch.autograd.Function):
@@ -99,10 +97,13 @@ class _GumbelSoftmaxFunction(torch.autograd.Function):
             gumbels.contiguous().view(-1, V) if gumbels is not None else logits_2d
         )
         n_rows = logits_2d.shape[0]
-        block_v = min(_BLOCK_V, triton.next_power_of_2(V))
+        block_v = triton.next_power_of_2(V)
+        if block_v > _MAX_BLOCK_V:
+            raise ValueError(f"vocab size {V} exceeds TritonGumbelSoftmaxOp limit {_MAX_BLOCK_V}")
+        num_warps = 32 if block_v >= 65536 else 16 if block_v >= 32768 else 8
 
-        y_soft = torch.empty_like(logits_2d, dtype=torch.float32)
-        out = torch.empty_like(logits_2d, dtype=torch.float32)
+        y_soft = torch.empty_like(logits_2d)
+        out = torch.empty_like(logits_2d) if hard else y_soft
         _gumbel_softmax_fwd_kernel[(n_rows,)](
             logits_2d,
             gumbels_2d,
@@ -115,21 +116,57 @@ class _GumbelSoftmaxFunction(torch.autograd.Function):
             HAS_GUMBELS=gumbels is not None,
             HARD=bool(hard),
             BLOCK_V=block_v,
+            num_warps=num_warps,
         )
 
         ctx.save_for_backward(y_soft)
         ctx.tau = float(tau)
         ctx.logits_shape = tuple(logits.shape)
         ctx.logits_dtype = logits.dtype
-        return out.view(*lead_shape, V).to(logits.dtype)
+        return out.view(*lead_shape, V)
 
     @staticmethod
     def backward(ctx, grad_output):
         (y_soft,) = ctx.saved_tensors
-        grad_2d = grad_output.contiguous().view_as(y_soft).to(torch.float32)
-        dot = (grad_2d * y_soft).sum(dim=-1, keepdim=True)
-        grad_logits = y_soft * (grad_2d - dot) / ctx.tau
+        grad_2d = grad_output.contiguous().view_as(y_soft)
+        grad_logits = torch._softmax_backward_data(
+            grad_2d,
+            y_soft,
+            -1,
+            ctx.logits_dtype,
+        )
+        if ctx.tau != 1.0:
+            grad_logits = grad_logits / ctx.tau
         return grad_logits.view(ctx.logits_shape).to(ctx.logits_dtype), None, None, None, None
+
+
+def _hard_gumbel_softmax_nograd(
+    logits: torch.Tensor,
+    gumbels: Optional[torch.Tensor],
+    seed: int,
+) -> torch.Tensor:
+    V = logits.shape[-1]
+    lead_shape = logits.shape[:-1]
+    logits_2d = logits.contiguous().view(-1, V)
+    gumbels_2d = gumbels.contiguous().view(-1, V) if gumbels is not None else logits_2d
+    block_v = triton.next_power_of_2(V)
+    if block_v > _MAX_BLOCK_V:
+        raise ValueError(f"vocab size {V} exceeds TritonGumbelSoftmaxOp limit {_MAX_BLOCK_V}")
+    num_warps = 32 if block_v >= 65536 else 16 if block_v >= 32768 else 8
+
+    out = torch.empty_like(logits_2d)
+    _gumbel_softmax_hard_nograd_kernel[(logits_2d.shape[0],)](
+        logits_2d,
+        gumbels_2d,
+        out,
+        int(seed),
+        logits_2d.shape[0],
+        V,
+        HAS_GUMBELS=gumbels is not None,
+        BLOCK_V=block_v,
+        num_warps=num_warps,
+    )
+    return out.view(*lead_shape, V)
 
 
 class TritonGumbelSoftmaxOp:
@@ -163,4 +200,6 @@ class TritonGumbelSoftmaxOp:
             )
         if seed is None:
             seed = int(torch.randint(0, 2**31 - 1, (), device="cpu").item())
+        if hard and (not torch.is_grad_enabled() or not logits.requires_grad):
+            return _hard_gumbel_softmax_nograd(logits, gumbels, int(seed))
         return _GumbelSoftmaxFunction.apply(logits, gumbels, float(tau), bool(hard), int(seed))

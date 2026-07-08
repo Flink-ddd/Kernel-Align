@@ -26,11 +26,15 @@ DEFAULT_CONFIGS = [
 ]
 
 
-def _make_inputs(batch, seq, vocab, device, dtype):
+def _make_inputs(batch, seq, vocab, device, dtype, internal_gumbels):
     logits = torch.randn(batch, seq, vocab, device=device, dtype=dtype)
-    gumbels = (
-        -torch.empty(batch, seq, vocab, device=device, dtype=torch.float32).exponential_().log()
-    )
+    gumbels = None
+    if not internal_gumbels:
+        gumbels = (
+            -torch.empty(batch, seq, vocab, device=device, dtype=torch.float32)
+            .exponential_()
+            .log()
+        )
     return logits, gumbels
 
 
@@ -71,12 +75,13 @@ def run_benchmark(args):
     triton_op = TritonGumbelSoftmaxOp()
 
     logger.info(
-        f"gumbel_softmax benchmark on {device} (dtype={dtype}, hard={args.hard}, tau={args.tau})"
+        f"gumbel_softmax benchmark on {device} (dtype={dtype}, hard={args.hard}, "
+        f"tau={args.tau}, internal_gumbels={args.internal_gumbels})"
     )
 
     rows = []
     for batch, seq, vocab in args.configs:
-        logits, gumbels = _make_inputs(batch, seq, vocab, device, dtype)
+        logits, gumbels = _make_inputs(batch, seq, vocab, device, dtype, args.internal_gumbels)
         upstream = torch.randn_like(logits)
 
         def fwd(op, x=logits, g=gumbels):
@@ -131,6 +136,12 @@ def parse_args():
     parser.add_argument("--tau", type=float, default=1.0)
     parser.add_argument("--hard", action="store_true")
     parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
+    parser.add_argument(
+        "--internal-gumbels",
+        action="store_true",
+        help="Let each backend sample Gumbel noise internally. By default the benchmark "
+        "passes a materialized Gumbel tensor for deterministic apples-to-apples timing.",
+    )
     parser.add_argument(
         "--configs",
         type=str,

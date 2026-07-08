@@ -83,14 +83,16 @@ def test_native_rejects_invalid_inputs():
         op(torch.randn(8))
 
 
-def test_registry_dispatch_matches_native_cpu():
+def test_registry_dispatch_matches_native():
     from rl_engine.kernels.registry import kernel_registry
+    from rl_engine.platforms.device import device_ctx
 
-    logits, gumbels = _inputs(5)
+    device = device_ctx.device if device_ctx.device_type == "cuda" else "cpu"
+    logits, gumbels = _inputs(5, device=device)
     op = kernel_registry.get_op("gumbel_softmax")
     out = op(logits, tau=0.7, hard=False, gumbels=gumbels)
     ref = NativeGumbelSoftmaxOp()(logits, tau=0.7, hard=False, gumbels=gumbels)
-    assert torch.allclose(out, ref, atol=1e-6)
+    assert torch.allclose(out.cpu(), ref.cpu(), atol=1e-5, rtol=1e-5)
 
 
 @requires_triton_cuda
