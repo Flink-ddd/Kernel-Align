@@ -1,4 +1,4 @@
-name: GPU CI
+name: Hardware GPU CI
 
 on:
   pull_request_target:
@@ -10,47 +10,150 @@ on:
       - 'pyproject.toml'
       - 'setup.py'
       - 'requirements*.txt'
-      - 'docker/Dockerfile.cuda'
+      - 'docker/**'
       - 'ci/run_gpu_ci.sh'
+      - 'ci/run_cuda_tests.sh'
+      - 'ci/run_rocm_ci.sh'
+      - 'ci/run_rocm_container.sh'
       - '.github/workflows/gpu-ci.yml'
-    types: [ opened, synchronize, reopened, labeled ]
+      - '.github/actions/setup-runpod/**'
+    types: [ labeled ]
 
 concurrency:
-  group: gpu-ci-serial
+  group: hardware-gpu-ci
   cancel-in-progress: false
 
+permissions:
+  contents: read
 
 jobs:
-  gpu-tests:
-    if: contains(github.event.pull_request.labels.*.name, 'needs-gpu-ci')
+  # ── Option A: RunPod CUDA runner ──────────────────────────────────────────
+  # Triggered by the 'needs-gpu-ci' label. Runs ci/run_cuda_tests.sh on an
+  # ephemeral RunPod pod and removes the pod afterwards.
+  cuda-cloud:
+    if: github.event.action == 'labeled' && github.event.label.name == 'needs-gpu-ci'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - name: cuda-a4000-tp2
+            gpu_id: NVIDIA RTX A4000
+            gpu_count: 2
+            fallback_gpu_id: NVIDIA A40
+            fallback_gpu_count: 1
+            torch_cuda_arch_list: "8.6"
+          - name: cuda-a40-tp1
+            gpu_id: NVIDIA A40
+            gpu_count: 1
+            fallback_gpu_id: NVIDIA RTX A4000
+            fallback_gpu_count: 1
+            torch_cuda_arch_list: "8.6"
+    steps:
+      # The checkout uses the base SHA, so both the orchestrator script and the
+      # local setup-runpod action come from trusted (already-merged) code.
+      - name: Checkout secure orchestrator script from base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Setup RunPod CLI and SSH key
+        uses: ./.github/actions/setup-runpod
+        with:
+          api-key: ${{ secrets.RUNPOD_API_KEY }}
+          ssh-private-key: ${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}
+
+      - name: Run CUDA hardware tests
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_GPU_ID: ${{ matrix.gpu_id }}
+          RUNPOD_GPU_COUNT: ${{ matrix.gpu_count }}
+          RUNPOD_FALLBACK_GPU_ID: ${{ matrix.fallback_gpu_id }}
+          RUNPOD_FALLBACK_GPU_COUNT: ${{ matrix.fallback_gpu_count }}
+          RUNPOD_PROFILE_NAME: ${{ matrix.name }}
+          TORCH_CUDA_ARCH_LIST: ${{ matrix.torch_cuda_arch_list }}
+          PR_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash ci/run_gpu_ci.sh
+
+  # ── Option B: self-hosted CUDA runner (no cloud account needed) ───────────
+  # Triggered by the 'needs-gpu-ci-self-hosted' label. The runner must have
+  # CUDA drivers installed and be registered with the label 'cuda'.
+  cuda-self-hosted:
+    if: github.event.action == 'labeled' && github.event.label.name == 'needs-gpu-ci-self-hosted'
+    runs-on: [ self-hosted, linux, x64, cuda ]
+    timeout-minutes: 90
+    steps:
+      # Check out trusted CI scripts from the base branch. The test script still
+      # executes the PR commit on this runner, so only apply this label to PRs
+      # that are allowed to run on the configured CUDA hardware.
+      - name: Checkout secure CI scripts from base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Run CUDA tests
+        env:
+          PR_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash ci/run_cuda_tests.sh
+
+  # ── Option C: RunPod CUDA SM90 runner ─────────────────────────────────────
+  # Triggered separately because H100 capacity is expensive and not needed for
+  # every GPU label. This validates the Hopper/TMA build path with SM90 enabled.
+  cuda-sm90-cloud:
+    if: github.event.action == 'labeled' && github.event.label.name == 'needs-gpu-ci-sm90'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - name: Checkout secure orchestrator script from base branch
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
 
-      - name: Install runpodctl
-        run: |
-          wget -qO runpodctl https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64
-          chmod +x runpodctl
-          sudo mv runpodctl /usr/local/bin/runpodctl
-          runpodctl version
+      - name: Setup RunPod CLI and SSH key
+        uses: ./.github/actions/setup-runpod
+        with:
+          api-key: ${{ secrets.RUNPOD_API_KEY }}
+          ssh-private-key: ${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}
 
-      - name: Configure runpodctl
-        run: runpodctl config --apiKey "${{ secrets.RUNPOD_API_KEY }}"
-
-      - name: Setup SSH key
-        run: |
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keygen -y -f ~/.ssh/id_ed25519 > /dev/null && echo "key OK" || echo "key BROKEN"
-
-      - name: Run GPU tests on RunPod
+      - name: Run SM90 CUDA hardware tests
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_GPU_ID: NVIDIA H100 80GB HBM3
+          RUNPOD_GPU_COUNT: 1
+          RUNPOD_FALLBACK_GPU_ID: NVIDIA H100 NVL
+          RUNPOD_FALLBACK_GPU_COUNT: 1
+          RUNPOD_PROFILE_NAME: cuda-h100-sm90
+          TORCH_CUDA_ARCH_LIST: auto
+          KERNEL_ALIGN_FORCE_SM90: "1"
           PR_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url }}
           PR_SHA: ${{ github.event.pull_request.head.sha }}
         run: bash ci/run_gpu_ci.sh
+
+  # ── Option D: self-hosted ROCm runner ─────────────────────────────────────
+  rocm-self-hosted:
+    if: github.event.action == 'labeled' && github.event.label.name == 'needs-rocm-ci'
+    runs-on: [ self-hosted, linux, x64, rocm ]
+    timeout-minutes: 90
+    steps:
+      # Check out trusted CI scripts from the base branch. The test script still
+      # executes the PR commit on this runner, so only apply this label to PRs
+      # that are allowed to run on the configured ROCm hardware.
+      - name: Checkout secure CI scripts from base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Run ROCm hardware tests
+        env:
+          RL_KERNEL_ROCM_ATTN_BACKEND: sdpa
+          PR_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash ci/run_rocm_ci.sh

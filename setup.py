@@ -46,6 +46,17 @@ def _cuda_define_from_env(name: str, macro: str) -> list[str]:
     return [f"-D{macro}={parsed}"]
 
 
+def _sm90_arch_from_env_or_device(cc_major: int, cc_minor: int) -> str:
+    override = os.environ.get("KERNEL_ALIGN_SM90_ARCH")
+    if override:
+        return (
+            override.strip().lower().removeprefix("sm_").removeprefix("compute_").replace(".", "")
+        )
+    if cc_major == 9:
+        return f"{cc_major}{cc_minor}a"
+    return "90a"
+
+
 def get_extensions():
     torch, _, CUDAExtension, ROCMExtension = _load_torch_extension_tools()
     if torch is None:
@@ -58,22 +69,28 @@ def get_extensions():
         torch_rpath.append(f"-Wl,-rpath,{torch_lib_dir}")
     is_rocm = torch.version.hip is not None
 
-    if is_rocm and ROCMExtension is not None:
+    if is_rocm:
+        rocm_extension = ROCMExtension or CUDAExtension
+        if rocm_extension is None:
+            return []
         extensions.append(
-            ROCMExtension(
+            rocm_extension(
                 name="rl_engine._C",
                 sources=[
                     "csrc/ops.cpp",
-                    "csrc/fused_logp_kernel.cpp",
+                    "csrc/fused_logp_kernel.cu",
                 ],
                 extra_compile_args={
                     "cxx": ["-O3", "-std=c++17"],
-                    "hipcc": ["-O3", "--use_fast_math", "-Xhipcc", "-compress-all"],
+                    # PyTorch ROCm builds may expose CUDAExtension but not
+                    # ROCMExtension; BuildExtension still routes the "nvcc"
+                    # bucket to hipcc in that case. Keep these flags HIP-safe.
+                    "nvcc": ["-O3"],
                 },
                 extra_link_args=list(torch_rpath),
             )
         )
-    elif torch.cuda.is_available():
+    elif torch.cuda.is_available() or os.environ.get("FORCE_CUDA") == "1":
         cuda_sources = [
             "csrc/ops.cpp",
             "csrc/fused_logp_kernel.cu",
@@ -143,7 +160,9 @@ def get_extensions():
         enable_sm90 = envs.env_flag(envs.KERNEL_ALIGN_FORCE_SM90)
         present_sm90 = [s for s in sm90_srcs if os.path.exists(s)]
         if enable_sm90 and present_sm90:
-            tma_arch = f"{cc_major}{cc_minor}a"  # WGMMA/TMA require the arch-native 'a' variant
+            # WGMMA/TMA require an arch-native 'a' target.  Keep forced SM90
+            # builds probeable from non-Hopper CUDA hosts by defaulting to 90a.
+            tma_arch = _sm90_arch_from_env_or_device(cc_major, cc_minor)
             cuda_sources.extend(present_sm90)
             nvcc_flags.append(f"-gencode=arch=compute_{tma_arch},code=sm_{tma_arch}")
             cxx_flags.append("-DKERNEL_ALIGN_WITH_SM90")
@@ -170,23 +189,39 @@ def get_cmdclass():
     return {"build_ext": BuildExtension}
 
 
+TEST_REQUIRES = ["pytest", "tabulate"]
+BENCH_REQUIRES = ["tabulate"]
+HF_REQUIRES = ["accelerate", "transformers"]
+DEV_REQUIRES = [
+    *TEST_REQUIRES,
+    "black",
+    "isort",
+    "ruff",
+    "mypy",
+    "pre-commit",
+    *HF_REQUIRES,
+]
+
+
 setup(
     name="rl-engine",
     version="0.1.0",
     packages=find_packages(include=["rl_engine", "rl_engine.*"]),
     install_requires=[
         "torch>=2.4.1",
-        "tabulate",
         "numpy",
-        "accelerate",
-        "transformers",
     ],
     ext_modules=get_extensions(),
     cmdclass=get_cmdclass(),
     extras_require={
-        "cuda": ["flashinfer"],
-        "rocm": ["aiter"],
+        "cuda": ["flashinfer-python", "nvidia-ml-py"],
+        # amd-aiter must be installed from source; see docs/getting_started/installation.md
+        "rocm": [],
         "vllm": ["vllm>=0.6.0"],
+        "hf": HF_REQUIRES,
+        "bench": BENCH_REQUIRES,
+        "test": TEST_REQUIRES,
+        "dev": DEV_REQUIRES,
     },
     python_requires=">=3.10",
     include_package_data=True,

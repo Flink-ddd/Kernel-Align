@@ -83,6 +83,16 @@ class GPUProfiler:
 
     @staticmethod
     def get_target_info(device_index: int = 0) -> GPUTargetInfo:
+        if device_index is not None and device_index < 0:
+            return GPUTargetInfo(
+                name="CPU",
+                architecture="unknown",
+                total_memory_gb=0.0,
+                driver_version="N/A",
+                backend="cpu",
+                compute_capability=None,
+                device_index=-1,
+            )
         if not torch.cuda.is_available():
             return GPUTargetInfo(
                 name="CPU",
@@ -94,7 +104,7 @@ class GPUProfiler:
                 device_index=-1,
             )
 
-        if device_index is None or device_index < 0:
+        if device_index is None:
             device_index = torch.cuda.current_device()
         device = torch.device(f"cuda:{device_index}")
         name = torch.cuda.get_device_name(device)
@@ -554,7 +564,15 @@ def _fused_logp_fn(
         generator=generator,
     )
     op = kernel_registry.get_op("logp")
-    return lambda: op.apply_fp32(logits, token_ids)
+    backend_name = op.__class__.__name__
+    if not backend_name.startswith("FusedLogp"):
+        raise RuntimeError(
+            "logp-fused requested, but kernel dispatch selected "
+            f"{backend_name}. Build the CUDA extension and verify strict fused dispatch first."
+        )
+    if hasattr(op, "apply_fp32"):
+        return lambda: op.apply_fp32(logits, token_ids)
+    return lambda: op(logits, token_ids).float()
 
 
 def _sampling_fn(

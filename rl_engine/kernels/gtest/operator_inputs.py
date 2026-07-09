@@ -8,7 +8,6 @@ from typing import Any
 
 import torch
 
-
 DEFAULT_HIDDEN = 4096
 DEFAULT_N_HEADS = 32
 DEFAULT_N_KV_HEADS = 8
@@ -95,9 +94,15 @@ def _make_attention_inputs(
 ) -> dict[str, Any]:
     batch, seq = _batch_seq(args)
     return {
-        "q": _floating_tensor((batch, DEFAULT_N_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 0),
-        "k": _floating_tensor((batch, DEFAULT_N_KV_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 1),
-        "v": _floating_tensor((batch, DEFAULT_N_KV_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 2),
+        "q": _floating_tensor(
+            (batch, DEFAULT_N_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 0
+        ),
+        "k": _floating_tensor(
+            (batch, DEFAULT_N_KV_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 1
+        ),
+        "v": _floating_tensor(
+            (batch, DEFAULT_N_KV_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 2
+        ),
         "causal": True,
     }
 
@@ -132,7 +137,9 @@ def _make_rope_inputs(
 ) -> dict[str, Any]:
     batch, seq = _batch_seq(args)
     return {
-        "x": _floating_tensor((batch, DEFAULT_N_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 0),
+        "x": _floating_tensor(
+            (batch, DEFAULT_N_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 0
+        ),
         "positions": torch.arange(seq, device=device, dtype=torch.long),
         "theta": _arg_float(args, "theta", DEFAULT_ROPE_THETA),
     }
@@ -185,11 +192,21 @@ def _make_kv_cache_attention_inputs(
 ) -> dict[str, Any]:
     batch, seq = _batch_seq(args)
     return {
-        "q": _floating_tensor((batch, DEFAULT_N_HEADS, 1, DEFAULT_HEAD_DIM), args, dtype, device, 0),
-        "k_cache": _floating_tensor((batch, DEFAULT_N_KV_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 1),
-        "v_cache": _floating_tensor((batch, DEFAULT_N_KV_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 2),
-        "k_new": _floating_tensor((batch, DEFAULT_N_KV_HEADS, 1, DEFAULT_HEAD_DIM), args, dtype, device, 3),
-        "v_new": _floating_tensor((batch, DEFAULT_N_KV_HEADS, 1, DEFAULT_HEAD_DIM), args, dtype, device, 4),
+        "q": _floating_tensor(
+            (batch, DEFAULT_N_HEADS, 1, DEFAULT_HEAD_DIM), args, dtype, device, 0
+        ),
+        "k_cache": _floating_tensor(
+            (batch, DEFAULT_N_KV_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 1
+        ),
+        "v_cache": _floating_tensor(
+            (batch, DEFAULT_N_KV_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 2
+        ),
+        "k_new": _floating_tensor(
+            (batch, DEFAULT_N_KV_HEADS, 1, DEFAULT_HEAD_DIM), args, dtype, device, 3
+        ),
+        "v_new": _floating_tensor(
+            (batch, DEFAULT_N_KV_HEADS, 1, DEFAULT_HEAD_DIM), args, dtype, device, 4
+        ),
         "causal": True,
     }
 
@@ -201,7 +218,7 @@ def _floating_tensor(
     device: torch.device,
     offset: int,
 ) -> torch.Tensor:
-    # Example: torch.randn((B, S, V), device="cuda", dtype=torch.bfloat16) 
+    # Example: torch.randn((B, S, V), device="cuda", dtype=torch.bfloat16)
     mode = _arg_str(args, "input_mode", "random")
     if mode == "constant":
         value = _arg_float(args, "constant_value", 0.25) + float(offset) * 0.01

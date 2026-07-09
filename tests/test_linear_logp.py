@@ -147,6 +147,10 @@ def _sm90_inputs(seed, *, bias=True, dtype=torch.bfloat16, lead=None):
 _N = 40
 _D = 80
 _V = 300
+# Measured worst-case Triton-vs-native drift is ~2e-5 (reduction order only).
+# Anything near 1e-2 means the native oracle itself degraded — usually
+# NVIDIA_TF32_OVERRIDE=1 forcing cuBLAS into TF32; conftest.py pins it off.
+_TRITON_FP32_ATOL = 1e-3
 
 
 def _inputs(seed, *, device, dtype=torch.float32, bias=True, lead=None):
@@ -430,7 +434,7 @@ def test_triton_forward_matches_native_fp32():
     hidden, weight, target, bias = _inputs(1, device="cuda")
     ref = native(hidden, weight, target, bias)
     out = trit(hidden, weight, target, bias)
-    assert torch.allclose(out, ref, atol=1e-3)
+    assert torch.allclose(out, ref, atol=_TRITON_FP32_ATOL)
 
 
 @requires_triton_cuda
@@ -491,7 +495,7 @@ def test_triton_preserves_leading_shape():
     hidden, weight, target, bias = _inputs(5, device="cuda", lead=(4, 7))
     out = trit(hidden, weight, target, bias)
     assert out.shape == (4, 7)
-    assert torch.allclose(out, native(hidden, weight, target, bias), atol=1e-3)
+    assert torch.allclose(out, native(hidden, weight, target, bias), atol=_TRITON_FP32_ATOL)
 
 
 @requires_triton_cuda
@@ -741,8 +745,8 @@ def test_registry_dispatch_matches_native():
     from rl_engine.platforms.device import device_ctx
 
     op = kernel_registry.get_op("linear_logp")
-    device = device_ctx.device if device_ctx.device_type == "cuda" else "cpu"
+    device = device_ctx.device if device_ctx.device_type in {"cuda", "rocm"} else "cpu"
     hidden, weight, target, bias = _inputs(6, device=device)
     out = op(hidden, weight, target, bias)
     ref = NativeLinearLogpOp()(hidden, weight, target, bias)
-    assert torch.allclose(out.cpu(), ref.cpu(), atol=1e-3)
+    assert torch.allclose(out.cpu(), ref.cpu(), atol=_TRITON_FP32_ATOL)

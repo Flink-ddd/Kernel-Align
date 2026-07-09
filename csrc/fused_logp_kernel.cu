@@ -1,9 +1,20 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#ifdef __HIP_PLATFORM_AMD__
+#include <hip/hip_runtime.h>
+#else
 #include <cuda_runtime.h>
+#endif
 #include <limits>
 #include <torch/extension.h>
+
+#ifdef __HIP_PLATFORM_AMD__
+constexpr unsigned long long kWarpFullMask = 0xffffffffffffffffULL;
+#else
+constexpr unsigned int kWarpFullMask = 0xffffffffU;
+#endif
+constexpr int kWarpReduceWidth = 32;
 
 template <typename scalar_t>
 __device__ __forceinline__ scalar_t blockReduceMax(scalar_t val) {
@@ -14,7 +25,7 @@ __device__ __forceinline__ scalar_t blockReduceMax(scalar_t val) {
     float f_val = static_cast<float>(val);
 
     for (int offset = 16; offset > 0; offset /= 2)
-        f_val = max(f_val, __shfl_down_sync(0xffffffff, f_val, offset));
+        f_val = max(f_val, __shfl_down_sync(kWarpFullMask, f_val, offset, kWarpReduceWidth));
 
     if (lane == 0) shared[wid] = f_val;
     __syncthreads();
@@ -22,7 +33,7 @@ __device__ __forceinline__ scalar_t blockReduceMax(scalar_t val) {
     f_val = (threadIdx.x < blockDim.x / 32) ? shared[lane] : -1e20f;
     if (wid == 0) {
         for (int offset = 16; offset > 0; offset /= 2)
-            f_val = max(f_val, __shfl_down_sync(0xffffffff, f_val, offset));
+            f_val = max(f_val, __shfl_down_sync(kWarpFullMask, f_val, offset, kWarpReduceWidth));
     }
     return static_cast<scalar_t>(f_val);
 }
@@ -36,7 +47,7 @@ __device__ __forceinline__ scalar_t blockReduceSum(scalar_t val) {
     float f_val = static_cast<float>(val);
 
     for (int offset = 16; offset > 0; offset /= 2)
-        f_val += __shfl_down_sync(0xffffffff, f_val, offset);
+        f_val += __shfl_down_sync(kWarpFullMask, f_val, offset, kWarpReduceWidth);
 
     if (lane == 0) shared[wid] = f_val;
     __syncthreads();
@@ -44,7 +55,7 @@ __device__ __forceinline__ scalar_t blockReduceSum(scalar_t val) {
     f_val = (threadIdx.x < blockDim.x / 32) ? shared[lane] : 0.0f;
     if (wid == 0) {
         for (int offset = 16; offset > 0; offset /= 2)
-            f_val += __shfl_down_sync(0xffffffff, f_val, offset);
+            f_val += __shfl_down_sync(kWarpFullMask, f_val, offset, kWarpReduceWidth);
     }
     return static_cast<scalar_t>(f_val);
 }
@@ -82,8 +93,8 @@ __device__ __forceinline__ LogSumExpState blockReduceLogSumExp(LogSumExpState st
 
     for (int offset = 16; offset > 0; offset /= 2) {
         LogSumExpState other{
-            __shfl_down_sync(0xffffffff, state.max_val, offset),
-            __shfl_down_sync(0xffffffff, state.sum_exp, offset)};
+            __shfl_down_sync(kWarpFullMask, state.max_val, offset, kWarpReduceWidth),
+            __shfl_down_sync(kWarpFullMask, state.sum_exp, offset, kWarpReduceWidth)};
         state = merge_logsumexp_state(state, other);
     }
 
@@ -100,8 +111,8 @@ __device__ __forceinline__ LogSumExpState blockReduceLogSumExp(LogSumExpState st
     if (wid == 0) {
         for (int offset = 16; offset > 0; offset /= 2) {
             LogSumExpState other{
-                __shfl_down_sync(0xffffffff, state.max_val, offset),
-                __shfl_down_sync(0xffffffff, state.sum_exp, offset)};
+                __shfl_down_sync(kWarpFullMask, state.max_val, offset, kWarpReduceWidth),
+                __shfl_down_sync(kWarpFullMask, state.sum_exp, offset, kWarpReduceWidth)};
             state = merge_logsumexp_state(state, other);
         }
     }
