@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-
 _CONTRACT_PATH = Path(__file__).with_name("tolerance_contract.json")
 
 

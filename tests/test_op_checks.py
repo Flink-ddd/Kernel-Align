@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import torch
 
-from rl_engine.kernels.ops.pytorch.loss.logp import NativeLogpOp
 from rl_engine.kernels.gtest.op_checks import CandidateSpec, OperatorCase, run_operator_suite
+from rl_engine.kernels.ops.pytorch.loss.logp import NativeLogpOp
 
 
 def _logp_case(name: str, dtype: torch.dtype, *, seed: int = 0) -> OperatorCase:
