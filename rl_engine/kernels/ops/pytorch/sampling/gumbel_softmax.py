@@ -38,9 +38,7 @@ def _validate_gumbel_softmax_inputs(
 def _sample_gumbels_like(logits: torch.Tensor) -> torch.Tensor:
     # Matches torch.nn.functional.gumbel_softmax's exponential sampling path.
     return (
-        -torch.empty_like(logits, memory_format=torch.legacy_contiguous_format)
-        .exponential_()
-        .log()
+        -torch.empty_like(logits, memory_format=torch.legacy_contiguous_format).exponential_().log()
     )
 
 
