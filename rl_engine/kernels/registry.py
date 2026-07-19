@@ -1,11 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
+from __future__ import annotations
+
 import importlib
 import os
 from enum import Enum, EnumMeta
 from typing import Any, Dict, Optional, Set, Type
 
+from rl_engine.kernels.semantic_registry import (
+    OperatorBackendDescriptor,
+    OperatorFallbackPolicy,
+    OperatorLifecycle,
+    SemanticOperatorCatalog,
+)
 from rl_engine.platforms.device import device_ctx
 from rl_engine.utils.logger import logger
 
@@ -16,9 +24,11 @@ class _KernelEnumMeta(EnumMeta):
     def __getitem__(cls, name: str):
         try:
             return super().__getitem__(name)
-        except KeyError as e:
+        except KeyError as exc:
             valid_ops = ", ".join(cls.__members__.keys())
-            raise ValueError(f"Operator '{name}' not found. Supported backends: {valid_ops}") from e
+            raise ValueError(
+                f"Operator '{name}' not found. Supported backends: {valid_ops}"
+            ) from exc
 
 
 class OpBackend(Enum, metaclass=_KernelEnumMeta):
@@ -78,6 +88,52 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_NATIVE_EMBEDDING = "rl_engine.kernels.ops.pytorch.linear.embedding.NativeEmbeddingOp"
 
 
+def _default_semantic_descriptors() -> tuple[OperatorBackendDescriptor, ...]:
+    return (
+        OperatorBackendDescriptor(
+            semantic_op="selected_logprob",
+            backend_id="rlkernel.reference_logp",
+            supported_targets=frozenset({"rollout", "training"}),
+            supported_devices=frozenset({"cpu", "cuda", "rocm"}),
+            supported_dtypes=frozenset({"float32", "bfloat16", "float16"}),
+            supported_topologies={
+                "world_size": (1,),
+                "tensor_parallel_size": (1,),
+                "context_parallel_size": (1,),
+                "sharding": ("unsharded",),
+            },
+            determinism_or_alignment_properties={
+                "algorithm": "pytorch.log_softmax_gather",
+                "batch_invariant": True,
+                "deterministic": True,
+                "strict_observable": True,
+            },
+            lifecycle=OperatorLifecycle.ENGINE_CONSTRUCTION,
+            implementation_class_or_factory=(
+                "rl_engine.kernels.ops.pytorch.loss.logp.NativeLogpOp"
+            ),
+            fallback_policy=OperatorFallbackPolicy.ERROR,
+            version_or_build_fingerprint="NativeLogpOp-selected-logprob-v1",
+        ),
+        OperatorBackendDescriptor(
+            semantic_op="selected_logprob",
+            backend_id="native",
+            supported_targets=frozenset({"rollout", "training"}),
+            supported_devices=frozenset({"*"}),
+            supported_dtypes=frozenset({"*"}),
+            supported_topologies={"*": "*"},
+            determinism_or_alignment_properties={
+                "selection": "runtime_native",
+                "strict_observable": False,
+            },
+            lifecycle=OperatorLifecycle.ENGINE_CONSTRUCTION,
+            implementation_class_or_factory=None,
+            fallback_policy=OperatorFallbackPolicy.RUNTIME_MANAGED,
+            version_or_build_fingerprint="runtime-native-unresolved-v1",
+        ),
+    )
+
+
 def resolve_logp_op_type(
     logp_backend: Optional[str] = None,
     *,
@@ -126,14 +182,12 @@ def resolve_logp_op_type(
 
 
 class KernelRegistry:
-    """
-    Central dispatcher for high-performance kernels.
-    Handles dynamic routing between ROCm and CUDA backends at runtime.
-    """
+    """Legacy hardware dispatcher plus a composed semantic operator catalog."""
 
     def __init__(self):
         self._instance_cache: Dict[str, Any] = {}
         self._failed_backends: Set[str] = set()
+        self.semantic = SemanticOperatorCatalog(_default_semantic_descriptors())
 
         self._priority_map = {
             "cuda": {
@@ -163,23 +217,33 @@ class KernelRegistry:
                     OpBackend.CUDA_DETERMINISTIC_LOGP,
                     OpBackend.PYTORCH_NATIVE,
                 ],
-                "attn": [OpBackend.FLASH_ATTN, OpBackend.TRITON_GENERIC, OpBackend.PYTORCH_ATTN],
+                "attn": [
+                    OpBackend.FLASH_ATTN,
+                    OpBackend.TRITON_GENERIC,
+                    OpBackend.PYTORCH_ATTN,
+                ],
                 "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
-                "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
+                "linear_logp": [
+                    OpBackend.TRITON_LINEAR_LOGP,
+                    OpBackend.PYTORCH_LINEAR_LOGP,
+                ],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
                 "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
                 "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
                 "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
                 "silu": [OpBackend.PYTORCH_NATIVE_SILU],
                 "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
-                # Default dispatch logic for new operators
                 "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
                 "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
             },
             "rocm": {
-                "logp": [OpBackend.ROCM_AITER, OpBackend.TRITON_GENERIC, OpBackend.PYTORCH_NATIVE],
+                "logp": [
+                    OpBackend.ROCM_AITER,
+                    OpBackend.TRITON_GENERIC,
+                    OpBackend.PYTORCH_NATIVE,
+                ],
                 "logp_deterministic": [OpBackend.PYTORCH_NATIVE],
                 "logp_deterministic_indexed": [OpBackend.PYTORCH_NATIVE],
                 "attn": [
@@ -191,7 +255,10 @@ class KernelRegistry:
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
-                "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
+                "linear_logp": [
+                    OpBackend.TRITON_LINEAR_LOGP,
+                    OpBackend.PYTORCH_LINEAR_LOGP,
+                ],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
                 "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
                 "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
@@ -237,14 +304,15 @@ class KernelRegistry:
                 OpBackend.ROCM_FLASH_ATTN,
                 OpBackend.TRITON_GENERIC,
             ]
-        elif rocm_attn_backend and rocm_attn_backend not in {"native", "pytorch", "sdpa"}:
+        elif rocm_attn_backend:
             logger.warning(
                 "Unknown RL_KERNEL_ROCM_ATTN_BACKEND=%s; using default ROCm attention priority.",
                 rocm_attn_backend,
             )
 
     def _adjust_priority_for_hardware(self):
-        """Adjust CUDA priorities for hardware-gated experimental and production kernels."""
+        """Adjust CUDA priorities for hardware-gated kernels."""
+
         if device_ctx.device_type != "cuda":
             return
         try:
@@ -266,8 +334,6 @@ class KernelRegistry:
                 if OpBackend.CUDA_FUSED_LOGP_SM90 not in logp_list:
                     logp_list.insert(0, OpBackend.CUDA_FUSED_LOGP_SM90)
 
-            # The fused linear-logp SM90 kernel uses TMA bulk-tensor copies built
-            # for sm_90a -- gate strictly on cc_major == 9 (Hopper), not >= 9.
             linear_logp_compiled = _EXT_AVAILABLE and hasattr(_C, "fused_linear_logp_sm90")
             if linear_logp_compiled and cc_major == 9:
                 ll_list = self._priority_map["cuda"]["linear_logp"]
@@ -278,25 +344,26 @@ class KernelRegistry:
                     f"SM{cc}: fused linear-logp SM90 kernel not compiled into _C; "
                     "using generic linear-logp backend."
                 )
-        except Exception as e:
-            logger.warning(f"Failed to probe device capability: {e}")
+        except Exception as exc:
+            logger.warning(f"Failed to probe device capability: {exc}")
 
     def get_op(self, op_type: str) -> Any:
-        """Core distribution logic: Automatically select the best operator
-        based on hardware and priority.
-        """
+        """Select the best legacy operator based on hardware and priority."""
+
         if device_ctx.is_rocm:
             platform = "rocm"
         elif device_ctx.device_type == "cuda":
             platform = "cuda"
         else:
             platform = "cpu"
-        candidates = self._priority_map.get(platform, {}).get(op_type, [OpBackend.PYTORCH_NATIVE])
+        candidates = self._priority_map.get(platform, {}).get(
+            op_type,
+            [OpBackend.PYTORCH_NATIVE],
+        )
 
         for backend in candidates:
             if backend.name in self._instance_cache:
                 return self._instance_cache[backend.name]
-
             if backend.name in self._failed_backends:
                 continue
 
@@ -306,8 +373,8 @@ class KernelRegistry:
                     op_instance = op_class()
                     self._instance_cache[backend.name] = op_instance
                     return op_instance
-                except Exception as e:
-                    logger.error(f"Failed to instantiate {backend.name}: {e}")
+                except Exception as exc:
+                    logger.error(f"Failed to instantiate {backend.name}: {exc}")
                     self._failed_backends.add(backend.name)
             else:
                 self._failed_backends.add(backend.name)
@@ -315,23 +382,30 @@ class KernelRegistry:
         raise RuntimeError(f"No functional backend found for {op_type} on {platform}")
 
     def _load_backend(self, backend: OpBackend) -> Optional[Type]:
-        """Dynamic loading technique: Import modules only when needed
-        and check environment dependencies.
-        """
+        """Import a legacy backend and distinguish wrapper bugs from absence."""
+
         module_path, class_name = backend.value.rsplit(".", 1)
         try:
             module = importlib.import_module(module_path)
             return getattr(module, class_name)
-        except (ImportError, AttributeError, ModuleNotFoundError) as e:
-            missing_module = str(e.name) if hasattr(e, "name") else ""
+        except (ImportError, AttributeError, ModuleNotFoundError) as exc:
+            missing_module = str(exc.name) if hasattr(exc, "name") else ""
             is_missing_backend = missing_module and (
                 missing_module == module_path or module_path.startswith(missing_module)
             )
             if missing_module and "rl_engine" in missing_module and not is_missing_backend:
-                logger.critical(f"Internal wrapper implementation bug in '{module_path}': {e}")
-                raise e
-            logger.warning(f"Backend {backend.name} unavailable: {e}. Falling back...")
+                logger.critical(f"Internal wrapper implementation bug in '{module_path}': {exc}")
+                raise
+            logger.warning(f"Backend {backend.name} unavailable: {exc}. Falling back...")
             return None
 
 
 kernel_registry = KernelRegistry()
+
+
+__all__ = [
+    "KernelRegistry",
+    "OpBackend",
+    "kernel_registry",
+    "resolve_logp_op_type",
+]
