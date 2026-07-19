@@ -2,6 +2,7 @@
 // Copyright (c) 2026 RL-Kernel Contributors
 
 #include "../utils/tma_utils.cuh"
+#include <cstdint>
 #include <math_constants.h>
 #include <torch/extension.h>
 #include <tuple>
@@ -140,8 +141,13 @@ __global__ void fused_logp_online_tma_kernel(
                 logsum_out[row_idx] = log_sum;
             }
             int label_idx = labels[row_idx];
-            float label_val = __bfloat162float(logits_gmem[row_idx * vocab_size + label_idx]);
-            output_logp[row_idx] = label_val - row_max - log_sum;
+            if (label_idx >= 0 && label_idx < vocab_size) {
+                int64_t label_offset = static_cast<int64_t>(row_idx) * vocab_size + label_idx;
+                float label_val = __bfloat162float(logits_gmem[label_offset]);
+                output_logp[row_idx] = label_val - row_max - log_sum;
+            } else {
+                output_logp[row_idx] = 0.0f;
+            }
         }
     }
 }

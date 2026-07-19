@@ -459,6 +459,18 @@ class TestFusedLogpSM90Kernel:
             rtol=1e-5,
         )
 
+    def test_invalid_labels_return_zero(self):
+        logits, token_ids = _make_inputs(4, 520, dtype=torch.bfloat16, seed=5)
+        labels = token_ids.to(torch.int32)
+        labels[0] = -1
+        labels[1] = logits.size(1)
+
+        logp, _, _ = _C.fused_logp_sm90_with_lse(logits, labels)
+        assert torch.equal(logp[:2], torch.zeros_like(logp[:2]))
+
+        ref = selected_logprobs_reference(logits, token_ids)
+        assert torch.allclose(logp[2:], ref[2:], atol=1e-3, rtol=1e-5)
+
     def test_unaligned_row_stride_uses_generic_fallback(self, monkeypatch):
         from rl_engine.kernels.ops.cuda.loss.logp import FusedLogpSM90Op
 
