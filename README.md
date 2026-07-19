@@ -104,7 +104,7 @@ methodology, exact commands, and raw CSVs are in the
 
 - **Qwen3-30B-A3B weight footprint, confirmed on real weights**: 56.87 GB / 79.11 GB total → 22.24 GB headroom, matching the A100 claim above. RL-Kernel's fused logprob path keeps ~0 GB extra VRAM through 24,576 tokens where the naive path OOMs past 12,288.
 - **Fused `logp` kernel (generic CUDA, vocab=128256, seq=512, batch=32)**: 23.29 ms / 19.57 GB (native) → 6.93 ms / 7.83 GB (fused), a 3.4x speedup *and* lower memory — no tradeoff here.
-- **FlashInfer sampling (vocab=128256, batch=256)**: 32.43 ms (native) → 1.57 ms (RL-Kernel), ~21x.
+- **FlashInfer sampling (vocab=128256, batch=256)**: 29.30 ms (native) → 1.65 ms (RL-Kernel), ~18x. Raw output: `reports/benchmark_sampling_NVIDIA_H100_80GB_HBM3.txt`.
 - **`linear_logp` SM90 kernel — reported honestly, not cherry-picked**: it beats the Triton path by 1.7–1.9x at ~600–2500x less memory than the naive materializing path, but does **not** uniformly beat naive on raw latency (naive wins forward at 2 of 3 vocab sizes tested, and wins backward across the board — the SM90 kernel trades FLOPs for memory via tile recomputation, same as Triton's approach). Its win is fitting at all in constrained memory, not raw speed everywhere.
 
 See the dashboard doc for the full sweep, exact reproduction commands, and two known limitations

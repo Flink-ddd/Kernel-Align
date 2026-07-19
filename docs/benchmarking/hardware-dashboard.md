@@ -52,11 +52,15 @@ note below for why SM90-specific dispatch is more nuanced.
 
 | Environment | Backend | Batch | Vocabulary | Top-k | Top-p | Temperature | Latency (ms) | Tokens/s | Peak VRAM (GB) | Status | Command |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| `h100-sxm5` | native (topk→topp→softmax→multinomial) | 64 | 128256 | 50 | 0.9 | 1.0 | 10.66 | n/a | n/a | pass | `python benchmarks/benchmark_sampling.py --g-sizes 32,64,128,256 --vocab-size 128256 --top-k 50 --top-p 0.9` |
-| `h100-sxm5` | FlashInfer (`RL_Sampler`) | 64 | 128256 | 50 | 0.9 | 1.0 | 1.09 | n/a | n/a | pass | same as above |
-| `h100-sxm5` | native | 256 | 128256 | 50 | 0.9 | 1.0 | 32.43 | n/a | n/a | pass | same as above |
-| `h100-sxm5` | FlashInfer (`RL_Sampler`) | 256 | 128256 | 50 | 0.9 | 1.0 | 1.57 | n/a | n/a | pass | same as above |
+| `h100-sxm5` | native (topk→topp→softmax→multinomial) | 64 | 128256 | 50 | 0.9 | 1.0 | 8.73 | n/a | n/a | pass | `python benchmarks/benchmark_sampling.py --g-sizes 32,64,128,256 --vocab-size 128256 --top-k 50 --top-p 0.9` |
+| `h100-sxm5` | FlashInfer (`RL_Sampler`) | 64 | 128256 | 50 | 0.9 | 1.0 | 0.84 | n/a | n/a | pass | same as above |
+| `h100-sxm5` | native | 256 | 128256 | 50 | 0.9 | 1.0 | 29.30 | n/a | n/a | pass | same as above |
+| `h100-sxm5` | FlashInfer (`RL_Sampler`) | 256 | 128256 | 50 | 0.9 | 1.0 | 1.65 | n/a | n/a | pass | same as above |
 | `mi300-template` | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending |
+
+Raw artifact backing the rows above: `reports/benchmark_sampling_NVIDIA_H100_80GB_HBM3.txt`
+(this PR) — full console output of the exact command listed, including all four batch sizes
+(32/64/128/256), not just the two rows excerpted here.
 
 Limitation: `benchmarks/profiler.py`'s `WORKLOAD_REGISTRY` only registers `sampling-native`
 (no `sampling-fused` workload), so the FlashInfer rows above come from
@@ -73,12 +77,13 @@ op; the question "does SM90 warp specialization help vs SM86" reduces to "does t
 help vs SM86's only options (Triton / native)".
 
 Command: `python benchmarks/benchmark_linear_logp.py` (built with `KERNEL_ALIGN_FORCE_SM90=1`).
+Raw artifact: `reports/benchmark_linear_logp_sm90_NVIDIA_H100_80GB_HBM3.txt` (this PR).
 
 | shape (N×H×V) | native fwd ms | triton fwd ms | sm90 fwd ms | native fwd MB | triton fwd MB | sm90 fwd MB | sm90 vs triton | sm90 vs native |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 4096×2048×32768 | 1.80 | 6.37 | 3.78 | 1280 | 0 | 2 | 1.69x faster | 0.48x (slower) |
-| 4096×2048×50257 | 10.26 | 9.94 | 5.40 | 1965 | 0 | 2 | 1.84x faster | 1.90x faster |
-| 4096×2048×131072 | 7.20 | 24.74 | 14.11 | 5120 | 0 | 2 | 1.75x faster | 0.51x (slower) |
+| 4096×2048×32768 | 1.80 | 6.29 | 3.65 | 1280 | 0 | 2 | 1.72x faster | 0.49x (slower) |
+| 4096×2048×50257 | 10.27 | 9.88 | 5.40 | 1965 | 0 | 2 | 1.83x faster | 1.90x faster |
+| 4096×2048×131072 | 7.20 | 24.76 | 14.11 | 5120 | 0 | 2 | 1.75x faster | 0.51x (slower) |
 
 Status: pass. Limitation (report honestly, not cherry-picked): SM90 **consistently beats Triton**
 (1.7–1.9x) at ~600–2500x less memory than the native materializing path, but does **not**
@@ -97,6 +102,9 @@ the flag defaults off and isn't part of any existing benchmark claim.
 Real weights (`Qwen/Qwen3-30B-A3B`, 56.9 GB, downloaded from the HF Hub) and a real forward pass
 (not synthetic tensors) were used for the `lm_head` weight and hidden-state distribution.
 
+Command: `python benchmarks/benchmark_qwen3_moe_real_model.py` (script added in this PR).
+Raw artifact: `reports/benchmark_qwen3_30b_a3b_NVIDIA_H100_80GB_HBM3.txt` (this PR).
+
 | Metric | Value |
 | --- | --- |
 | Weight VRAM | 56.87 GB |
@@ -105,9 +113,9 @@ Real weights (`Qwen/Qwen3-30B-A3B`, 56.9 GB, downloaded from the HF Hub) and a r
 
 | N tokens | native extra VRAM | RL-Kernel (SM90) extra VRAM | native ms | RL-Kernel ms | status |
 | ---: | ---: | ---: | ---: | ---: | --- |
-| 12,288 | 17.39 GB | 0.00 GB | 25.09 | 48.47 | pass |
-| 16,384 | OOM | 0.00 GB | n/a | 66.08 | native: oom |
-| 24,576 | OOM | 0.00 GB | n/a | 105.98 | native: oom |
+| 12,288 | 17.39 GB | 0.00 GB | 25.08 | 48.03 | pass |
+| 16,384 | OOM | 0.00 GB | n/a | 65.90 | native: oom |
+| 24,576 | OOM | 0.00 GB | n/a | 105.50 | native: oom |
 
 Status: pass (memory claim), with the same latency caveat as above — RL-Kernel is ~1.9–2x
 slower per call than native at shapes where native still fits; its advantage here is fitting at
