@@ -68,6 +68,14 @@ jobs:
           python -m pytest rl_engine/tests/test_dispatch.py -v
           PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_attention_correctness.py -q -rs
 
+      - name: Run Cross-Configuration Contract Tests (CPU-safe)
+        run: |
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q \
+            tests/test_cross_config_*.py \
+            tests/test_stateless_executor.py \
+            tests/test_tolerance_contract.py \
+            tests/test_kernel_registry.py
+
       - name: Run Attention Ground-Truth Tests (CPU-safe)
         run: |
           python -m pytest tests/test_attention.py -v -k "not large and not gpu"
