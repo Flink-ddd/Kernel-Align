@@ -654,6 +654,9 @@ def _bwd_preprocess_varlen(
     stride_om,
     stride_oh,
     stride_ok,
+    stride_dom,
+    stride_doh,
+    stride_dok,
     total_q,
     H,
     BLOCK_M: tl.constexpr,
@@ -667,7 +670,7 @@ def _bwd_preprocess_varlen(
     valid_m = offs_m < total_q
 
     o_ptrs = Out + offs_m[:, None] * stride_om + h * stride_oh + offs_d[None, :] * stride_ok
-    do_ptrs = DO + offs_m[:, None] * stride_om + h * stride_oh + offs_d[None, :] * stride_ok
+    do_ptrs = DO + offs_m[:, None] * stride_dom + h * stride_doh + offs_d[None, :] * stride_dok
 
     o = tl.load(o_ptrs, mask=valid_m[:, None], other=0.0)
     do = tl.load(do_ptrs, mask=valid_m[:, None], other=0.0).to(o.dtype)
@@ -700,6 +703,9 @@ def _bwd_kernel_varlen(
     stride_vn,
     stride_vh,
     stride_vk,
+    stride_dom,
+    stride_doh,
+    stride_dok,
     H,
     BLOCK_M: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -755,9 +761,9 @@ def _bwd_kernel_varlen(
         )
         do_ptrs = (
             DO
-            + (q_start + offs_m[:, None]) * stride_qm
-            + h * stride_qh
-            + offs_d[None, :] * stride_qk
+            + (q_start + offs_m[:, None]) * stride_dom
+            + h * stride_doh
+            + offs_d[None, :] * stride_dok
         )
         q = tl.load(q_ptrs, mask=valid_m[:, None], other=0.0)
         do = tl.load(do_ptrs, mask=valid_m[:, None], other=0.0)
@@ -907,6 +913,9 @@ class _TritonAttentionVarlen(torch.autograd.Function):
             out.stride(0),
             out.stride(1),
             out.stride(2),
+            do.stride(0),
+            do.stride(1),
+            do.stride(2),
             total_q,
             H,
             BLOCK_M=BLOCK_M,
@@ -938,6 +947,9 @@ class _TritonAttentionVarlen(torch.autograd.Function):
             v.stride(0),
             v.stride(1),
             v.stride(2),
+            do.stride(0),
+            do.stride(1),
+            do.stride(2),
             H,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,

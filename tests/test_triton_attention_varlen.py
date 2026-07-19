@@ -192,3 +192,66 @@ class TestVarlenAttention:
     def test_zero_length_sequence_in_batch(self):
         # A fully-masked / empty response is a real occurrence in packed RL batches.
         _run_varlen_case([0, 128, 0, 37], [50, 128, 0, 37], heads=2, head_dim=64, causal=True)
+
+    def test_non_contiguous_q_k_v_backward(self):
+        # Regression test (review finding): `do` was forced `.contiguous()` in
+        # backward, but the kernels indexed DO using Q's/Out's strides instead of
+        # DO's own -- silently correct only when Q/Out/DO all happen to share the
+        # same contiguous layout, as every other case in this file does by
+        # construction (fresh `torch.randn(...)`).
+        #
+        # Building q/k/v as `[H, total, D].transpose(0, 1)` gives a non-contiguous
+        # but non-overlapping-and-dense view. `torch.empty_like` (used for `out`
+        # and `dq`) preserves that exact stride pattern rather than falling back to
+        # a contiguous layout, so `out`'s strides differ from `do`'s (`do` is a
+        # plain contiguous tensor here) -- exactly the mismatch the review flagged.
+        device = "cuda"
+        heads, head_dim = 2, 64
+        seqlens = [37, 61]
+        total = sum(seqlens)
+        cu = torch.tensor(
+            [0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32, device=device
+        )
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+        def make(seed):
+            gen = torch.Generator(device=device).manual_seed(seed)
+            base = torch.randn(
+                heads, total, head_dim, device=device, dtype=torch.float16, generator=gen
+            )
+            return base.transpose(0, 1).detach().requires_grad_()
+
+        q, k, v = make(1), make(2), make(3)
+        assert not (q.is_contiguous() or k.is_contiguous() or v.is_contiguous())
+
+        out = triton_flash_attention_varlen(
+            q, k, v, cu, cu, max(seqlens), max(seqlens), causal=True, sm_scale=sm_scale
+        )
+        assert not out.is_contiguous()  # confirms empty_like preserved q's layout
+
+        do = torch.randn(total, heads, head_dim, device=device, dtype=out.dtype)  # plain contiguous
+        assert do.stride() != out.stride()
+        out.backward(do)
+        dq, dk, dv = q.grad.clone(), k.grad.clone(), v.grad.clone()
+
+        q_ref = q.detach().clone().float().requires_grad_()
+        k_ref = k.detach().clone().float().requires_grad_()
+        v_ref = v.detach().clone().float().requires_grad_()
+        out_ref = torch.empty(total, heads, head_dim, device=device, dtype=torch.float32)
+        qs = 0
+        for sq in seqlens:
+            o, _ = _ref_attn(
+                q_ref[qs : qs + sq].transpose(0, 1),
+                k_ref[qs : qs + sq].transpose(0, 1),
+                v_ref[qs : qs + sq].transpose(0, 1),
+                True,
+                sm_scale,
+            )
+            out_ref[qs : qs + sq] = o.transpose(0, 1)
+            qs += sq
+        out_ref.backward(do.float())
+
+        torch.testing.assert_close(out.float(), out_ref, atol=_ATOL_OUT, rtol=0.0)
+        torch.testing.assert_close(dq.float(), q_ref.grad, atol=_ATOL_OUT, rtol=0.0)
+        torch.testing.assert_close(dk.float(), k_ref.grad, atol=_ATOL_OUT, rtol=0.0)
+        torch.testing.assert_close(dv.float(), v_ref.grad, atol=_ATOL_OUT, rtol=0.0)
