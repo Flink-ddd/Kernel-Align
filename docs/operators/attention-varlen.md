@@ -1,4 +1,4 @@
-# FlashAttention: LSE Export + Variable-Length Packing (Triton)
+# FlashAttention: LSE Export + Variable-Length Packing
 
 ## Summary
 
@@ -18,11 +18,12 @@ long-context RL rollout/training workloads:
   batches with wildly different response lengths (or empty/fully-masked
   responses) don't pay for padding in either compute or memory.
 
-This module is the **cross-platform semantic baseline**: the planned SM90
-WGMMA+TMA, SM80 `mma.sync`, and ROCm MFMA fused-attention kernels are checked
-against it (and, transitively, against `NativeAttentionOp`) rather than against
-each other. See `docs/operators/attention.md` for the pure-PyTorch WS1
-ground-truth reference this whole family is validated against.
+This module is the **cross-platform semantic baseline**: the SM90 (forward,
+now implemented — see Backends), SM80 `mma.sync`, and ROCm MFMA
+fused-attention kernels are checked against it (and, transitively, against
+`NativeAttentionOp`) rather than against each other. See
+`docs/operators/attention.md` for the pure-PyTorch WS1 ground-truth reference
+this whole family is validated against.
 
 ## Entry Point
 
@@ -51,7 +52,7 @@ out, lse = triton_flash_attention_varlen(..., return_lse=True)           # lse: 
 | Backend | Wrapper | Native symbol | Status |
 | --- | --- | --- | --- |
 | Triton (CUDA) | `triton_flash_attention` / `triton_flash_attention_varlen` | `_fwd_kernel[_varlen]`, `_bwd_kernel[_varlen]` | Cross-platform semantic baseline. |
-| CUDA SM90 (WGMMA+TMA) | — | — | Planned; validates against this Triton path. |
+| CUDA SM90 (TMA + `mma.sync`) | `flash_attention_sm90_varlen` (`rl_engine.kernels.ops.cuda.attention.flash_attn_sm90`) | `flash_attention_varlen_sm90` | Forward-only (causal, varlen, LSE export); backward planned. Validated against this Triton path. |
 | CUDA SM80 (`mma.sync`) | — | — | Planned; validates against this Triton path. |
 | ROCm (MFMA) | — | — | Planned; validates against this Triton path. |
 
@@ -73,6 +74,16 @@ production op_type contract for causal/varlen attention is settled.
 | `causal` | — | bool | Per-sequence anchor `Skv - Sq` (see Accuracy) — identical formula for prefill (`Sq == Skv`) and decode (`Sq < Skv`). |
 | `return_lse` | — | bool | If `True`, also returns the attention-domain LSE, float32, **non-differentiable** (`ctx.mark_non_differentiable`) — diagnostics/backward-recompute only, matching `flash_attn`'s `softmax_lse` external contract. |
 | output | dense: `[B, H, Sq, D]`; varlen: `[total_q, H, D]` | input dtype | — |
+
+The table above states the **Triton** path's contract. The **CUDA SM90**
+backend (`flash_attention_sm90_varlen`) is narrower: **varlen only** (no dense
+entry point), **bf16 only** (no fp16/fp32 — the reused `mma.sync` PTX
+hardcodes bf16 operands), **`D == 128` only** (no other head dim this
+milestone), and **contiguous `q`/`k`/`v` only** (raises `RuntimeError` on a
+non-contiguous/transposed view — TMA descriptors assume a fixed row stride;
+this is a deliberate, tested divergence from the Triton path, which tolerates
+non-contiguous inputs). Inputs outside this support surface fall back to
+`triton_flash_attention_varlen` automatically rather than erroring.
 
 ## Dispatch Behavior
 
@@ -119,20 +130,39 @@ existing `benchmarks/benchmark_attention.py`.
 
 ```bash
 python -m pytest tests/test_triton_attention_varlen.py -v
+python -m pytest tests/test_flash_attention_sm90.py -v
 ```
 
-Covers: dense LSE vs. independent reference, LSE non-differentiability with
-backward still populating `q`/`k`/`v` grads, default-call backward
-compatibility (bare tensor when `return_lse=False`), varlen forward+backward
-across uneven non-block-aligned seqlens, non-causal, decode-style (`Sq < Skv`
-varying per sequence), `head_dim=128`, and a zero-length sequence in the batch
-(a real occurrence for fully-masked/empty RL responses).
+`test_triton_attention_varlen.py` covers: dense LSE vs. independent reference,
+LSE non-differentiability with backward still populating `q`/`k`/`v` grads,
+default-call backward compatibility (bare tensor when `return_lse=False`),
+varlen forward+backward across uneven non-block-aligned seqlens, non-causal,
+decode-style (`Sq < Skv` varying per sequence), `head_dim=128`, and a
+zero-length sequence in the batch (a real occurrence for fully-masked/empty RL
+responses).
+
+`test_flash_attention_sm90.py` (requires a Hopper GPU with the extension built
+`KERNEL_ALIGN_FORCE_SM90=1`) covers the same varlen shape matrix for the
+forward-only SM90 kernel — uneven non-block-aligned seqlens, non-causal,
+decode-style, `head_dim=128`, zero-length sequence — plus a dense-vs-varlen
+consistency check (packed multi-batch call must match calling the kernel once
+per sequence) and a non-contiguous-input-rejection check. Each case is
+validated against both the independent fp32 reference and
+`triton_flash_attention_varlen` on the same bf16 tensors.
 
 ## Known Limitations
 
-- No GQA support on either path (`Hk` must equal `Hq`) — same constraint the
+- No GQA support on any path (`Hk` must equal `Hq`) — same constraint the
   pre-existing dense kernel already had; not introduced by this change.
 - Not wired into `KernelRegistry`; no automatic backend selection yet.
-- SM90 WGMMA+TMA, SM80 `mma.sync`, and ROCm MFMA kernels are not implemented —
-  this page covers the Triton baseline only.
+- CUDA SM90 forward is implemented (TMA + `mma.sync`, causal, varlen, LSE
+  export) but has **no backward pass** yet (no `dQ`/`dK`/`dV` kernel) — a
+  separately tracked follow-up. It is also **bf16-only**, **`D=128`-only**,
+  **varlen-only** (no dense entry point), and **rejects non-contiguous
+  inputs** (see Tensor Contract) — inputs outside that surface fall back to
+  the Triton path automatically. It does not use split-KV parallelism or a
+  persistent-kernel schedule (a sequential KV loop per CTA, same as
+  `prefix_shared_attention.cu`) — a possible future perf pass, not attempted
+  here.
+- SM80 `mma.sync` and ROCm MFMA kernels are not implemented yet.
 - No standalone performance benchmark yet (see Performance Notes).
