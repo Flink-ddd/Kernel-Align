@@ -52,7 +52,7 @@ out, lse = triton_flash_attention_varlen(..., return_lse=True)           # lse: 
 | Backend | Wrapper | Native symbol | Status |
 | --- | --- | --- | --- |
 | Triton (CUDA) | `triton_flash_attention` / `triton_flash_attention_varlen` | `_fwd_kernel[_varlen]`, `_bwd_kernel[_varlen]` | Cross-platform semantic baseline. |
-| CUDA SM90 (TMA + `mma.sync`) | `flash_attention_sm90_varlen` (`rl_engine.kernels.ops.cuda.attention.flash_attn_sm90`) | `flash_attention_varlen_sm90` | Forward-only (causal, varlen, LSE export); backward planned. Validated against this Triton path. |
+| CUDA SM90 (TMA + `mma.sync`) | `flash_attention_sm90_varlen` (`rl_engine.kernels.ops.cuda.attention.flash_attn_sm90`) | `flash_attention_varlen_sm90[_backward]` | Forward + backward (causal, varlen, LSE export, `dQ`/`dK`/`dV`), fully differentiable via `torch.autograd.Function`. Validated against this Triton path. |
 | CUDA SM80 (`mma.sync`) | — | — | Planned; validates against this Triton path. |
 | ROCm (MFMA) | — | — | Planned; validates against this Triton path. |
 
@@ -111,6 +111,13 @@ Measured on an H100 SXM5 (fp16 inputs, fp32 accumulation in-kernel):
 - Varlen: `out`/`dq`/`dk`/`dv` max-abs-diff in the `5e-4`–`1.1e-2` range across
   uneven, non-block-aligned sequence lengths; `lse` ≈ `1e-6`.
 
+CUDA SM90 (bf16 inputs, bf16×bf16→fp32 `mma.sync` accumulation, checked
+against the same fp32 reference): `out`/`lse` max-abs-diff up to ≈ `1.6e-2`;
+`dq`/`dk`/`dv` max-abs-diff up to ≈ `1.6e-2` across the full shape matrix,
+including the 24-KV-tile long-sequence and `dQ` atomic-accumulation stress
+cases — bf16 (fewer mantissa bits than fp16) accounts for the looser bound
+than the Triton fp16 numbers above.
+
 Varlen boundary handling: since packed sequences sit back-to-back in memory (no
 padding), reading past a sequence's own `cu_seqlens` bound is a genuine
 correctness bug (you'd read the *next* sequence's tokens), not just wasted
@@ -142,27 +149,48 @@ zero-length sequence in the batch (a real occurrence for fully-masked/empty RL
 responses).
 
 `test_flash_attention_sm90.py` (requires a Hopper GPU with the extension built
-`KERNEL_ALIGN_FORCE_SM90=1`) covers the same varlen shape matrix for the
-forward-only SM90 kernel — uneven non-block-aligned seqlens, non-causal,
-decode-style, `head_dim=128`, zero-length sequence — plus a dense-vs-varlen
-consistency check (packed multi-batch call must match calling the kernel once
-per sequence) and a non-contiguous-input-rejection check. Each case is
-validated against both the independent fp32 reference and
-`triton_flash_attention_varlen` on the same bf16 tensors.
+`KERNEL_ALIGN_FORCE_SM90=1`) covers the same varlen shape matrix for the SM90
+kernel — uneven non-block-aligned seqlens, block-aligned seqlens, non-causal,
+decode-style, `head_dim=128`, zero-length sequence, long/many-KV-tile
+sequences, single-head, and 8-entry mixed batches — with every case also
+exercising `.backward()` and checking `dQ`/`dK`/`dV`. Forward output/LSE is
+checked against both the independent fp32 reference and
+`triton_flash_attention_varlen` on the same bf16 tensors; gradients are
+checked against the fp32 reference only (`triton_flash_attention_varlen`'s
+own backward can't run on bf16 tensors at all in this Triton version —
+`tl.atomic_add` doesn't support bf16, a compiler-level restriction, not a
+numerical one; this repo's own Triton backward tests avoid it too, always
+using fp16). Additional dedicated cases: a single-KV-tile-CTA case (isolates
+the `P`/`ds` shared-memory transpose-trick correctness from the causal
+`lo`-bound loop and cross-CTA `dQ` atomics), a `dQ` atomic-accumulation stress
+case (short query sequence attended to by ~16 KV-tile CTAs, non-causal, so
+every CTA atomic-adds into the same few rows), an LSE-non-differentiability
+check, a dense-vs-varlen consistency check, and validation-guard tests for
+both the forward and backward native symbols (bad head_dim/dtype/GQA/
+cu_seqlens-mismatch/non-contiguous input).
 
 ## Known Limitations
 
 - No GQA support on any path (`Hk` must equal `Hq`) — same constraint the
   pre-existing dense kernel already had; not introduced by this change.
 - Not wired into `KernelRegistry`; no automatic backend selection yet.
-- CUDA SM90 forward is implemented (TMA + `mma.sync`, causal, varlen, LSE
-  export) but has **no backward pass** yet (no `dQ`/`dK`/`dV` kernel) — a
-  separately tracked follow-up. It is also **bf16-only**, **`D=128`-only**,
-  **varlen-only** (no dense entry point), and **rejects non-contiguous
-  inputs** (see Tensor Contract) — inputs outside that surface fall back to
-  the Triton path automatically. It does not use split-KV parallelism or a
-  persistent-kernel schedule (a sequential KV loop per CTA, same as
-  `prefix_shared_attention.cu`) — a possible future perf pass, not attempted
-  here.
+- CUDA SM90 forward + backward is implemented (TMA + `mma.sync`, causal,
+  varlen, LSE export, `dQ`/`dK`/`dV`) and fully differentiable. It is
+  **bf16-only**, **`D=128`-only**, **varlen-only** (no dense entry point), and
+  **rejects non-contiguous inputs** (see Tensor Contract) — inputs outside
+  that surface fall back to `triton_flash_attention_varlen` entirely
+  (forward *and* backward together; a build with only the forward native
+  symbol compiled also falls back entirely, rather than mixing an SM90
+  forward with a Triton backward). Neither the forward nor backward kernel
+  uses split-KV/split-Q parallelism or a persistent-kernel schedule (a
+  sequential loop per CTA, same as `prefix_shared_attention.cu`) — a possible
+  future perf pass, not attempted here.
+- `seqlen_q > seqlen_k` under `causal=True` is out-of-contract (violates the
+  `Skv - Sq` causal-offset convention, which assumes a query can always
+  attend at least to itself) and produces `NaN`/degenerate output — this is
+  not specific to the SM90 kernel; `triton_flash_attention_varlen` produces
+  `NaN` for the identical input too, confirmed directly. Neither
+  implementation is designed to handle it; callers must ensure
+  `seqlen_k >= seqlen_q` per sequence whenever `causal=True`.
 - SM80 `mma.sync` and ROCm MFMA kernels are not implemented yet.
 - No standalone performance benchmark yet (see Performance Notes).
