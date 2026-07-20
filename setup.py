@@ -1,9 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
+import importlib.util
 import os
+from pathlib import Path
 
 from setuptools import find_packages, setup
+
+
+def _load_envs_module():
+    envs_path = Path(__file__).with_name("envs.py")
+    spec = importlib.util.spec_from_file_location("_rl_kernel_envs", envs_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load environment helpers from {envs_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+envs = _load_envs_module()
 
 
 def _load_torch_extension_tools():
@@ -37,6 +52,10 @@ def get_extensions():
         return []
 
     extensions = []
+    torch_lib_dir = os.path.join(os.path.dirname(torch.__file__), "lib")
+    torch_rpath = ["-Wl,-rpath,$ORIGIN/../torch/lib"]
+    if os.environ.get("KERNEL_ALIGN_DEV_RPATH") == "1":
+        torch_rpath.append(f"-Wl,-rpath,{torch_lib_dir}")
     is_rocm = torch.version.hip is not None
 
     if is_rocm and ROCMExtension is not None:
@@ -51,17 +70,21 @@ def get_extensions():
                     "cxx": ["-O3", "-std=c++17"],
                     "hipcc": ["-O3", "--use_fast_math", "-Xhipcc", "-compress-all"],
                 },
+                extra_link_args=list(torch_rpath),
             )
         )
     elif torch.cuda.is_available():
         cuda_sources = [
             "csrc/ops.cpp",
             "csrc/fused_logp_kernel.cu",
+            "csrc/deterministic_logp_kernel.cu",
             "csrc/cuda/attention/prefix_shared_attention.cu",
         ]
 
         cc_major, cc_minor = torch.cuda.get_device_capability()
-        nvcc_flags = ["-O3", "--use_fast_math", "-Xfatbin", "-compress-all"]
+        nvcc_flags = ["-O3", "-Xfatbin", "-compress-all"]
+        if envs.env_flag(envs.KERNEL_ALIGN_USE_FAST_MATH):
+            nvcc_flags.append("--use_fast_math")
         nvcc_flags.extend(
             _cuda_define_from_env(
                 "FUSED_LOGP_TWOPASS_BLOCK_SIZE",
@@ -104,17 +127,20 @@ def get_extensions():
                 "FUSED_LOGP_ONLINE_MIN_BLOCKS_PER_SM",
             )
         )
-        if os.environ.get("KERNEL_ALIGN_NCU_LINEINFO") == "1":
+        if envs.env_flag(envs.KERNEL_ALIGN_NCU_LINEINFO):
             nvcc_flags.append("-lineinfo")
+        if os.name == "nt" and envs.env_flag(envs.KERNEL_ALIGN_ALLOW_UNSUPPORTED_MSVC):
+            nvcc_flags.append("-allow-unsupported-compiler")
+            nvcc_flags.append("-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH")
 
         cxx_flags = ["-O3", "-std=c++17", "-DKERNEL_ALIGN_WITH_CUDA"]
-        extra_link_args = []
+        extra_link_args = list(torch_rpath)
 
         sm90_srcs = [
             "csrc/cuda/fused_logp_sm90.cu",
             "csrc/cuda/fused_linear_logp_sm90.cu",  # TMA + WGMMA fused linear log-prob
         ]
-        enable_sm90 = os.environ.get("KERNEL_ALIGN_FORCE_SM90") == "1"
+        enable_sm90 = envs.env_flag(envs.KERNEL_ALIGN_FORCE_SM90)
         present_sm90 = [s for s in sm90_srcs if os.path.exists(s)]
         if enable_sm90 and present_sm90:
             tma_arch = f"{cc_major}{cc_minor}a"  # WGMMA/TMA require the arch-native 'a' variant
@@ -153,7 +179,7 @@ setup(
         "tabulate",
         "numpy",
         "accelerate",
-        "transformers",
+        "transformers==5.13.1",
     ],
     ext_modules=get_extensions(),
     cmdclass=get_cmdclass(),

@@ -47,6 +47,7 @@ class DeepSpeedTrainingConfig(TorchRLTrainingConfig):
     initialize_kwargs: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if self.zero_stage < 0:
             raise ValueError("zero_stage must be >= 0")
 
@@ -490,6 +491,7 @@ def _coerce_hidden_tensor(
     if hasattr(candidate, "hidden_states"):
         hidden = _last_hidden_state_tensor(
             getattr(candidate, "hidden_states"),
+            candidate.hidden_states,
             expected_hidden_dim=expected_hidden_dim,
         )
         if hidden is not None:

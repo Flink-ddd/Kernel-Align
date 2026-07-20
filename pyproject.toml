@@ -17,11 +17,11 @@ dependencies = [
     "tabulate",
     "numpy",
     "accelerate",
-    "transformers",
+    "transformers==5.13.1",
 ]
 
 [project.optional-dependencies]
-cuda = ["flashinfer>=0.1.6", "nvidia-ml-py"]
+cuda = ["flashinfer-python>=0.1.6", "nvidia-ml-py"]
 rocm = ["aiter"]
 vllm = ["vllm>=0.6.0"]
 dev = ["pytest", "black", "isort", "ruff", "mypy", "pre-commit"]

@@ -5,24 +5,44 @@ CUDA toolchain; ROCm builds require a compatible ROCm environment.
 
 ## From Source
 
+For CUDA (or ROCm) source builds, install PyTorch first (matching your CUDA/ROCm
+runtime), then build with build isolation disabled so `setup.py` can access
+PyTorch's extension build utilities and compile the native kernels (`rl_engine._C`):
+
 ```bash
 git clone https://github.com/RL-Align/RL-Kernel.git
 cd RL-Kernel
-pip install -e .
+# Optional: pin the compile target. If unset, the build targets your GPU's arch.
+# export TORCH_CUDA_ARCH_LIST="9.0+PTX"   # e.g. Hopper; or "8.6+PTX", "12.0+PTX"
+pip install --no-build-isolation -e .
 ```
+
+Without `--no-build-isolation`, PyTorch is invisible to the isolated build
+environment, the extension is silently skipped, and the library falls back to the
+slower pure-PyTorch kernels. Confirm the compiled extension is present with:
+
+```bash
+python -c "from rl_engine import _C; print('compiled extension OK')"
+```
+
+A CPU-only install (plain `pip install -e .` on a machine with no GPU) remains
+supported and runs on the pure-PyTorch backends.
 
 ## Optional Backends
 
+The extras add optional dependencies on top of the compiled package, so they use
+the same `--no-build-isolation` flag as the source build above.
+
 ```bash
-pip install -e ".[cuda]"
+pip install --no-build-isolation -e ".[cuda]"
 ```
 
 ```bash
-pip install -e ".[rocm]"
+pip install --no-build-isolation -e ".[rocm]"
 ```
 
 ```bash
-pip install -e ".[vllm]"
+pip install --no-build-isolation -e ".[vllm]"
 ```
 
 Install the vLLM extra only on rollout or benchmark environments that need the

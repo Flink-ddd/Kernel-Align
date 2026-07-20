@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
+import queue
+import tempfile
+import traceback
+from pathlib import Path
+
 import pytest
 import torch
+import torch.multiprocessing as mp
 
 from rl_engine.executors.deepspeed_trainer import _EmbeddingLMHeadModel, _safe_token_ids
 from rl_engine.kernels.ops.pytorch.loss.linear_logp import (
@@ -43,6 +49,82 @@ requires_sm90 = pytest.mark.skipif(
     reason="Fused linear log-prob SM90 kernel requires a Hopper (sm_90) GPU with the "
     "extension built KERNEL_ALIGN_FORCE_SM90=1.",
 )
+
+
+def _gloo_available():
+    return torch.distributed.is_available() and torch.distributed.is_gloo_available()
+
+
+requires_gloo = pytest.mark.skipif(
+    not _gloo_available(),
+    reason="tensor-parallel linear_logp CPU test requires torch.distributed Gloo.",
+)
+
+
+def _tp_linear_logp_gloo_worker(rank, world_size, init_method, result_queue):
+    try:
+        import torch.distributed as dist
+
+        torch.set_num_threads(1)
+        dist.init_process_group(
+            backend="gloo",
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size,
+        )
+
+        torch.manual_seed(2026)
+        n, d, vocab = 8, 5, 16
+        boundaries = [0, 3, 7, 12, vocab]
+        start = boundaries[rank]
+        end = boundaries[rank + 1]
+
+        hidden_base = torch.randn(n, d)
+        weight_full = torch.randn(vocab, d)
+        bias_full = torch.randn(vocab)
+        target = torch.tensor([0, 2, 3, 6, 7, 11, 12, 15], dtype=torch.long)
+        grad_out = torch.randn(n)
+        op = NativeLinearLogpOp()
+
+        ref_hidden = hidden_base.detach().clone().requires_grad_(True)
+        ref_weight = weight_full.detach().clone().requires_grad_(True)
+        ref_bias = bias_full.detach().clone().requires_grad_(True)
+        ref_out = op(ref_hidden, ref_weight, target, ref_bias)
+        ref_out.backward(grad_out)
+
+        tp_hidden = hidden_base.detach().clone().requires_grad_(True)
+        local_weight = weight_full[start:end].detach().clone().requires_grad_(True)
+        local_bias = bias_full[start:end].detach().clone().requires_grad_(True)
+        tp_out = op(
+            tp_hidden,
+            local_weight,
+            target,
+            local_bias,
+            tp_group=dist.group.WORLD,
+            vocab_start_index=start,
+            global_vocab_size=vocab,
+        )
+        tp_out.backward(grad_out)
+
+        result_queue.put(
+            {
+                "ok": True,
+                "rank": rank,
+                "out": float((tp_out - ref_out).abs().max().item()),
+                "hidden_grad": float((tp_hidden.grad - ref_hidden.grad).abs().max().item()),
+                "weight_grad": float(
+                    (local_weight.grad - ref_weight.grad[start:end]).abs().max().item()
+                ),
+                "bias_grad": float((local_bias.grad - ref_bias.grad[start:end]).abs().max().item()),
+            }
+        )
+    except Exception:  # pragma: no cover - forwarded to parent process
+        result_queue.put({"ok": False, "rank": rank, "traceback": traceback.format_exc()})
+        raise
+    finally:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
 
 # SM90 forward needs bf16 and a hidden dim that is a multiple of the kernel's K
 # slice (32); N / V are deliberately left unaligned to the 64-wide tiles.
@@ -286,6 +368,60 @@ def test_native_rejects_shape_mismatch():
         native(hidden, weight, torch.zeros(_N + 1, dtype=torch.long), bias)
 
 
+def test_tensor_parallel_metadata_requires_multi_rank_group():
+    native = NativeLinearLogpOp()
+    hidden, weight, target, bias = _inputs(0, device="cpu")
+    with pytest.raises(ValueError, match="vocab_start_index requires"):
+        native(hidden, weight, target, bias, vocab_start_index=4)
+    with pytest.raises(ValueError, match="global_vocab_size differs"):
+        native(hidden, weight, target, bias, global_vocab_size=weight.size(0) + 1)
+
+
+@requires_gloo
+def test_native_tensor_parallel_matches_full_reference_cpu_gloo_4_ranks():
+    ctx = mp.get_context("spawn")
+    world_size = 4
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_method = (Path(tmpdir) / "gloo_init").as_uri()
+        result_queue = ctx.Queue()
+        processes = [
+            ctx.Process(
+                target=_tp_linear_logp_gloo_worker,
+                args=(rank, world_size, init_method, result_queue),
+            )
+            for rank in range(world_size)
+        ]
+
+        for process in processes:
+            process.start()
+
+        results = []
+        try:
+            for _ in processes:
+                results.append(result_queue.get(timeout=45))
+        except queue.Empty:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+            pytest.fail("timed out waiting for tensor-parallel Gloo workers")
+        finally:
+            for process in processes:
+                process.join(timeout=10)
+                if process.is_alive():
+                    process.terminate()
+
+    sorted_results = sorted(results, key=lambda item: item["rank"])
+    for result in sorted_results:
+        assert result["ok"], result.get("traceback")
+    for process in processes:
+        assert process.exitcode == 0
+    for result in sorted_results:
+        assert result["out"] < 1e-5
+        assert result["hidden_grad"] < 1e-5
+        assert result["weight_grad"] < 1e-5
+        assert result["bias_grad"] < 1e-5
+
+
 @requires_triton_cuda
 def test_triton_forward_matches_native_fp32():
     from rl_engine.kernels.ops.triton.loss.linear_logp import TritonLinearLogpOp
@@ -396,13 +532,77 @@ def test_sm90_forward_no_bias():
 
 
 @requires_sm90
+def test_sm90_save_probs_bf16_output_only_matches_native(monkeypatch):
+    from rl_engine.kernels.ops.base import _C
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
+
+    if not (
+        hasattr(_C, "linear_logp_probs_bf16_forward")
+        and hasattr(_C, "linear_logp_probs_bf16_to_dlogits_")
+    ):
+        pytest.skip("save-probs bf16 helpers are not compiled into the extension")
+
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_SAVE_PROBS_BF16", "1")
+    op = FusedLinearLogpSM90Op()
+    hidden, weight, target, _ = _sm90_inputs(136, bias=False)
+    grad_out = torch.randn(_SM90_N, device="cuda")
+
+    h = hidden.detach().clone().requires_grad_(False)
+    w = weight.detach().clone().requires_grad_(True)
+    out = op(h, w, target, None)
+    out.backward(grad_out)
+
+    ref_w = weight.detach().clone().requires_grad_(True)
+    ref_out = NativeLinearLogpOp()(hidden.detach(), ref_w, target, None)
+    ref_out.backward(grad_out)
+
+    assert h.grad is None
+    assert torch.allclose(out.detach(), ref_out.detach(), atol=2e-2)
+    assert torch.allclose(w.grad, ref_w.grad, atol=1.5e-1, rtol=8e-2)
+
+
+@requires_sm90
+def test_sm90_save_probs_bf16_full_gradient_matches_native(monkeypatch):
+    from rl_engine.kernels.ops.base import _C
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
+
+    if not (
+        hasattr(_C, "linear_logp_probs_bf16_forward")
+        and hasattr(_C, "linear_logp_probs_bf16_to_dlogits_")
+    ):
+        pytest.skip("save-probs bf16 helpers are not compiled into the extension")
+
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_SAVE_PROBS_BF16", "1")
+    op = FusedLinearLogpSM90Op()
+    hidden, weight, target, _ = _sm90_inputs(137, bias=False)
+    grad_out = torch.randn(_SM90_N, device="cuda")
+
+    h = hidden.detach().clone().requires_grad_(True)
+    w = weight.detach().clone().requires_grad_(True)
+    out = op(h, w, target, None)
+    out.backward(grad_out)
+
+    ref_h = hidden.detach().clone().requires_grad_(True)
+    ref_w = weight.detach().clone().requires_grad_(True)
+    ref_out = NativeLinearLogpOp()(ref_h, ref_w, target, None)
+    ref_out.backward(grad_out)
+
+    assert h.grad is not None
+    assert w.grad is not None
+    assert torch.allclose(out.detach(), ref_out.detach(), atol=2e-2)
+    assert torch.allclose(h.grad, ref_h.grad, atol=1.5e-1, rtol=8e-2)
+    assert torch.allclose(w.grad, ref_w.grad, atol=1.5e-1, rtol=8e-2)
+
+
+@requires_sm90
 @pytest.mark.parametrize("use_bias", [True, False])
-def test_sm90_forward_backward_matches_triton(use_bias):
-    # The SM90 forward is fp32-accurate and the backward reuses the same
-    # deterministic chunked path as the Triton op, so both match very tightly.
+def test_sm90_forward_backward_matches_triton(use_bias, monkeypatch):
+    # The strict fp32 backward mode reuses the same deterministic chunked
+    # numerics as the Triton op, so both match very tightly.
     from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
     from rl_engine.kernels.ops.triton.loss.linear_logp import TritonLinearLogpOp
 
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_FUSED_BWD_PRECISION", "fp32")
     sm90, trit = FusedLinearLogpSM90Op(), TritonLinearLogpOp()
     hidden, weight, target, bias = _sm90_inputs(13, bias=use_bias)
     grad_out = torch.randn(_SM90_N, device="cuda")
@@ -422,6 +622,154 @@ def test_sm90_forward_backward_matches_triton(use_bias):
     assert torch.allclose(sw, tw, atol=2e-3)
     if use_bias:
         assert torch.allclose(sb, tb, atol=2e-3)
+
+
+@requires_sm90
+def test_sm90_default_fast_backward_matches_strict_with_bf16_tolerance(monkeypatch):
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
+
+    op = FusedLinearLogpSM90Op()
+    hidden, weight, target, bias = _sm90_inputs(131, bias=True)
+    grad_out = torch.randn(_SM90_N, device="cuda")
+
+    def run():
+        h = hidden.detach().clone().requires_grad_(True)
+        w = weight.detach().clone().requires_grad_(True)
+        b = bias.detach().clone().requires_grad_(True)
+        out = op(h, w, target, b)
+        out.backward(grad_out)
+        return out.detach(), h.grad, w.grad, b.grad
+
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_FUSED_BWD_PRECISION", "fp32")
+    strict_out, strict_h, strict_w, strict_b = run()
+    monkeypatch.delenv("RL_KERNEL_LINEAR_LOGP_FUSED_BWD_PRECISION", raising=False)
+    fast_out, fast_h, fast_w, fast_b = run()
+
+    assert torch.allclose(fast_out, strict_out, atol=0.0, rtol=0.0)
+    assert torch.allclose(fast_h, strict_h, atol=8e-2, rtol=8e-2)
+    assert torch.allclose(fast_w, strict_w, atol=8e-2, rtol=8e-2)
+    assert torch.allclose(fast_b, strict_b, atol=2e-3, rtol=2e-3)
+
+
+@requires_sm90
+def test_sm90_bf16_dlogits_fast_path_matches_cast_path(monkeypatch):
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
+
+    op = FusedLinearLogpSM90Op()
+    hidden, weight, target, _ = _sm90_inputs(133, bias=False)
+    grad_out = torch.randn(_SM90_N, device="cuda")
+
+    def run():
+        h = hidden.detach().clone().requires_grad_(True)
+        w = weight.detach().clone().requires_grad_(True)
+        out = op(h, w, target, None)
+        out.backward(grad_out)
+        return out.detach(), h.grad, w.grad
+
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_FUSED_BWD_BF16_DLOGITS", "0")
+    cast_out, cast_h, cast_w = run()
+    monkeypatch.delenv("RL_KERNEL_LINEAR_LOGP_FUSED_BWD_BF16_DLOGITS", raising=False)
+    fast_out, fast_h, fast_w = run()
+
+    assert torch.allclose(fast_out, cast_out, atol=0.0, rtol=0.0)
+    assert torch.allclose(fast_h, cast_h, atol=0.0, rtol=0.0)
+    assert torch.allclose(fast_w, cast_w, atol=0.0, rtol=0.0)
+
+
+@requires_sm90
+def test_sm90_streaming_output_only_backward_matches_strict(monkeypatch):
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
+
+    op = FusedLinearLogpSM90Op()
+    hidden, weight, target, bias = _sm90_inputs(132, bias=True)
+    grad_out = torch.randn(_SM90_N, device="cuda")
+
+    def run():
+        h = hidden.detach().clone().requires_grad_(False)
+        w = weight.detach().clone().requires_grad_(True)
+        b = bias.detach().clone().requires_grad_(True)
+        out = op(h, w, target, b)
+        out.backward(grad_out)
+        return out.detach(), w.grad, b.grad
+
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_FUSED_BWD_PRECISION", "fp32")
+    strict_out, strict_w, strict_b = run()
+    monkeypatch.delenv("RL_KERNEL_LINEAR_LOGP_FUSED_BWD_PRECISION", raising=False)
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD", "1")
+    stream_out, stream_w, stream_b = run()
+
+    assert torch.allclose(stream_out, strict_out, atol=0.0, rtol=0.0)
+    assert torch.allclose(stream_w, strict_w, atol=8e-2, rtol=8e-2)
+    assert torch.allclose(stream_b, strict_b, atol=2e-3, rtol=2e-3)
+
+
+@requires_sm90
+def test_sm90_streaming_tiled_output_only_backward_matches_fast(monkeypatch):
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
+
+    op = FusedLinearLogpSM90Op()
+    hidden, weight, target, _ = _sm90_inputs(134, bias=False)
+    grad_out = torch.randn(_SM90_N, device="cuda")
+
+    def run():
+        h = hidden.detach().clone().requires_grad_(False)
+        w = weight.detach().clone().requires_grad_(True)
+        out = op(h, w, target, None)
+        out.backward(grad_out)
+        return out.detach(), w.grad
+
+    monkeypatch.delenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD", raising=False)
+    fast_out, fast_w = run()
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD", "1")
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD_VOCAB_TILE", "128")
+    stream_out, stream_w = run()
+
+    assert torch.allclose(stream_out, fast_out, atol=0.0, rtol=0.0)
+    assert torch.allclose(stream_w, fast_w, atol=8e-2, rtol=8e-2)
+
+
+@requires_sm90
+def test_sm90_streaming_tiled_cuda_logits_backward_matches_tiled(monkeypatch):
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
+
+    op = FusedLinearLogpSM90Op()
+    gen = torch.Generator(device="cuda").manual_seed(135)
+    hidden = torch.randn(_SM90_N, _SM90_D, device="cuda", dtype=torch.bfloat16, generator=gen)
+    weight = torch.randn(512, _SM90_D, device="cuda", dtype=torch.bfloat16, generator=gen)
+    target = torch.randint(0, 512, (_SM90_N,), device="cuda", generator=gen)
+    grad_out = torch.randn(_SM90_N, device="cuda", generator=gen)
+
+    def run(logits_mode=None, grad_weight_mode=None):
+        h = hidden.detach().clone().requires_grad_(False)
+        w = weight.detach().clone().requires_grad_(True)
+        monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD", "1")
+        monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD_VOCAB_TILE", "128")
+        if logits_mode is not None:
+            monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD_LOGITS", logits_mode)
+        else:
+            monkeypatch.delenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD_LOGITS", raising=False)
+        if grad_weight_mode is not None:
+            monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD_GW", grad_weight_mode)
+        else:
+            monkeypatch.delenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD_GW", raising=False)
+        out = op(h, w, target, None)
+        out.backward(grad_out)
+        return out.detach(), w.grad
+
+    tiled_out, tiled_w = run()
+
+    for logits_mode in ("cuda_tf32", "cuda_bf16_mma", "cuda_bf16_mma_dz"):
+        cuda_out, cuda_w = run(logits_mode)
+        assert torch.allclose(cuda_out, tiled_out, atol=0.0, rtol=0.0)
+        assert torch.allclose(cuda_w, tiled_w, atol=8e-2, rtol=8e-2)
+
+    wmma_out, wmma_w = run("cuda_bf16_mma_dz", "cuda_wmma")
+    assert torch.allclose(wmma_out, tiled_out, atol=0.0, rtol=0.0)
+    assert torch.allclose(wmma_w, tiled_w, atol=8e-2, rtol=8e-2)
+
+    fused_tile_out, fused_tile_w = run("cuda_bf16_mma_dz", "fused_tile")
+    assert torch.allclose(fused_tile_out, tiled_out, atol=0.0, rtol=0.0)
+    assert torch.allclose(fused_tile_w, tiled_w, atol=8e-2, rtol=8e-2)
 
 
 @requires_sm90
@@ -510,6 +858,244 @@ def test_sm90_rejects_out_of_range_target():
     # A valid target (all in [0, V)) still works.
     out = sm90(hidden, weight, target, bias)
     assert out.shape == target.shape and torch.isfinite(out).all()
+
+
+def test_sm90_tp_metadata_prefers_sm90_tp_helper(monkeypatch):
+    from rl_engine.kernels.ops.cuda.loss import linear_logp as cuda_linear_logp
+
+    monkeypatch.delenv("RL_KERNEL_LINEAR_LOGP_SAVE_PROBS_BF16", raising=False)
+    op = object.__new__(cuda_linear_logp.FusedLinearLogpSM90Op)
+    hidden = torch.randn(2, 4)
+    weight = torch.randn(3, 4)
+    target = torch.tensor([3, 5])
+    sentinel = torch.full((2,), 7.0)
+    tp_group = object()
+    calls = {}
+
+    monkeypatch.setattr(
+        cuda_linear_logp,
+        "should_use_tensor_parallel_linear_logp",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(cuda_linear_logp, "_sm90_supported", lambda h, w: True)
+
+    def fake_sm90_tp(hidden_arg, weight_arg, target_arg, bias_arg, **kwargs):
+        calls["sm90_tp"] = (hidden_arg, weight_arg, target_arg, bias_arg, kwargs)
+        return sentinel
+
+    def forbidden_portable_tp(*args, **kwargs):
+        raise AssertionError("portable TP path should not run when SM90 TP is available")
+
+    monkeypatch.setattr(cuda_linear_logp, "_sm90_tensor_parallel_linear_logp", fake_sm90_tp)
+    monkeypatch.setattr(cuda_linear_logp, "tensor_parallel_linear_logp", forbidden_portable_tp)
+
+    out = op(
+        hidden,
+        weight,
+        target,
+        tp_group=tp_group,
+        vocab_start_index=3,
+        global_vocab_size=6,
+    )
+
+    assert out is sentinel
+    assert calls["sm90_tp"][0] is hidden
+    assert calls["sm90_tp"][1] is weight
+    assert calls["sm90_tp"][2] is target
+    assert calls["sm90_tp"][4] == {
+        "tp_group": tp_group,
+        "vocab_start_index": 3,
+        "global_vocab_size": 6,
+    }
+
+
+def test_sm90_tp_metadata_prefers_save_probs_for_output_only(monkeypatch):
+    from rl_engine.kernels.ops.cuda.loss import linear_logp as cuda_linear_logp
+
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_SAVE_PROBS_BF16", "1")
+    op = object.__new__(cuda_linear_logp.FusedLinearLogpSM90Op)
+    hidden = torch.randn(2, 4, requires_grad=False)
+    weight = torch.randn(3, 4, requires_grad=True)
+    target = torch.tensor([3, 5])
+    sentinel = torch.full((2,), 11.0)
+    tp_group = object()
+    calls = {}
+
+    monkeypatch.setattr(
+        cuda_linear_logp,
+        "should_use_tensor_parallel_linear_logp",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(cuda_linear_logp, "_sm90_supported", lambda h, w: True)
+    monkeypatch.setattr(cuda_linear_logp, "_sm90_save_probs_bf16_tp_available", lambda: True)
+
+    def fake_save_probs_apply(hidden_arg, weight_arg, target_arg, vocab_start, global_vocab, group):
+        calls["save_probs"] = (hidden_arg, weight_arg, target_arg, vocab_start, global_vocab, group)
+        return sentinel
+
+    def forbidden_sm90_tp(*args, **kwargs):
+        raise AssertionError("regular SM90 TP path should not run when save-probs is available")
+
+    monkeypatch.setattr(
+        cuda_linear_logp._TensorParallelLinearLogpSaveProbsBF16Function,
+        "apply",
+        staticmethod(fake_save_probs_apply),
+    )
+    monkeypatch.setattr(cuda_linear_logp, "_sm90_tensor_parallel_linear_logp", forbidden_sm90_tp)
+
+    out = op(
+        hidden,
+        weight,
+        target,
+        tp_group=tp_group,
+        vocab_start_index=3,
+        global_vocab_size=6,
+    )
+
+    assert out is sentinel
+    assert calls["save_probs"][0] is hidden
+    assert calls["save_probs"][1] is weight
+    assert calls["save_probs"][2] is target
+    assert calls["save_probs"][3:] == (3, 6, tp_group)
+
+
+def test_sm90_tp_metadata_prefers_fused_tp_helper_for_full_gradient(monkeypatch):
+    from rl_engine.kernels.ops.cuda.loss import linear_logp as cuda_linear_logp
+
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_SAVE_PROBS_BF16", "1")
+    op = object.__new__(cuda_linear_logp.FusedLinearLogpSM90Op)
+    hidden = torch.randn(2, 4, requires_grad=True)
+    weight = torch.randn(3, 4, requires_grad=True)
+    target = torch.tensor([3, 5])
+    sentinel = torch.full((2,), 13.0)
+    tp_group = object()
+    calls = {}
+
+    monkeypatch.setattr(
+        cuda_linear_logp,
+        "should_use_tensor_parallel_linear_logp",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(cuda_linear_logp, "_sm90_supported", lambda h, w: True)
+    monkeypatch.setattr(cuda_linear_logp, "_sm90_save_probs_bf16_tp_available", lambda: True)
+
+    def forbidden_save_probs(*args, **kwargs):
+        raise AssertionError("save-probs TP path should not run for full-gradient training")
+
+    def fake_sm90_tp(hidden_arg, weight_arg, target_arg, bias_arg, **kwargs):
+        calls["sm90_tp"] = (hidden_arg, weight_arg, target_arg, bias_arg, kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        cuda_linear_logp._TensorParallelLinearLogpSaveProbsBF16Function,
+        "apply",
+        staticmethod(forbidden_save_probs),
+    )
+    monkeypatch.setattr(cuda_linear_logp, "_sm90_tensor_parallel_linear_logp", fake_sm90_tp)
+
+    out = op(
+        hidden,
+        weight,
+        target,
+        tp_group=tp_group,
+        vocab_start_index=3,
+        global_vocab_size=6,
+    )
+
+    assert out is sentinel
+    assert calls["sm90_tp"][0] is hidden
+    assert calls["sm90_tp"][1] is weight
+    assert calls["sm90_tp"][2] is target
+    assert calls["sm90_tp"][4] == {
+        "tp_group": tp_group,
+        "vocab_start_index": 3,
+        "global_vocab_size": 6,
+    }
+
+
+def test_sm90_tp_metadata_falls_back_to_portable_tp_when_sm90_unsupported(monkeypatch):
+    from rl_engine.kernels.ops.cuda.loss import linear_logp as cuda_linear_logp
+
+    op = object.__new__(cuda_linear_logp.FusedLinearLogpSM90Op)
+    hidden = torch.randn(2, 4)
+    weight = torch.randn(3, 4)
+    target = torch.tensor([3, 5])
+    sentinel = torch.full((2,), 11.0)
+
+    monkeypatch.setattr(
+        cuda_linear_logp,
+        "should_use_tensor_parallel_linear_logp",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(cuda_linear_logp, "_sm90_supported", lambda h, w: False)
+    monkeypatch.setattr(
+        cuda_linear_logp,
+        "_sm90_tensor_parallel_linear_logp",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("SM90 TP helper should not run for unsupported inputs")
+        ),
+    )
+    monkeypatch.setattr(
+        cuda_linear_logp,
+        "tensor_parallel_linear_logp",
+        lambda *args, **kwargs: sentinel,
+    )
+
+    out = op(
+        hidden,
+        weight,
+        target,
+        tp_group=object(),
+        vocab_start_index=3,
+        global_vocab_size=6,
+    )
+
+    assert out is sentinel
+
+
+def test_sm90_backward_prefers_fused_extension_when_available(monkeypatch):
+    from rl_engine.kernels.ops.cuda.loss import linear_logp as cuda_linear_logp
+
+    hidden = torch.randn(4, 6)
+    weight = torch.randn(5, 6)
+    bias = torch.randn(5)
+    target = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    grad_logp = torch.randn(4)
+    lse = torch.randn(4)
+    calls = {}
+
+    class FakeC:
+        @staticmethod
+        def fused_linear_logp_sm90_backward(*args):
+            calls["backward"] = args
+            return torch.ones_like(hidden), torch.ones_like(weight), torch.ones_like(bias)
+
+    monkeypatch.setattr(cuda_linear_logp, "_EXT_AVAILABLE", True)
+    monkeypatch.setattr(cuda_linear_logp, "_C", FakeC)
+    monkeypatch.delenv("RL_KERNEL_LINEAR_LOGP_FUSED_BACKWARD", raising=False)
+
+    grad_hidden, grad_weight, grad_bias = cuda_linear_logp._sm90_linear_logp_backward(
+        grad_logp,
+        hidden,
+        weight,
+        bias,
+        target,
+        lse,
+        has_bias=True,
+        lead_shape=(4,),
+        hidden_dtype=hidden.dtype,
+        weight_dtype=weight.dtype,
+        bias_dtype=bias.dtype,
+        compute_grad_hidden=False,
+        compute_grad_weight=True,
+        compute_grad_bias=True,
+    )
+
+    assert "backward" in calls
+    assert calls["backward"][7:10] == (False, True, True)
+    assert grad_hidden is None
+    assert torch.equal(grad_weight, torch.ones_like(weight))
+    assert torch.equal(grad_bias, torch.ones_like(bias))
 
 
 def test_registry_dispatch_matches_native():

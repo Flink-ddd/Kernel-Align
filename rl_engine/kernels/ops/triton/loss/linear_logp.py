@@ -2,13 +2,17 @@
 # Copyright (c) 2026 RL-Kernel Contributors
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import triton
 import triton.language as tl
 
-from rl_engine.kernels.ops.pytorch.loss.linear_logp import chunked_linear_logp_backward
+from rl_engine.kernels.ops.pytorch.loss.linear_logp import (
+    chunked_linear_logp_backward,
+    should_use_tensor_parallel_linear_logp,
+    tensor_parallel_linear_logp,
+)
 
 # Token / vocab / hidden tile sizes (forward Triton kernel).
 _BLOCK_N = 32
@@ -145,6 +149,9 @@ class _LinearLogpFunction(torch.autograd.Function):
             hidden_dtype=ctx.hidden_dtype,
             weight_dtype=ctx.weight_dtype,
             bias_dtype=ctx.bias_dtype,
+            compute_grad_hidden=ctx.needs_input_grad[0],
+            compute_grad_weight=ctx.needs_input_grad[1],
+            compute_grad_bias=ctx.needs_input_grad[2],
         )
         # Inputs: hidden, lm_head_weight, bias, target_ids.
         return grad_hidden, grad_weight, grad_bias, None
@@ -165,8 +172,20 @@ class TritonLinearLogpOp:
         lm_head_weight: torch.Tensor,
         target_ids: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        *,
+        tp_group: Any = None,
+        vocab_start_index: int = 0,
+        global_vocab_size: Optional[int] = None,
     ) -> torch.Tensor:
-        return self.apply(hidden, lm_head_weight, target_ids, bias)
+        return self.apply(
+            hidden,
+            lm_head_weight,
+            target_ids,
+            bias,
+            tp_group=tp_group,
+            vocab_start_index=vocab_start_index,
+            global_vocab_size=global_vocab_size,
+        )
 
     def apply(
         self,
@@ -174,6 +193,10 @@ class TritonLinearLogpOp:
         lm_head_weight: torch.Tensor,
         target_ids: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        *,
+        tp_group: Any = None,
+        vocab_start_index: int = 0,
+        global_vocab_size: Optional[int] = None,
     ) -> torch.Tensor:
         if hidden.device.type not in ("cuda", "xpu", "hip"):
             raise RuntimeError(
@@ -189,6 +212,21 @@ class TritonLinearLogpOp:
             raise ValueError(
                 f"hidden dim {hidden.size(-1)} must match lm_head_weight dim "
                 f"{lm_head_weight.size(-1)}"
+            )
+        if should_use_tensor_parallel_linear_logp(
+            tp_group,
+            int(vocab_start_index),
+            global_vocab_size,
+            lm_head_weight.size(0),
+        ):
+            return tensor_parallel_linear_logp(
+                hidden,
+                lm_head_weight,
+                target_ids,
+                bias,
+                tp_group=tp_group,
+                vocab_start_index=vocab_start_index,
+                global_vocab_size=global_vocab_size,
             )
         vocab = lm_head_weight.size(0)
         if bool(((target_ids < 0) | (target_ids >= vocab)).any()):

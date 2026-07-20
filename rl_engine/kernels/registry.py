@@ -29,6 +29,7 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     # TMA-accelerated LogP for SM90+ (Warp Specialization)
     CUDA_FUSED_LOGP_SM90 = "rl_engine.kernels.ops.cuda.loss.logp.FusedLogpSM90Op"
     CUDA_FUSED_LOGP_GENERIC = "rl_engine.kernels.ops.cuda.loss.logp.FusedLogpGenericOp"
+    CUDA_DETERMINISTIC_LOGP = "rl_engine.kernels.ops.cuda.loss.logp.DeterministicLogpCUDAOp"
 
     # AMD ROCm optimized stack
     ROCM_AITER = "rl_engine.kernels.ops.rocm.aiter.AiterOp"
@@ -49,10 +50,79 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     TRITON_RATIO_KL = "rl_engine.kernels.ops.triton.loss.ratio_kl.TritonRatioKLOp"
     PYTORCH_RATIO_KL = "rl_engine.kernels.ops.pytorch.loss.ratio_kl.NativeRatioKLOp"
 
+    # RMSNorm(pre-norm / QK-Norm) - pure Pytorch reference(ws1 ground-truth)
+    PYTORCH_NATIVE_RMS_NORM = "rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp"
+
     # Generic fallback
     TRITON_GENERIC = "rl_engine.kernels.ops.triton.generic.TritonOp"
     PYTORCH_ATTN = "rl_engine.kernels.ops.pytorch.attention.NativeAttentionOp"
     PYTORCH_NATIVE = "rl_engine.kernels.ops.pytorch.loss.logp.NativeLogpOp"
+    PYTORCH_NATIVE_MATMUL = "rl_engine.kernels.ops.pytorch.linear.matmul.NativeMatmulOp"
+    PYTORCH_NATIVE_ROPE = "rl_engine.kernels.ops.pytorch.rotary_embedding.rope.NativeRoPEOp"
+    PYTORCH_NATIVE_SILU = "rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSiLUOp"
+    PYTORCH_NATIVE_SWIGLU = "rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSwiGLUOp"
+
+    # WS1 pure-PyTorch ground-truth attention reference (hand-written fp32 softmax).
+    # Distinct from PYTORCH_ATTN above, which is the production SDPA fallback.
+    PYTORCH_NATIVE_ATTENTION = (
+        "rl_engine.kernels.ops.pytorch.attention.standard_attn.NativeAttentionOp"
+    )
+    # WS1 pure-PyTorch ground-truth KV-cache (decode/incremental) attention
+    # reference; concats cache+new then reuses the standard attention reduction.
+    PYTORCH_NATIVE_KV_CACHE_ATTN = (
+        "rl_engine.kernels.ops.pytorch.attention.kv_cache.NativeKVCacheAttnOp"
+    )
+    # WS1 pure-PyTorch ground-truth linear ops
+    PYTORCH_NATIVE_LM_HEAD = "rl_engine.kernels.ops.pytorch.linear.lm_head.NativeLMHeadOp"
+    # WS1 pure-PyTorch ground-truth embedding ops
+    PYTORCH_NATIVE_EMBEDDING = "rl_engine.kernels.ops.pytorch.linear.embedding.NativeEmbeddingOp"
+
+
+def resolve_logp_op_type(
+    logp_backend: Optional[str] = None,
+    *,
+    require_batch_invariant: bool = False,
+) -> str:
+    """Normalize user-facing logp backend names to KernelRegistry op types."""
+
+    normalized = (logp_backend or "auto").strip().lower().replace("-", "_")
+    aliases = {
+        "auto": "logp",
+        "default": "logp",
+        "fused": "logp",
+        "fused_logp": "logp",
+        "generic": "logp",
+        "logp": "logp",
+        "indexed": "logp_indexed",
+        "logp_indexed": "logp_indexed",
+        "online": "logp_online",
+        "logp_online": "logp_online",
+        "online_indexed": "logp_online_indexed",
+        "logp_online_indexed": "logp_online_indexed",
+        "deterministic": "logp_deterministic",
+        "deterministic_cuda": "logp_deterministic",
+        "batch_invariant": "logp_deterministic",
+        "batch_invariant_deterministic": "logp_deterministic",
+        "logp_deterministic": "logp_deterministic",
+        "deterministic_indexed": "logp_deterministic_indexed",
+        "deterministic_cuda_indexed": "logp_deterministic_indexed",
+        "batch_invariant_indexed": "logp_deterministic_indexed",
+        "logp_deterministic_indexed": "logp_deterministic_indexed",
+    }
+    if normalized not in aliases:
+        valid = ", ".join(sorted(aliases))
+        raise ValueError(f"unsupported logp backend {logp_backend!r}; valid values: {valid}")
+
+    op_type = aliases[normalized]
+    if require_batch_invariant:
+        if normalized in {"auto", "default", "logp"}:
+            return "logp_deterministic"
+        if not op_type.startswith("logp_deterministic"):
+            raise ValueError(
+                "require_batch_invariant_logp=True requires a deterministic logp backend; "
+                f"got {logp_backend!r}"
+            )
+    return op_type
 
 
 class KernelRegistry:
@@ -85,29 +155,68 @@ class KernelRegistry:
                     OpBackend.CUDA_FUSED_LOGP_GENERIC,
                     OpBackend.PYTORCH_NATIVE,
                 ],
+                "logp_deterministic": [
+                    OpBackend.CUDA_DETERMINISTIC_LOGP,
+                    OpBackend.PYTORCH_NATIVE,
+                ],
+                "logp_deterministic_indexed": [
+                    OpBackend.CUDA_DETERMINISTIC_LOGP,
+                    OpBackend.PYTORCH_NATIVE,
+                ],
                 "attn": [OpBackend.FLASH_ATTN, OpBackend.TRITON_GENERIC, OpBackend.PYTORCH_ATTN],
+                "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
+                "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
+                "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
+                "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
+                "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
+                "silu": [OpBackend.PYTORCH_NATIVE_SILU],
+                "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
                 # Default dispatch logic for new operators
+                "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
+                "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
             },
             "rocm": {
                 "logp": [OpBackend.ROCM_AITER, OpBackend.TRITON_GENERIC, OpBackend.PYTORCH_NATIVE],
+                "logp_deterministic": [OpBackend.PYTORCH_NATIVE],
+                "logp_deterministic_indexed": [OpBackend.PYTORCH_NATIVE],
                 "attn": [
                     OpBackend.ROCM_FLASH_ATTN,
                     OpBackend.PYTORCH_ATTN,
                     OpBackend.TRITON_GENERIC,
                 ],
+                "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
+                "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
+                "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
                 "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
+                "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
+                "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
+                "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
+                "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
+                "silu": [OpBackend.PYTORCH_NATIVE_SILU],
+                "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
             },
             "cpu": {
                 "logp": [OpBackend.PYTORCH_NATIVE],
+                "logp_deterministic": [OpBackend.PYTORCH_NATIVE],
+                "logp_deterministic_indexed": [OpBackend.PYTORCH_NATIVE],
                 "attn": [OpBackend.PYTORCH_ATTN],
+                "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
+                "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.PYTORCH_GRPO_LOSS],
+                "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
                 "linear_logp": [OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.PYTORCH_RATIO_KL],
+                "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
+                "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
+                "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
+                "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
+                "silu": [OpBackend.PYTORCH_NATIVE_SILU],
+                "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
             },
         }
         logger.info(f"KernelRegistry initialized for {device_ctx.device_type}")
@@ -135,8 +244,7 @@ class KernelRegistry:
             )
 
     def _adjust_priority_for_hardware(self):
-        """Prioritize the fused TMA LogP kernel only when it is compiled into the
-        extension and the device is TMA-capable (SM90/100/120)."""
+        """Adjust CUDA priorities for hardware-gated experimental and production kernels."""
         if device_ctx.device_type != "cuda":
             return
         try:
@@ -148,10 +256,11 @@ class KernelRegistry:
             cc = cc_major * 10 + cc_minor
             tma_compiled = _EXT_AVAILABLE and hasattr(_C, "fused_logp_sm90")
 
-            if tma_compiled and cc_major in (9, 10, 12):
+            sm90_logp_enabled = os.getenv("RL_KERNEL_ENABLE_EXPERIMENTAL_SM90_LOGP") == "1"
+            if sm90_logp_enabled and tma_compiled and cc_major in (9, 10, 12):
                 logger.info(
                     f"Detected TMA-capable architecture (SM{cc}); "
-                    "prioritizing fused TMA LogP kernel."
+                    "prioritizing experimental fused TMA LogP kernel."
                 )
                 logp_list = self._priority_map["cuda"]["logp"]
                 if OpBackend.CUDA_FUSED_LOGP_SM90 not in logp_list:
@@ -166,8 +275,8 @@ class KernelRegistry:
                     ll_list.insert(0, OpBackend.CUDA_FUSED_LINEAR_LOGP_SM90)
             elif cc >= 90:
                 logger.debug(
-                    f"SM{cc}: fused TMA LogP kernel not compiled into _C; "
-                    "using generic fused kernel."
+                    f"SM{cc}: fused linear-logp SM90 kernel not compiled into _C; "
+                    "using generic linear-logp backend."
                 )
         except Exception as e:
             logger.warning(f"Failed to probe device capability: {e}")
