@@ -8,6 +8,12 @@
 
 #define TILE_V 4096
 
+struct MaxOp {
+    __device__ __forceinline__ float operator()(float a, float b) const {
+        return fmaxf(a, b);
+    }
+};
+
 template<int NUM_WARPS>
 __global__ void fused_logp_online_tma_kernel(
     const __grid_constant__ CUtensorMap logits_tmap,
@@ -73,7 +79,7 @@ __global__ void fused_logp_online_tma_kernel(
                 float val = __bfloat162float(smem_logits[i]);
                 tile_max = max(tile_max, val);
             }
-            float block_tile_max = BlockReduce(temp_storage).Reduce(tile_max, cub::Max());
+            float block_tile_max = BlockReduce(temp_storage).Reduce(tile_max, MaxOp{});
             __shared__ float s_tile_max;
             if (consumer_tid == 0) s_tile_max = block_tile_max;
             asm volatile("bar.sync 1, %0;" :: "n"(num_consumers));
@@ -83,7 +89,7 @@ __global__ void fused_logp_online_tma_kernel(
                 float val = __bfloat162float(smem_logits[i]);
                 tile_sum += expf(val - s_tile_max);
             }
-            float block_tile_sum = BlockReduce(temp_storage).Reduce(tile_sum, cub::Sum());
+            float block_tile_sum = BlockReduce(temp_storage).Sum(tile_sum);
             __shared__ float s_tile_sum;
             if (consumer_tid == 0) s_tile_sum = block_tile_sum;
             asm volatile("bar.sync 1, %0;" :: "n"(num_consumers));

@@ -66,7 +66,9 @@ def _summarize(report: Any) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Validate an operator candidate against a PyTorch gold path.")
+    parser = argparse.ArgumentParser(
+        description="Validate an operator candidate against a PyTorch gold path."
+    )
     parser.add_argument("--op", choices=operator_names(), default="logp")
     parser.add_argument(
         "--candidate",
@@ -92,7 +94,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional tolerance override key, for example sm90. Defaults to contract.default.",
     )
-    parser.add_argument("--check-grad", action="store_true", help="Also compare gradients for supported inputs.")
+    parser.add_argument(
+        "--check-grad", action="store_true", help="Also compare gradients for supported inputs."
+    )
     # Defaults to random because it catches bugs hidden by output.sum().backward().
     parser.add_argument(
         "--grad-mode",
@@ -101,7 +105,9 @@ def parse_args() -> argparse.Namespace:
         help="Upstream gradient mode used with --check-grad.",
     )
     parser.add_argument("--grad-seed", type=int, default=123, help="Seed for --grad-mode random.")
-    parser.add_argument("--json", action="store_true", help="Print the full structured report as JSON.")
+    parser.add_argument(
+        "--json", action="store_true", help="Print the full structured report as JSON."
+    )
     return parser.parse_args()
 
 

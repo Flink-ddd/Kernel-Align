@@ -1,16 +1,17 @@
 # Fused Linear LogP
 
 Fused Linear LogP computes per-token selected log-probabilities directly from
-hidden states and the LM-head weight `log_softmax(hidden @ Wᵀ + b)[target]`
-without ever materializing the `[N, V]` logits. It targets large-vocabulary RL
-post-training, where the `[B, S, V]` logits activation (and its gradient) dominate
-memory. The forward streams the vocab in blocks through an online softmax; the
-backward recomputes the logit tiles instead of storing them, trading compute for
-memory. It is differentiable w.r.t. `hidden`, `lm_head_weight`, and `bias`.
+hidden states and the LM-head weight `log_softmax(hidden @ Wᵀ + b)[target]`.
+The forward path avoids materializing the full `[N, V]` logits and targets
+large-vocabulary RL post-training, where the `[B, S, V]` logits activation
+dominates memory. Backward has multiple implementations: chunked paths recompute
+tiles to reduce memory, while the fused SM90 fast path may materialize local or
+tiled logits/dlogits workspaces to reduce Python dispatch and small GEMM overhead.
+It is differentiable w.r.t. `hidden`, `lm_head_weight`, and `bias`.
 
 This differs from [Fused LogP](fused-logp.md), which takes already-materialized
-logits as input. Here the LM-head projection is fused into the reduction, so the
-`[N, V]` tensor never lands in HBM.
+logits as input. Here the LM-head projection is fused into the forward reduction,
+so the forward `[N, V]` tensor never lands in HBM.
 
 ## Entry Point
 
@@ -86,8 +87,9 @@ logp = linear_logp(
 
 The TP path streams local vocab chunks, computes local online-softmax state, then
 uses TP collectives to merge the global max, global sum, and selected target
-logit. Backward recomputes local logits in chunks and all-reduces `hidden.grad`
-across the TP group; `lm_head_weight.grad` and `bias.grad` remain local shards.
+logit. Backward either recomputes local logits in chunks or uses fused/tiled
+local dlogits workspaces, then all-reduces `hidden.grad` across the TP group;
+`lm_head_weight.grad` and `bias.grad` remain local shards.
 Shard ranges must form a contiguous `[0, global_vocab_size)` partition.
 
 ## Reference Semantics
@@ -132,21 +134,22 @@ Measured on an **NVIDIA H100 80GB** (SM90), bf16, N=4096, D=2048, CUDA 12.8.
 | 4096×2048×131072 | 17.05 | 117.62 | 104.97 |
 
 **Memory**: the native path allocates the `[N, V]` logits (forward
-peak scales with `V`), while the fused op streams them online — its forward peak is
-just the per-CTA shared-memory tiles, **independent of `V`** (≈0 MB of activation),
-and the chunked backward only ever holds `chunk·V`. That freed memory is what lets
-you grow the batch or the CoT length.
+peak scales with `V`), while the fused forward streams them online -- its forward
+peak is just the per-CTA shared-memory tiles, **independent of `V`** (≈0 MB of
+activation). Backward memory depends on the selected path: chunked backward holds
+`chunk·V`, while fused SM90 backward may use local or tiled logits/dlogits
+workspaces to trade memory for lower dispatch overhead. That freed forward memory
+is what lets you grow the batch or the CoT length.
 
 **Latency**: the SM90 forward runs at **~2× the memory-free Triton baseline**
 across the vocab range — from TMA double-buffering, register-blocked `mma.sync`
 M-tiling (`BM=256`, so the weight matrix is re-read `N/BM` times), and split-V over
 the grid. It also beats the materializing native path at moderate vocab (2.0× at
 V=50257); at the extremes the native cuBLAS GEMM is still faster in raw ms, but only
-by paying the 1.3–5 GB `[N, V]` allocation the fused op avoids. The backward is the
-shared deterministic chunked-recompute path (recomputes logit tiles rather than
-storing them), so the fused forward+backward already beats Triton's. Closing the
-remaining forward gap to native's cuBLAS GEMM (WGMMA, a register-resident softmax
-epilogue) and a fully fused CUDA backward are future work.
+by paying the 1.3–5 GB forward `[N, V]` allocation the fused op avoids. The fused
+SM90 backward improves latency by moving dlogits and linear-gradient orchestration
+into CUDA/C++ and by reducing Python chunk loops and small matmul dispatches. A
+more fully streaming backward remains future work.
 
 ## Tests
 
