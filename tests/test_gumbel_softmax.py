@@ -72,6 +72,18 @@ def test_native_temperature_changes_distribution_sharpness():
     assert cool.max(dim=-1).values.mean() > warm.max(dim=-1).values.mean()
 
 
+def test_native_treats_supplied_gumbels_as_fixed_noise():
+    logits, gumbels = _inputs(11)
+    logits = logits.requires_grad_(True)
+    gumbels = gumbels.requires_grad_(True)
+
+    out = NativeGumbelSoftmaxOp()(logits, tau=0.8, hard=False, gumbels=gumbels)
+    out[..., 0].sum().backward()
+
+    assert logits.grad is not None
+    assert gumbels.grad is None
+
+
 def test_native_rejects_invalid_inputs():
     op = NativeGumbelSoftmaxOp()
     logits, gumbels = _inputs(4)
@@ -87,12 +99,23 @@ def test_registry_dispatch_matches_native():
     from rl_engine.kernels.registry import kernel_registry
     from rl_engine.platforms.device import device_ctx
 
-    device = device_ctx.device if device_ctx.device_type == "cuda" else "cpu"
+    device = device_ctx.device if device_ctx.device_type == "cuda" or device_ctx.is_rocm else "cpu"
     logits, gumbels = _inputs(5, device=device)
     op = kernel_registry.get_op("gumbel_softmax")
     out = op(logits, tau=0.7, hard=False, gumbels=gumbels)
     ref = NativeGumbelSoftmaxOp()(logits, tau=0.7, hard=False, gumbels=gumbels)
     assert torch.allclose(out.cpu(), ref.cpu(), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not _HAS_TRITON, reason="Triton import is required for fallback wrapper test.")
+def test_triton_wrapper_falls_back_to_native_for_unsupported_vocab(monkeypatch):
+    from rl_engine.kernels.ops.triton.sampling import gumbel_softmax as triton_gs
+
+    monkeypatch.setattr(triton_gs, "_MAX_BLOCK_V", 8)
+    logits, gumbels = _inputs(12, shape=(2, 9))
+    out = triton_gs.TritonGumbelSoftmaxOp()(logits, tau=0.9, hard=True, gumbels=gumbels)
+    ref = NativeGumbelSoftmaxOp()(logits, tau=0.9, hard=True, gumbels=gumbels)
+    assert torch.allclose(out, ref, atol=0.0)
 
 
 @requires_triton_cuda

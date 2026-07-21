@@ -50,7 +50,9 @@ def gumbel_softmax_reference(
     gumbels: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     _validate_gumbel_softmax_inputs(logits, tau, gumbels)
-    noise = _sample_gumbels_like(logits) if gumbels is None else gumbels.to(dtype=logits.dtype)
+    noise = (
+        _sample_gumbels_like(logits) if gumbels is None else gumbels.detach().to(dtype=logits.dtype)
+    )
     y_soft = torch.softmax((logits + noise) / tau, dim=-1)
     if not hard:
         return y_soft

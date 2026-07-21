@@ -38,12 +38,14 @@ softmax gradient.
 | `logits` | `[..., V]` | fp32/fp16/bf16 | Floating-point tensor, `V` is vocab size. |
 | `tau` | scalar | Python float | Must be positive. |
 | `hard` | scalar | Python bool | Enables straight-through one-hot output. |
-| `gumbels` | `[..., V]` or `None` | Floating point | Optional deterministic noise for tests/repro. |
+| `gumbels` | `[..., V]` or `None` | Floating point | Optional deterministic fixed noise for tests/repro; gradients are not propagated to this tensor. |
 | `seed` | scalar or `None` | Python int | Triton-only seed for backend-internal Gumbel noise when `gumbels=None`. |
 | Output | `[..., V]` | Same as `logits` | Probabilities or one-hot rows over vocab. |
 
 The Triton backend flattens leading dimensions to `[N, V]` and launches one
 program per row. It supports vocab sizes up to 131072 in this implementation.
+For larger vocab sizes, `TritonGumbelSoftmaxOp` falls back to the PyTorch
+reference implementation instead of raising.
 
 ## Backends
 

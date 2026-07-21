@@ -9,7 +9,10 @@ import torch
 import triton
 import triton.language as tl
 
-from rl_engine.kernels.ops.pytorch.sampling.gumbel_softmax import _validate_gumbel_softmax_inputs
+from rl_engine.kernels.ops.pytorch.sampling.gumbel_softmax import (
+    NativeGumbelSoftmaxOp,
+    _validate_gumbel_softmax_inputs,
+)
 
 _MAX_BLOCK_V = 131072
 
@@ -198,6 +201,8 @@ class TritonGumbelSoftmaxOp:
         seed: Optional[int] = None,
     ) -> torch.Tensor:
         _validate_gumbel_softmax_inputs(logits, float(tau), gumbels)
+        if triton.next_power_of_2(logits.shape[-1]) > _MAX_BLOCK_V:
+            return NativeGumbelSoftmaxOp()(logits, tau=tau, hard=hard, gumbels=gumbels)
         if logits.device.type not in ("cuda", "xpu", "hip"):
             raise RuntimeError(
                 "TritonGumbelSoftmaxOp requires a GPU tensor (CUDA / ROCm / XPU), got "
