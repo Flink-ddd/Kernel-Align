@@ -138,6 +138,11 @@ Contact the developers and community on the [Discord](https://discord.gg/RGUQrr7
 The documentation of **RL-Kernel** is located on the website: [https://rl-align.github.io/RL-Kernel](https://rl-align.github.io/RL-Kernel)
 or in the [docs](./docs) directory of the source code.
 
+Featured docs:
+
+- [Announcing RL-Kernel for vime: Faster and Leaner `linear_logp` for Full RL Rollouts](./docs/blog/2026-07-08-announcing-rl-kernel-linear-logp-for-vime.md)
+- [中文版：发布 vime + RL-Kernel](./docs/blog/2026-07-08-announcing-rl-kernel-linear-logp-for-vime-zh.md)
+
 # Acknowledgments
 
 RL-Kernel builds on the shoulders of excellent open-source projects:

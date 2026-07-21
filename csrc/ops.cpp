@@ -13,6 +13,51 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_forward(torch::Tensor hidden,
                                                           torch::Tensor weight,
                                                           torch::Tensor target,
                                                           torch::optional<torch::Tensor> bias);
+std::vector<torch::Tensor> fused_linear_logp_sm90_global_target_forward(
+    torch::Tensor hidden,
+    torch::Tensor weight,
+    torch::Tensor target,
+    torch::optional<torch::Tensor> bias,
+    int64_t vocab_start_index);
+std::vector<torch::Tensor> fused_linear_logp_sm90_backward(torch::Tensor grad_logp,
+                                                           torch::Tensor hidden,
+                                                           torch::Tensor weight,
+                                                           torch::Tensor target,
+                                                           torch::Tensor lse,
+                                                           torch::optional<torch::Tensor> bias,
+                                                           int64_t vocab_start_index,
+                                                           bool compute_grad_hidden,
+                                                           bool compute_grad_weight,
+                                                           bool compute_grad_bias,
+                                                           bool use_global_lse);
+std::vector<torch::Tensor> linear_logp_probs_bf16_forward(torch::Tensor logits,
+                                                          torch::Tensor target,
+                                                          int64_t vocab_start_index);
+std::vector<torch::Tensor> linear_logp_bf16_forward(torch::Tensor logits,
+                                                    torch::Tensor target,
+                                                    int64_t vocab_start_index);
+std::vector<torch::Tensor> linear_logp_local_probs_bf16_forward(torch::Tensor logits,
+                                                                torch::Tensor target,
+                                                                int64_t vocab_start_index);
+std::vector<torch::Tensor> linear_logp_local_bf16_forward(torch::Tensor logits,
+                                                          torch::Tensor target,
+                                                          int64_t vocab_start_index);
+torch::Tensor linear_logp_probs_bf16_to_dlogits_(torch::Tensor probs,
+                                                 torch::Tensor target,
+                                                 torch::Tensor grad_logp,
+                                                 int64_t vocab_start_index);
+torch::Tensor linear_logp_local_probs_bf16_to_dlogits_(torch::Tensor probs,
+                                                       torch::Tensor target,
+                                                       torch::Tensor grad_logp,
+                                                       torch::Tensor local_lse,
+                                                       torch::Tensor global_lse,
+                                                       int64_t vocab_start_index);
+torch::Tensor linear_logp_logits_bf16_to_dlogits(torch::Tensor logits,
+                                                 torch::Tensor dlogits,
+                                                 torch::Tensor target,
+                                                 torch::Tensor grad_logp,
+                                                 torch::Tensor lse,
+                                                 int64_t vocab_start_index);
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
@@ -86,6 +131,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_logp_sm90", &fused_logp_sm90_forward, "TMA-accelerated Online Softmax Fused LogP");
     m.def("fused_linear_logp_sm90", &fused_linear_logp_sm90_forward,
           "TMA+WGMMA fused linear log-prob (hidden @ W^T -> selected-token logp), SM90");
+    m.def("fused_linear_logp_sm90_global_target", &fused_linear_logp_sm90_global_target_forward,
+          "TMA+WGMMA local-shard target-logit/lse for vocab-parallel linear log-prob, SM90");
+    m.def("fused_linear_logp_sm90_backward", &fused_linear_logp_sm90_backward,
+          "CUDA fused backward for linear log-prob, SM90 backend");
+    m.def("linear_logp_probs_bf16_forward", &linear_logp_probs_bf16_forward,
+          "Build bf16 softmax probabilities and selected log-prob from bf16 logits");
+    m.def("linear_logp_bf16_forward", &linear_logp_bf16_forward,
+          "Build selected log-prob and lse from bf16 logits without saving probabilities");
+    m.def("linear_logp_local_probs_bf16_forward", &linear_logp_local_probs_bf16_forward,
+          "Build local bf16 softmax probabilities, target logits, and lse from bf16 logits");
+    m.def("linear_logp_local_bf16_forward", &linear_logp_local_bf16_forward,
+          "Build local target logits and lse from bf16 logits without saving probabilities");
+    m.def("linear_logp_probs_bf16_to_dlogits_", &linear_logp_probs_bf16_to_dlogits_,
+          "In-place bf16 probs -> dlogits for selected log-prob backward");
+    m.def("linear_logp_local_probs_bf16_to_dlogits_",
+          &linear_logp_local_probs_bf16_to_dlogits_,
+          "In-place local bf16 probs -> TP dlogits for selected log-prob backward");
+    m.def("linear_logp_logits_bf16_to_dlogits", &linear_logp_logits_bf16_to_dlogits,
+          "Build bf16 dlogits from bf16 logits and fp32 lse");
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)

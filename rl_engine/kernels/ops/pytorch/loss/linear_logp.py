@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 import torch
@@ -12,6 +13,17 @@ import torch
 # ``N*V``.
 BWD_CHUNK_ELEMS = 1 << 24
 _LOW_PRECISION_DTYPES = (torch.float16, torch.bfloat16)
+_TP_VOCAB_PARTITION_CACHE: dict[tuple[int, str, int, int, Optional[int], int], int] = {}
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _validate_tp_targets_enabled() -> bool:
+    return _env_flag("RL_KERNEL_LINEAR_LOGP_VALIDATE_TP_TARGETS") or _env_flag(
+        "VIME_RL_KERNEL_VALIDATE_TP_TARGETS"
+    )
 
 
 def _use_fp32_matmul(*tensors: torch.Tensor) -> bool:
@@ -110,7 +122,10 @@ def _validate_tp_vocab_partition(
 
     covered_vocab_size = expected_start
     global_size = torch.tensor(
-        [0, 0 if global_vocab_size is None else int(global_vocab_size)],
+        [
+            1 if global_vocab_size is not None else 0,
+            0 if global_vocab_size is None else int(global_vocab_size),
+        ],
         device=device,
         dtype=torch.long,
     )
@@ -127,6 +142,38 @@ def _validate_tp_vocab_partition(
             f"got {invalid_sizes[0]}, covered {covered_vocab_size}."
         )
     return covered_vocab_size if global_vocab_size is None else int(global_vocab_size)
+
+
+def _validate_tp_vocab_partition_cached(
+    *,
+    tp_group: Any,
+    device: torch.device,
+    vocab_start_index: int,
+    local_vocab_size: int,
+    global_vocab_size: Optional[int],
+) -> int:
+    dist = _require_distributed_initialized()
+    world_size = dist.get_world_size(group=tp_group)
+    key = (
+        id(tp_group),
+        str(device),
+        int(vocab_start_index),
+        int(local_vocab_size),
+        None if global_vocab_size is None else int(global_vocab_size),
+        int(world_size),
+    )
+    cached = _TP_VOCAB_PARTITION_CACHE.get(key)
+    if cached is not None:
+        return cached
+    covered = _validate_tp_vocab_partition(
+        tp_group=tp_group,
+        device=device,
+        vocab_start_index=vocab_start_index,
+        local_vocab_size=local_vocab_size,
+        global_vocab_size=global_vocab_size,
+    )
+    _TP_VOCAB_PARTITION_CACHE[key] = int(covered)
+    return int(covered)
 
 
 def _validate_global_targets(
@@ -172,8 +219,9 @@ def _chunked_local_linear_logp_stats(
     *,
     has_bias: bool,
     vocab_start_index: int,
+    validate_owner_count: bool = False,
     chunk_elems: int = BWD_CHUNK_ELEMS,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     n = hidden_2d.size(0)
     local_vocab = weight.size(0)
     device = hidden_2d.device
@@ -181,7 +229,7 @@ def _chunked_local_linear_logp_stats(
     local_max = torch.full((n,), -torch.inf, device=device, dtype=torch.float32)
     local_sum = torch.zeros(n, device=device, dtype=torch.float32)
     local_target_logit = torch.zeros(n, device=device, dtype=torch.float32)
-    owner_count = torch.zeros(n, device=device, dtype=torch.int32)
+    owner_count = torch.zeros(n, device=device, dtype=torch.int32) if validate_owner_count else None
     rows = torch.arange(n, device=device)
     use_fp32 = _use_fp32_matmul(hidden_2d, weight)
 
@@ -206,12 +254,124 @@ def _chunked_local_linear_logp_stats(
         global_v0 = vocab_start_index + v0
         global_v1 = vocab_start_index + v1
         owns_target = (target_1d >= global_v0) & (target_1d < global_v1)
-        if bool(owns_target.any().item()):
-            local_idx = (target_1d[owns_target] - global_v0).long()
-            local_target_logit[owns_target] = logits_f[rows[owns_target], local_idx]
-            owner_count[owns_target] += 1
+        safe_local_idx = (target_1d - global_v0).clamp(0, max(v1 - v0 - 1, 0)).long()
+        tile_target_logit = logits_f[rows, safe_local_idx]
+        local_target_logit = torch.where(owns_target, tile_target_logit, local_target_logit)
+        if owner_count is not None:
+            owner_count += owns_target.to(torch.int32)
 
     return local_max, local_sum, local_target_logit, owner_count
+
+
+def _merge_tp_local_logp(
+    local_lse: torch.Tensor,
+    local_target_logit: torch.Tensor,
+    *,
+    tp_group: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    dist = _require_distributed_initialized()
+    world_size = dist.get_world_size(group=tp_group)
+    if world_size <= 1:
+        global_lse = local_lse
+        return local_target_logit - global_lse, global_lse
+
+    local_stats = torch.stack((local_lse, local_target_logit), dim=0).contiguous()
+    gathered = torch.empty(
+        (world_size, *local_stats.shape),
+        device=local_stats.device,
+        dtype=local_stats.dtype,
+    )
+    try:
+        dist.all_gather_into_tensor(gathered, local_stats, group=tp_group)
+    except (AttributeError, RuntimeError):
+        chunks = [torch.empty_like(local_stats) for _ in range(world_size)]
+        dist.all_gather(chunks, local_stats, group=tp_group)
+        gathered = torch.stack(chunks, dim=0)
+
+    global_lse = torch.logsumexp(gathered[:, 0, :], dim=0)
+    target_logit = gathered[:, 1, :].sum(dim=0)
+    return target_logit - global_lse, global_lse
+
+
+def tensor_parallel_linear_logp_backward(
+    grad_logp: torch.Tensor,
+    hidden_2d: torch.Tensor,
+    weight: torch.Tensor,
+    bias_t: torch.Tensor,
+    target_1d: torch.Tensor,
+    global_lse: torch.Tensor,
+    *,
+    has_bias: bool,
+    lead_shape,
+    hidden_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    bias_dtype,
+    vocab_start_index: int,
+    tp_group: Any,
+    compute_grad_hidden: bool = True,
+    compute_grad_weight: bool = True,
+    compute_grad_bias: bool = True,
+    chunk_elems: int = BWD_CHUNK_ELEMS,
+):
+    dist = _require_distributed_initialized()
+    n, d = hidden_2d.shape
+    local_vocab = weight.shape[0]
+    dt = weight.dtype
+    g = grad_logp.reshape(-1).to(torch.float32)
+
+    grad_h = torch.empty_like(hidden_2d, dtype=torch.float32) if compute_grad_hidden else None
+    grad_w = (
+        torch.zeros(local_vocab, d, device=weight.device, dtype=torch.float32)
+        if compute_grad_weight
+        else None
+    )
+    grad_b = (
+        torch.zeros(local_vocab, device=weight.device, dtype=torch.float32)
+        if has_bias and compute_grad_bias
+        else None
+    )
+    use_fp32 = _use_fp32_matmul(hidden_2d, weight)
+
+    chunk = max(1, min(n, chunk_elems // local_vocab))
+    for i0 in range(0, n, chunk):
+        i1 = min(i0 + chunk, n)
+        x = hidden_2d[i0:i1]
+        logits = _linear_logits(
+            x,
+            weight,
+            bias_t if has_bias else None,
+            use_fp32=use_fp32,
+        )
+
+        dz = -torch.exp(logits.float() - global_lse[i0:i1].unsqueeze(1))
+        local_idx = target_1d[i0:i1] - int(vocab_start_index)
+        owns_target = (local_idx >= 0) & (local_idx < local_vocab)
+        rows = torch.arange(i1 - i0, device=dz.device)
+        safe_local_idx = local_idx.clamp(0, max(local_vocab - 1, 0)).long()
+        dz[rows, safe_local_idx] += owns_target.to(dz.dtype)
+        dz *= g[i0:i1].unsqueeze(1)
+
+        if use_fp32:
+            if grad_h is not None:
+                grad_h[i0:i1] = torch.matmul(dz, weight.float()).float()
+            if grad_w is not None:
+                grad_w += torch.matmul(dz.t(), x.float()).float()
+        else:
+            dz_dt = dz.to(dt)
+            if grad_h is not None:
+                grad_h[i0:i1] = torch.matmul(dz_dt, weight).float()
+            if grad_w is not None:
+                grad_w += torch.matmul(dz_dt.t(), x).float()
+        if grad_b is not None:
+            grad_b += dz.sum(0)
+
+    grad_hidden = None
+    if grad_h is not None:
+        dist.all_reduce(grad_h, op=dist.ReduceOp.SUM, group=tp_group)
+        grad_hidden = grad_h.to(hidden_dtype).reshape((*tuple(lead_shape), d))
+    grad_weight = grad_w.to(weight_dtype) if grad_w is not None else None
+    grad_bias = grad_b.to(bias_dtype) if grad_b is not None else None
+    return grad_hidden, grad_weight, grad_bias
 
 
 class _TensorParallelLinearLogpFunction(torch.autograd.Function):
@@ -228,7 +388,6 @@ class _TensorParallelLinearLogpFunction(torch.autograd.Function):
         global_vocab_size,
         tp_group,
     ):
-        dist = _require_distributed_initialized()
         hidden_2d = hidden.reshape(-1, hidden.size(-1)).contiguous()
         weight = lm_head_weight.contiguous()
         target_1d = (
@@ -236,14 +395,16 @@ class _TensorParallelLinearLogpFunction(torch.autograd.Function):
         )
         bias_t = bias.contiguous() if bias is not None else hidden_2d
         vocab_start_index = int(vocab_start_index)
-        global_vocab_size = _validate_tp_vocab_partition(
+        global_vocab_size = _validate_tp_vocab_partition_cached(
             tp_group=tp_group,
             device=hidden_2d.device,
             vocab_start_index=vocab_start_index,
             local_vocab_size=weight.size(0),
             global_vocab_size=global_vocab_size,
         )
-        _validate_global_targets(target_1d, global_vocab_size, tp_group)
+        validate_tp_targets = _validate_tp_targets_enabled()
+        if validate_tp_targets:
+            _validate_global_targets(target_1d, global_vocab_size, tp_group)
 
         local_max, local_sum, local_target_logit, owner_count = _chunked_local_linear_logp_stats(
             hidden_2d,
@@ -252,25 +413,21 @@ class _TensorParallelLinearLogpFunction(torch.autograd.Function):
             bias_t,
             has_bias=bias is not None,
             vocab_start_index=vocab_start_index,
+            validate_owner_count=validate_tp_targets,
         )
 
-        global_max = local_max.clone()
-        dist.all_reduce(global_max, op=dist.ReduceOp.MAX, group=tp_group)
-        global_sum = local_sum * torch.exp(local_max - global_max)
-        dist.all_reduce(global_sum, op=dist.ReduceOp.SUM, group=tp_group)
+        if owner_count is not None:
+            dist = _require_distributed_initialized()
+            global_owner_count = owner_count.clone()
+            dist.all_reduce(global_owner_count, op=dist.ReduceOp.SUM, group=tp_group)
+            if bool((global_owner_count != 1).any().item()):
+                raise ValueError(
+                    "target_ids must be covered by exactly one TP vocab shard; check "
+                    "vocab_start_index and global_vocab_size."
+                )
 
-        target_logit = local_target_logit.clone()
-        dist.all_reduce(target_logit, op=dist.ReduceOp.SUM, group=tp_group)
-
-        global_owner_count = owner_count.clone()
-        dist.all_reduce(global_owner_count, op=dist.ReduceOp.SUM, group=tp_group)
-        if bool((global_owner_count != 1).any().item()):
-            raise ValueError(
-                "target_ids must be covered by exactly one TP vocab shard; check "
-                "vocab_start_index and global_vocab_size."
-            )
-
-        lse = global_max + torch.log(global_sum)
+        local_lse = local_max + torch.log(local_sum)
+        log_prob, lse = _merge_tp_local_logp(local_lse, local_target_logit, tp_group=tp_group)
         ctx.save_for_backward(hidden_2d, weight, bias_t, target_1d, lse)
         ctx.has_bias = bias is not None
         ctx.lead_shape = hidden.shape[:-1]
@@ -279,59 +436,29 @@ class _TensorParallelLinearLogpFunction(torch.autograd.Function):
         ctx.bias_dtype = bias.dtype if bias is not None else None
         ctx.vocab_start_index = vocab_start_index
         ctx.tp_group = tp_group
-        return (target_logit - lse).reshape(hidden.shape[:-1])
+        return log_prob.reshape(hidden.shape[:-1])
 
     @staticmethod
     def backward(ctx, grad_logp):
-        dist = _require_distributed_initialized()
         hidden_2d, weight, bias_t, target_1d, lse = ctx.saved_tensors
-        n, d = hidden_2d.shape
-        local_vocab = weight.shape[0]
-        dt = weight.dtype
-        g = grad_logp.reshape(-1).to(torch.float32)
-
-        grad_h = torch.empty_like(hidden_2d, dtype=torch.float32)
-        grad_w = torch.zeros(local_vocab, d, device=weight.device, dtype=torch.float32)
-        grad_b = (
-            torch.zeros(local_vocab, device=weight.device, dtype=torch.float32)
-            if ctx.has_bias
-            else None
+        grad_hidden, grad_weight, grad_bias = tensor_parallel_linear_logp_backward(
+            grad_logp,
+            hidden_2d,
+            weight,
+            bias_t,
+            target_1d,
+            lse,
+            has_bias=ctx.has_bias,
+            lead_shape=ctx.lead_shape,
+            hidden_dtype=ctx.hidden_dtype,
+            weight_dtype=ctx.weight_dtype,
+            bias_dtype=ctx.bias_dtype,
+            vocab_start_index=ctx.vocab_start_index,
+            tp_group=ctx.tp_group,
+            compute_grad_hidden=ctx.needs_input_grad[0],
+            compute_grad_weight=ctx.needs_input_grad[1],
+            compute_grad_bias=ctx.needs_input_grad[2],
         )
-        use_fp32 = _use_fp32_matmul(hidden_2d, weight)
-
-        chunk = max(1, min(n, BWD_CHUNK_ELEMS // local_vocab))
-        for i0 in range(0, n, chunk):
-            i1 = min(i0 + chunk, n)
-            x = hidden_2d[i0:i1]
-            logits = _linear_logits(
-                x,
-                weight,
-                bias_t if ctx.has_bias else None,
-                use_fp32=use_fp32,
-            )
-
-            dz = -torch.exp(logits.float() - lse[i0:i1].unsqueeze(1))
-            local_idx = target_1d[i0:i1] - ctx.vocab_start_index
-            owns_target = (local_idx >= 0) & (local_idx < local_vocab)
-            if bool(owns_target.any().item()):
-                rows = torch.arange(i1 - i0, device=dz.device)[owns_target]
-                dz[rows, local_idx[owns_target].long()] += 1.0
-            dz *= g[i0:i1].unsqueeze(1)
-
-            if use_fp32:
-                grad_h[i0:i1] = torch.matmul(dz, weight.float()).float()
-                grad_w += torch.matmul(dz.t(), x.float()).float()
-            else:
-                dz_dt = dz.to(dt)
-                grad_h[i0:i1] = torch.matmul(dz_dt, weight).float()
-                grad_w += torch.matmul(dz_dt.t(), x).float()
-            if grad_b is not None:
-                grad_b += dz.sum(0)
-
-        dist.all_reduce(grad_h, op=dist.ReduceOp.SUM, group=ctx.tp_group)
-        grad_hidden = grad_h.to(ctx.hidden_dtype).reshape((*ctx.lead_shape, d))
-        grad_weight = grad_w.to(ctx.weight_dtype)
-        grad_bias = grad_b.to(ctx.bias_dtype) if grad_b is not None else None
         return grad_hidden, grad_weight, grad_bias, None, None, None, None
 
 
@@ -393,6 +520,9 @@ def chunked_linear_logp_backward(
     weight_dtype: torch.dtype,
     bias_dtype,
     chunk_elems: int = BWD_CHUNK_ELEMS,
+    compute_grad_hidden: bool = True,
+    compute_grad_weight: bool = True,
+    compute_grad_bias: bool = True,
 ):
     # Liger-style chunked backward shared by the Triton and CUDA SM90 fused ops.
     n, d = hidden_2d.shape
@@ -400,9 +530,17 @@ def chunked_linear_logp_backward(
     dt = weight.dtype
     g = grad_logp.reshape(-1).to(torch.float32)
 
-    grad_h = torch.empty_like(hidden_2d, dtype=torch.float32)
-    grad_w = torch.zeros(v, d, device=weight.device, dtype=torch.float32)
-    grad_b = torch.zeros(v, device=weight.device, dtype=torch.float32) if has_bias else None
+    grad_h = torch.empty_like(hidden_2d, dtype=torch.float32) if compute_grad_hidden else None
+    grad_w = (
+        torch.zeros(v, d, device=weight.device, dtype=torch.float32)
+        if compute_grad_weight
+        else None
+    )
+    grad_b = (
+        torch.zeros(v, device=weight.device, dtype=torch.float32)
+        if has_bias and compute_grad_bias
+        else None
+    )
     use_fp32 = _use_fp32_matmul(hidden_2d, weight)
 
     chunk = max(1, min(n, chunk_elems // v))
@@ -424,17 +562,23 @@ def chunked_linear_logp_backward(
         dz *= g[i0:i1].unsqueeze(1)
 
         if use_fp32:
-            grad_h[i0:i1] = torch.matmul(dz, weight.float()).float()  # [C, D]
-            grad_w += torch.matmul(dz.t(), x.float()).float()  # [V, D]
+            if grad_h is not None:
+                grad_h[i0:i1] = torch.matmul(dz, weight.float()).float()  # [C, D]
+            if grad_w is not None:
+                grad_w += torch.matmul(dz.t(), x.float()).float()  # [V, D]
         else:
             dz_dt = dz.to(dt)
-            grad_h[i0:i1] = torch.matmul(dz_dt, weight).float()  # [C, D]
-            grad_w += torch.matmul(dz_dt.t(), x).float()  # [V, D]
+            if grad_h is not None:
+                grad_h[i0:i1] = torch.matmul(dz_dt, weight).float()  # [C, D]
+            if grad_w is not None:
+                grad_w += torch.matmul(dz_dt.t(), x).float()  # [V, D]
         if grad_b is not None:
             grad_b += dz.sum(0)
 
-    grad_hidden = grad_h.to(hidden_dtype).reshape(tuple(lead_shape) + (d,))
-    grad_weight = grad_w.to(weight_dtype)
+    grad_hidden = (
+        grad_h.to(hidden_dtype).reshape(tuple(lead_shape) + (d,)) if grad_h is not None else None
+    )
+    grad_weight = grad_w.to(weight_dtype) if grad_w is not None else None
     grad_bias = grad_b.to(bias_dtype) if grad_b is not None else None
     return grad_hidden, grad_weight, grad_bias
 

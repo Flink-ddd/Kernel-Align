@@ -327,10 +327,15 @@ def _backward_grads(
         raise ValueError(f"got {len(grad_outputs)} upstream gradients for {len(outputs)} outputs")
     # `ones` makes this equivalent to output.sum().backward(); `random` tests a
     # stricter vector-Jacobian product.
-    loss = sum(
+    loss_terms = [
         (output.float() * grad_output.to(device=output.device).float()).sum()
         for output, grad_output in zip(outputs, grad_outputs, strict=True)
-    )
+    ]
+    if not loss_terms:
+        raise ValueError("backward checks require at least one output")
+    loss = loss_terms[0]
+    for term in loss_terms[1:]:
+        loss = loss + term
     loss.backward()
     grads: list[torch.Tensor] = []
     for name in grad_input_names:

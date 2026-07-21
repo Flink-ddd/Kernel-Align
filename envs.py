@@ -12,7 +12,7 @@ import os
 
 def env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
-    if value is None:
+    if not value or value.strip() == "":
         return default
     normalized = value.strip().lower()
     if normalized in {"1", "true", "yes", "on"}:

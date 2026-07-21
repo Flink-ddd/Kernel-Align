@@ -149,6 +149,9 @@ class _LinearLogpFunction(torch.autograd.Function):
             hidden_dtype=ctx.hidden_dtype,
             weight_dtype=ctx.weight_dtype,
             bias_dtype=ctx.bias_dtype,
+            compute_grad_hidden=ctx.needs_input_grad[0],
+            compute_grad_weight=ctx.needs_input_grad[1],
+            compute_grad_bias=ctx.needs_input_grad[2],
         )
         # Inputs: hidden, lm_head_weight, bias, target_ids.
         return grad_hidden, grad_weight, grad_bias, None
