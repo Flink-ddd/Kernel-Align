@@ -7,6 +7,10 @@ import importlib
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping, Optional, Sequence
 
+from rl_engine.observability.metrics import metrics as obs_metrics
+from rl_engine.observability.nvtx import nvtx_range
+from rl_engine.utils.logger import logger
+
 
 @dataclass(frozen=True)
 class VLLMSamplerConfig:
@@ -104,24 +108,28 @@ class VLLMSharedPrefixSampler:
         sampling_params: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
         """Generate grouped candidates while keeping each prompt prefix byte-identical."""
-        prompt_list = _normalize_prompts(prompts)
-        generations = num_generations or self.config.num_generations
-        if generations < 1:
-            raise ValueError("num_generations must be >= 1")
+        with obs_metrics.stage_timer("rollout_generate"), nvtx_range("rlk::rollout.generate"):
+            prompt_list = _normalize_prompts(prompts)
+            generations = num_generations or self.config.num_generations
+            if generations < 1:
+                raise ValueError("num_generations must be >= 1")
 
-        expanded_prompts = _expand_prompts(prompt_list, generations)
-        params = self._build_sampling_params(sampling_params)
-        outputs = self.engine.generate(expanded_prompts, params)
-        grouped_outputs = _group_outputs(outputs, len(prompt_list), generations)
+            expanded_prompts = _expand_prompts(prompt_list, generations)
+            params = self._build_sampling_params(sampling_params)
+            outputs = self.engine.generate(expanded_prompts, params)
+            grouped_outputs = _group_outputs(outputs, len(prompt_list), generations)
 
-        return {
-            "backend": self.config.backend,
-            "prefix_cache_enabled": self.config.enable_prefix_caching,
-            "num_prompts": len(prompt_list),
-            "num_generations": generations,
-            "outputs": grouped_outputs,
-            "normalized_outputs": normalize_grouped_outputs(grouped_outputs),
-        }
+            normalized_outputs = normalize_grouped_outputs(grouped_outputs)
+            result = {
+                "backend": self.config.backend,
+                "prefix_cache_enabled": self.config.enable_prefix_caching,
+                "num_prompts": len(prompt_list),
+                "num_generations": generations,
+                "outputs": grouped_outputs,
+                "normalized_outputs": normalized_outputs,
+            }
+        _record_rollout_observability(normalized_outputs)
+        return result
 
     def _build_engine(self) -> Any:
         if not self.config.model:
@@ -155,6 +163,21 @@ class VLLMSharedPrefixSampler:
         self._llm_cls = self._llm_cls or vllm.LLM
         self._sampling_params_cls = self._sampling_params_cls or vllm.SamplingParams
         return self._llm_cls, self._sampling_params_cls
+
+
+def _record_rollout_observability(
+    normalized_outputs: Sequence[Sequence[NormalizedRolloutCandidate]],
+) -> None:
+    """Export generated-token counts to the Prometheus facade; never raises."""
+    try:
+        generated_tokens = sum(
+            len(candidate.token_ids or [])
+            for candidate_group in normalized_outputs
+            for candidate in candidate_group
+        )
+        obs_metrics.add_output_tokens("rollout_generate", generated_tokens)
+    except Exception as exc:
+        logger.warn_once(f"Failed to record rollout generation metrics: {exc}")
 
 
 def _normalize_prompts(

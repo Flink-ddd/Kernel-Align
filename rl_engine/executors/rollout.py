@@ -16,6 +16,8 @@ from rl_engine.executors.bridge import (
 )
 from rl_engine.executors.vllm_sampler import VLLMSamplerConfig, VLLMSharedPrefixSampler
 from rl_engine.kernels.registry import kernel_registry, resolve_logp_op_type
+from rl_engine.observability.metrics import metrics as obs_metrics
+from rl_engine.observability.nvtx import nvtx_range
 from rl_engine.utils.logger import logger
 
 
@@ -67,17 +69,19 @@ class RolloutExecutor:
             manifest.transport,
         )
         previous_update_id = self.active_weight_update_id
-        try:
-            imported = dict(self.bridge.import_update(manifest))
-            if self.weight_install_adapter is not None:
-                self.weight_install_adapter.install(manifest, imported)
-            self.bridge.acknowledge(manifest.update_id)
-        except Exception as exc:
+        with obs_metrics.stage_timer("update_weights"), nvtx_range("rlk::update_weights"):
             try:
-                self.bridge.reject(manifest.update_id, f"rollout weight install failed: {exc}")
-            except Exception:
-                logger.exception("Failed to reject weight update %s", manifest.update_id)
-            raise
+                imported = dict(self.bridge.import_update(manifest))
+                if self.weight_install_adapter is not None:
+                    self.weight_install_adapter.install(manifest, imported)
+                self.bridge.acknowledge(manifest.update_id)
+            except Exception as exc:
+                try:
+                    self.bridge.reject(manifest.update_id, f"rollout weight install failed: {exc}")
+                except Exception:
+                    logger.exception("Failed to reject weight update %s", manifest.update_id)
+                raise
+        obs_metrics.set_weight_version("consumed", int(manifest.weight_version))
         self.shared_weights = imported
         self.active_weight_version = manifest.weight_version
         self.active_weight_update_id = manifest.update_id

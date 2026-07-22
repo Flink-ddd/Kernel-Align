@@ -134,6 +134,9 @@ def get_extensions():
             nvcc_flags.append("-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH")
 
         cxx_flags = ["-O3", "-std=c++17", "-DKERNEL_ALIGN_WITH_CUDA"]
+        if envs.env_flag(envs.KERNEL_ALIGN_DISABLE_NVTX):
+            cxx_flags.append("-DKERNEL_ALIGN_DISABLE_NVTX")
+            nvcc_flags.append("-DKERNEL_ALIGN_DISABLE_NVTX")
         extra_link_args = list(torch_rpath)
 
         sm90_srcs = [
@@ -187,6 +190,7 @@ setup(
         "cuda": ["flashinfer"],
         "rocm": ["aiter"],
         "vllm": ["vllm>=0.6.0"],
+        "observability": ["prometheus-client>=0.20"],
     },
     python_requires=">=3.10",
     include_package_data=True,

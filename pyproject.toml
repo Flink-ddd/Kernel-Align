@@ -24,7 +24,10 @@ dependencies = [
 cuda = ["flashinfer-python>=0.1.6", "nvidia-ml-py"]
 rocm = ["aiter"]
 vllm = ["vllm>=0.6.0"]
-dev = ["pytest", "black", "isort", "ruff", "mypy", "pre-commit"]
+observability = ["prometheus-client>=0.20"]
+# prometheus-client is repeated in dev so the CPU CI job (installs ".[dev]")
+# exercises the real exporter path, not only the no-op degradation path.
+dev = ["pytest", "black", "isort", "ruff", "mypy", "pre-commit", "prometheus-client>=0.20"]
 
 [tool.setuptools.packages.find]
 where = ["."]

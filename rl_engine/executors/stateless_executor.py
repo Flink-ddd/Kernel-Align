@@ -11,7 +11,10 @@ from typing import Any, Callable, Iterator, Literal, Mapping, Optional
 
 import torch
 
+from rl_engine.observability.metrics import metrics as obs_metrics
+from rl_engine.observability.nvtx import nvtx_range
 from rl_engine.testing.reference_ops import selected_logprobs_reference
+from rl_engine.utils.logger import logger
 
 StatelessForwardMode = Literal["reference", "reward", "both"]
 StatelessAttentionBackend = Literal["flash_attention_2", "sdpa", "eager", "model_default"]
@@ -111,6 +114,14 @@ class StatelessForwardExecutor:
         self.reward_adapter = reward_adapter or default_reward_adapter
 
     def score(self, inputs: StatelessForwardInputs) -> StatelessForwardResult:
+        # The error recorder must wrap input validation too: a shape/device
+        # mismatch is the most common failure and has to be counted as an
+        # errored stage, not slip past uninstrumented.
+        stage_started = time.perf_counter()
+        with _StageErrorRecorder("score", stage_started):
+            return self._score_impl(inputs)
+
+    def _score_impl(self, inputs: StatelessForwardInputs) -> StatelessForwardResult:
         _validate_inputs(inputs, self.config)
 
         device = inputs.input_ids.device
@@ -120,7 +131,10 @@ class StatelessForwardExecutor:
             torch.cuda.synchronize(device)
 
         started_at = time.perf_counter()
-        with _temporarily_configure_stateless_model(self.model, self.config) as no_cache_policy:
+        with (
+            nvtx_range("rlk::score"),
+            _temporarily_configure_stateless_model(self.model, self.config) as no_cache_policy,
+        ):
             with torch.no_grad():
                 try:
                     raw_outputs, use_cache_passed = _run_no_cache_forward(self.model, inputs)
@@ -201,12 +215,83 @@ class StatelessForwardExecutor:
             no_cache_policy=no_cache_policy,
             kv_cache_summary=kv_cache_summary,
         )
+        _record_score_observability(metrics)
         return StatelessForwardResult(
             reference_logps=reference_logps,
             rewards=rewards,
             token_scores=token_scores,
             metrics=metrics,
         )
+
+
+def _record_score_observability(
+    result_metrics: Mapping[str, float | int | str | bool],
+) -> None:
+    """Export scoring metrics to the Prometheus facade; never raises.
+
+    Peak-memory values are read back from the metrics dict rather than queried
+    again: each ``torch.cuda.max_memory_*`` call goes through ``memory_stats()``,
+    which costs ~40us, and ``collect_stateless_metrics`` has already paid for it.
+    """
+    try:
+        allocated_bytes = (
+            int(float(result_metrics["peak_allocated_mb"]) * 1_048_576)
+            if "peak_allocated_mb" in result_metrics
+            else None
+        )
+        reserved_bytes = (
+            int(float(result_metrics["peak_reserved_mb"]) * 1_048_576)
+            if "peak_reserved_mb" in result_metrics
+            else None
+        )
+        obs_metrics.record_stage(
+            "score",
+            float(result_metrics["elapsed_ms"]) / 1000.0,
+            status="ok",
+            output_tokens=int(result_metrics.get("active_completion_tokens", 0)),
+            allocated_bytes=allocated_bytes,
+            reserved_bytes=reserved_bytes,
+        )
+        if result_metrics.get("attention_backend_fallback"):
+            reason = str(result_metrics.get("attention_backend_fallback_reason", ""))
+            obs_metrics.record_hardware_fallback(
+                "attention_backend",
+                requested_backend=str(result_metrics.get("attention_backend_requested", "")),
+                selected_backend="eager",
+                # Only the exception type is kept: the free-form message would
+                # be an unbounded Prometheus label value.
+                reason=reason.split(":", 1)[0] or "unknown",
+            )
+    except Exception as exc:
+        logger.warn_once(f"Failed to record stateless scoring metrics: {exc}")
+
+
+class _StageErrorRecorder:
+    """Record an errored stage exit.
+
+    The success path records ``status="ok"`` itself (with the executor's own
+    forward-region timing), so this only fires when the wrapped block raises,
+    and reports the full-method wall time from ``score`` down to the failure.
+    """
+
+    def __init__(self, stage: str, started_at: float) -> None:
+        self._stage = stage
+        self._started_at = started_at
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        if exc_type is None:
+            return
+        try:
+            obs_metrics.record_stage(
+                self._stage,
+                time.perf_counter() - self._started_at,
+                status="error",
+            )
+        except Exception as metrics_exc:
+            logger.warn_once(f"Failed to record stage error metrics: {metrics_exc}")
 
 
 def score_reference_logprobs(
