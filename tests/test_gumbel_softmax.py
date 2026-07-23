@@ -108,14 +108,14 @@ def test_registry_dispatch_matches_native():
 
 
 @pytest.mark.skipif(not _HAS_TRITON, reason="Triton import is required for fallback wrapper test.")
-def test_triton_wrapper_falls_back_to_native_for_unsupported_vocab(monkeypatch):
+def test_triton_internal_gumbel_generation_precompute_guard(monkeypatch):
     from rl_engine.kernels.ops.triton.sampling import gumbel_softmax as triton_gs
 
-    monkeypatch.setattr(triton_gs, "_MAX_BLOCK_V", 8)
-    logits, gumbels = _inputs(12, shape=(2, 9))
-    out = triton_gs.TritonGumbelSoftmaxOp()(logits, tau=0.9, hard=True, gumbels=gumbels)
-    ref = NativeGumbelSoftmaxOp()(logits, tau=0.9, hard=True, gumbels=gumbels)
-    assert torch.allclose(out, ref, atol=0.0)
+    logits, _ = _inputs(12, shape=(2, 9))
+    assert not triton_gs._needs_precomputed_gumbels(logits)
+
+    monkeypatch.setattr(triton_gs, "_MAX_RAND_OFFSET", logits.numel() - 1)
+    assert triton_gs._needs_precomputed_gumbels(logits)
 
 
 @requires_triton_cuda
@@ -175,6 +175,75 @@ def test_triton_generated_noise_smoke():
     assert out.shape == logits.shape
     assert torch.isfinite(out).all()
     assert torch.allclose(out.sum(dim=-1), torch.ones(8, device="cuda"), atol=1e-5)
+
+
+@requires_triton_cuda
+def test_triton_chunked_forward_matches_native_soft_fp32(monkeypatch):
+    from rl_engine.kernels.ops.triton.sampling import gumbel_softmax as triton_gs
+
+    monkeypatch.setattr(triton_gs, "_MAX_BLOCK_V", 8)
+    monkeypatch.setattr(triton_gs, "_CHUNK_V", 8)
+    logits, gumbels = _inputs(13, device="cuda", shape=(3, 19))
+    out = triton_gs.TritonGumbelSoftmaxOp()(logits, tau=0.8, hard=False, gumbels=gumbels)
+    ref = NativeGumbelSoftmaxOp()(logits, tau=0.8, hard=False, gumbels=gumbels)
+    assert torch.allclose(out, ref, atol=1e-5, rtol=1e-5)
+
+
+@requires_triton_cuda
+def test_triton_chunked_forward_matches_native_hard_fp32(monkeypatch):
+    from rl_engine.kernels.ops.triton.sampling import gumbel_softmax as triton_gs
+
+    monkeypatch.setattr(triton_gs, "_MAX_BLOCK_V", 8)
+    monkeypatch.setattr(triton_gs, "_CHUNK_V", 8)
+    logits, gumbels = _inputs(14, device="cuda", shape=(3, 19))
+    out = triton_gs.TritonGumbelSoftmaxOp()(logits, tau=0.7, hard=True, gumbels=gumbels)
+    ref = NativeGumbelSoftmaxOp()(logits, tau=0.7, hard=True, gumbels=gumbels)
+    assert torch.allclose(out, ref, atol=0.0)
+    assert torch.allclose(out.sum(dim=-1), torch.ones(3, device="cuda"))
+
+
+@requires_triton_cuda
+def test_triton_chunked_backward_matches_native(monkeypatch):
+    from rl_engine.kernels.ops.triton.sampling import gumbel_softmax as triton_gs
+
+    monkeypatch.setattr(triton_gs, "_MAX_BLOCK_V", 8)
+    monkeypatch.setattr(triton_gs, "_CHUNK_V", 8)
+    logits, gumbels = _inputs(15, device="cuda", shape=(2, 3, 19))
+    grad_out = torch.randn_like(logits)
+    triton_out, triton_grad = _run_grad(
+        triton_gs.TritonGumbelSoftmaxOp(), logits, gumbels, grad_out, hard=True, tau=0.9
+    )
+    native_out, native_grad = _run_grad(
+        NativeGumbelSoftmaxOp(), logits, gumbels, grad_out, hard=True, tau=0.9
+    )
+    assert torch.allclose(triton_out, native_out, atol=0.0)
+    assert torch.allclose(triton_grad, native_grad, atol=2e-5, rtol=2e-5)
+
+
+@requires_triton_cuda
+def test_triton_chunked_hard_nograd_is_one_hot(monkeypatch):
+    from rl_engine.kernels.ops.triton.sampling import gumbel_softmax as triton_gs
+
+    monkeypatch.setattr(triton_gs, "_MAX_BLOCK_V", 8)
+    monkeypatch.setattr(triton_gs, "_CHUNK_V", 8)
+    logits, gumbels = _inputs(16, device="cuda", shape=(2, 3, 19))
+    with torch.no_grad():
+        out = triton_gs.TritonGumbelSoftmaxOp()(logits, tau=0.7, hard=True, gumbels=gumbels)
+    assert torch.allclose(out.sum(dim=-1), torch.ones(2, 3, device="cuda"))
+    assert torch.all((out == 0.0) | (out == 1.0))
+
+
+@requires_triton_cuda
+def test_triton_qwen3_vocab_smoke_with_supplied_gumbels():
+    from rl_engine.kernels.ops.triton.sampling.gumbel_softmax import TritonGumbelSoftmaxOp
+
+    logits, gumbels = _inputs(17, device="cuda", shape=(1, 151936))
+    out = TritonGumbelSoftmaxOp()(logits, tau=1.0, hard=False, gumbels=gumbels)
+    ref = NativeGumbelSoftmaxOp()(logits, tau=1.0, hard=False, gumbels=gumbels)
+    assert out.shape == logits.shape
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out.sum(dim=-1), torch.ones(1, device="cuda"), atol=1e-5)
+    assert torch.allclose(out, ref, atol=1e-5, rtol=1e-5)
 
 
 @requires_triton_cuda

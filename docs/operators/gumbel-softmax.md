@@ -42,10 +42,10 @@ softmax gradient.
 | `seed` | scalar or `None` | Python int | Triton-only seed for backend-internal Gumbel noise when `gumbels=None`. |
 | Output | `[..., V]` | Same as `logits` | Probabilities or one-hot rows over vocab. |
 
-The Triton backend flattens leading dimensions to `[N, V]` and launches one
-program per row. It supports vocab sizes up to 131072 in this implementation.
-For larger vocab sizes, `TritonGumbelSoftmaxOp` falls back to the PyTorch
-reference implementation instead of raising.
+The Triton backend flattens leading dimensions to `[N, V]`. For vocab sizes
+that fit in one Triton block, it launches one program per row. For larger vocab
+sizes such as Qwen3's 151936-token vocabulary, it uses a chunked Triton path that
+computes one global softmax across all chunks.
 
 ## Backends
 
@@ -57,7 +57,9 @@ reference implementation instead of raising.
 For deterministic correctness tests, pass the same precomputed `gumbels` tensor
 to both backends. If `gumbels=None`, each backend samples its own Gumbel noise.
 The Triton backend accepts `seed` to make backend-internal Gumbel generation
-reproducible for smoke tests and benchmarks.
+reproducible for smoke tests and benchmarks. For large tensors where flattened
+Triton RNG offsets may exceed the safe counter range, the wrapper precomputes
+Gumbel noise with PyTorch and passes it into the Triton kernel.
 
 ## Tests and Benchmarks
 
