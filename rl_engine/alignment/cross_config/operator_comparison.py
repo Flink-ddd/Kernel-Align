@@ -515,8 +515,7 @@ OPERATOR_COMPARISON_SPECS: Mapping[str, OperatorComparisonSpec] = MappingProxyTy
             category="loss",
             boundary="loss.dpo_fragment",
             unsupported_reason=(
-                "DPO is not exposed as a framework operator-level training "
-                "fragment in this stack."
+                "DPO is not exposed as a framework operator-level training fragment in this stack."
             ),
             required_inputs=(),
         ),
@@ -819,8 +818,7 @@ def run_deterministic_repeatability_check(
             op_name=op_name,
             status="unsupported",
             unsupported_reason=(
-                f"Backend {backend_id!r} advertises operator {backend_operator!r}, "
-                f"not {op_name!r}."
+                f"Backend {backend_id!r} advertises operator {backend_operator!r}, not {op_name!r}."
             ),
             metadata=metadata or {},
         )
