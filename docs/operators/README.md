@@ -23,6 +23,7 @@ Every operator page should include:
 - [FlashAttention: LSE Export + Variable-Length Packing (Triton)](attention-varlen.md)
 - [Fused LogP](fused-logp.md)
 - [Fused Linear LogP](linear-logp.md)
+- [Batch-Invariant LogP](batch-invariant-logp.md)
 - [Fused Linear LogP TP Test Runbook](linear-logp-tp-test.md)
 - [GRPO Loss](grpo-loss.md)
 - [RoPE](rope.md)
