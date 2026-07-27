@@ -4,6 +4,8 @@
 #include <torch/extension.h>
 #include <cuda_bf16.h>
 
+#include "utils/nvtx_utils.h"
+
 // Fused LogP Declarations
 torch::Tensor fused_logp_forward(torch::Tensor logits, torch::Tensor token_ids);
 
@@ -93,6 +95,7 @@ at::Tensor prefix_shared_attention(
   const at::Tensor& K,
   const at::Tensor& V)
 {
+  RL_KERNEL_NVTX_RANGE("rl_kernel::prefix_shared_attention");
   TORCH_CHECK(Q.dim() == 4, "Q must be [bs, G, len_q, DIM]");
   TORCH_CHECK(K.dim() == 3, "K must be [bs, len_kv, DIM]");
   TORCH_CHECK(V.dim() == 3, "V must be [bs, len_kv, DIM]");
@@ -125,49 +128,106 @@ at::Tensor prefix_shared_attention(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "RL-Kernel High-Performance Operator Extension Library";
 
-    m.def("fused_logp", &fused_logp_forward, "Fused logp forward fallback");
+    m.def("fused_logp", ::rl_kernel::traced("rl_kernel::fused_logp", &fused_logp_forward),
+          "Fused logp forward fallback");
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_SM90)
-    m.def("fused_logp_sm90", &fused_logp_sm90_forward, "TMA-accelerated Online Softmax Fused LogP");
-    m.def("fused_linear_logp_sm90", &fused_linear_logp_sm90_forward,
+    m.def("fused_logp_sm90",
+          ::rl_kernel::traced("rl_kernel::fused_logp_sm90", &fused_logp_sm90_forward),
+          "TMA-accelerated Online Softmax Fused LogP");
+    m.def("fused_linear_logp_sm90",
+          ::rl_kernel::traced("rl_kernel::fused_linear_logp_sm90", &fused_linear_logp_sm90_forward),
           "TMA+WGMMA fused linear log-prob (hidden @ W^T -> selected-token logp), SM90");
-    m.def("fused_linear_logp_sm90_global_target", &fused_linear_logp_sm90_global_target_forward,
+    m.def("fused_linear_logp_sm90_global_target",
+          ::rl_kernel::traced("rl_kernel::fused_linear_logp_sm90_global_target",
+                               &fused_linear_logp_sm90_global_target_forward),
           "TMA+WGMMA local-shard target-logit/lse for vocab-parallel linear log-prob, SM90");
-    m.def("fused_linear_logp_sm90_backward", &fused_linear_logp_sm90_backward,
+    m.def("fused_linear_logp_sm90_backward",
+          ::rl_kernel::traced("rl_kernel::fused_linear_logp_sm90_backward",
+                               &fused_linear_logp_sm90_backward),
           "CUDA fused backward for linear log-prob, SM90 backend");
-    m.def("linear_logp_probs_bf16_forward", &linear_logp_probs_bf16_forward,
+    m.def("linear_logp_probs_bf16_forward",
+          ::rl_kernel::traced("rl_kernel::linear_logp_probs_bf16_forward",
+                               &linear_logp_probs_bf16_forward),
           "Build bf16 softmax probabilities and selected log-prob from bf16 logits");
-    m.def("linear_logp_bf16_forward", &linear_logp_bf16_forward,
+    m.def("linear_logp_bf16_forward",
+          ::rl_kernel::traced("rl_kernel::linear_logp_bf16_forward", &linear_logp_bf16_forward),
           "Build selected log-prob and lse from bf16 logits without saving probabilities");
-    m.def("linear_logp_local_probs_bf16_forward", &linear_logp_local_probs_bf16_forward,
+    m.def("linear_logp_local_probs_bf16_forward",
+          ::rl_kernel::traced("rl_kernel::linear_logp_local_probs_bf16_forward",
+                               &linear_logp_local_probs_bf16_forward),
           "Build local bf16 softmax probabilities, target logits, and lse from bf16 logits");
-    m.def("linear_logp_local_bf16_forward", &linear_logp_local_bf16_forward,
+    m.def("linear_logp_local_bf16_forward",
+          ::rl_kernel::traced("rl_kernel::linear_logp_local_bf16_forward",
+                               &linear_logp_local_bf16_forward),
           "Build local target logits and lse from bf16 logits without saving probabilities");
-    m.def("linear_logp_probs_bf16_to_dlogits_", &linear_logp_probs_bf16_to_dlogits_,
+    m.def("linear_logp_probs_bf16_to_dlogits_",
+          ::rl_kernel::traced("rl_kernel::linear_logp_probs_bf16_to_dlogits_",
+                               &linear_logp_probs_bf16_to_dlogits_),
           "In-place bf16 probs -> dlogits for selected log-prob backward");
     m.def("linear_logp_local_probs_bf16_to_dlogits_",
-          &linear_logp_local_probs_bf16_to_dlogits_,
+          ::rl_kernel::traced("rl_kernel::linear_logp_local_probs_bf16_to_dlogits_",
+                               &linear_logp_local_probs_bf16_to_dlogits_),
           "In-place local bf16 probs -> TP dlogits for selected log-prob backward");
-    m.def("linear_logp_logits_bf16_to_dlogits", &linear_logp_logits_bf16_to_dlogits,
+    m.def("linear_logp_logits_bf16_to_dlogits",
+          ::rl_kernel::traced("rl_kernel::linear_logp_logits_bf16_to_dlogits",
+                               &linear_logp_logits_bf16_to_dlogits),
           "Build bf16 dlogits from bf16 logits and fp32 lse");
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
-    m.def("fused_logp_forward_out", &fused_logp_forward_out, "Fused logp out");
-    m.def("fused_logp_forward_fp32", &fused_logp_forward_fp32, "Fused logp fp32");
-    m.def("fused_logp_forward_indexed_out", &fused_logp_forward_indexed_out, "Fused logp indexed out");
-    m.def("fused_logp_forward_indexed_fp32", &fused_logp_forward_indexed_fp32, "Fused logp indexed fp32");
-    m.def("fused_logp_forward_online_out", &fused_logp_forward_online_out, "Fused logp online out");
-    m.def("fused_logp_forward_online_fp32", &fused_logp_forward_online_fp32, "Fused logp online fp32");
-    m.def("fused_logp_forward_online_indexed_out", &fused_logp_forward_online_indexed_out, "Fused logp online indexed out");
-    m.def("fused_logp_forward_online_indexed_fp32", &fused_logp_forward_online_indexed_fp32, "Fused logp online indexed fp32");
-    m.def("deterministic_logp", &deterministic_logp_forward, "Batch-invariant deterministic logp");
-    m.def("deterministic_logp_forward_out", &deterministic_logp_forward_out, "Batch-invariant deterministic logp out");
-    m.def("deterministic_logp_forward_fp32", &deterministic_logp_forward_fp32, "Batch-invariant deterministic logp fp32");
-    m.def("deterministic_logp_forward_indexed_out", &deterministic_logp_forward_indexed_out, "Batch-invariant deterministic logp indexed out");
-    m.def("deterministic_logp_forward_indexed_fp32", &deterministic_logp_forward_indexed_fp32, "Batch-invariant deterministic logp indexed fp32");
+    m.def("fused_logp_forward_out",
+          ::rl_kernel::traced("rl_kernel::fused_logp_forward_out", &fused_logp_forward_out),
+          "Fused logp out");
+    m.def("fused_logp_forward_fp32",
+          ::rl_kernel::traced("rl_kernel::fused_logp_forward_fp32", &fused_logp_forward_fp32),
+          "Fused logp fp32");
+    m.def("fused_logp_forward_indexed_out",
+          ::rl_kernel::traced("rl_kernel::fused_logp_forward_indexed_out",
+                               &fused_logp_forward_indexed_out),
+          "Fused logp indexed out");
+    m.def("fused_logp_forward_indexed_fp32",
+          ::rl_kernel::traced("rl_kernel::fused_logp_forward_indexed_fp32",
+                               &fused_logp_forward_indexed_fp32),
+          "Fused logp indexed fp32");
+    m.def("fused_logp_forward_online_out",
+          ::rl_kernel::traced("rl_kernel::fused_logp_forward_online_out",
+                               &fused_logp_forward_online_out),
+          "Fused logp online out");
+    m.def("fused_logp_forward_online_fp32",
+          ::rl_kernel::traced("rl_kernel::fused_logp_forward_online_fp32",
+                               &fused_logp_forward_online_fp32),
+          "Fused logp online fp32");
+    m.def("fused_logp_forward_online_indexed_out",
+          ::rl_kernel::traced("rl_kernel::fused_logp_forward_online_indexed_out",
+                               &fused_logp_forward_online_indexed_out),
+          "Fused logp online indexed out");
+    m.def("fused_logp_forward_online_indexed_fp32",
+          ::rl_kernel::traced("rl_kernel::fused_logp_forward_online_indexed_fp32",
+                               &fused_logp_forward_online_indexed_fp32),
+          "Fused logp online indexed fp32");
+    m.def("deterministic_logp",
+          ::rl_kernel::traced("rl_kernel::deterministic_logp", &deterministic_logp_forward),
+          "Batch-invariant deterministic logp");
+    m.def("deterministic_logp_forward_out",
+          ::rl_kernel::traced("rl_kernel::deterministic_logp_forward_out",
+                               &deterministic_logp_forward_out),
+          "Batch-invariant deterministic logp out");
+    m.def("deterministic_logp_forward_fp32",
+          ::rl_kernel::traced("rl_kernel::deterministic_logp_forward_fp32",
+                               &deterministic_logp_forward_fp32),
+          "Batch-invariant deterministic logp fp32");
+    m.def("deterministic_logp_forward_indexed_out",
+          ::rl_kernel::traced("rl_kernel::deterministic_logp_forward_indexed_out",
+                               &deterministic_logp_forward_indexed_out),
+          "Batch-invariant deterministic logp indexed out");
+    m.def("deterministic_logp_forward_indexed_fp32",
+          ::rl_kernel::traced("rl_kernel::deterministic_logp_forward_indexed_fp32",
+                               &deterministic_logp_forward_indexed_fp32),
+          "Batch-invariant deterministic logp indexed fp32");
 
     // registry Prefix-Shared Attention
-    m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
+    m.def("prefix_shared_attention", &prefix_shared_attention,
+          "Prefix-Shared Fused Attention for GRPO");
 #endif
 }

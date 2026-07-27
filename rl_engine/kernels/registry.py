@@ -6,6 +6,7 @@ import os
 from enum import Enum, EnumMeta
 from typing import Any, Dict, Optional, Set, Type
 
+from rl_engine.observability.metrics import InstrumentedOp, op_metrics_enabled, record_fallback
 from rl_engine.platforms.device import device_ctx
 from rl_engine.utils.logger import logger
 
@@ -311,7 +312,7 @@ class KernelRegistry:
 
         for backend in candidates:
             if backend.name in self._instance_cache:
-                return self._instance_cache[backend.name]
+                return self._instrument(self._instance_cache[backend.name], op_type, backend.name)
 
             if backend.name in self._failed_backends:
                 continue
@@ -321,14 +322,29 @@ class KernelRegistry:
                 try:
                     op_instance = op_class()
                     self._instance_cache[backend.name] = op_instance
-                    return op_instance
+                    return self._instrument(op_instance, op_type, backend.name)
                 except Exception as e:
                     logger.error(f"Failed to instantiate {backend.name}: {e}")
                     self._failed_backends.add(backend.name)
+                    record_fallback(op_type, backend.name)
             else:
                 self._failed_backends.add(backend.name)
+                record_fallback(op_type, backend.name)
 
         raise RuntimeError(f"No functional backend found for {op_type} on {platform}")
+
+    @staticmethod
+    def _instrument(op_instance: Any, op_type: str, backend_name: str) -> Any:
+        """Wrap a resolved op instance for latency/throughput metrics, opt-in only.
+
+        `_instance_cache` keeps storing the raw, unwrapped instance; only the value returned
+        from `get_op(...)` is wrapped, freshly, per call -- so the same cached instance is
+        always labeled with the `op_type` of the *current* call, not whichever op_type first
+        populated the cache.
+        """
+        if not op_metrics_enabled():
+            return op_instance
+        return InstrumentedOp(op_instance, op_type=op_type, backend=backend_name)
 
     def _load_backend(self, backend: OpBackend) -> Optional[Type]:
         """Dynamic loading technique: Import modules only when needed

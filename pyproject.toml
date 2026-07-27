@@ -24,6 +24,7 @@ dependencies = [
 cuda = ["flashinfer-python>=0.1.6", "nvidia-ml-py"]
 rocm = ["aiter"]
 vllm = ["vllm>=0.6.0"]
+observability = ["prometheus-client>=0.19"]
 dev = ["pytest", "black", "isort", "ruff", "mypy", "pre-commit"]
 
 [tool.setuptools.packages.find]
