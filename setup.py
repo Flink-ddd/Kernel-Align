@@ -134,7 +134,11 @@ def get_extensions():
             nvcc_flags.append("-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH")
 
         cxx_flags = ["-O3", "-std=c++17", "-DKERNEL_ALIGN_WITH_CUDA"]
-        extra_link_args = list(torch_rpath)
+        # csrc/utils/nvtx_utils.h uses the classic <nvToolsExt.h> API (nvtxRangePushA/Pop),
+        # which resolves its symbols at link time rather than via nvtx3's dlopen-based
+        # injection layer -- link libnvToolsExt explicitly so `rl_kernel::traced(...)` in
+        # csrc/ops.cpp loads cleanly.
+        extra_link_args = list(torch_rpath) + ["-lnvToolsExt"]
 
         sm90_srcs = [
             "csrc/cuda/fused_logp_sm90.cu",
@@ -187,6 +191,7 @@ setup(
         "cuda": ["flashinfer"],
         "rocm": ["aiter"],
         "vllm": ["vllm>=0.6.0"],
+        "observability": ["prometheus-client>=0.19"],
     },
     python_requires=">=3.10",
     include_package_data=True,

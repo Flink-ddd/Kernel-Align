@@ -23,6 +23,7 @@ from rl_engine.executors.stateless_executor import (
     score_rewards,
     summarize_tensor_tree,
 )
+from rl_engine.observability.metrics import record_kv_cache_fragmentation
 
 
 @dataclass(frozen=True)
@@ -306,6 +307,11 @@ def collect_paged_kv_metrics(
         device = input_ids.device
         metrics["peak_allocated_mb"] = torch.cuda.max_memory_allocated(device) / 1_048_576.0
         metrics["peak_reserved_mb"] = torch.cuda.max_memory_reserved(device) / 1_048_576.0
+    record_kv_cache_fragmentation(
+        reservation.required_blocks,
+        reservation.reserved_blocks,
+        baseline_kind=str(metrics["baseline_kind"]),
+    )
     return metrics
 
 

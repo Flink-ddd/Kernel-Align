@@ -16,6 +16,7 @@ from rl_engine.executors.bridge import (
 )
 from rl_engine.executors.vllm_sampler import VLLMSamplerConfig, VLLMSharedPrefixSampler
 from rl_engine.kernels.registry import kernel_registry, resolve_logp_op_type
+from rl_engine.observability.metrics import metrics_server_enabled, start_metrics_server
 from rl_engine.utils.logger import logger
 
 
@@ -136,6 +137,9 @@ class RolloutExecutor:
                 f"Active Kernels -> Logp({self.logp_op_type}): {type(self.logp_op).__name__},"
                 f" Attn: {type(self.attn_op).__name__}"
             )
+
+            if metrics_server_enabled():
+                start_metrics_server()
 
     def _prepare_sampler(self) -> VLLMSharedPrefixSampler:
         """
