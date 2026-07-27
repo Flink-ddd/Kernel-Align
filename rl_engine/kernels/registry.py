@@ -6,6 +6,7 @@ import os
 from enum import Enum, EnumMeta
 from typing import Any, Dict, Optional, Set, Type
 
+from rl_engine.observability.metrics import metrics
 from rl_engine.platforms.device import device_ctx
 from rl_engine.utils.logger import logger
 
@@ -309,8 +310,10 @@ class KernelRegistry:
             platform = "cpu"
         candidates = self._priority_map.get(platform, {}).get(op_type, [OpBackend.PYTORCH_NATIVE])
 
-        for backend in candidates:
+        failed_this_call: list[tuple[str, str]] = []
+        for index, backend in enumerate(candidates):
             if backend.name in self._instance_cache:
+                self._record_dispatch(op_type, backend.name, index, failed_this_call)
                 return self._instance_cache[backend.name]
 
             if backend.name in self._failed_backends:
@@ -321,14 +324,43 @@ class KernelRegistry:
                 try:
                     op_instance = op_class()
                     self._instance_cache[backend.name] = op_instance
+                    self._record_dispatch(op_type, backend.name, index, failed_this_call)
                     return op_instance
                 except Exception as e:
                     logger.error(f"Failed to instantiate {backend.name}: {e}")
                     self._failed_backends.add(backend.name)
+                    failed_this_call.append((backend.name, "instantiation_error"))
             else:
                 self._failed_backends.add(backend.name)
+                failed_this_call.append((backend.name, "import_error"))
 
+        self._record_dispatch(op_type, "none", -1, failed_this_call)
         raise RuntimeError(f"No functional backend found for {op_type} on {platform}")
+
+    def _record_dispatch(
+        self,
+        op_type: str,
+        selected_backend: str,
+        candidate_index: int,
+        failed_candidates: list[tuple[str, str]],
+    ) -> None:
+        """Export dispatch-time state and per-call fallback events; never raises."""
+        try:
+            for failed_backend, reason in failed_candidates:
+                metrics.record_hardware_fallback(
+                    op_type,
+                    requested_backend=failed_backend,
+                    selected_backend=selected_backend,
+                    reason=reason,
+                )
+            if candidate_index >= 0:
+                metrics.set_selected_backend(
+                    op_type,
+                    selected_backend,
+                    is_fallback=candidate_index > 0,
+                )
+        except Exception as e:  # observability must never break dispatch
+            logger.warn_once(f"Failed to record kernel dispatch metrics: {e}")
 
     def _load_backend(self, backend: OpBackend) -> Optional[Type]:
         """Dynamic loading technique: Import modules only when needed

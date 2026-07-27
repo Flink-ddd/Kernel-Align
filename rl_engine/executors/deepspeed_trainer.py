@@ -29,7 +29,10 @@ from rl_engine.executors.training_contract import (
 )
 from rl_engine.kernels.ops.pytorch.loss.linear_logp import NativeLinearLogpOp
 from rl_engine.kernels.registry import kernel_registry
+from rl_engine.observability.metrics import metrics as obs_metrics
+from rl_engine.observability.nvtx import nvtx_range
 from rl_engine.testing import compute_policy_ratio, compute_reference_kl, masked_mean
+from rl_engine.utils.logger import logger
 
 _TDestination = TypeVar("_TDestination", bound=dict[str, Any])
 
@@ -127,7 +130,16 @@ class DeepSpeedTrainingWorker(RolloutBatchMixin):
         self._linear_logp = _linear_logp_op_for_device(self.device)
 
     def train(self, rollout: RolloutStageResult) -> TrainingStageResult:
+        with obs_metrics.stage_timer("train_step"), nvtx_range("rlk::train_step"):
+            result = self._train_impl(rollout)
+        _record_training_observability(result.metrics, device=self.device)
+        return result
+
+    def _train_impl(self, rollout: RolloutStageResult) -> TrainingStageResult:
         started_at = time.perf_counter()
+        cuda_tracking = self.device.type == "cuda" and torch.cuda.is_available()
+        if cuda_tracking:
+            torch.cuda.reset_peak_memory_stats(self.device)
         batch, payload_metrics = self._batch_from_rollout_or_synthetic(rollout)
         training_model = _unwrap_training_model(self.engine, self.model)
         training_embedding = _embedding_layer(training_model)
@@ -150,14 +162,15 @@ class DeepSpeedTrainingWorker(RolloutBatchMixin):
             zero_stage=self._deepspeed_zero_stage,
             world_size=self._engine_world_size(),
         ):
-            current_logps = _extract_logps(
-                self.engine(batch.token_ids.long()),
-                training_model,
-                batch.token_ids,
-                batch.completion_mask,
-                self._linear_logp,
-                output_dtype=torch.float32,
-            )
+            with nvtx_range("rlk::train.forward"):
+                current_logps = _extract_logps(
+                    self.engine(batch.token_ids.long()),
+                    training_model,
+                    batch.token_ids,
+                    batch.completion_mask,
+                    self._linear_logp,
+                    output_dtype=torch.float32,
+                )
             old_logps = current_logps.detach() - 0.01
             ref_logps = objective_reference_logps(current_logps, batch)
             ratio = compute_policy_ratio(current_logps, old_logps, batch.completion_mask)
@@ -166,8 +179,10 @@ class DeepSpeedTrainingWorker(RolloutBatchMixin):
             policy_loss = -torch.minimum(unclipped, clipped)
             kl = compute_reference_kl(current_logps, ref_logps, batch.completion_mask)
             loss = masked_mean(policy_loss + 0.01 * kl, batch.completion_mask)
-            self.engine.backward(loss)
-        self.engine.step()
+            with nvtx_range("rlk::train.backward"):
+                self.engine.backward(loss)
+        with nvtx_range("rlk::train.optim_step"):
+            self.engine.step()
 
         finished_at = time.perf_counter()
         published = self._next_published_weight_version(rollout.weight_version)
@@ -216,6 +231,20 @@ class DeepSpeedTrainingWorker(RolloutBatchMixin):
         runtime cannot provide a safe full-state view, the worker fails
         explicitly instead of publishing a shard.
         """
+        with obs_metrics.stage_timer("publish_weights"), nvtx_range("rlk::publish_weights"):
+            manifest = self._publish_weights_impl(
+                weight_version=weight_version,
+                metadata=metadata,
+            )
+        obs_metrics.set_weight_version("published", int(weight_version))
+        return manifest
+
+    def _publish_weights_impl(
+        self,
+        *,
+        weight_version: int,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> WeightUpdateManifest:
         manifest_metadata = dict(metadata or {})
         layout = {
             "kind": "full-state",
@@ -310,6 +339,30 @@ class DeepSpeedTrainingWorker(RolloutBatchMixin):
             "bf16": {"enabled": self.config.dtype == torch.bfloat16},
         }
         return _deep_merge(base, dict(self.config.deepspeed_config))
+
+
+def _record_training_observability(
+    result_metrics: Mapping[str, Any],
+    *,
+    device: torch.device,
+) -> None:
+    """Export training metrics to the Prometheus facade; never raises."""
+    try:
+        loss = result_metrics.get("loss")
+        if loss is not None:
+            obs_metrics.set_training_loss(float(loss))
+        obs_metrics.add_output_tokens("train_step", int(result_metrics.get("active_tokens", 0)))
+        if device.type == "cuda" and torch.cuda.is_available():
+            # One memory_stats() read instead of two max_memory_* calls, which
+            # would each rebuild the same ~40us allocator-statistics dict.
+            stats = torch.cuda.memory_stats(device)
+            obs_metrics.set_gpu_peak_memory(
+                "train_step",
+                allocated_bytes=int(stats.get("allocated_bytes.all.peak", 0)),
+                reserved_bytes=int(stats.get("reserved_bytes.all.peak", 0)),
+            )
+    except Exception as exc:
+        logger.warn_once(f"Failed to record training metrics: {exc}")
 
 
 def _load_deepspeed() -> Any:

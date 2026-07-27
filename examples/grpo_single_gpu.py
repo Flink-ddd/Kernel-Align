@@ -22,6 +22,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from rl_engine.kernels.registry import resolve_logp_op_type  # noqa: E402
+from rl_engine.observability import maybe_start_metrics_server_from_env  # noqa: E402
+from rl_engine.observability import metrics as obs_metrics  # noqa: E402
+from rl_engine.observability import nvtx_range  # noqa: E402
 from rl_engine.testing import (  # noqa: E402
     active_token_count,
     compute_policy_ratio,
@@ -186,6 +189,9 @@ def run_training(args: argparse.Namespace) -> list[StepMetrics]:
     if args.steps <= 0:
         raise ValueError("--steps must be greater than zero")
 
+    # Opt-in Prometheus exporter: only starts when RL_KERNEL_METRICS=1.
+    maybe_start_metrics_server_from_env()
+
     torch.manual_seed(args.seed)
     device = select_device(args.device)
     logp_op = resolve_logp_op(
@@ -247,47 +253,57 @@ def run_training(args: argparse.Namespace) -> list[StepMetrics]:
     )
 
     for step in range(args.steps):
-        optimizer.zero_grad(set_to_none=True)
-        logits = policy(batch.token_ids)
-        reference_logps = selected_logprobs_reference(
-            logits,
-            batch.token_ids,
-            mask=batch.completion_mask,
-            output_dtype=torch.float32,
-        )
-        kernel_logps = selected_logps_with_op(
-            logp_op,
-            logits,
-            batch.token_ids,
-            batch.completion_mask,
-        )
-        drift = summarize_kernel_drift(
-            kernel_logps.detach(),
-            reference_logps.detach(),
-            batch.completion_mask,
-        )
+        with obs_metrics.stage_timer("train_step"), nvtx_range("rlk::train_step"):
+            optimizer.zero_grad(set_to_none=True)
+            with nvtx_range("rlk::train.forward"):
+                logits = policy(batch.token_ids)
+                reference_logps = selected_logprobs_reference(
+                    logits,
+                    batch.token_ids,
+                    mask=batch.completion_mask,
+                    output_dtype=torch.float32,
+                )
+                kernel_logps = selected_logps_with_op(
+                    logp_op,
+                    logits,
+                    batch.token_ids,
+                    batch.completion_mask,
+                )
+            drift = summarize_kernel_drift(
+                kernel_logps.detach(),
+                reference_logps.detach(),
+                batch.completion_mask,
+            )
 
-        if kernel_logps.requires_grad:
-            train_logps = kernel_logps
-            train_source = backend_name
-        else:
-            train_logps = reference_logps
-            train_source = "autograd_reference"
+            if kernel_logps.requires_grad:
+                train_logps = kernel_logps
+                train_source = backend_name
+            else:
+                train_logps = reference_logps
+                train_source = "autograd_reference"
 
-        loss, policy_loss, kl = grpo_loss(
-            train_logps,
-            old_logps,
-            ref_logps,
-            advantages,
-            batch.completion_mask,
-            args.clip_eps,
-            args.beta,
+            loss, policy_loss, kl = grpo_loss(
+                train_logps,
+                old_logps,
+                ref_logps,
+                advantages,
+                batch.completion_mask,
+                args.clip_eps,
+                args.beta,
+            )
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"non-finite loss at step {step}: {loss.item()}")
+
+            with nvtx_range("rlk::train.backward"):
+                loss.backward()
+            with nvtx_range("rlk::train.optim_step"):
+                optimizer.step()
+
+        obs_metrics.set_training_loss(float(loss.detach().cpu().item()))
+        obs_metrics.add_output_tokens(
+            "train_step",
+            int(active_token_count(batch.completion_mask).item()),
         )
-        if not torch.isfinite(loss):
-            raise RuntimeError(f"non-finite loss at step {step}: {loss.item()}")
-
-        loss.backward()
-        optimizer.step()
 
         step_metrics = StepMetrics(
             step=step,

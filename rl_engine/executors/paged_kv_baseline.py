@@ -23,6 +23,8 @@ from rl_engine.executors.stateless_executor import (
     score_rewards,
     summarize_tensor_tree,
 )
+from rl_engine.observability.metrics import metrics as obs_metrics
+from rl_engine.utils.logger import logger
 
 
 @dataclass(frozen=True)
@@ -270,6 +272,13 @@ def collect_paged_kv_metrics(
     input_ids = inputs.input_ids
     active_tokens = int(_bool_mask(inputs.completion_mask, device=input_ids.device).sum().item())
     total_kv_cache_bytes = reservation.reserved_bytes + model_kv_cache_summary.total_bytes
+    try:
+        obs_metrics.set_kv_cache_blocks(
+            required=int(reservation.required_blocks),
+            reserved=int(reservation.reserved_blocks),
+        )
+    except Exception as exc:
+        logger.warn_once(f"Failed to record paged KV-cache metrics: {exc}")
     metrics: dict[str, float | int | str | bool] = {
         "baseline_kind": "generation_engine_paged_kv_reservation",
         "baseline_includes_model_kv_cache": model_kv_cache_summary.tensor_count > 0,
