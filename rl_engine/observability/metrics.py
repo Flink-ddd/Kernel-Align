@@ -183,8 +183,23 @@ def start_metrics_server(port: Optional[int] = None) -> Optional[int]:
     if not metrics_enabled() or _server_started:
         return None
     if port is None:
-        base_port = int(os.environ.get(_METRICS_PORT_ENV, str(_DEFAULT_METRICS_PORT)))
-        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        try:
+            base_port = int(os.environ.get(_METRICS_PORT_ENV, str(_DEFAULT_METRICS_PORT)))
+        except (TypeError, ValueError):
+            logger.warn_once(
+                "%s=%r is not a valid integer port; using default=%d.",
+                _METRICS_PORT_ENV,
+                os.environ.get(_METRICS_PORT_ENV),
+                _DEFAULT_METRICS_PORT,
+            )
+            base_port = _DEFAULT_METRICS_PORT
+        try:
+            rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        except (TypeError, ValueError):
+            logger.warn_once(
+                "RANK/LOCAL_RANK env var is not a valid integer; using rank=0.",
+            )
+            rank = 0
         port = base_port + rank
     try:
         start_http_server(port)
