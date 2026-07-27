@@ -186,7 +186,7 @@ TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu124}"
 # --no-build-isolation: torch must be visible to setup.py, else the extension is silently skipped.
 # --no-deps: keep the pinned torch; do not let the editable install re-resolve it.
 "$PY" -m pip install --no-build-isolation --no-deps -e .
-"$PY" -m pip install --no-cache-dir numpy tabulate accelerate transformers pytest
+"$PY" -m pip install --no-cache-dir numpy tabulate accelerate "transformers==5.13.1" pytest
 nvidia-smi
 # Fail fast if _C did not build or cannot launch, instead of silently using native fallbacks.
 "$PY" scripts/ci_smoke.py
