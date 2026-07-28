@@ -1,0 +1,196 @@
+# FlashAttention: LSE Export + Variable-Length Packing
+
+## Summary
+
+Extends the existing pure-Triton FlashAttention fallback
+(`rl_engine/kernels/ops/triton/triton_attn.py`) with two capabilities needed for
+long-context RL rollout/training workloads:
+
+- **Attention-domain LSE export** — the per-query-row log-sum-exp of the scaled,
+  masked `QKᵀ` logits, in the same fixed online-softmax reduction order the
+  kernel already used internally for the backward pass. Useful for backward
+  recomputation, diagnostics, and rollout/training attention alignment checks.
+  **This is not the vocab-domain LSE produced by the `fused_logp` /
+  `linear_logp` kernels** — same name, different tensor domain (per key-length
+  reduction vs. per-vocab reduction). Do not conflate the two.
+- **Variable-length (packed) attention** — operates directly on `cu_seqlens`-packed
+  `[total_tokens, H, D]` tensors instead of a padded `[B, H, S, D]` batch, so RL
+  batches with wildly different response lengths (or empty/fully-masked
+  responses) don't pay for padding in either compute or memory.
+
+This module is the **cross-platform semantic baseline**: the SM90 (forward,
+now implemented — see Backends), SM80 `mma.sync`, and ROCm MFMA
+fused-attention kernels are checked against it (and, transitively, against
+`NativeAttentionOp`) rather than against each other. See
+`docs/operators/attention.md` for the pure-PyTorch WS1 ground-truth reference
+this whole family is validated against.
+
+## Entry Point
+
+```python
+from rl_engine.kernels.ops.triton.triton_attn import (
+    triton_flash_attention,
+    triton_flash_attention_varlen,
+)
+
+# Dense — unchanged default behavior, opt into LSE:
+out = triton_flash_attention(q, k, v, causal=True)                       # [B, H, S, D]
+out, lse = triton_flash_attention(q, k, v, causal=True, return_lse=True)  # lse: [B, H, S] fp32
+
+# Packed variable-length:
+out = triton_flash_attention_varlen(
+    q, k, v,                      # [total_q, H, D], [total_k, H, D], [total_k, H, D]
+    cu_seqlens_q, cu_seqlens_k,   # int32 [batch + 1], cu_seqlens[0] == 0
+    max_seqlen_q, max_seqlen_k,   # host ints, size the launch grid
+    causal=True,
+)
+out, lse = triton_flash_attention_varlen(..., return_lse=True)           # lse: [total_q, H] fp32
+```
+
+## Backends
+
+| Backend | Wrapper | Native symbol | Status |
+| --- | --- | --- | --- |
+| Triton (CUDA) | `triton_flash_attention` / `triton_flash_attention_varlen` | `_fwd_kernel[_varlen]`, `_bwd_kernel[_varlen]` | Cross-platform semantic baseline. |
+| CUDA SM90 (TMA + `mma.sync`) | `flash_attention_sm90_varlen` (`rl_engine.kernels.ops.cuda.attention.flash_attn_sm90`) | `flash_attention_varlen_sm90[_backward]` | Forward + backward (causal, varlen, LSE export, `dQ`/`dK`/`dV`), fully differentiable via `torch.autograd.Function`. Validated against this Triton path. |
+| CUDA SM80 (`mma.sync`) | — | — | Planned; validates against this Triton path. |
+| ROCm (MFMA) | — | — | Planned; validates against this Triton path. |
+
+Not yet wired into `KernelRegistry` — this is the standalone kernel-development
+stage (mirrors how `prefix_shared_attention` and the SM90 logp kernels were
+built before registry integration). Registry dispatch is future work once a
+production op_type contract for causal/varlen attention is settled.
+
+## Tensor Contract
+
+| Argument | Shape | Dtype | Requirements |
+| --- | --- | --- | --- |
+| `q` (dense) | `[B, H, Sq, D]` | fp16/bf16/fp32 | `D ∈ {16,32,64,128,256}`. |
+| `k`, `v` (dense) | `[B, H, Skv, D]` | same as `q` | **No GQA**: `k`/`v` head count must equal `q`'s (matches the pre-existing dense kernel's limitation, not new). |
+| `q` (varlen) | `[total_q, H, D]` | fp16/bf16/fp32 | Packed, no padding. |
+| `k`, `v` (varlen) | `[total_k, H, D]` | same as `q` | Same no-GQA constraint. |
+| `cu_seqlens_q`, `cu_seqlens_k` | `[batch + 1]` | int32 | Cumulative offsets, `cu_seqlens[0] == 0`. Same convention as `flash_attn_varlen_func` and this repo's `pack` op (#182). |
+| `max_seqlen_q`, `max_seqlen_k` | — | Python `int` | Host-side; sizes the launch grid. |
+| `causal` | — | bool | Per-sequence anchor `Skv - Sq` (see Accuracy) — identical formula for prefill (`Sq == Skv`) and decode (`Sq < Skv`). |
+| `return_lse` | — | bool | If `True`, also returns the attention-domain LSE, float32, **non-differentiable** (`ctx.mark_non_differentiable`) — diagnostics/backward-recompute only, matching `flash_attn`'s `softmax_lse` external contract. |
+| output | dense: `[B, H, Sq, D]`; varlen: `[total_q, H, D]` | input dtype | — |
+
+The table above states the **Triton** path's contract. The **CUDA SM90**
+backend (`flash_attention_sm90_varlen`) is narrower: **varlen only** (no dense
+entry point), **bf16 only** (no fp16/fp32 — the reused `mma.sync` PTX
+hardcodes bf16 operands), **`D == 128` only** (no other head dim this
+milestone), and **contiguous `q`/`k`/`v` only** (raises `RuntimeError` on a
+non-contiguous/transposed view — TMA descriptors assume a fixed row stride;
+this is a deliberate, tested divergence from the Triton path, which tolerates
+non-contiguous inputs). Inputs outside this support surface fall back to
+`triton_flash_attention_varlen` automatically rather than erroring.
+
+## Dispatch Behavior
+
+Direct function calls only (see Backends). No registry op_type yet.
+
+## Accuracy
+
+Both paths are checked against an **independent** fp32 masked-softmax + LSE
+closed form (not against each other, so a shared online-softmax bug can't
+hide):
+
+```python
+scores = einsum("hqd,hkd->hqk", q.float(), k.float()) * scale
+if causal:
+    mask = torch.triu(torch.ones(Sq, Skv, bool), diagonal=Skv - Sq + 1)
+    scores = scores.masked_fill(mask, -inf)
+probs = softmax(scores, dim=-1)
+out = einsum("hqk,hkd->hqd", probs, v.float())
+lse = torch.logsumexp(scores, dim=-1)
+```
+
+Measured on an H100 SXM5 (fp16 inputs, fp32 accumulation in-kernel):
+
+- Dense: `out` max-abs-diff ≈ `1.4e-3`, `lse` max-abs-diff ≈ `1e-6`.
+- Varlen: `out`/`dq`/`dk`/`dv` max-abs-diff in the `5e-4`–`1.1e-2` range across
+  uneven, non-block-aligned sequence lengths; `lse` ≈ `1e-6`.
+
+CUDA SM90 (bf16 inputs, bf16×bf16→fp32 `mma.sync` accumulation, checked
+against the same fp32 reference): `out`/`lse` max-abs-diff up to ≈ `1.6e-2`;
+`dq`/`dk`/`dv` max-abs-diff up to ≈ `1.6e-2` across the full shape matrix,
+including the 24-KV-tile long-sequence and `dQ` atomic-accumulation stress
+cases — bf16 (fewer mantissa bits than fp16) accounts for the looser bound
+than the Triton fp16 numbers above.
+
+Varlen boundary handling: since packed sequences sit back-to-back in memory (no
+padding), reading past a sequence's own `cu_seqlens` bound is a genuine
+correctness bug (you'd read the *next* sequence's tokens), not just wasted
+compute. All loads/stores in the varlen kernels are therefore explicitly masked
+against `seqlen_q`/`seqlen_k` (not `boundary_check` on dynamically-shaped block
+pointers) — this is deliberate and was chosen specifically to make the
+padding-vs-next-sequence distinction unambiguous.
+
+## Performance Notes
+
+No standalone benchmark script yet (unlike `fused-logp.md` / `linear-logp.md`).
+Follow-up: add `benchmarks/benchmark_attention_varlen.py` measuring
+packed-vs-padded latency/VRAM at representative RL group sizes, alongside the
+existing `benchmarks/benchmark_attention.py`.
+
+## Tests
+
+```bash
+python -m pytest tests/test_triton_attention_varlen.py -v
+python -m pytest tests/test_flash_attention_sm90.py -v
+```
+
+`test_triton_attention_varlen.py` covers: dense LSE vs. independent reference,
+LSE non-differentiability with backward still populating `q`/`k`/`v` grads,
+default-call backward compatibility (bare tensor when `return_lse=False`),
+varlen forward+backward across uneven non-block-aligned seqlens, non-causal,
+decode-style (`Sq < Skv` varying per sequence), `head_dim=128`, and a
+zero-length sequence in the batch (a real occurrence for fully-masked/empty RL
+responses).
+
+`test_flash_attention_sm90.py` (requires a Hopper GPU with the extension built
+`KERNEL_ALIGN_FORCE_SM90=1`) covers the same varlen shape matrix for the SM90
+kernel — uneven non-block-aligned seqlens, block-aligned seqlens, non-causal,
+decode-style, `head_dim=128`, zero-length sequence, long/many-KV-tile
+sequences, single-head, and 8-entry mixed batches — with every case also
+exercising `.backward()` and checking `dQ`/`dK`/`dV`. Forward output/LSE is
+checked against both the independent fp32 reference and
+`triton_flash_attention_varlen` on the same bf16 tensors; gradients are
+checked against the fp32 reference only (`triton_flash_attention_varlen`'s
+own backward can't run on bf16 tensors at all in this Triton version —
+`tl.atomic_add` doesn't support bf16, a compiler-level restriction, not a
+numerical one; this repo's own Triton backward tests avoid it too, always
+using fp16). Additional dedicated cases: a single-KV-tile-CTA case (isolates
+the `P`/`ds` shared-memory transpose-trick correctness from the causal
+`lo`-bound loop and cross-CTA `dQ` atomics), a `dQ` atomic-accumulation stress
+case (short query sequence attended to by ~16 KV-tile CTAs, non-causal, so
+every CTA atomic-adds into the same few rows), an LSE-non-differentiability
+check, a dense-vs-varlen consistency check, and validation-guard tests for
+both the forward and backward native symbols (bad head_dim/dtype/GQA/
+cu_seqlens-mismatch/non-contiguous input).
+
+## Known Limitations
+
+- No GQA support on any path (`Hk` must equal `Hq`) — same constraint the
+  pre-existing dense kernel already had; not introduced by this change.
+- Not wired into `KernelRegistry`; no automatic backend selection yet.
+- CUDA SM90 forward + backward is implemented (TMA + `mma.sync`, causal,
+  varlen, LSE export, `dQ`/`dK`/`dV`) and fully differentiable. It is
+  **bf16-only**, **`D=128`-only**, **varlen-only** (no dense entry point), and
+  **rejects non-contiguous inputs** (see Tensor Contract) — inputs outside
+  that surface fall back to `triton_flash_attention_varlen` entirely
+  (forward *and* backward together; a build with only the forward native
+  symbol compiled also falls back entirely, rather than mixing an SM90
+  forward with a Triton backward). Neither the forward nor backward kernel
+  uses split-KV/split-Q parallelism or a persistent-kernel schedule (a
+  sequential loop per CTA, same as `prefix_shared_attention.cu`) — a possible
+  future perf pass, not attempted here.
+- `seqlen_q > seqlen_k` under `causal=True` is out-of-contract (violates the
+  `Skv - Sq` causal-offset convention, which assumes a query can always
+  attend at least to itself) and produces `NaN`/degenerate output — this is
+  not specific to the SM90 kernel; `triton_flash_attention_varlen` produces
+  `NaN` for the identical input too, confirmed directly. Neither
+  implementation is designed to handle it; callers must ensure
+  `seqlen_k >= seqlen_q` per sequence whenever `causal=True`.
+- SM80 `mma.sync` and ROCm MFMA kernels are not implemented yet.
+- No standalone performance benchmark yet (see Performance Notes).

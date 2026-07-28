@@ -58,6 +58,26 @@ torch::Tensor linear_logp_logits_bf16_to_dlogits(torch::Tensor logits,
                                                  torch::Tensor grad_logp,
                                                  torch::Tensor lse,
                                                  int64_t vocab_start_index);
+std::vector<torch::Tensor> flash_attention_varlen_sm90_forward(torch::Tensor q,
+                                                               torch::Tensor k,
+                                                               torch::Tensor v,
+                                                               torch::Tensor cu_seqlens_q,
+                                                               torch::Tensor cu_seqlens_k,
+                                                               int64_t max_seqlen_q,
+                                                               int64_t max_seqlen_k,
+                                                               bool causal,
+                                                               double sm_scale);
+std::vector<torch::Tensor> flash_attention_varlen_sm90_backward(torch::Tensor do_,
+                                                                torch::Tensor q,
+                                                                torch::Tensor k,
+                                                                torch::Tensor v,
+                                                                torch::Tensor out,
+                                                                torch::Tensor lse,
+                                                                torch::Tensor cu_seqlens_q,
+                                                                torch::Tensor cu_seqlens_k,
+                                                                int64_t max_seqlen_k,
+                                                                bool causal,
+                                                                double sm_scale);
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
@@ -169,6 +189,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "In-place local bf16 probs -> TP dlogits for selected log-prob backward");
     m.def("linear_logp_logits_bf16_to_dlogits", &linear_logp_logits_bf16_to_dlogits,
           "Build bf16 dlogits from bf16 logits and fp32 lse");
+    m.def("flash_attention_varlen_sm90", &flash_attention_varlen_sm90_forward,
+          "TMA+mma.sync causal packed varlen FlashAttention forward (SM90), returns (out, lse)");
+    m.def("flash_attention_varlen_sm90_backward", &flash_attention_varlen_sm90_backward,
+          "TMA+mma.sync causal packed varlen FlashAttention backward (SM90), returns (dq, dk, dv)");
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
