@@ -139,7 +139,8 @@ def get_extensions():
         sm90_srcs = [
             "csrc/cuda/fused_logp_sm90.cu",
             "csrc/cuda/fused_linear_logp_sm90.cu",  # TMA + WGMMA fused linear log-prob
-            "csrc/cuda/attention/flash_attention_varlen_sm90.cu",  # TMA + mma.sync varlen attention fwd
+            # TMA + mma.sync varlen attention fwd
+            "csrc/cuda/attention/flash_attention_varlen_sm90.cu",
         ]
         enable_sm90 = envs.env_flag(envs.KERNEL_ALIGN_FORCE_SM90)
         present_sm90 = [s for s in sm90_srcs if os.path.exists(s)]

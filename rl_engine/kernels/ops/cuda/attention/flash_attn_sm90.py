@@ -136,8 +136,7 @@ class FlashAttentionVarlenSM90Op:
         self.has_hardware_op = _sm90_hardware_available()
         if self.has_hardware_op:
             logger.info(
-                "Successfully linked to RL-Kernel _C.flash_attention_varlen_sm90"
-                " (+ backward)."
+                "Successfully linked to RL-Kernel _C.flash_attention_varlen_sm90" " (+ backward)."
             )
         else:
             logger.warning(

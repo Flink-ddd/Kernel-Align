@@ -223,7 +223,15 @@ class TestFlashAttentionSM90Varlen:
         cu = _cu_seqlens(seqlens, device)
 
         out_packed, lse_packed = flash_attention_sm90_varlen(
-            q, k, v, cu, cu, max(seqlens), max(seqlens), causal=True, sm_scale=sm_scale,
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max(seqlens),
+            max(seqlens),
+            causal=True,
+            sm_scale=sm_scale,
             return_lse=True,
         )
 
@@ -375,12 +383,28 @@ class TestFlashAttentionSM90Varlen:
         v = torch.randn(total, heads, _HEAD_DIM, device=device, dtype=torch.float16, generator=gen)
 
         out, lse = flash_attention_sm90_varlen(
-            q, k, v, cu, cu, max(seqlens), max(seqlens), causal=True, sm_scale=sm_scale,
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max(seqlens),
+            max(seqlens),
+            causal=True,
+            sm_scale=sm_scale,
             return_lse=True,
         )
 
         out_triton, lse_triton = triton_flash_attention_varlen(
-            q, k, v, cu, cu, max(seqlens), max(seqlens), causal=True, sm_scale=sm_scale,
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max(seqlens),
+            max(seqlens),
+            causal=True,
+            sm_scale=sm_scale,
             return_lse=True,
         )
         # Should be the *same* Triton call under the hood (fp16 is unsupported
@@ -434,7 +458,15 @@ class TestFlashAttentionSM90Varlen:
         ).requires_grad_()
 
         out = flash_attention_sm90_varlen(
-            q, k, v, cu, cu, max(seqlens), max(seqlens), causal=True, sm_scale=sm_scale,
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max(seqlens),
+            max(seqlens),
+            causal=True,
+            sm_scale=sm_scale,
             return_lse=False,
         )
         assert isinstance(out, torch.Tensor)  # bare tensor, not a tuple
@@ -490,7 +522,15 @@ class TestFlashAttentionSM90Varlen:
         for rq, rk, rv in [(True, False, False), (False, True, True), (True, True, False)]:
             q, k, v = make(2, rq, rk, rv)
             out, _ = flash_attention_sm90_varlen(
-                q, k, v, cu, cu, max(seqlens), max(seqlens), causal=True, sm_scale=sm_scale,
+                q,
+                k,
+                v,
+                cu,
+                cu,
+                max(seqlens),
+                max(seqlens),
+                causal=True,
+                sm_scale=sm_scale,
                 return_lse=True,
             )
             out.backward(torch.randn_like(out))
@@ -520,7 +560,15 @@ class TestFlashAttentionSM90Varlen:
         ).requires_grad_()
 
         out, _ = flash_attention_sm90_varlen(
-            q, k, v, cu, cu, max(seqlens), max(seqlens), causal=True, sm_scale=sm_scale,
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max(seqlens),
+            max(seqlens),
+            causal=True,
+            sm_scale=sm_scale,
             return_lse=True,
         )
         do = torch.randn(2, total, _HEAD_DIM, device=device, dtype=torch.bfloat16).transpose(0, 1)
@@ -566,7 +614,15 @@ class TestFlashAttentionSM90Varlen:
         )
 
         out, lse = flash_attention_sm90_varlen(
-            q, k, v, cu, cu, max(seqlens), max(seqlens), causal=True, sm_scale=sm_scale,
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max(seqlens),
+            max(seqlens),
+            causal=True,
+            sm_scale=sm_scale,
             return_lse=True,
         )
         assert not lse.requires_grad
@@ -600,14 +656,26 @@ class TestFlashAttentionSM90Varlen:
         # Bad head_dim.
         q_bad_dim = torch.randn(total, 2, 64, device=device, dtype=torch.bfloat16)
         with pytest.raises(RuntimeError):
-            call(q_bad_dim, q_bad_dim, q_bad_dim, q_bad_dim, q_bad_dim,
-                 torch.randn(total, 2, device=device, dtype=torch.float32))
+            call(
+                q_bad_dim,
+                q_bad_dim,
+                q_bad_dim,
+                q_bad_dim,
+                q_bad_dim,
+                torch.randn(total, 2, device=device, dtype=torch.float32),
+            )
 
         # Bad dtype (fp16 instead of bf16).
         q_fp16 = torch.randn(total, 2, _HEAD_DIM, device=device, dtype=torch.float16)
         with pytest.raises(RuntimeError):
-            call(q_fp16, q_fp16, q_fp16, q_fp16, q_fp16,
-                 torch.randn(total, 2, device=device, dtype=torch.float32))
+            call(
+                q_fp16,
+                q_fp16,
+                q_fp16,
+                q_fp16,
+                q_fp16,
+                torch.randn(total, 2, device=device, dtype=torch.float32),
+            )
 
         # GQA mismatch.
         q_4h = torch.randn(total, 4, _HEAD_DIM, device=device, dtype=torch.bfloat16)
@@ -618,7 +686,9 @@ class TestFlashAttentionSM90Varlen:
             call(q_4h, q_ok, q_ok, do_4h, out_4h, lse_4h)
 
         # Non-contiguous.
-        q_noncontig = torch.randn(2, total, _HEAD_DIM, device=device, dtype=torch.bfloat16).transpose(0, 1)
+        q_noncontig = torch.randn(
+            2, total, _HEAD_DIM, device=device, dtype=torch.bfloat16
+        ).transpose(0, 1)
         with pytest.raises(RuntimeError):
             call(q_noncontig, q_ok, q_ok, do_ok, out_ok, lse_ok)
 
