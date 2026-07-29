@@ -121,14 +121,18 @@ def run_benchmark(args):
             continue
 
         try:
-            native_extra, native_ms = measure(lambda: native_logprob(hidden, lm_head_weight, target))
+            native_extra, native_ms = measure(
+                lambda: native_logprob(hidden, lm_head_weight, target)
+            )
             native_str, native_ms_str = f"{native_extra:.2f} GB", f"{native_ms:.2f} ms"
         except torch.cuda.OutOfMemoryError:
             native_str, native_ms_str = "OOM", "N/A"
         torch.cuda.empty_cache()
 
         try:
-            kernel_extra, kernel_ms = measure(lambda: linear_logp_op(hidden, lm_head_weight, target))
+            kernel_extra, kernel_ms = measure(
+                lambda: linear_logp_op(hidden, lm_head_weight, target)
+            )
             kernel_str, kernel_ms_str = f"{kernel_extra:.2f} GB", f"{kernel_ms:.2f} ms"
         except torch.cuda.OutOfMemoryError:
             kernel_str, kernel_ms_str = "OOM", "N/A"
@@ -144,12 +148,14 @@ def run_benchmark(args):
                 f"current alloc: {gb(torch.cuda.memory_allocated()):.1f} GB",
             ]
         )
-        del hidden, target
         torch.cuda.empty_cache()
 
     print("\n" + "=" * 100)
     print(f"{args.model} REAL MODEL LOGPROB BENCHMARK on {torch.cuda.get_device_name(0)}")
-    print(f"Weight VRAM: {weight_gb:.2f} GB | Total: {total_gb:.2f} GB | Headroom: {headroom_gb:.2f} GB")
+    print(
+        f"Weight VRAM: {weight_gb:.2f} GB | Total: {total_gb:.2f} GB | "
+        f"Headroom: {headroom_gb:.2f} GB"
+    )
     print(f"linear_logp backend: {type(linear_logp_op).__name__}")
     print("=" * 100)
     print(

@@ -11,10 +11,10 @@ INFO 07-19 04:44:54 [RL-Kernel]: Starting Sampling Benchmark on cuda
 INFO 07-19 04:44:54 [RL-Kernel]: Config: VocabSize=128256, TopK=50, TopP=0.9
 INFO 07-19 04:44:54 [RL-Kernel]: Warming up kernels...
 2026-07-19 04:44:54,376 - INFO - flashinfer.jit: Loading JIT ops: sampling
-/gpu02home/nkl5280/miniconda3/envs/mlaaware/lib/python3.10/site-packages/torch/utils/cpp_extension.py:2059: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+/gpu02home/nkl5280/miniconda3/envs/mlaaware/lib/python3.10/site-packages/torch/utils/cpp_extension.py:2059: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation.
 If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
   warnings.warn(
-/gpu02home/nkl5280/miniconda3/envs/mlaaware/lib/python3.10/site-packages/torch/utils/cpp_extension.py:2059: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+/gpu02home/nkl5280/miniconda3/envs/mlaaware/lib/python3.10/site-packages/torch/utils/cpp_extension.py:2059: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation.
 If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
   warnings.warn(
 2026-07-19 04:44:54,415 - INFO - flashinfer.jit: Finished loading JIT ops: sampling
@@ -38,4 +38,3 @@ RL-KERNEL SAMPLING BENCHMARK REPORT (TopK=50, TopP=0.9)
 │              256 │ 29.30 ms         │ 1.65 ms     │ 17.71x    │
 ╘══════════════════╧══════════════════╧═════════════╧═══════════╛
 ================================================================================
-
