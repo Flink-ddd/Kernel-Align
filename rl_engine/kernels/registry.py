@@ -30,6 +30,10 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     CUDA_FUSED_LOGP_SM90 = "rl_engine.kernels.ops.cuda.loss.logp.FusedLogpSM90Op"
     CUDA_FUSED_LOGP_GENERIC = "rl_engine.kernels.ops.cuda.loss.logp.FusedLogpGenericOp"
     CUDA_DETERMINISTIC_LOGP = "rl_engine.kernels.ops.cuda.loss.logp.DeterministicLogpCUDAOp"
+    # Deterministic standard-softmax attention (issue #147); not FlashAttention.
+    CUDA_DETERMINISTIC_ATTENTION = (
+        "rl_engine.kernels.ops.cuda.attention.deterministic_attn.DeterministicAttentionOp"
+    )
 
     # AMD ROCm optimized stack
     ROCM_AITER = "rl_engine.kernels.ops.rocm.aiter.AiterOp"
@@ -50,6 +54,12 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     TRITON_RATIO_KL = "rl_engine.kernels.ops.triton.loss.ratio_kl.TritonRatioKLOp"
     PYTORCH_RATIO_KL = "rl_engine.kernels.ops.pytorch.loss.ratio_kl.NativeRatioKLOp"
 
+    # Batch-invariant deterministic GEMM (WS1 #146)
+    CUDA_DET_GEMM = "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp"
+    TRITON_DET_GEMM = "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp"
+    # NON-deterministic reference (torch.matmul); reference/benchmark ONLY,
+    # intentionally excluded from det_gemm dispatch (cuBLAS breaks invariance).
+    PYTORCH_GEMM = "rl_engine.kernels.ops.pytorch.matmul.det_gemm.NativeGemmOp"
     # Batch-invariant selected-logprob (WS1 #148: locked reduction order)
     TRITON_BATCH_INVARIANT_LOGP = (
         "rl_engine.kernels.ops.triton.loss.batch_invariant_logp.TritonBatchInvariantLogpOp"
@@ -66,6 +76,8 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_NATIVE = "rl_engine.kernels.ops.pytorch.loss.logp.NativeLogpOp"
     PYTORCH_NATIVE_MATMUL = "rl_engine.kernels.ops.pytorch.linear.matmul.NativeMatmulOp"
     PYTORCH_NATIVE_ROPE = "rl_engine.kernels.ops.pytorch.rotary_embedding.rope.NativeRoPEOp"
+    TRITON_ROPE = "rl_engine.kernels.ops.triton.rotary_embedding.rope.TritonRoPEOp"
+    CUDA_ROPE_SM90 = "rl_engine.kernels.ops.cuda.rotary_embedding.rope.RoPESM90Op"
     PYTORCH_NATIVE_SILU = "rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSiLUOp"
     PYTORCH_NATIVE_SWIGLU = "rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSwiGLUOp"
 
@@ -171,11 +183,15 @@ class KernelRegistry:
                     OpBackend.PYTORCH_NATIVE,
                 ],
                 "attn": [OpBackend.FLASH_ATTN, OpBackend.TRITON_GENERIC, OpBackend.PYTORCH_ATTN],
-                "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
+                "attention": [
+                    OpBackend.CUDA_DETERMINISTIC_ATTENTION,
+                    OpBackend.PYTORCH_NATIVE_ATTENTION,
+                ],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
+                "det_gemm": [OpBackend.CUDA_DET_GEMM, OpBackend.TRITON_DET_GEMM],
                 "batch_invariant_logp": [
                     OpBackend.TRITON_BATCH_INVARIANT_LOGP,
                     OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
@@ -187,7 +203,11 @@ class KernelRegistry:
                 "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
                 # Default dispatch logic for new operators
                 "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
-                "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
+                "rope": [
+                    OpBackend.CUDA_ROPE_SM90,
+                    OpBackend.TRITON_ROPE,
+                    OpBackend.PYTORCH_NATIVE_ROPE,
+                ],
             },
             "rocm": {
                 "logp": [OpBackend.ROCM_AITER, OpBackend.TRITON_GENERIC, OpBackend.PYTORCH_NATIVE],
@@ -201,9 +221,10 @@ class KernelRegistry:
                 "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
-                "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
+                "rope": [OpBackend.TRITON_ROPE, OpBackend.PYTORCH_NATIVE_ROPE],
                 "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
+                "det_gemm": [OpBackend.TRITON_DET_GEMM],
                 "batch_invariant_logp": [
                     OpBackend.TRITON_BATCH_INVARIANT_LOGP,
                     OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,

@@ -5,7 +5,16 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from rl_engine.kernels.ops.cuda.norm.rmsnorm import rmsnorm_cuda
 from rl_engine.kernels.ops.pytorch.norm.rms_norm import NativeRMSNormOp
+from rl_engine.kernels.ops.triton.rmsnorm_triton import rmsnorm_triton
+
+try:
+    from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
+
+    _HAS_CUDA_RMSNORM = _EXT_AVAILABLE and hasattr(_C, "rmsnorm_forward")
+except ImportError:  # pragma: no cover - import can fail when the extension is not built.
+    _HAS_CUDA_RMSNORM = False
 
 # Qwen3-8B normalized dims this op must cover.
 _HIDDEN = 4096  # input / post-attention norm
@@ -24,6 +33,69 @@ def _manual_rms_norm(x, weight, *, eps=_EPS):
     x_f = x.float()
     var = x_f.pow(2).mean(dim=-1, keepdim=True)
     return x_f * torch.rsqrt(var + eps) * weight.float()
+
+
+def _dtype_tolerance(dtype):
+    if dtype is torch.float32:
+        return 2e-5, 2e-5
+    if dtype is torch.float16:
+        return 3e-3, 3e-3
+    if dtype is torch.bfloat16:
+        return 2e-2, 2e-2
+    raise ValueError(f"unsupported dtype: {dtype}")
+
+
+def _run_forward_backward(fn, x, weight, dy):
+    x_req = x.detach().clone().contiguous().requires_grad_(True)
+    w_req = weight.detach().clone().contiguous().requires_grad_(True)
+    y = fn(x_req, w_req)
+    y.backward(dy.detach().clone().contiguous())
+    return y.detach(), x_req.grad.detach(), w_req.grad.detach()
+
+
+def _native_rstd(x, eps=_EPS):
+    return torch.rsqrt(x.float().pow(2).mean(dim=-1) + eps)
+
+
+def _native_dw(x, dy, rstd, mask):
+    contrib = dy.float() * x.float() * rstd.float().unsqueeze(-1)
+    return contrib.masked_fill(~mask[:, None], 0.0).sum(dim=0)
+
+
+def _build_padded_layout(x_real, dy_real, total_rows, real_positions):
+    dtype = x_real.dtype
+    device = x_real.device
+    real_rows, hidden = x_real.shape
+
+    assert len(real_positions) == real_rows
+    assert total_rows >= real_rows
+
+    x_pad = torch.randn((total_rows, hidden), device=device, dtype=torch.float32).to(dtype)
+    dy_pad = torch.randn((total_rows, hidden), device=device, dtype=torch.float32).to(dtype)
+    mask = torch.zeros((total_rows,), device=device, dtype=torch.bool)
+
+    for src_t, dst_t in enumerate(real_positions):
+        x_pad[dst_t] = x_real[src_t]
+        dy_pad[dst_t] = dy_real[src_t]
+        mask[dst_t] = True
+
+    return x_pad, dy_pad, mask
+
+
+def _run_cuda_dw(x, dy, weight, mask, eps=_EPS):
+    x_req = x.detach().clone().contiguous().requires_grad_(True)
+    w_req = weight.detach().clone().contiguous().requires_grad_(True)
+    y = rmsnorm_cuda(x_req, w_req, eps=eps, mask=mask)
+    y.backward(dy.detach().clone().contiguous())
+    return w_req.grad.detach()
+
+
+requires_cuda_rmsnorm = pytest.mark.skipif(
+    not (torch.cuda.is_available() and _HAS_CUDA_RMSNORM),
+    reason="CUDA RMSNorm extension is not available",
+)
+
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 
 # 1. Primary correctness check vs PyTorch's own F.rms_norm. This is a *truly*
@@ -166,3 +238,184 @@ def test_registry_dispatches_rms_norm():
     op = kernel_registry.get_op("rms_norm")
     assert isinstance(op, NativeRMSNormOp)
     assert hasattr(op, "forward") and hasattr(op, "forward_fp32")
+
+
+@requires_cuda
+@pytest.mark.parametrize("impl", ["triton", "cuda"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("rows, hidden", [(1, 128), (8, 768), (32, 2048), (128, _HIDDEN)])
+def test_cuda_triton_rms_norm_matches_native_forward_and_backward(impl, dtype, rows, hidden):
+    if impl == "cuda" and not _HAS_CUDA_RMSNORM:
+        pytest.skip("CUDA RMSNorm extension is not available")
+
+    torch.manual_seed(0)
+    native = NativeRMSNormOp()
+    x_cpu = torch.randn(rows, hidden, device="cpu", dtype=torch.float32)
+    w_cpu = torch.randn(hidden, device="cpu", dtype=torch.float32)
+    dy_cpu = torch.randn(rows, hidden, device="cpu", dtype=torch.float32)
+
+    x_ref = x_cpu.to(dtype).float().detach().requires_grad_(True)
+    w_ref = w_cpu.to(dtype).float().detach().requires_grad_(True)
+    dy_ref = dy_cpu.to(dtype).float()
+    y_ref = native.forward_fp32(x_ref, w_ref, eps=_EPS)
+    y_ref.backward(dy_ref)
+
+    x_gpu = x_cpu.to(device="cuda", dtype=dtype).detach().requires_grad_(True)
+    w_gpu = w_cpu.to(device="cuda", dtype=dtype).detach().requires_grad_(True)
+    dy_gpu = dy_cpu.to(device="cuda", dtype=dtype)
+    fn = rmsnorm_cuda if impl == "cuda" else rmsnorm_triton
+    y_gpu = fn(x_gpu, w_gpu, eps=_EPS)
+    y_gpu.backward(dy_gpu)
+
+    assert w_gpu.grad.dtype == w_gpu.dtype
+
+    atol, rtol = _dtype_tolerance(dtype)
+    dw_scale = max(1.0, rows**0.5 / 4.0)
+    torch.testing.assert_close(y_gpu.detach().cpu().float(), y_ref.detach(), atol=atol, rtol=rtol)
+    torch.testing.assert_close(x_gpu.grad.detach().cpu().float(), x_ref.grad, atol=atol, rtol=rtol)
+    torch.testing.assert_close(
+        w_gpu.grad.detach().cpu().float(),
+        w_ref.grad,
+        atol=atol * dw_scale,
+        rtol=rtol * dw_scale,
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("impl", ["triton", "cuda"])
+def test_cuda_triton_rms_norm_deterministic_repeat(impl):
+    if impl == "cuda" and not _HAS_CUDA_RMSNORM:
+        pytest.skip("CUDA RMSNorm extension is not available")
+
+    torch.manual_seed(0)
+    fn = rmsnorm_cuda if impl == "cuda" else rmsnorm_triton
+    x = torch.randn(128, _HIDDEN, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(_HIDDEN, device="cuda", dtype=torch.bfloat16)
+    dy = torch.randn(128, _HIDDEN, device="cuda", dtype=torch.bfloat16)
+
+    y0, dx0, dw0 = _run_forward_backward(fn, x, weight, dy)
+    torch.cuda.synchronize()
+    for _ in range(10):
+        y, dx, dw = _run_forward_backward(fn, x, weight, dy)
+        torch.cuda.synchronize()
+        assert torch.equal(y0, y)
+        assert torch.equal(dx0, dx)
+        assert torch.equal(dw0, dw)
+
+
+@requires_cuda
+def test_triton_rms_norm_long_context_dw_reduction():
+    torch.manual_seed(2)
+    rows, hidden = 1025, _HEAD_DIM
+    dtype = torch.bfloat16
+    native = NativeRMSNormOp()
+    x_cpu = torch.randn(rows, hidden, device="cpu", dtype=torch.float32)
+    w_cpu = torch.randn(hidden, device="cpu", dtype=torch.float32)
+    dy_cpu = torch.randn(rows, hidden, device="cpu", dtype=torch.float32)
+
+    x_ref = x_cpu.to(dtype).float().detach().requires_grad_(True)
+    w_ref = w_cpu.to(dtype).float().detach().requires_grad_(True)
+    y_ref = native.forward_fp32(x_ref, w_ref, eps=_EPS)
+    y_ref.backward(dy_cpu.to(dtype).float())
+
+    x_gpu = x_cpu.to(device="cuda", dtype=dtype).detach().requires_grad_(True)
+    w_gpu = w_cpu.to(device="cuda", dtype=dtype).detach().requires_grad_(True)
+    dy_gpu = dy_cpu.to(device="cuda", dtype=dtype)
+    y_gpu = rmsnorm_triton(x_gpu, w_gpu, eps=_EPS)
+    y_gpu.backward(dy_gpu)
+
+    assert w_gpu.grad.dtype == w_gpu.dtype
+    torch.testing.assert_close(y_gpu.detach().cpu().float(), y_ref.detach(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        w_gpu.grad.detach().cpu().float(),
+        w_ref.grad,
+        atol=8e-2,
+        rtol=8e-2,
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("impl", ["triton", "cuda"])
+@pytest.mark.parametrize("hidden", [63, 64, 65, 127, 128, 129, 255, 256, 257, _HIDDEN])
+def test_cuda_triton_rms_norm_forward_dx_layout_invariance(impl, hidden):
+    if impl == "cuda" and not _HAS_CUDA_RMSNORM:
+        pytest.skip("CUDA RMSNorm extension is not available")
+
+    torch.manual_seed(1)
+    fn = rmsnorm_cuda if impl == "cuda" else rmsnorm_triton
+    dtype = torch.bfloat16
+    target_x = torch.randn(1, hidden, device="cuda", dtype=dtype)
+    target_dy = torch.randn(1, hidden, device="cuda", dtype=dtype)
+    weight = torch.randn(hidden, device="cuda", dtype=dtype)
+
+    y_single, dx_single, _ = _run_forward_backward(fn, target_x, weight, target_dy)
+    for total_rows, row_id in [(16, 0), (16, 7), (64, 63)]:
+        x = torch.randn(total_rows, hidden, device="cuda", dtype=dtype)
+        dy = torch.randn(total_rows, hidden, device="cuda", dtype=dtype)
+        x[row_id : row_id + 1] = target_x
+        dy[row_id : row_id + 1] = target_dy
+        y, dx, _ = _run_forward_backward(fn, x, weight, dy)
+        assert torch.equal(y_single[0], y[row_id])
+        assert torch.equal(dx_single[0], dx[row_id])
+
+    valid_rows = 4
+    positions = [1, 5, 9, 14]
+    valid_x = torch.randn(valid_rows, hidden, device="cuda", dtype=dtype)
+    valid_dy = torch.randn(valid_rows, hidden, device="cuda", dtype=dtype)
+    x_a = torch.randn(16, hidden, device="cuda", dtype=dtype)
+    dy_a = torch.randn(16, hidden, device="cuda", dtype=dtype)
+    x_a[:valid_rows] = valid_x
+    dy_a[:valid_rows] = valid_dy
+    y_a, dx_a, _ = _run_forward_backward(fn, x_a, weight, dy_a)
+
+    x_b = torch.randn(16, hidden, device="cuda", dtype=dtype)
+    dy_b = torch.randn(16, hidden, device="cuda", dtype=dtype)
+    for idx, pos in enumerate(positions):
+        x_b[pos] = valid_x[idx]
+        dy_b[pos] = valid_dy[idx]
+    y_b, dx_b, _ = _run_forward_backward(fn, x_b, weight, dy_b)
+
+    for idx, pos in enumerate(positions):
+        assert torch.equal(y_a[idx], y_b[pos])
+        assert torch.equal(dx_a[idx], dx_b[pos])
+
+
+@requires_cuda_rmsnorm
+def test_cuda_rms_norm_masked_dw_layout_invariance():
+    torch.manual_seed(0)
+    rows, hidden = 128, _HIDDEN
+    dtype = torch.bfloat16
+    x_real = torch.randn((rows, hidden), device="cuda", dtype=torch.float32).to(dtype)
+    dy_real = torch.randn((rows, hidden), device="cuda", dtype=torch.float32).to(dtype)
+    weight = torch.randn((hidden,), device="cuda", dtype=torch.float32).to(dtype)
+
+    x1 = x_real.clone()
+    dy1 = dy_real.clone()
+    mask1 = torch.ones((rows,), device="cuda", dtype=torch.bool)
+    x2, dy2, mask2 = _build_padded_layout(
+        x_real=x_real,
+        dy_real=dy_real,
+        total_rows=2 * rows,
+        real_positions=[2 * i + 1 for i in range(rows)],
+    )
+    x3, dy3, mask3 = _build_padded_layout(
+        x_real=x_real,
+        dy_real=dy_real,
+        total_rows=2 * rows + 1,
+        real_positions=[2 * i for i in range(rows)],
+    )
+
+    dw1 = _run_cuda_dw(x1, dy1, weight, mask1)
+    dw2 = _run_cuda_dw(x2, dy2, weight, mask2)
+    dw3 = _run_cuda_dw(x3, dy3, weight, mask3)
+
+    ref_dw1 = _native_dw(x1, dy1, _native_rstd(x1), mask1)
+    ref_dw2 = _native_dw(x2, dy2, _native_rstd(x2), mask2)
+    ref_dw3 = _native_dw(x3, dy3, _native_rstd(x3), mask3)
+
+    atol, rtol = _dtype_tolerance(dtype)
+    torch.testing.assert_close(dw1.float(), dw2.float(), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(dw2.float(), dw3.float(), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(dw1.float(), ref_dw1.float(), atol=atol, rtol=rtol)
+    torch.testing.assert_close(dw2.float(), ref_dw2.float(), atol=atol, rtol=rtol)
+    torch.testing.assert_close(dw3.float(), ref_dw3.float(), atol=atol, rtol=rtol)

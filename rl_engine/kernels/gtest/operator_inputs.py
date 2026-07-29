@@ -27,6 +27,7 @@ def make_operator_inputs(
     builders = {
         "rms_norm": _make_rms_norm_inputs,
         "matmul": _make_matmul_inputs,
+        "det_gemm": _make_det_gemm_inputs,
         "attention": _make_attention_inputs,
         "logp": _make_logp_inputs,
         "linear_logp": _make_linear_logp_inputs,
@@ -50,6 +51,7 @@ def operator_shape_name(op_name: str, args: argparse.Namespace) -> str:
     names = {
         "rms_norm": f"{batch}x{seq}x{_normalized_dim(args)}",
         "matmul": f"{batch}x{seq}x{_matmul_k(args)}x{_matmul_n(args)}",
+        "det_gemm": f"{batch}x{seq}x{_matmul_k(args)}x{_matmul_n(args)}",
         "attention": f"{batch}x{DEFAULT_N_HEADS}x{seq}x{DEFAULT_HEAD_DIM}",
         "logp": f"{batch}x{seq}x{vocab}",
         "linear_logp": f"{batch}x{seq}x{_normalized_dim(args)}x{vocab}",
@@ -91,22 +93,50 @@ def _make_matmul_inputs(
     }
 
 
+def _make_det_gemm_inputs(
+    args: argparse.Namespace, dtype: torch.dtype, device: torch.device
+) -> dict[str, Any]:
+    batch, seq = _batch_seq(args)
+    k_dim = _matmul_k(args)
+    n_dim = _matmul_n(args)
+    m_dim = batch * seq
+    return {
+        "a": _floating_tensor((m_dim, k_dim), args, dtype, device, offset=0),
+        "b": _floating_tensor((k_dim, n_dim), args, dtype, device, offset=1),
+    }
+
+
 def _make_attention_inputs(
     args: argparse.Namespace, dtype: torch.dtype, device: torch.device
 ) -> dict[str, Any]:
     batch, seq = _batch_seq(args)
-    return {
-        "q": _floating_tensor(
-            (batch, DEFAULT_N_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 0
-        ),
-        "k": _floating_tensor(
-            (batch, DEFAULT_N_KV_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 1
-        ),
-        "v": _floating_tensor(
-            (batch, DEFAULT_N_KV_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 2
-        ),
-        "causal": True,
+    skv = _arg_int(args, "skv", seq)
+    n_heads = _arg_int(args, "n_heads", DEFAULT_N_HEADS)
+    n_kv_heads = _arg_int(args, "n_kv_heads", DEFAULT_N_KV_HEADS)
+    causal = bool(_arg_int(args, "causal", 1))
+    use_padding = bool(_arg_int(args, "use_padding", 0))
+    scale_mode = _arg_str(args, "scale_mode", "default")
+
+    inputs: dict[str, Any] = {
+        "q": _floating_tensor((batch, n_heads, seq, DEFAULT_HEAD_DIM), args, dtype, device, 0),
+        "k": _floating_tensor((batch, n_kv_heads, skv, DEFAULT_HEAD_DIM), args, dtype, device, 1),
+        "v": _floating_tensor((batch, n_kv_heads, skv, DEFAULT_HEAD_DIM), args, dtype, device, 2),
+        "causal": causal,
     }
+
+    if scale_mode == "zero":
+        inputs["scale"] = 0.0
+    elif scale_mode == "custom":
+        inputs["scale"] = 0.05
+    # else: scale_mode == "default" -> no scale kwarg (uses 1/sqrt(D))
+
+    if use_padding:
+        generator = _generator(args, device, offset=42)
+        key_padding_mask = torch.rand((batch, skv), generator=generator, device=device) > 0.3
+        key_padding_mask[:, 0] = True
+        inputs["key_padding_mask"] = key_padding_mask
+
+    return inputs
 
 
 def _make_logp_inputs(

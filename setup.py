@@ -79,12 +79,23 @@ def get_extensions():
             "csrc/fused_logp_kernel.cu",
             "csrc/deterministic_logp_kernel.cu",
             "csrc/cuda/attention/prefix_shared_attention.cu",
+            "csrc/cuda/gemm/det_gemm_kernel.cu",
+            "csrc/cuda/rmsnorm.cu",
+            "csrc/cuda/attention/deterministic_attention.cu",
         ]
 
         cc_major, cc_minor = torch.cuda.get_device_capability()
+        enable_sm90 = os.environ.get("KERNEL_ALIGN_FORCE_SM90") == "1"
         nvcc_flags = ["-O3", "-Xfatbin", "-compress-all"]
         if envs.env_flag(envs.KERNEL_ALIGN_USE_FAST_MATH):
             nvcc_flags.append("--use_fast_math")
+        if not enable_sm90:
+            # SM90 build emits 90a below; mixing plain compute_90 breaks TMA ptxas.
+            nvcc_flags.append(
+                f"-gencode=arch=compute_{cc_major}{cc_minor},code=sm_{cc_major}{cc_minor}"
+            )
+        nvcc_flags.append("--expt-relaxed-constexpr")
+        nvcc_flags.append("--expt-extended-lambda")
         nvcc_flags.extend(
             _cuda_define_from_env(
                 "FUSED_LOGP_TWOPASS_BLOCK_SIZE",
@@ -139,6 +150,7 @@ def get_extensions():
         sm90_srcs = [
             "csrc/cuda/fused_logp_sm90.cu",
             "csrc/cuda/fused_linear_logp_sm90.cu",  # TMA + WGMMA fused linear log-prob
+            "csrc/cuda/rope_sm90.cu",  # RoPE rotate-half apply, gated to SM90 build
         ]
         enable_sm90 = envs.env_flag(envs.KERNEL_ALIGN_FORCE_SM90)
         present_sm90 = [s for s in sm90_srcs if os.path.exists(s)]
@@ -149,10 +161,25 @@ def get_extensions():
             cxx_flags.append("-DKERNEL_ALIGN_WITH_SM90")
             extra_link_args.append("-lcuda")
 
+        # det_gemm SM90 (mma.sync + TMA) path — independent of the fused_logp
+        # SM90 sources, which currently fail ptxas on CUDA 12.4 (shared::cta in
+        # the shared tma_utils.cuh). det_gemm uses its own gemm/det_gemm_tma.cuh.
+        enable_det_gemm_sm90 = os.environ.get("KERNEL_ALIGN_DET_GEMM_SM90") == "1"
+        if enable_det_gemm_sm90:
+            tma_arch = f"{cc_major}{cc_minor}a"
+            arch_flag = f"-gencode=arch=compute_{tma_arch},code=sm_{tma_arch}"
+            if arch_flag not in nvcc_flags:
+                nvcc_flags.append(arch_flag)
+            if "-lcuda" not in extra_link_args:
+                extra_link_args.append("-lcuda")
+            nvcc_flags.append("-DRL_KERNEL_ENABLE_SM90")
+            cxx_flags.append("-DRL_KERNEL_ENABLE_SM90")
+
         extensions.append(
             CUDAExtension(
                 name="rl_engine._C",
                 sources=cuda_sources,
+                include_dirs=[],
                 extra_compile_args={
                     "cxx": cxx_flags,
                     "nvcc": nvcc_flags,
