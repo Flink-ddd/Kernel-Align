@@ -155,7 +155,7 @@ def test_embedding_gradient_flows_to_weight():
 # Registry dispatch -- "embedding" resolves to NativeEmbeddingOp (matches the
 # PYTORCH_NATIVE_EMBEDDING entry + the per-platform priority-map additions).
 def test_registry_dispatches_native_embedding_op():
-    assert isinstance(kernel_registry.get_op("embedding"), NativeEmbeddingOp)
+    assert isinstance(kernel_registry.get_op("embedding", device="cpu"), NativeEmbeddingOp)
 
 
 # --------------------------------------------------------------------------- #

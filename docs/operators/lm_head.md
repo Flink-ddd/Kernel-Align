@@ -1,18 +1,20 @@
 # LM Head
 
-The lm_head operator projects hidden states back to vocabulary logits — the final
-layer of the Qwen3/Llama stack. It is a **WS1 ground-truth reference** (issue #108):
-a pure-PyTorch definition of the "correct answer" that downstream fused CUDA/Triton
+The lm_head operator projects hidden states back to vocabulary logits, the final
+layer of the Qwen3/Llama stack. It is a WS1 ground-truth reference for issue #108:
+a pure-PyTorch definition of the correct answer that downstream fused CUDA/Triton
 kernels are validated against.
 
-- **LM Head** (`NativeLMHeadOp`): `out = hidden @ weight.t() (+ bias)`.
+- **LM Head** (`NativeLMHeadOp`): mathematically `out = hidden @ weight.t() (+ bias)`.
+  The native reference implements this as row-wise fixed-K GEMV projections so the
+  reference path is batch-invariant.
 
 For Qwen3-8B the weight is the output projection `[vocab=151936, hidden=4096]` in the
-HF `nn.Linear` `[out, in]` convention, so it is transposed internally. It is
-**independent** from the embedding table (`tie_word_embeddings=false`) — the two
-weights are not shared — and Qwen3 has **no bias** (`bias=None`).
+HF `nn.Linear` `[out, in]` convention. It is independent from the embedding table
+(`tie_word_embeddings=false`), and Qwen3 has no bias (`bias=None`).
 
 ## Entry Point
+
 ```python
 from rl_engine.kernels.registry import kernel_registry
 
@@ -24,80 +26,73 @@ logits = lm_head(hidden, weight, bias=b)  # optional [vocab] bias
 
 The op exposes the WS1 dual-path contract:
 
-- `forward(...)` — projects in the input dtype, returns the input dtype (Axis-B accuracy
-  candidate / dtype-behavior path).
-- `forward_fp32(...)` — upcasts to fp32, accumulates in fp32, returns fp32 (the
-  ground-truth golden path). The matmul runs with autocast disabled and CUDA TF32
-  turned off, so it stays a true fp32 reference regardless of the caller's ambient
-  precision context (the global `allow_tf32` flag is saved and restored around it).
+- `forward(...)` projects in the input dtype and returns the input dtype.
+- `forward_fp32(...)` upcasts to fp32, accumulates in fp32, and returns fp32. The
+  fixed-K projection runs with autocast disabled and CUDA TF32 turned off, so it
+  stays a true fp32 reference regardless of the caller's ambient precision context.
 
 ## Backends
 
 | Backend | Wrapper | Native symbol | Status |
 | --- | --- | --- | --- |
 | PyTorch fallback | `NativeLMHeadOp` | None | fp32 ground-truth reference; CPU and any GPU. |
-| CUDA / ROCm / Triton | — | — | Planned: downstream fused kernels validate against this reference. |
+| CUDA SM90 (H200/Hopper) | `SM90LMHeadOp` | `_C.lm_head_sm90_forward` | Single-card batch-invariant forward backend; no Split-K; bf16 backward uses deterministic GEMM. |
+| ROCm / Triton | N/A | N/A | Falls back to the PyTorch native reference. |
 
 ## Tensor Contract
 
 | Argument | Shape | Dtype | Requirements |
 | --- | --- | --- | --- |
-| `hidden` | `[B, S, hidden]` (any leading dims) | float (fp16/bf16/fp32) | Hidden states (Qwen3-8B `hidden=4096`). |
-| `weight` | `[vocab, hidden]` | float | Output projection in HF `[out, in]` layout; transposed internally. Qwen3-8B `[151936, 4096]`. |
-| `bias` | `[vocab]` or `None` | float | Optional; Qwen3 has none (`None`). |
-| output | `hidden.shape[:-1] + (vocab,)` | `forward`: hidden dtype · `forward_fp32`: float32 | Logits. |
+| `hidden` | `[B, S, hidden]` or any leading dims | fp16/bf16/fp32 | Hidden states. |
+| `weight` | `[vocab, hidden]` | fp16/bf16/fp32 | Output projection in HF `[out, in]` layout. |
+| `bias` | `[vocab]` or `None` | fp16/bf16/fp32 | Optional; Qwen3 uses `None`. |
+| output | `hidden.shape[:-1] + (vocab,)` | `forward`: hidden dtype; `forward_fp32`: fp32 | Logits. |
 
-Output dtype follows `hidden`. Pure function — no randomness, no in-place mutation,
-device/dtype follow the inputs.
-
-> **Difference from the bare `matmul` op**: lm_head takes the weight in HF `[out, in]`
-> layout and transposes it internally (`weight.t()`); the `matmul` op computes a bare
-> `a @ b` with no transpose. Do not use them interchangeably.
-
-## Dispatch Behavior
-
-`kernel_registry.get_op("lm_head")` resolves through the `OpBackend` priority map. On
-`cuda` / `rocm` / `cpu` the only registered backend today is the PyTorch native op
-(`PYTORCH_NATIVE_LM_HEAD`), so every device dispatches to the fp32 reference. When fused
-kernels land, they are prepended to the priority list and the native op becomes the fallback.
+Output dtype follows `hidden`. The op is pure: no randomness and no in-place mutation.
 
 ## Accuracy
 
 Reference semantics (`forward_fp32`):
 
 ```python
-out = hidden.float() @ weight.float().t()
+flat_hidden = hidden.float().reshape(-1, hidden.size(-1))
+if flat_hidden.size(0) == 0:
+    flat_out = flat_hidden @ weight.float().t()
+else:
+    rows = [torch.mv(weight.float(), row) for row in flat_hidden]
+    flat_out = torch.stack(rows)
+out = flat_out.reshape(*hidden.shape[:-1], weight.size(0))
 if bias is not None:
     out = out + bias.float()
 ```
 
 - **Ground truth**: `forward_fp32` accumulates in and returns fp32, with autocast and
-  CUDA TF32 disabled so it is a true fp32 reference even if the caller has TF32 or
-  autocast enabled.
+  CUDA TF32 disabled.
 - **Dtype path**: `forward` runs the projection in the input dtype. Because this is a
-  reduction over `hidden`, low-precision accumulation **drifts** from the fp32 reference
-  (unlike the lossless embedding gather). Unlike `forward_fp32`, this path intentionally
-  follows the ambient precision context (it is the dtype-behavior path): with an fp32
-  input it is bitwise-equal to the ground truth **when ambient TF32/autocast is off**, but
-  on a TF32-enabled GPU it tracks real hardware behavior and may drift. bf16/fp16 are
-  always checked with a tolerance.
-- **Axis-B — accuracy tolerance**: measured as max absolute error relative to the output
-  peak magnitude. On a SMALL load point with the real `hidden=4096` reduction length,
-  bf16 drifts ~0.3–0.4% of peak and fp16 ~0.05%. Elementwise `rtol` is not used: many
-  logits are near zero while the accumulated error tracks the reduction length, not the
-  output value.
-- **Axis-A — batch invariance**: a row's logits are independent of the rest of the batch,
-  so the output is bitwise-identical regardless of batch size or padding (`torch.equal`,
-  `atol=0`) — **provided the reduction order is fixed**. Multi-threaded CPU GEMM splits
-  the `hidden` reduction across threads by the `M = batch*seq` dimension, which silently
-  breaks bitwise batch invariance for large `hidden`; the tests pin a single thread to fix
-  the order. On GPU, cuBLAS likewise splits K by `M`, so a bitwise batch-invariant GEMM is
-  a downstream kernel concern, not a free property of `torch.matmul`.
+  reduction over `hidden`, low-precision accumulation drifts from the fp32 reference and
+  is checked with tolerance.
+- **Axis-A batch invariance**: a row's logits are bitwise-identical regardless of batch
+  size or padding. The native reference enforces this by flattening leading dimensions
+  and projecting each row through the same GEMV-shaped K reduction instead of relying on
+  batched GEMM, whose reduction tree can change with `M = batch * seq`.
 
-## Performance Notes
+## Dispatch Behavior
 
-Reference operator — no fused kernel or benchmark yet. Downstream fused kernels carry their
-own benchmarks and are measured against this reference for correctness.
+`kernel_registry.get_op("lm_head")` resolves through the `OpBackend` priority map. On
+CPU, ROCm, and CUDA devices without the SM90 extension, dispatch uses the PyTorch native op
+(`PYTORCH_NATIVE_LM_HEAD`). On H200/Hopper-class builds that expose `_C.lm_head_sm90_forward`,
+the CUDA SM90 single-card batch-invariant backend is prepended. Its forward path assigns
+one CTA to each output logit and performs the full K reduction without Split-K.
+
+The one-CTA-per-logit design is a deliberate invariance tradeoff: CTAs re-read the
+hidden row and vocab weight row independently, so large-vocab projections are expected
+to be memory-bandwidth bound compared with a tiled GEMM. This path exists to preserve a
+fixed hidden-dimension accumulation order for the WS1/H200 correctness gate.
+
+For bf16 H200 training, `SM90LMHeadOp.backward` routes `dhidden` through
+`_C.det_gemm_da` and `dweight` through `_C.det_gemm_db` (`hidden.T @ dlogits`, transposed
+back to the HF `[vocab, hidden]` layout). The wrapper fails fast if those deterministic
+GEMM symbols are missing instead of silently falling back to cuBLAS for bf16 gradients.
 
 ## Tests
 
@@ -105,23 +100,15 @@ own benchmarks and are measured against this reference for correctness.
 python -m pytest tests/test_lm_head.py -v
 ```
 
-Covers: fp32 correctness vs naive matmul (bitwise, with ambient TF32 pinned off),
-`forward_fp32` precision-context safety (true fp32 under ambient autocast + restores the
-global TF32 flag on CPU; numerically beats a TF32 matmul on GPU), bf16/fp16 dtype-path
-accuracy (relative-to-peak tolerance, with `bias`), output shape, bias semantics, Axis-A
-batch invariance (slice + padding, single-thread reduction, all dtypes), input purity,
-gradient flow to `hidden`/`weight` (closed-form check), registry dispatch, and a GPU-only
-smoke test at the real Qwen3-8B dims (`vocab=151936, hidden=4096`) that skips when CUDA or
-GPU memory is unavailable.
+Covers fp32 correctness vs the fixed-K reference, precision-context safety, bf16/fp16
+accuracy, output shape, bias semantics, Axis-A batch invariance, input purity, gradient
+flow to `hidden` and `weight`, registry dispatch, and a GPU-only smoke test at the real
+Qwen3-8B dimensions.
 
 ## Implementation Files
 
 - `rl_engine/kernels/ops/pytorch/linear/lm_head.py`
+- `rl_engine/kernels/ops/cuda/linear/lm_head.py`
+- `csrc/cuda/embedding_lm_head_sm90.cu`
 - `rl_engine/kernels/registry.py`
 - `tests/test_lm_head.py`
-
-## Known Limitations
-
-- PyTorch fallback only; no fused CUDA/Triton backend yet (downstream work).
-- Axis-A bitwise batch invariance holds only with a fixed reduction order (single-thread on
-  CPU); a batch-invariant GEMM on GPU is a downstream concern.

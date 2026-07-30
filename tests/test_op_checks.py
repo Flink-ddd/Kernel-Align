@@ -3,9 +3,18 @@
 
 from __future__ import annotations
 
+import argparse
+
 import torch
 
 from rl_engine.kernels.gtest.op_checks import CandidateSpec, OperatorCase, run_operator_suite
+from rl_engine.kernels.gtest.operator_specs import (
+    make_candidate,
+    make_operator_case,
+    operator_names,
+)
+from rl_engine.kernels.ops.pytorch.linear.embedding import NativeEmbeddingOp
+from rl_engine.kernels.ops.pytorch.linear.lm_head import NativeLMHeadOp
 from rl_engine.kernels.ops.pytorch.loss.logp import NativeLogpOp
 
 
@@ -34,6 +43,54 @@ def _logp_backward_case(name: str, *, seed: int = 0) -> OperatorCase:
     )
 
 
+def _embedding_case(name: str, *, seed: int = 0) -> OperatorCase:
+    generator = torch.Generator().manual_seed(seed)
+    token_ids = torch.tensor([[1, 7, 3], [7, 0, 5]], dtype=torch.long)
+    weight = torch.randn(11, 5, generator=generator)
+    return OperatorCase(
+        name=name,
+        op_class="elementwise",
+        dtype=torch.float32,
+        inputs={"token_ids": token_ids, "weight": weight},
+        gold_fn=NativeEmbeddingOp().forward_fp32,
+        grad_input_names=("weight",),
+    )
+
+
+def _lm_head_case(name: str, *, seed: int = 0) -> OperatorCase:
+    generator = torch.Generator().manual_seed(seed)
+    hidden = torch.randn(2, 3, 5, generator=generator)
+    weight = torch.randn(13, 5, generator=generator)
+    return OperatorCase(
+        name=name,
+        op_class="reduction",
+        dtype=torch.float32,
+        inputs={"hidden": hidden, "weight": weight, "bias": None},
+        gold_fn=NativeLMHeadOp().forward_fp32,
+        grad_input_names=("hidden", "weight"),
+    )
+
+
+def _spec_args(op: str) -> argparse.Namespace:
+    return argparse.Namespace(
+        op=op,
+        candidate="native",
+        arch_key=None,
+        batch=1,
+        seq=2,
+        vocab=17,
+        seed=123,
+        input_mode="constant",
+        constant_value=0.5,
+        token_value=3,
+        normalized_dim=8,
+        k_dim=8,
+        n_dim=8,
+        theta=1.0e6,
+        eps=1.0e-6,
+    )
+
+
 def test_logp_native_candidate_suite_passes():
     report = run_operator_suite(
         "logp",
@@ -49,6 +106,48 @@ def test_logp_native_candidate_suite_passes():
     assert report.pass_rate == 1.0
     assert report.candidates[0].passed_outputs == 3
     assert all(case.passed for case in report.candidates[0].cases)
+
+
+def test_embedding_native_candidate_suite_passes_issue_108_helper():
+    report = run_operator_suite(
+        "embedding",
+        candidates=[
+            CandidateSpec(name="native-embedding", backend="pytorch", fn=NativeEmbeddingOp())
+        ],
+        cases=[_embedding_case("fp32", seed=10)],
+        check_grad=True,
+    )
+
+    assert report.passed
+    assert report.candidates[0].cases[0].outputs[1].message == "gradient:weight"
+
+
+def test_lm_head_native_candidate_suite_passes_issue_108_helper():
+    report = run_operator_suite(
+        "lm_head",
+        candidates=[CandidateSpec(name="native-lm-head", backend="pytorch", fn=NativeLMHeadOp())],
+        cases=[_lm_head_case("fp32", seed=11)],
+        check_grad=True,
+    )
+
+    assert report.passed
+    messages = [output.message for output in report.candidates[0].cases[0].outputs]
+    assert "gradient:hidden" in messages
+    assert "gradient:weight" in messages
+
+
+def test_issue151_ops_pass_shared_issue_108_spec_path():
+    assert {"embedding", "lm_head"}.issubset(operator_names())
+
+    for op_name in ("embedding", "lm_head"):
+        args = _spec_args(op_name)
+        report = run_operator_suite(
+            op_name,
+            candidates=[make_candidate(args)],
+            cases=[make_operator_case(args, torch.float32, torch.device("cpu"))],
+            check_grad=True,
+        )
+        assert report.passed
 
 
 def test_suite_reports_failure_for_bad_candidate():
