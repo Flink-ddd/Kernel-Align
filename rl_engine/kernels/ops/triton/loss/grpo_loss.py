@@ -8,10 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
+from rl_engine.kernels.ops.triton.loss.ratio_clip_aggregate import TritonRatioClipAggregateOp
 from rl_engine.kernels.ops.triton.loss.ratio_kl import TritonRatioKLOp
-from rl_engine.kernels.ops.triton.loss.ratio_clip_aggregate import (
-    TritonRatioClipAggregateOp,
-)
 
 
 def _next_pow2(x: int) -> int:

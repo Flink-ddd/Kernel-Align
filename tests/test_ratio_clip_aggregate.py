@@ -4,12 +4,8 @@
 import pytest
 import torch
 
-from rl_engine.kernels.ops.pytorch.loss.ratio_clip_aggregate import (
-    NativeRatioClipAggregateOp,
-)
-from rl_engine.kernels.ops.triton.loss.ratio_clip_aggregate import (
-    TritonRatioClipAggregateOp,
-)
+from rl_engine.kernels.ops.pytorch.loss.ratio_clip_aggregate import NativeRatioClipAggregateOp
+from rl_engine.kernels.ops.triton.loss.ratio_clip_aggregate import TritonRatioClipAggregateOp
 
 try:
     import triton  # noqa: F401

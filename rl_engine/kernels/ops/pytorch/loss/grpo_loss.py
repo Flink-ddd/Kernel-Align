@@ -7,10 +7,8 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
+from rl_engine.kernels.ops.pytorch.loss.ratio_clip_aggregate import NativeRatioClipAggregateOp
 from rl_engine.kernels.ops.pytorch.loss.ratio_kl import NativeRatioKLOp
-from rl_engine.kernels.ops.pytorch.loss.ratio_clip_aggregate import (
-    NativeRatioClipAggregateOp,
-)
 
 
 class NativeGRPOLossOp:

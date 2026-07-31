@@ -11,9 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-from rl_engine.kernels.ops.pytorch.loss.ratio_clip_aggregate import (
-    _validate_ratio_clip_inputs,
-)
+from rl_engine.kernels.ops.pytorch.loss.ratio_clip_aggregate import _validate_ratio_clip_inputs
 
 _BLOCK = 256
 _NUM_WARPS = 4

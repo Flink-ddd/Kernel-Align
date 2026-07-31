@@ -14,12 +14,8 @@ import argparse
 import torch
 from tabulate import tabulate
 
-from rl_engine.kernels.ops.pytorch.loss.ratio_clip_aggregate import (
-    NativeRatioClipAggregateOp,
-)
-from rl_engine.kernels.ops.triton.loss.ratio_clip_aggregate import (
-    TritonRatioClipAggregateOp,
-)
+from rl_engine.kernels.ops.pytorch.loss.ratio_clip_aggregate import NativeRatioClipAggregateOp
+from rl_engine.kernels.ops.triton.loss.ratio_clip_aggregate import TritonRatioClipAggregateOp
 
 DEFAULT_CONFIGS = [
     (32, 256),
