@@ -97,7 +97,7 @@ not duplicated.
 - Correctness and gradients: `tests/test_ratio_clip_aggregate.py`
 - GRPO integration: `tests/test_grpo_loss.py`
 - Performance and peak memory:
-  `python benchmarks/benchmark_ratio_clip_aggregate.py`
+  `python benchmarks/benchmark_ratio_clip_aggregate.py --warmup 100 --iterations 500`
 
 The native backend is the semantic reference. FP16/BF16 comparisons use FP32
 accumulation and dtype-appropriate tolerances.
@@ -109,10 +109,10 @@ iterations.
 
 | Shape | PyTorch fwd | Triton fwd | Speedup | PyTorch fwd+bwd | Triton fwd+bwd | Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 32 × 256 | 0.143 ms | 0.036 ms | 4.02× | 0.416 ms | 0.178 ms | 2.34× |
-| 128 × 1024 | 0.153 ms | 0.050 ms | 3.04× | 0.429 ms | 0.201 ms | 2.14× |
-| 256 × 4096 | 0.154 ms | 0.050 ms | 3.05× | 0.432 ms | 0.200 ms | 2.16× |
-| 256 × 16384 | 0.317 ms | 0.051 ms | 6.28× | 0.664 ms | 0.200 ms | 3.32× |
+| 32 × 256 | 0.144 ms | 0.038 ms | 3.78× | 0.409 ms | 0.192 ms | 2.13× |
+| 128 × 1024 | 0.152 ms | 0.051 ms | 2.98× | 0.423 ms | 0.208 ms | 2.03× |
+| 256 × 4096 | 0.154 ms | 0.051 ms | 3.00× | 0.425 ms | 0.211 ms | 2.01× |
+| 256 × 16384 | 0.318 ms | 0.051 ms | 6.25× | 0.664 ms | 0.211 ms | 3.15× |
 
 Peak forward intermediates at 4.19M tokens fall from 64.0 MiB to 0.3 MiB.
 Results are workload- and device-specific; rerun the benchmark for deployment

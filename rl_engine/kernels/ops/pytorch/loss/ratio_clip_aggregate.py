@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 import torch
 
 
-def _validate_ratio_clip_inputs(
+def validate_ratio_clip_inputs(
     ratio: torch.Tensor,
     advantages: torch.Tensor,
     mask: torch.Tensor,
@@ -96,7 +96,7 @@ class NativeRatioClipAggregateOp:
         penalty_terms: Optional[torch.Tensor] = None,
         penalty_coef: float = 0.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        per_token_advantages = _validate_ratio_clip_inputs(
+        per_token_advantages = validate_ratio_clip_inputs(
             ratio, advantages, mask, penalty_terms, clip_low, clip_high
         )
         bool_mask = mask.to(torch.bool)

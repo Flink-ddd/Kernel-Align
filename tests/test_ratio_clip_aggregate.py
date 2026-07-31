@@ -5,13 +5,15 @@ import pytest
 import torch
 
 from rl_engine.kernels.ops.pytorch.loss.ratio_clip_aggregate import NativeRatioClipAggregateOp
-from rl_engine.kernels.ops.triton.loss.ratio_clip_aggregate import TritonRatioClipAggregateOp
 
 try:
-    import triton  # noqa: F401
+    from rl_engine.kernels.ops.triton.loss.ratio_clip_aggregate import (
+        TritonRatioClipAggregateOp,
+    )
 
     _HAS_TRITON = True
 except ImportError:  # pragma: no cover
+    TritonRatioClipAggregateOp = None
     _HAS_TRITON = False
 
 requires_triton_cuda = pytest.mark.skipif(
@@ -213,6 +215,20 @@ def test_triton_backward_supports_policy_output_without_materialized_grads():
 
 
 @requires_triton_cuda
+def test_triton_output_mutation_does_not_invalidate_backward_state():
+    ratio = torch.tensor([[0.7, 0.95, 1.3]], device="cuda", requires_grad=True)
+    advantages = torch.tensor([[2.0, -1.0, 0.5]], device="cuda")
+    mask = torch.tensor([[True, True, True]], device="cuda")
+
+    total, policy, _, _ = TritonRatioClipAggregateOp()(ratio, advantages, mask)
+    with torch.no_grad():
+        total.add_(1.0)
+    policy.backward()
+
+    assert ratio.grad is not None
+
+
+@requires_triton_cuda
 def test_triton_backward_preserves_mixed_input_gradient_dtypes():
     ratio = torch.tensor([[0.7, 0.95, 1.3]], device="cuda", requires_grad=True)
     penalty = torch.tensor(
@@ -295,6 +311,7 @@ def test_triton_empty_mask_returns_finite_zeros_and_zero_gradients():
 def test_triton_matches_native_at_single_and_staged_reduction_boundary(elements):
     generator = torch.Generator(device="cuda").manual_seed(elements)
     ratio = torch.exp(torch.randn(elements, generator=generator, device="cuda") * 0.3)
+    ratio.requires_grad_(True)
     advantages = torch.randn(elements, generator=generator, device="cuda")
     mask = torch.rand(elements, generator=generator, device="cuda") > 0.1
     penalty = torch.rand(elements, generator=generator, device="cuda")
@@ -310,6 +327,8 @@ def test_triton_matches_native_at_single_and_staged_reduction_boundary(elements)
 
     for got, want in zip(actual, expected, strict=True):
         torch.testing.assert_close(got, want, atol=2e-5, rtol=2e-5)
+    assert not expected[3].requires_grad
+    assert not actual[3].requires_grad
 
 
 @requires_triton_cuda
@@ -333,6 +352,7 @@ def test_registry_dispatches_ratio_clip_aggregate():
 
     op = kernel_registry.get_op("ratio_clip_aggregate")
     if _HAS_TRITON and torch.cuda.is_available():
+        assert TritonRatioClipAggregateOp is not None
         assert isinstance(op, TritonRatioClipAggregateOp)
     else:
         assert isinstance(op, NativeRatioClipAggregateOp)

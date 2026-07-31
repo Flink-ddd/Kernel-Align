@@ -13,7 +13,7 @@ operators: the per-token `policy_ratio` and `kl_penalty` come from the fused
 ratio/KL kernel (logits → ratio/KL via online softmax), and the group-normalized
 advantages feed the fused clip/reduction stage:
 
-```
+```text
 logits --[ratio_kl]--> (ratio, kl) --[ratio_clip_aggregate + group adv]--> loss
 ```
 

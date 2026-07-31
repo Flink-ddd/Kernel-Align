@@ -11,10 +11,11 @@ import torch
 import triton
 import triton.language as tl
 
-from rl_engine.kernels.ops.pytorch.loss.ratio_clip_aggregate import _validate_ratio_clip_inputs
+from rl_engine.kernels.ops.pytorch.loss.ratio_clip_aggregate import validate_ratio_clip_inputs
 
 _BLOCK = 256
 _NUM_WARPS = 4
+_SINGLE_PASS_TILE = 8192
 _SINGLE_PASS_MAX = 65536
 _SINGLE_PASS_NUM_WARPS = 8
 _MAX_PARTIALS = 65536
@@ -26,7 +27,11 @@ def _ratio_clip_single_pass_kernel(
     advantage_ptr,
     mask_ptr,
     penalty_ptr,
-    outputs_ptr,
+    total_ptr,
+    policy_ptr,
+    mean_penalty_ptr,
+    clip_fraction_ptr,
+    active_count_ptr,
     n_elements,
     tokens_per_sequence,
     clip_low,
@@ -35,44 +40,53 @@ def _ratio_clip_single_pass_kernel(
     HAS_PENALTY: tl.constexpr,
     ADV_PER_TOKEN: tl.constexpr,
     BLOCK: tl.constexpr,
+    NUM_TILES: tl.constexpr,
 ):
-    offsets = tl.arange(0, BLOCK)
-    in_bounds = offsets < n_elements
-    active = in_bounds & (tl.load(mask_ptr + offsets, mask=in_bounds, other=0) != 0)
-
-    ratio = tl.load(ratio_ptr + offsets, mask=in_bounds, other=1.0).to(tl.float32)
-    if ADV_PER_TOKEN:
-        advantage = tl.load(advantage_ptr + offsets, mask=in_bounds, other=0.0).to(tl.float32)
-    else:
-        sequence_ids = offsets // tokens_per_sequence
-        advantage = tl.load(advantage_ptr + sequence_ids, mask=in_bounds, other=0.0).to(tl.float32)
-
     lower = 1.0 - clip_low
     upper = 1.0 + clip_high
-    clipped_ratio = tl.minimum(tl.maximum(ratio, lower), upper)
-    policy_term = -tl.minimum(ratio * advantage, clipped_ratio * advantage)
-    policy_sum = tl.sum(tl.where(active, policy_term, 0.0), axis=0)
+    lane_offsets = tl.arange(0, BLOCK)
+    policy_sum = 0.0
+    penalty_sum = 0.0
+    clipped_sum = 0.0
+    active_count = 0.0
 
-    if HAS_PENALTY:
-        penalty = tl.load(penalty_ptr + offsets, mask=in_bounds, other=0.0).to(tl.float32)
-        penalty_sum = tl.sum(tl.where(active, penalty, 0.0), axis=0)
-    else:
-        penalty_sum = 0.0
+    for tile_id in range(NUM_TILES):
+        offsets = tile_id * BLOCK + lane_offsets
+        in_bounds = offsets < n_elements
+        active = in_bounds & (tl.load(mask_ptr + offsets, mask=in_bounds, other=0) != 0)
 
-    clipped_sum = tl.sum(
-        (((ratio < lower) | (ratio > upper)) & active).to(tl.float32),
-        axis=0,
-    )
-    active_count = tl.sum(active.to(tl.float32), axis=0)
+        ratio = tl.load(ratio_ptr + offsets, mask=in_bounds, other=1.0).to(tl.float32)
+        if ADV_PER_TOKEN:
+            advantage = tl.load(advantage_ptr + offsets, mask=in_bounds, other=0.0).to(tl.float32)
+        else:
+            sequence_ids = offsets // tokens_per_sequence
+            advantage = tl.load(advantage_ptr + sequence_ids, mask=in_bounds, other=0.0).to(
+                tl.float32
+            )
+
+        clipped_ratio = tl.minimum(tl.maximum(ratio, lower), upper)
+        policy_term = -tl.minimum(ratio * advantage, clipped_ratio * advantage)
+        policy_sum += tl.sum(tl.where(active, policy_term, 0.0), axis=0)
+
+        if HAS_PENALTY:
+            penalty = tl.load(penalty_ptr + offsets, mask=in_bounds, other=0.0).to(tl.float32)
+            penalty_sum += tl.sum(tl.where(active, penalty, 0.0), axis=0)
+
+        clipped_sum += tl.sum(
+            (((ratio < lower) | (ratio > upper)) & active).to(tl.float32),
+            axis=0,
+        )
+        active_count += tl.sum(active.to(tl.float32), axis=0)
+
     denominator = tl.maximum(active_count, 1.0)
     policy_loss = policy_sum / denominator
     mean_penalty = penalty_sum / denominator
 
-    tl.store(outputs_ptr, policy_loss + penalty_coef * mean_penalty)
-    tl.store(outputs_ptr + 1, policy_loss)
-    tl.store(outputs_ptr + 2, mean_penalty)
-    tl.store(outputs_ptr + 3, clipped_sum / denominator)
-    tl.store(outputs_ptr + 4, active_count)
+    tl.store(total_ptr, policy_loss + penalty_coef * mean_penalty)
+    tl.store(policy_ptr, policy_loss)
+    tl.store(mean_penalty_ptr, mean_penalty)
+    tl.store(clip_fraction_ptr, clipped_sum / denominator)
+    tl.store(active_count_ptr, active_count)
 
 
 @triton.jit
@@ -129,7 +143,11 @@ def _ratio_clip_partial_kernel(
 @triton.jit
 def _ratio_clip_finalize_kernel(
     partials_ptr,
-    outputs_ptr,
+    total_ptr,
+    policy_ptr,
+    mean_penalty_ptr,
+    clip_fraction_ptr,
+    active_count_ptr,
     partial_count,
     penalty_coef,
     REDUCE_BLOCK: tl.constexpr,
@@ -153,11 +171,11 @@ def _ratio_clip_finalize_kernel(
     policy_loss = policy_sum / denominator
     mean_penalty = penalty_sum / denominator
 
-    tl.store(outputs_ptr, policy_loss + penalty_coef * mean_penalty)
-    tl.store(outputs_ptr + 1, policy_loss)
-    tl.store(outputs_ptr + 2, mean_penalty)
-    tl.store(outputs_ptr + 3, clipped_sum / denominator)
-    tl.store(outputs_ptr + 4, active_count)
+    tl.store(total_ptr, policy_loss + penalty_coef * mean_penalty)
+    tl.store(policy_ptr, policy_loss)
+    tl.store(mean_penalty_ptr, mean_penalty)
+    tl.store(clip_fraction_ptr, clipped_sum / denominator)
+    tl.store(active_count_ptr, active_count)
 
 
 @triton.jit
@@ -165,7 +183,7 @@ def _ratio_clip_backward_kernel(
     ratio_ptr,
     advantage_ptr,
     mask_ptr,
-    outputs_ptr,
+    active_count_ptr,
     grad_total_ptr,
     grad_policy_ptr,
     grad_mean_penalty_ptr,
@@ -204,7 +222,7 @@ def _ratio_clip_backward_kernel(
     clipped_derivative = tl.where((ratio >= lower) & (ratio <= upper), advantage, 0.0)
     policy_derivative = -tl.where(use_unclipped, advantage, clipped_derivative)
 
-    active_count = tl.load(outputs_ptr + 4)
+    active_count = tl.load(active_count_ptr)
     denominator = tl.maximum(active_count, 1.0)
     if HAS_GRAD_TOTAL:
         grad_total = tl.load(grad_total_ptr)
@@ -242,13 +260,9 @@ class _RatioClipAggregateFunction(torch.autograd.Function):
     ):
         if not ratio.is_cuda:
             raise RuntimeError("TritonRatioClipAggregateOp requires CUDA/ROCm tensors.")
-        per_token_advantages = _validate_ratio_clip_inputs(
+        per_token_advantages = validate_ratio_clip_inputs(
             ratio, advantages, mask, penalty_terms, clip_low, clip_high
         )
-        if not ratio.is_floating_point() or not advantages.is_floating_point():
-            raise TypeError("ratio and advantages must be floating-point tensors.")
-        if penalty_terms is not None and not penalty_terms.is_floating_point():
-            raise TypeError("penalty_terms must be a floating-point tensor.")
 
         ratio_flat = ratio.contiguous().view(-1)
         advantages_flat = advantages.contiguous().view(-1)
@@ -259,17 +273,36 @@ class _RatioClipAggregateFunction(torch.autograd.Function):
         if n_elements == 0:
             raise ValueError("ratio must contain at least one element.")
 
-        outputs = torch.empty(5, device=ratio.device, dtype=torch.float32)
+        needs_backward = ratio.requires_grad or (
+            penalty_terms is not None and penalty_terms.requires_grad
+        )
+        if needs_backward:
+            # Independent storages prevent an in-place update to one public
+            # scalar from invalidating a sibling saved for backward.
+            total = torch.empty((), device=ratio.device, dtype=torch.float32)
+            policy = torch.empty((), device=ratio.device, dtype=torch.float32)
+            mean_penalty = torch.empty((), device=ratio.device, dtype=torch.float32)
+            clip_fraction = torch.empty((), device=ratio.device, dtype=torch.float32)
+            active_count = torch.empty((), device=ratio.device, dtype=torch.float32)
+        else:
+            # Avoid five allocator calls on the latency-sensitive inference path.
+            packed_outputs = torch.empty(5, device=ratio.device, dtype=torch.float32)
+            total, policy, mean_penalty, clip_fraction, active_count = packed_outputs.unbind()
         tokens_per_sequence = ratio.shape[-1] if ratio.ndim == 2 else n_elements
 
         if n_elements <= _SINGLE_PASS_MAX:
-            single_block = triton.next_power_of_2(n_elements)
+            single_block = min(_SINGLE_PASS_TILE, triton.next_power_of_2(n_elements))
+            num_tiles = triton.cdiv(n_elements, single_block)
             _ratio_clip_single_pass_kernel[(1,)](
                 ratio_flat,
                 advantages_flat,
                 mask_flat,
                 penalty_flat,
-                outputs,
+                total,
+                policy,
+                mean_penalty,
+                clip_fraction,
+                active_count,
                 n_elements,
                 tokens_per_sequence,
                 float(clip_low),
@@ -278,6 +311,7 @@ class _RatioClipAggregateFunction(torch.autograd.Function):
                 HAS_PENALTY=has_penalty,
                 ADV_PER_TOKEN=per_token_advantages,
                 BLOCK=single_block,
+                NUM_TILES=num_tiles,
                 num_warps=_SINGLE_PASS_NUM_WARPS,
             )
         else:
@@ -307,14 +341,18 @@ class _RatioClipAggregateFunction(torch.autograd.Function):
             reduce_block = triton.next_power_of_2(partial_count)
             _ratio_clip_finalize_kernel[(1,)](
                 partials,
-                outputs,
+                total,
+                policy,
+                mean_penalty,
+                clip_fraction,
+                active_count,
                 partial_count,
                 float(penalty_coef),
                 REDUCE_BLOCK=reduce_block,
                 num_warps=min(8, max(1, reduce_block // 128)),
             )
 
-        ctx.save_for_backward(ratio_flat, advantages_flat, mask_flat, outputs)
+        ctx.save_for_backward(ratio_flat, advantages_flat, mask_flat, active_count)
         ctx.has_penalty = has_penalty
         ctx.per_token_advantages = per_token_advantages
         ctx.tokens_per_sequence = tokens_per_sequence
@@ -326,33 +364,35 @@ class _RatioClipAggregateFunction(torch.autograd.Function):
         ctx.penalty_shape = tuple(penalty_terms.shape) if penalty_terms is not None else None
         ctx.penalty_dtype = penalty_terms.dtype if penalty_terms is not None else None
 
-        total, policy, mean_penalty, clip_fraction = outputs[:4].unbind()
         ctx.set_materialize_grads(False)
         ctx.mark_non_differentiable(clip_fraction)
         return total, policy, mean_penalty, clip_fraction
 
     @staticmethod
     def backward(ctx, grad_total, grad_policy, grad_mean_penalty, grad_clip_fraction):
-        ratio, advantages, mask, outputs = ctx.saved_tensors
+        ratio, advantages, mask, active_count = ctx.saved_tensors
         grad_ratio = torch.empty_like(ratio)
+        empty_placeholder = ratio.new_empty(0)
         grad_penalty = (
             torch.empty(ctx.penalty_shape, device=ratio.device, dtype=ctx.penalty_dtype).view(-1)
             if ctx.has_penalty
-            else ratio
+            else empty_placeholder
         )
 
         has_grad_total = grad_total is not None
         has_grad_policy = grad_policy is not None
         has_grad_mean_penalty = grad_mean_penalty is not None
-        grad_total = outputs if grad_total is None else grad_total.contiguous()
-        grad_policy = outputs if grad_policy is None else grad_policy.contiguous()
-        grad_mean_penalty = outputs if grad_mean_penalty is None else grad_mean_penalty.contiguous()
+        grad_total = empty_placeholder if grad_total is None else grad_total.contiguous()
+        grad_policy = empty_placeholder if grad_policy is None else grad_policy.contiguous()
+        grad_mean_penalty = (
+            empty_placeholder if grad_mean_penalty is None else grad_mean_penalty.contiguous()
+        )
         grid = (triton.cdiv(ratio.numel(), _BLOCK),)
         _ratio_clip_backward_kernel[grid](
             ratio,
             advantages,
             mask,
-            outputs,
+            active_count,
             grad_total,
             grad_policy,
             grad_mean_penalty,
