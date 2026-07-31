@@ -7,9 +7,7 @@ import torch
 from rl_engine.kernels.ops.pytorch.loss.ratio_clip_aggregate import NativeRatioClipAggregateOp
 
 try:
-    from rl_engine.kernels.ops.triton.loss.ratio_clip_aggregate import (
-        TritonRatioClipAggregateOp,
-    )
+    from rl_engine.kernels.ops.triton.loss.ratio_clip_aggregate import TritonRatioClipAggregateOp
 
     _HAS_TRITON = True
 except ImportError:  # pragma: no cover
