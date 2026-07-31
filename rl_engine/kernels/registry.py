@@ -55,6 +55,13 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     # Fused policy-ratio + KL-penalty front-end (PPO/GRPO), logits -> (ratio, kl)
     TRITON_RATIO_KL = "rl_engine.kernels.ops.triton.loss.ratio_kl.TritonRatioKLOp"
     PYTORCH_RATIO_KL = "rl_engine.kernels.ops.pytorch.loss.ratio_kl.NativeRatioKLOp"
+    # Fused PPO/GRPO ratio clipping + masked loss/penalty aggregation
+    TRITON_RATIO_CLIP_AGGREGATE = (
+        "rl_engine.kernels.ops.triton.loss.ratio_clip_aggregate.TritonRatioClipAggregateOp"
+    )
+    PYTORCH_RATIO_CLIP_AGGREGATE = (
+        "rl_engine.kernels.ops.pytorch.loss.ratio_clip_aggregate.NativeRatioClipAggregateOp"
+    )
 
     # Variable-length packing (pack-and-pad), [B,S,...] -> [Total_Active,...]
     PYTORCH_PACK = "rl_engine.kernels.ops.pytorch.packing.pack.NativePackOp"
@@ -204,6 +211,10 @@ class KernelRegistry:
                     OpBackend.PYTORCH_LINEAR_LOGP,
                 ],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
+                "ratio_clip_aggregate": [
+                    OpBackend.TRITON_RATIO_CLIP_AGGREGATE,
+                    OpBackend.PYTORCH_RATIO_CLIP_AGGREGATE,
+                ],
                 "pack": [OpBackend.PYTORCH_PACK],
                 "det_gemm": [OpBackend.CUDA_DET_GEMM, OpBackend.TRITON_DET_GEMM],
                 "batch_invariant_logp": [
@@ -242,6 +253,10 @@ class KernelRegistry:
                 "rope": [OpBackend.TRITON_ROPE, OpBackend.PYTORCH_NATIVE_ROPE],
                 "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
+                "ratio_clip_aggregate": [
+                    OpBackend.TRITON_RATIO_CLIP_AGGREGATE,
+                    OpBackend.PYTORCH_RATIO_CLIP_AGGREGATE,
+                ],
                 "pack": [OpBackend.PYTORCH_PACK],
                 "det_gemm": [OpBackend.TRITON_DET_GEMM],
                 "batch_invariant_logp": [
@@ -266,6 +281,7 @@ class KernelRegistry:
                 "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
                 "linear_logp": [OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.PYTORCH_RATIO_KL],
+                "ratio_clip_aggregate": [OpBackend.PYTORCH_RATIO_CLIP_AGGREGATE],
                 "pack": [OpBackend.PYTORCH_PACK],
                 "batch_invariant_logp": [OpBackend.PYTORCH_BATCH_INVARIANT_LOGP],
                 "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
