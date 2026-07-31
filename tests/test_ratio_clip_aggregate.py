@@ -10,7 +10,9 @@ try:
     from rl_engine.kernels.ops.triton.loss.ratio_clip_aggregate import TritonRatioClipAggregateOp
 
     _HAS_TRITON = True
-except ImportError:  # pragma: no cover
+except ModuleNotFoundError as exc:  # pragma: no cover
+    if exc.name not in {"triton", "triton.language"}:
+        raise
     TritonRatioClipAggregateOp = None
     _HAS_TRITON = False
 
