@@ -11,9 +11,11 @@ occurs, so GPU CI cannot pass while silently running only native fallbacks:
     succeeds (``dlopen`` does not check arch) but the first kernel launch raises
     ``cudaErrorNoKernelImageForDevice`` once the stream is synchronized.
 
-Uses only ``fused_logp`` - the op registered unconditionally in ``csrc/ops.cpp`` -
-so it does not require ``KERNEL_ALIGN_FORCE_SM90=1`` / a Hopper build.
+The baseline launch uses ``fused_logp``, which is registered unconditionally. When an SM90
+activation build is requested on Hopper, the smoke check additionally requires and launches
+the fused SwiGLU forward symbol.
 """
+import os
 import sys
 
 import torch
@@ -69,6 +71,35 @@ def main() -> int:
             f"[smoke] FATAL: unexpected fused_logp output shape {tuple(out.shape)}", file=sys.stderr
         )
         return 1
+
+    activation_requested = (
+        os.environ.get("KERNEL_ALIGN_FORCE_SM90") == "1"
+        or os.environ.get("KERNEL_ALIGN_ACTIVATION_SM90") == "1"
+    )
+    if cc[0] == 9 and activation_requested:
+        activation_symbols = ("swiglu_forward_sm90",)
+        missing = [symbol for symbol in activation_symbols if not hasattr(_C, symbol)]
+        if missing:
+            print(
+                "[smoke] FATAL: SM90 activation build is missing symbols: " + ", ".join(missing),
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            gate = torch.randn(3, 17, device="cuda", dtype=torch.bfloat16)
+            up = torch.randn_like(gate)
+            activation_out = _C.swiglu_forward_sm90(gate, up)
+            torch.cuda.synchronize()
+        except Exception as exc:
+            print(
+                "[smoke] FATAL: SM90 SwiGLU forward launch failed: " f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        expected_shape = tuple(gate.shape)
+        if tuple(activation_out.shape) != expected_shape:
+            print("[smoke] FATAL: SM90 SwiGLU returned an unexpected shape", file=sys.stderr)
+            return 1
 
     print(f"[smoke] OK: rl_engine._C built and fused_logp ran on sm_{cc[0]}{cc[1]}.")
     return 0

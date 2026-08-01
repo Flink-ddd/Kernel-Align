@@ -122,6 +122,17 @@ OP_SPECS = {
         },
         grad_input_names=("a", "b"),
     ),
+    "swiglu": OperatorSpec(
+        name="swiglu",
+        op_class="elementwise",
+        gold_path="rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSwiGLUOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSwiGLUOp",
+            "cuda-sm90": "rl_engine.kernels.ops.cuda.activation.swiglu.SwiGLUSM90Op",
+            "triton": "rl_engine.kernels.ops.triton.activation.swiglu.TritonSwiGLUOp",
+        },
+    ),
     "rope": OperatorSpec(
         name="rope",
         op_class="elementwise",

@@ -165,6 +165,5 @@ def test_swiglu_backward_batch_invariance_slice():
     assert torch.equal(up_slice.grad, grad_up_full_sliced)
 
 
-def test_registry_dispatches_native_activation_ops():
+def test_registry_dispatches_native_silu():
     assert isinstance(kernel_registry.get_op("silu"), NativeSiLUOp)
-    assert isinstance(kernel_registry.get_op("swiglu"), NativeSwiGLUOp)

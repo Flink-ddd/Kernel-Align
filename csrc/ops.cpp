@@ -73,6 +73,11 @@ torch::Tensor lm_head_sm90_forward_fp32(torch::Tensor hidden,
                                         torch::optional<torch::Tensor> bias);
 #endif
 
+#if defined(__CUDACC__) || defined(RL_KERNEL_ENABLE_ACTIVATION_SM90)
+// Qwen3 fused activation boundary for SM90; BF16 I/O with FP32 element math.
+torch::Tensor swiglu_forward_sm90(torch::Tensor gate, torch::Tensor up);
+#endif
+
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
 torch::Tensor fused_logp_forward_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor output);
 torch::Tensor fused_logp_forward_fp32(torch::Tensor logits, torch::Tensor token_ids);
@@ -309,6 +314,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Single-card SM90 batch-invariant LM-head forward");
     m.def("lm_head_sm90_forward_fp32", &lm_head_sm90_forward_fp32,
           "Single-card SM90 batch-invariant LM-head forward with fp32 output");
+#endif
+
+#if defined(__CUDACC__) || defined(RL_KERNEL_ENABLE_ACTIVATION_SM90)
+    // Qwen3 fused SiLU + Multiply activation boundary, SM90.
+    m.def("swiglu_forward_sm90", &swiglu_forward_sm90,
+          "Qwen3 fused SiLU(gate) * up forward (BF16 I/O, FP32 element math), SM90");
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
