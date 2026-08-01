@@ -1,13 +1,12 @@
 # SiLU / SwiGLU Activation
 
-The activation operators are the element-wise core of the Qwen3/Llama gated MLP. They are
-**WS1 ground-truth references** (issue #108): pure-PyTorch, fp32-accumulating definitions of
-the "correct answer" that downstream fused CUDA/Triton MLP kernels are validated against.
+The activation operators are the element-wise core of the Qwen3/Llama gated MLP. The
+pure-PyTorch implementations are **WS1 ground-truth references** (issue #108):
+fp32-accumulating definitions of the correct answer for optimized backends.
 
 - **SiLU** (`NativeSiLUOp`): `silu(x) = x * sigmoid(x)` — the `hidden_act="silu"` gate.
-- **SwiGLU** (`NativeSwiGLUOp`): `swiglu(gate, up) = silu(gate) * up` — the gated MLP middle
-  stage. `gate` / `up` are the `gate_proj` / `up_proj` outputs (already at the intermediate
-  width); the following `down_proj` is a plain Matmul and is **not** part of this operator.
+- **SwiGLU** (`NativeSwiGLUOp`): `swiglu(gate, up) = silu(gate) * up` — the gated MLP
+  middle stage. The following `down_proj` is a separate operator.
 
 ```text
 hidden --gate_proj--> gate --\
@@ -15,57 +14,65 @@ hidden --gate_proj--> gate --\
 hidden --up_proj----> up ----/
 ```
 
-## Entry Point
+## Entry point
+
 ```python
 from rl_engine.kernels.registry import kernel_registry
 
 silu = kernel_registry.get_op("silu")
 swiglu = kernel_registry.get_op("swiglu")
 
-# SiLU: single element-wise activation
-y = silu(x)                       # [..., N]  ->  [..., N]
-
-# SwiGLU: gated activation (gate and up must share shape)
-h = swiglu(gate, up)              # [..., I], [..., I]  ->  [..., I]
+y = silu(x)
+h = swiglu(gate, up)
 ```
 
-Both ops expose the WS1 dual-path contract:
+The native reference ops expose the WS1 dual-path contract:
 
-- `forward(...)` — computes in fp32, casts back to the input dtype (Axis-B accuracy
-  candidate / dtype-behavior path).
-- `forward_fp32(...)` — computes and returns fp32 (the ground-truth golden path).
+- `forward(...)` computes in fp32 and casts back to the input dtype.
+- `forward_fp32(...)` computes and returns fp32 ground truth.
+
+## Fused Qwen3 forward contract
+
+The optimized operator is the local activation boundary in issue #239's Qwen3-8B TP=2
+pipeline:
+
+```text
+gate_local [M_local, 6144] --\
+                                  SiLU(gate) * up --> hidden_local [M_local, 6144]
+up_local   [M_local, 6144] --/
+```
+
+| Tensor | Shape | Dtype | Layout/device |
+| --- | --- | --- | --- |
+| `gate_local` | `[..., I/TP]` | BF16 | CUDA; arbitrary input strides accepted |
+| `up_local` | same as `gate_local` | BF16 | same shape and device as `gate_local` |
+| `hidden_local` | same as inputs | BF16 | contiguous CUDA output |
+
+Both optimized backends compute every coordinate in FP32 and round once when storing BF16:
+
+```text
+sigmoid_gate = 1 / (1 + exp(-float(gate)))
+hidden = float(gate) * sigmoid_gate * float(up)
+```
+
+The fused activation has no collective, reduction, random state, in-place mutation, or Down
+GEMM. It runs on the caller's current stream and returns a tensor on the inputs' device.
 
 ## Backends
 
 | Backend | Wrapper | Native symbol | Status |
 | --- | --- | --- | --- |
-| PyTorch fallback | `NativeSiLUOp` / `NativeSwiGLUOp` | None | fp32 ground-truth reference; CPU and any GPU. |
-| CUDA / ROCm / Triton | — | — | Planned: downstream fused MLP kernels validate against this reference. |
+| CUDA SM90 | `SwiGLUSM90Op` | `swiglu_forward_sm90` | BF16x2 fixed mapping with scalar odd tail |
+| Triton | `TritonSwiGLUOp` | None | Fixed block size; no autotune |
+| PyTorch | `NativeSiLUOp` / `NativeSwiGLUOp` | None | FP32 ground-truth reference and fallback |
 
-## Tensor Contract
+On CUDA, registry dispatch prefers the compiled CUDA implementation on SM90, then Triton,
+then the PyTorch reference. Constructing a backend class directly provides explicit backend
+selection for validation.
 
-| Argument | Shape | Dtype | Requirements |
-| --- | --- | --- | --- |
-| `x` (SiLU) | `[..., N]` | float (fp16/bf16/fp32) | Any shape; last dim arbitrary (Qwen3-8B `I=12288`). |
-| `gate` (SwiGLU) | `[..., I]` | float | `gate_proj` output. |
-| `up` (SwiGLU) | `[..., I]` | float | `up_proj` output; **must share `gate`'s shape**. |
-| output | same as input | `forward`: input dtype · `forward_fp32`: float32 | Same shape as input. |
+## Accuracy and invariance
 
-Element-wise and shape-agnostic: the Qwen3-8B intermediate dim `I=12288` is just one valid
-last-dim size, not a hard requirement. Pure functions — no randomness, no in-place
-mutation, device/dtype follow the inputs.
-
-## Dispatch Behavior
-
-`kernel_registry.get_op("silu" | "swiglu")` resolves through the `OpBackend` priority map.
-On `cuda` / `rocm` / `cpu` the only registered backend today is the PyTorch native op
-(`PYTORCH_NATIVE_SILU` / `PYTORCH_NATIVE_SWIGLU`), so every device dispatches to the
-fp32 reference. When fused kernels land, they are prepended to the priority list and the
-native op becomes the fallback.
-
-## Accuracy
-
-Reference semantics (`forward_fp32`, fp32 accumulation):
+Reference semantics are:
 
 ```python
 # SiLU
@@ -76,37 +83,47 @@ gate_f = gate.float()
 out = gate_f * torch.sigmoid(gate_f) * up.float()
 ```
 
-- **Ground truth**: `forward_fp32` always accumulates in and returns fp32.
-- **Dtype path**: `forward` runs the same fp32 math, then casts back to the input dtype;
-  it is bitwise-equal to `forward_fp32(x).to(dtype)`.
-- **Axis A — batch invariance**: element-wise and row-independent, so a row's output is
-  bitwise-identical regardless of batch size or padding (`torch.equal`, `atol=0`).
-- **Axis B — tolerance**: as `elementwise` ops, low-precision tolerance follows the
-  `elementwise` row of the WS1 numerical contract.
+- The native dtype path is bitwise equal to its fp32 formula cast to the input dtype.
+- Every backend must be bitwise batch/chunk/padding invariant: a coordinate is independent
+  of unrelated rows.
+- Optimized output is currently checked against the independent fp32 oracle with issue
+  #108's elementwise threshold.
+- CUDA/Triton cross-backend bitwise equality is not currently part of the implementation
+  contract because their exponential implementations may differ. This must be confirmed
+  with the integration owner before the contract is frozen.
 
-## Performance Notes
+## Build and validation
 
-Reference operators — no fused kernel or benchmark yet. Downstream fused MLP kernels carry
-their own benchmarks and are measured against this reference for correctness.
-
-## Tests
+Build the CUDA backend with:
 
 ```bash
-python -m pytest tests/test_swiglu.py -v
+KERNEL_ALIGN_ACTIVATION_SM90=1 pip install --no-build-isolation -e .
 ```
 
-Covers: correctness vs an independent fp32 formula, dtype paths, Axis-A batch invariance
-(slice + padding), input purity, gradient flow, the SwiGLU shape guard, and registry
-dispatch.
+Validate the Qwen3-8B TP-local width on an H100:
 
-## Implementation Files
+```bash
+python scripts/check_operator.py --op swiglu --candidate cuda-sm90 \
+  --device cuda --dtype bf16 --batch 1 --seq 4096 --intermediate-dim 6144 --arch-key sm90
+python scripts/check_operator.py --op swiglu --candidate triton \
+  --device cuda --dtype bf16 --batch 1 --seq 4096 --intermediate-dim 6144 --arch-key sm90
+python -m pytest tests/test_swiglu.py tests/test_swiglu_forward_backends.py -v
+```
+
+The forward benchmark defaults to `[M_local, 6144]`:
+
+```bash
+python benchmarks/benchmark_swiglu.py --rows 4096 --width 6144
+```
+
+## Implementation files
 
 - `rl_engine/kernels/ops/pytorch/activation/swiglu.py`
-- `rl_engine/kernels/registry.py`
+- `rl_engine/kernels/ops/cuda/activation/swiglu.py`
+- `rl_engine/kernels/ops/triton/activation/swiglu.py`
+- `csrc/cuda/activation/swiglu_sm90.cu`
 - `tests/test_swiglu.py`
+- `tests/test_swiglu_forward_backends.py`
 
-## Known Limitations
-
-- PyTorch fallback only; no fused CUDA/Triton backend yet (downstream work).
-- SwiGLU requires `gate` and `up` to share shape (raises `ValueError` otherwise); no
-  broadcasting.
+Backward for the optimized CUDA and Triton backends is intentionally outside this
+forward-stage implementation.

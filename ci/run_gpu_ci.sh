@@ -15,6 +15,7 @@ TARGET_SM="${TARGET_SM:-}"
 
 # Forwarded to the remote build; setup.py compiles the Hopper (sm90) kernels only when "1".
 KERNEL_ALIGN_FORCE_SM90="${KERNEL_ALIGN_FORCE_SM90:-}"
+KERNEL_ALIGN_ACTIVATION_SM90="${KERNEL_ALIGN_ACTIVATION_SM90:-}"
 
 CI_IMAGE="${CI_IMAGE:-runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04}"
 DISK_GB=40
@@ -137,6 +138,7 @@ echo "[remote] Using interpreter: $PY"
 export FORCE_CUDA=1
 export MAX_JOBS=8
 export KERNEL_ALIGN_FORCE_SM90="'"${KERNEL_ALIGN_FORCE_SM90}"'"
+export KERNEL_ALIGN_ACTIVATION_SM90="'"${KERNEL_ALIGN_ACTIVATION_SM90}"'"
 
 # normalize_sm: compact (90) or dotted (9.0) compute cap -> torch dotted form, keeping +PTX.
 normalize_sm() {

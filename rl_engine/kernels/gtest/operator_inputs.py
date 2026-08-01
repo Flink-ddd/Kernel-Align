@@ -57,8 +57,8 @@ def operator_shape_name(op_name: str, args: argparse.Namespace) -> str:
         "linear_logp": f"{batch}x{seq}x{_normalized_dim(args)}x{vocab}",
         "batch_invariant_logp": f"{batch}x{seq}x{vocab}",
         "rope": f"{batch}x{DEFAULT_N_HEADS}x{seq}x{DEFAULT_HEAD_DIM}",
-        "silu": f"{batch}x{seq}x{DEFAULT_INTERMEDIATE}",
-        "swiglu": f"{batch}x{seq}x{DEFAULT_INTERMEDIATE}",
+        "silu": f"{batch}x{seq}x{_intermediate_dim(args)}",
+        "swiglu": f"{batch}x{seq}x{_intermediate_dim(args)}",
         "embedding": f"{batch}x{seq}x{vocab}x{_normalized_dim(args)}",
         "lm_head": f"{batch}x{seq}x{_normalized_dim(args)}x{vocab}",
         "kv_cache_attention": f"{batch}x{DEFAULT_N_HEADS}x1x{seq + 1}x{DEFAULT_HEAD_DIM}",
@@ -193,7 +193,7 @@ def _make_silu_inputs(
 ) -> dict[str, Any]:
     batch, seq = _batch_seq(args)
     return {
-        "x": _floating_tensor((batch, seq, DEFAULT_INTERMEDIATE), args, dtype, device, 0),
+        "x": _floating_tensor((batch, seq, _intermediate_dim(args)), args, dtype, device, 0),
     }
 
 
@@ -201,9 +201,10 @@ def _make_swiglu_inputs(
     args: argparse.Namespace, dtype: torch.dtype, device: torch.device
 ) -> dict[str, Any]:
     batch, seq = _batch_seq(args)
+    intermediate_dim = _intermediate_dim(args)
     return {
-        "gate": _floating_tensor((batch, seq, DEFAULT_INTERMEDIATE), args, dtype, device, 0),
-        "up": _floating_tensor((batch, seq, DEFAULT_INTERMEDIATE), args, dtype, device, 1),
+        "gate": _floating_tensor((batch, seq, intermediate_dim), args, dtype, device, 0),
+        "up": _floating_tensor((batch, seq, intermediate_dim), args, dtype, device, 1),
     }
 
 
@@ -300,6 +301,10 @@ def _batch_seq(args: argparse.Namespace) -> tuple[int, int]:
 
 def _normalized_dim(args: argparse.Namespace) -> int:
     return _arg_int(args, "normalized_dim", DEFAULT_HIDDEN)
+
+
+def _intermediate_dim(args: argparse.Namespace) -> int:
+    return _arg_int(args, "intermediate_dim", DEFAULT_INTERMEDIATE)
 
 
 def _matmul_k(args: argparse.Namespace) -> int:

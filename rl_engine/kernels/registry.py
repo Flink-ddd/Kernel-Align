@@ -86,6 +86,8 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_NATIVE_ROPE = "rl_engine.kernels.ops.pytorch.rotary_embedding.rope.NativeRoPEOp"
     TRITON_ROPE = "rl_engine.kernels.ops.triton.rotary_embedding.rope.TritonRoPEOp"
     CUDA_ROPE_SM90 = "rl_engine.kernels.ops.cuda.rotary_embedding.rope.RoPESM90Op"
+    CUDA_SWIGLU_SM90 = "rl_engine.kernels.ops.cuda.activation.swiglu.SwiGLUSM90Op"
+    TRITON_SWIGLU = "rl_engine.kernels.ops.triton.activation.swiglu.TritonSwiGLUOp"
     PYTORCH_NATIVE_SILU = "rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSiLUOp"
     PYTORCH_NATIVE_SWIGLU = "rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSwiGLUOp"
 
@@ -214,7 +216,7 @@ class KernelRegistry:
                 "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
                 "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
                 "silu": [OpBackend.PYTORCH_NATIVE_SILU],
-                "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
+                "swiglu": [OpBackend.TRITON_SWIGLU, OpBackend.PYTORCH_NATIVE_SWIGLU],
                 # Default dispatch logic for new operators
                 "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
                 "rope": [
@@ -358,6 +360,17 @@ class KernelRegistry:
                 lm_head_list = self._priority_map["cuda"]["lm_head"]
                 if OpBackend.CUDA_SM90_LM_HEAD not in lm_head_list:
                     lm_head_list.insert(0, OpBackend.CUDA_SM90_LM_HEAD)
+
+            activation_compiled = _EXT_AVAILABLE and hasattr(_C, "swiglu_forward_sm90")
+            if activation_compiled and cc_major == 9:
+                swiglu_list = self._priority_map["cuda"]["swiglu"]
+                if OpBackend.CUDA_SWIGLU_SM90 not in swiglu_list:
+                    swiglu_list.insert(0, OpBackend.CUDA_SWIGLU_SM90)
+            elif cc >= 90:
+                logger.debug(
+                    f"SM{cc}: CUDA SM90 SwiGLU is not compiled into _C; "
+                    "using the Triton backend."
+                )
         except Exception as e:
             logger.warning(f"Failed to probe device capability: {e}")
 

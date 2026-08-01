@@ -9,6 +9,7 @@ def batch_invariant_logp_sm90(
     target: torch.Tensor,
     ignore_index: int,
 ) -> list[torch.Tensor]: ...
+def swiglu_forward_sm90(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor: ...
 def fused_linear_logp_sm90(
     hidden: torch.Tensor,
     weight: torch.Tensor,
