@@ -13,6 +13,7 @@ python scripts/run_profile_suite.py --output reports/profile.csv
 python benchmarks/profiler.py --format json --output reports/profile.json
 python benchmarks/benchmark_sampling.py
 python benchmarks/benchmark_grpo_op.py
+python benchmarks/benchmark_pack.py --smoke
 python scripts/run_perf.py
 ```
 

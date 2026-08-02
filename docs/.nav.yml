@@ -1,5 +1,8 @@
 nav:
   - Home: README.md
+  - Blog:
+    - blog/README.md
+    - Announcing RL-Kernel for vime: blog/2026-07-08-announcing-rl-kernel-linear-logp-for-vime.md
   - User Guide:
     - usage/README.md
     - usage/weight-sync-bridge.md
@@ -12,13 +15,17 @@ nav:
     - Operators:
       - operators/README.md
       - operators/activation.md
+      - operators/attention.md
       - operators/fused-logp.md
       - operators/linear-logp.md
+      - operators/batch-invariant-logp.md
       - operators/linear-logp-tp-test.md
       - operators/grpo-loss.md
       - operators/lm_head.md
       - operators/ratio-kl.md
+      - operators/pack-and-pad.md
       - operators/sampling.md
+      - operators/det-gemm.md
       - operators/embedding.md
   - Developer Guide:
     - contributing/README.md

@@ -4,6 +4,91 @@ import torch
 
 def fused_logp(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor: ...
 def fused_logp_sm90(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor: ...
+def batch_invariant_logp_sm90(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int,
+) -> list[torch.Tensor]: ...
+def fused_linear_logp_sm90(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> list[torch.Tensor]: ...
+def fused_linear_logp_sm90_global_target(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    bias: torch.Tensor | None,
+    vocab_start_index: int,
+) -> list[torch.Tensor]: ...
+def fused_linear_logp_sm90_backward(
+    grad_logp: torch.Tensor,
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    lse: torch.Tensor,
+    bias: torch.Tensor | None,
+    vocab_start_index: int,
+    compute_grad_hidden: bool,
+    compute_grad_weight: bool,
+    compute_grad_bias: bool,
+    use_global_lse: bool,
+) -> list[torch.Tensor]: ...
+def linear_logp_probs_bf16_forward(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    vocab_start_index: int,
+) -> list[torch.Tensor]: ...
+def linear_logp_bf16_forward(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    vocab_start_index: int,
+) -> list[torch.Tensor]: ...
+def linear_logp_local_probs_bf16_forward(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    vocab_start_index: int,
+) -> list[torch.Tensor]: ...
+def linear_logp_local_bf16_forward(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    vocab_start_index: int,
+) -> list[torch.Tensor]: ...
+def linear_logp_probs_bf16_to_dlogits_(
+    probs: torch.Tensor,
+    target: torch.Tensor,
+    grad_logp: torch.Tensor,
+    vocab_start_index: int,
+) -> torch.Tensor: ...
+def linear_logp_local_probs_bf16_to_dlogits_(
+    probs: torch.Tensor,
+    target: torch.Tensor,
+    grad_logp: torch.Tensor,
+    local_lse: torch.Tensor,
+    global_lse: torch.Tensor,
+    vocab_start_index: int,
+) -> torch.Tensor: ...
+def linear_logp_logits_bf16_to_dlogits(
+    logits: torch.Tensor,
+    dlogits: torch.Tensor,
+    target: torch.Tensor,
+    grad_logp: torch.Tensor,
+    lse: torch.Tensor,
+    vocab_start_index: int,
+) -> torch.Tensor: ...
+def embedding_sm90_forward(token_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor: ...
+def embedding_sm90_forward_fp32(token_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor: ...
+def lm_head_sm90_forward(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor: ...
+def lm_head_sm90_forward_fp32(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor: ...
 def fused_logp_forward_out(
     logits: torch.Tensor,
     token_ids: torch.Tensor,
@@ -41,3 +126,45 @@ def fused_logp_forward_online_indexed_fp32(
     token_ids: torch.Tensor,
     row_indices: torch.Tensor,
 ) -> torch.Tensor: ...
+def deterministic_logp(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor: ...
+def deterministic_logp_forward_out(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor: ...
+def deterministic_logp_forward_fp32(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+) -> torch.Tensor: ...
+def deterministic_logp_forward_indexed_out(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    row_indices: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor: ...
+def deterministic_logp_forward_indexed_fp32(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    row_indices: torch.Tensor,
+) -> torch.Tensor: ...
+def deterministic_attention_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool,
+    scale: float,
+    key_padding_mask: torch.Tensor | None,
+) -> list[torch.Tensor]:
+    """Returns [out, lse, P]."""
+    ...
+
+def deterministic_attention_backward(
+    grad_output: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    P: torch.Tensor,
+    causal: bool,
+    scale: float,
+    key_padding_mask: torch.Tensor | None,
+) -> list[torch.Tensor]: ...

@@ -14,7 +14,7 @@ from rl_engine.kernels.ops.pytorch.loss.linear_logp import (
     _validate_tp_vocab_partition,
     chunked_linear_logp_backward,
     should_use_tensor_parallel_linear_logp,
-    tensor_parallel_chunked_linear_logp_backward,
+    tensor_parallel_linear_logp_backward,
 )
 from rl_engine.utils.logger import logger
 
@@ -167,6 +167,9 @@ class _LinearLogpFunction(torch.autograd.Function):
             hidden_dtype=ctx.hidden_dtype,
             weight_dtype=ctx.weight_dtype,
             bias_dtype=ctx.bias_dtype,
+            compute_grad_hidden=ctx.needs_input_grad[0],
+            compute_grad_weight=ctx.needs_input_grad[1],
+            compute_grad_bias=ctx.needs_input_grad[2],
         )
         # Inputs: hidden, lm_head_weight, bias, target_ids.
         return grad_hidden, grad_weight, grad_bias, None
@@ -242,12 +245,12 @@ class _TensorParallelTritonLinearLogpFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_logp):
         hidden_2d, weight, bias_t, target_1d, global_lse = ctx.saved_tensors
-        grad_hidden, grad_weight, grad_bias = tensor_parallel_chunked_linear_logp_backward(
+        grad_hidden, grad_weight, grad_bias = tensor_parallel_linear_logp_backward(
             grad_logp,
             hidden_2d,
             weight,
-            target_1d,
             bias_t,
+            target_1d,
             global_lse,
             has_bias=ctx.has_bias,
             lead_shape=ctx.lead_shape,
@@ -256,6 +259,9 @@ class _TensorParallelTritonLinearLogpFunction(torch.autograd.Function):
             bias_dtype=ctx.bias_dtype,
             vocab_start_index=ctx.vocab_start_index,
             tp_group=ctx.tp_group,
+            compute_grad_hidden=ctx.needs_input_grad[0],
+            compute_grad_weight=ctx.needs_input_grad[1],
+            compute_grad_bias=ctx.needs_input_grad[2],
         )
         return grad_hidden, grad_weight, grad_bias, None, None, None, None
 

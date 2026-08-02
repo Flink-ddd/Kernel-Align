@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-# TP=2
-PRIMARY_GPU_ID="NVIDIA RTX A4000"
-PRIMARY_GPU_COUNT=2
+# TP=2 (override via env; GPU_ID/GPU_COUNT accepted as matrix-friendly aliases)
+PRIMARY_GPU_ID="${PRIMARY_GPU_ID:-${GPU_ID:-NVIDIA RTX A4000}}"
+PRIMARY_GPU_COUNT="${PRIMARY_GPU_COUNT:-${GPU_COUNT:-2}}"
 
 # TP=1
-FALLBACK_GPU_ID="NVIDIA A40"
-FALLBACK_GPU_COUNT=1
+FALLBACK_GPU_ID="${FALLBACK_GPU_ID:-NVIDIA A40}"
+FALLBACK_GPU_COUNT="${FALLBACK_GPU_COUNT:-1}"
+
+# Optional arch override; asserted against the pod's real cap in the remote build so a
+# cross-arch resource fallback cannot build mismatched SASS.
+TARGET_SM="${TARGET_SM:-}"
+
+# Forwarded to the remote build; setup.py compiles the Hopper (sm90) kernels only when "1".
+KERNEL_ALIGN_FORCE_SM90="${KERNEL_ALIGN_FORCE_SM90:-}"
 
 CI_IMAGE="${CI_IMAGE:-runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04}"
 DISK_GB=40
@@ -127,17 +134,64 @@ if ! "$PY" -c "import torch" >/dev/null 2>&1; then
   done
 fi
 echo "[remote] Using interpreter: $PY"
-export TORCH_CUDA_ARCH_LIST=8.6
 export FORCE_CUDA=1
 export MAX_JOBS=8
+export KERNEL_ALIGN_FORCE_SM90="'"${KERNEL_ALIGN_FORCE_SM90}"'"
+
+# normalize_sm: compact (90) or dotted (9.0) compute cap -> torch dotted form, keeping +PTX.
+normalize_sm() {
+  sm_in="$1"; sm_ptx=""
+  case "$sm_in" in *+PTX) sm_ptx="+PTX"; sm_in="${sm_in%+PTX}";; esac
+  case "$sm_in" in
+    *.*) : ;;
+    [0-9][0-9]|[0-9][0-9][0-9]) sm_major="${sm_in%?}"; sm_in="${sm_major}.${sm_in#$sm_major}" ;;
+    *) return 1 ;;
+  esac
+  case "$sm_in" in [0-9]*.[0-9]|[0-9]*.[0-9][0-9]) echo "${sm_in}${sm_ptx}" ;; *) return 1 ;; esac
+}
+
+ACTUAL_SM=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d "[:space:]")
+[ -z "$ACTUAL_SM" ] && ACTUAL_SM=$("$PY" -c "import torch;a,b=torch.cuda.get_device_capability();print(f\"{a}.{b}\")" 2>/dev/null || true)
+[ -z "$ACTUAL_SM" ] && { echo "[remote] FATAL: cannot determine GPU compute capability"; exit 3; }
+
+REQUESTED_SM="'"${TARGET_SM}"'"
+if [ -n "$REQUESTED_SM" ]; then
+  NORM_REQ=$(normalize_sm "$REQUESTED_SM") || { echo "[remote] FATAL: unsupported TARGET_SM=$REQUESTED_SM"; exit 3; }
+  NORM_REQ_BASE="${NORM_REQ%+PTX}"
+  if [ "$NORM_REQ_BASE" != "$ACTUAL_SM" ]; then
+    echo "[remote] FATAL: requested TARGET_SM=$REQUESTED_SM (sm_$NORM_REQ_BASE) but provisioned GPU is sm_$ACTUAL_SM."
+    echo "[remote]        Refusing to build mismatched kernels (likely a cross-arch resource fallback)."
+    exit 3
+  fi
+  BUILD_SM="$NORM_REQ_BASE"
+else
+  BUILD_SM=$(normalize_sm "$ACTUAL_SM") || { echo "[remote] FATAL: unsupported detected arch $ACTUAL_SM"; exit 3; }
+fi
+# BUILD_SM is always bare here (both paths strip +PTX); +PTX gives forward-compat JIT.
+export TORCH_CUDA_ARCH_LIST="${BUILD_SM}+PTX"
+echo "[remote] Detected GPU sm_$ACTUAL_SM; building _C for TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
+
 cd /workspace
 git clone '"${PR_REPO_URL:-https://github.com/RL-Align/RL-Kernel.git}"' repo
 cd repo
 git fetch origin '"${PR_SHA}"'
 git checkout --detach '"${PR_SHA}"'
-"$PY" -m pip install -e .
-"$PY" -m pip install pytest
+"$PY" -c "import torch;print(f\"[remote] image torch {torch.__version__} cuda {torch.version.cuda}\")"
+# Pin torch (cu124, matching the CI image) so the extension is built against the exact
+# runtime torch, not a non-deterministic bare-install upgrade of the 2.4.0 in the image.
+TORCH_SPEC="${TORCH_SPEC:-torch==2.4.1}"
+TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu124}"
+"$PY" -m pip install --no-cache-dir "$TORCH_SPEC" --index-url "$TORCH_INDEX_URL"
+"$PY" -c "import torch;print(f\"[remote] pinned torch {torch.__version__} cuda {torch.version.cuda}\")"
+# --no-build-isolation: torch must be visible to setup.py, else the extension is silently skipped.
+# --no-deps: keep the pinned torch; do not let the editable install re-resolve it.
+"$PY" -m pip install --no-build-isolation --no-deps -e .
+"$PY" -m pip install --no-cache-dir numpy tabulate accelerate "transformers==5.13.1" pytest
 nvidia-smi
+# Fail fast if _C did not build or cannot launch, instead of silently using native fallbacks.
+"$PY" scripts/ci_smoke.py
+# Enforce _C in the pytest suite too (test_extension_smoke.py skips unless this is set).
+export RL_KERNEL_REQUIRE_EXT=1
 '"${TEST_CMD}"
 
 echo "[ci] Launching remote test suite on GPU pod (Distributed Execution Mode: TP=${GPU_COUNT})..."

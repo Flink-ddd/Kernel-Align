@@ -157,6 +157,26 @@ def test_missing_deepspeed_raises_explicit_blocker(monkeypatch):
         deepspeed_trainer.DeepSpeedTrainingWorker()
 
 
+def test_training_config_accepts_batch_invariant_logp_requirement():
+    from rl_engine.executors.training_contract import TorchRLTrainingConfig
+
+    TorchRLTrainingConfig(require_batch_invariant_logp=True)
+    TorchRLTrainingConfig(
+        logp_backend="deterministic",
+        require_batch_invariant_logp=True,
+    )
+
+
+def test_training_config_rejects_non_deterministic_batch_invariant_backend():
+    from rl_engine.executors.training_contract import TorchRLTrainingConfig
+
+    with pytest.raises(ValueError, match="requires a deterministic logp backend"):
+        TorchRLTrainingConfig(
+            logp_backend="online",
+            require_batch_invariant_logp=True,
+        )
+
+
 def test_deepspeed_loader_preserves_explicit_cuda_home(monkeypatch):
     import torch.utils.cpp_extension as cpp_extension
 
@@ -373,7 +393,9 @@ def test_extract_hidden_states_rejects_ambiguous_multi_tensor_tuple():
         _extract_hidden_states((torch.randn(2, 3, 11), torch.randn(2, 3, 5)))
 
 
-def test_deepspeed_training_worker_routes_linear_logp_and_zeroes_masked_targets(monkeypatch):
+def test_deepspeed_training_worker_routes_linear_logp_and_zeroes_masked_targets(
+    monkeypatch,
+):
     _install_fake_deepspeed(monkeypatch)
     from rl_engine.executors import deepspeed_trainer
 
@@ -443,6 +465,23 @@ def test_deepspeed_training_worker_routes_linear_logp_and_zeroes_masked_targets(
     assert math.isfinite(result.metrics["loss"])
 
 
+def test_deepspeed_linear_logp_device_lookup_uses_explicit_worker_device(monkeypatch):
+    from rl_engine.executors import deepspeed_trainer
+
+    sentinel = object()
+    call = {}
+
+    def fake_get_op(op_type, *, device=None):
+        call["op_type"] = op_type
+        call["device"] = device
+        return sentinel
+
+    monkeypatch.setattr(deepspeed_trainer.kernel_registry, "get_op", fake_get_op)
+
+    assert deepspeed_trainer._linear_logp_op_for_device("cuda:0") is sentinel
+    assert call == {"op_type": "linear_logp", "device": torch.device("cuda:0")}
+
+
 def test_deepspeed_training_worker_rejects_ignore_index_in_model_inputs(monkeypatch):
     _install_fake_deepspeed(monkeypatch)
     from rl_engine.executors import deepspeed_trainer
@@ -483,7 +522,9 @@ def test_deepspeed_training_worker_rejects_ignore_index_in_model_inputs(monkeypa
         worker.train(_rollout())
 
 
-def test_deepspeed_zero3_training_gathers_lm_head_parameters_during_backward(monkeypatch):
+def test_deepspeed_zero3_training_gathers_lm_head_parameters_during_backward(
+    monkeypatch,
+):
     _install_fake_deepspeed_with_gather(monkeypatch)
     from rl_engine.executors import deepspeed_trainer
 

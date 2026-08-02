@@ -47,6 +47,7 @@ class DeepSpeedTrainingConfig(TorchRLTrainingConfig):
     initialize_kwargs: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if self.zero_stage < 0:
             raise ValueError("zero_stage must be >= 0")
 
@@ -245,7 +246,9 @@ class DeepSpeedTrainingWorker(RolloutBatchMixin):
         self._latest_published_weight_version = published
         return published
 
-    def _export_zero3_full_state_model(self) -> tuple[torch.nn.Module, Mapping[str, Any]]:
+    def _export_zero3_full_state_model(
+        self,
+    ) -> tuple[torch.nn.Module, Mapping[str, Any]]:
         model = getattr(self.engine, "module", self.model)
         rank = self._engine_rank()
         if rank != 0:
@@ -438,7 +441,7 @@ def _linear_logp_op_for_device(device: torch.device | str) -> Any:
     resolved = torch.device(device)
     if resolved.type == "cpu":
         return NativeLinearLogpOp()
-    return kernel_registry.get_op("linear_logp")
+    return kernel_registry.get_op("linear_logp", device=resolved)
 
 
 def _unwrap_training_model(engine: Any, fallback_model: torch.nn.Module) -> torch.nn.Module:
