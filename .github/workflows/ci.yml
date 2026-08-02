@@ -76,6 +76,9 @@ jobs:
         run: |
           python -m pytest tests/test_kv_cache_attention.py -v -k "not large and not gpu"
 
+      - name: Run WS2 Logprob Contract Tests (CPU-safe)
+        run: python -m pytest tests/test_logprob_contract.py -v
+
   docs:
     runs-on: ubuntu-latest
     steps:

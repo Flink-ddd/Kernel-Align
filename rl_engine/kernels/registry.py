@@ -8,6 +8,14 @@ from typing import Any, Dict, Optional, Set, Type
 
 import torch
 
+from rl_engine.kernels.logprob_contract import (
+    LogprobBackendCapability,
+    LogprobContract,
+    LogprobContractError,
+    LogprobDispatchResult,
+    LogprobDType,
+    LogprobRole,
+)
 from rl_engine.platforms.device import device_ctx
 from rl_engine.utils.logger import logger
 
@@ -164,6 +172,51 @@ class KernelRegistry:
         self._instance_cache: Dict[str, Any] = {}
         self._failed_backends: Set[str] = set()
 
+        # These descriptors report what the existing WS1 batch-invariant logp
+        # implementations actually support: single-shard (TP=1) logits with
+        # ignore-index masking, no vocab-shard metadata, no padded-vs-real
+        # vocab distinction, and no public vocab-domain LSE export.  A strict
+        # WS2 request is rejected with explicit reasons until the deterministic
+        # vocab-parallel TP reference backend lands (issue #241 PR 3) instead
+        # of silently selecting an incompatible fallback.
+        common_logprob_roles = frozenset({LogprobRole.TRAIN, LogprobRole.INFER})
+        common_logprob_dtypes = frozenset({LogprobDType.BF16, LogprobDType.FP16, LogprobDType.FP32})
+        self._logprob_capabilities = {
+            OpBackend.PYTORCH_BATCH_INVARIANT_LOGP: LogprobBackendCapability(
+                backend_id="pytorch-batch-invariant-logp-ws1",
+                roles=common_logprob_roles,
+                dtypes=common_logprob_dtypes,
+                tp_world_sizes=(1,),
+                supports_vocab_padding=False,
+                supports_inactive_tokens=True,
+                exports_vocab_lse=False,
+                deterministic_tp_merge=False,
+                implementation_kind="reference",
+            ),
+            OpBackend.TRITON_BATCH_INVARIANT_LOGP: LogprobBackendCapability(
+                backend_id="triton-batch-invariant-logp-ws1",
+                roles=common_logprob_roles,
+                dtypes=common_logprob_dtypes,
+                tp_world_sizes=(1,),
+                supports_vocab_padding=False,
+                supports_inactive_tokens=True,
+                exports_vocab_lse=False,
+                deterministic_tp_merge=False,
+                implementation_kind="deterministic",
+            ),
+            OpBackend.CUDA_BATCH_INVARIANT_LOGP_SM90: LogprobBackendCapability(
+                backend_id="cuda-batch-invariant-logp-sm90-ws1",
+                roles=common_logprob_roles,
+                dtypes=frozenset({LogprobDType.BF16, LogprobDType.FP32}),
+                tp_world_sizes=(1,),
+                supports_vocab_padding=False,
+                supports_inactive_tokens=True,
+                exports_vocab_lse=False,
+                deterministic_tp_merge=False,
+                implementation_kind="deterministic",
+            ),
+        }
+
         self._priority_map = {
             "cuda": {
                 "logp": [
@@ -280,6 +333,17 @@ class KernelRegistry:
         self._adjust_priority_for_hardware()
         self._adjust_priority_from_env()
 
+        # WS2 contract-aware dispatch owns its candidate list.  It is seeded
+        # from the legacy batch_invariant_logp priority (after hardware/env
+        # adjustments) but deliberately decoupled afterwards: registering a
+        # TP-vocab backend for WS2 dispatch must not change what legacy
+        # get_op("batch_invariant_logp") returns to WS1 callers, and vice
+        # versa.
+        self._logprob_candidates: Dict[str, list] = {
+            platform: list(ops.get("batch_invariant_logp", []))
+            for platform, ops in self._priority_map.items()
+        }
+
     def _adjust_priority_from_env(self):
         rocm_attn_backend = os.getenv("RL_KERNEL_ROCM_ATTN_BACKEND", "").strip().lower()
         if rocm_attn_backend in {"flash_attn", "flash-attn", "flash_attention"}:
@@ -388,6 +452,134 @@ class KernelRegistry:
                 self._failed_backends.add(backend.name)
 
         raise RuntimeError(f"No functional backend found for {op_type} on {platform}")
+
+    def get_logprob_op(
+        self,
+        contract: LogprobContract,
+        *,
+        requested_backend: str = "auto",
+    ) -> LogprobDispatchResult:
+        """Resolve only a backend that explicitly supports the WS2 logprob contract.
+
+        This entry point is intentionally separate from legacy ``get_op`` so
+        existing callers retain their current behavior while WS2 callers cannot
+        silently fall back to a backend with different distributed semantics.
+
+        ``requested_backend`` is either a case-insensitive policy keyword
+        (``auto`` | ``production`` | ``reference`` | ``deterministic``) or an
+        exact, case-sensitive stable backend id.  Strictness comes from the
+        contract's capability checks, not from this policy string, so the
+        default is ``auto``.
+        """
+
+        if not isinstance(contract, LogprobContract):
+            raise LogprobContractError("contract must be a LogprobContract")
+        if not isinstance(requested_backend, str) or not requested_backend.strip():
+            raise LogprobContractError("requested_backend must be a non-empty string")
+        requested_backend = requested_backend.strip()
+
+        platform = self._platform()
+        candidates = self._logprob_candidates.get(platform, [])
+        rejected: list[str] = []
+        # provenance["fallback"] reports only capability/load rejections of
+        # otherwise-eligible candidates; skips caused purely by the caller's
+        # own requested_backend policy filter are not fallbacks.
+        capability_rejections = 0
+
+        for backend in candidates:
+            capability = self._logprob_capabilities.get(backend)
+            if capability is None:
+                rejected.append(f"{backend.name}: no LogprobBackendCapability declared")
+                capability_rejections += 1
+                continue
+            capability_incompat = list(capability.incompatibilities(contract))
+            policy_mismatch = self._logprob_policy_mismatch(requested_backend, capability)
+            reasons = capability_incompat + ([policy_mismatch] if policy_mismatch else [])
+            if reasons:
+                rejected.append(f"{backend.name}: " + "; ".join(reasons))
+                if capability_incompat:
+                    capability_rejections += 1
+                continue
+
+            op = self._get_or_create_backend(backend)
+            if op is None:
+                rejected.append(f"{backend.name}: backend could not be loaded or instantiated")
+                capability_rejections += 1
+                continue
+
+            provenance = {
+                "requested_backend": requested_backend,
+                "actual_backend": capability.backend_id,
+                "backend_enum": backend.name,
+                "platform": platform,
+                "fallback": capability_rejections > 0,
+                "prior_rejections": list(rejected),
+                "contract": contract.to_dict(),
+                "capability": capability.to_dict(),
+            }
+            return LogprobDispatchResult(
+                op=op,
+                capability=capability,
+                provenance=provenance,
+            )
+
+        details = " | ".join(rejected) if rejected else "no candidates registered"
+        requested = contract.to_dict()
+        raise RuntimeError(
+            "No logprob backend supports the requested WS2 contract on "
+            f"{platform}: role={requested['role']}, dtype={requested['dtype']}, "
+            f"TP={contract.sharding.tp_world_size}, CP={contract.sharding.cp_world_size}, "
+            f"padded_vocab={contract.sharding.padded_vocab_size}, "
+            f"real_vocab={contract.sharding.real_vocab_size}. Rejections: {details}"
+        )
+
+    @staticmethod
+    def _logprob_policy_mismatch(
+        requested_backend: str,
+        capability: LogprobBackendCapability,
+    ) -> str | None:
+        policy = requested_backend.lower()
+        if policy == "auto":
+            return None
+        if policy in {"production", "reference", "deterministic"}:
+            if capability.implementation_kind == policy:
+                return None
+            return (
+                f"implementation_kind={capability.implementation_kind} does not satisfy "
+                f"requested_backend={policy}"
+            )
+        if capability.backend_id == requested_backend:
+            return None
+        return (
+            f"backend_id={capability.backend_id} does not match "
+            f"requested_backend={requested_backend}"
+        )
+
+    def _platform(self) -> str:
+        if device_ctx.is_rocm:
+            return "rocm"
+        if device_ctx.device_type == "cuda":
+            return "cuda"
+        return "cpu"
+
+    def _get_or_create_backend(self, backend: OpBackend) -> Any | None:
+        if backend.name in self._instance_cache:
+            return self._instance_cache[backend.name]
+        if backend.name in self._failed_backends:
+            return None
+
+        op_class = self._load_backend(backend)
+        if op_class is None:
+            self._failed_backends.add(backend.name)
+            return None
+        try:
+            op = op_class()
+        except Exception as exc:
+            logger.error(f"Failed to instantiate {backend.name}: {exc}")
+            self._failed_backends.add(backend.name)
+            return None
+        self._instance_cache[backend.name] = op
+        return op
 
     def _platform_for_device(self, device: torch.device | str | None) -> str:
         if device is None:
