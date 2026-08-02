@@ -175,13 +175,9 @@ class KernelRegistry:
         self._instance_cache: Dict[str, Any] = {}
         self._failed_backends: Set[str] = set()
 
-        # These descriptors report what the existing WS1 batch-invariant logp
-        # implementations actually support: single-shard (TP=1) logits with
-        # ignore-index masking, no vocab-shard metadata, no padded-vs-real
-        # vocab distinction, and no public vocab-domain LSE export.  A strict
-        # WS2 request is rejected with explicit reasons until the deterministic
-        # vocab-parallel TP reference backend lands (issue #241 PR 3) instead
-        # of silently selecting an incompatible fallback.
+        # Truthful descriptors for the existing WS1 batch-invariant logp
+        # implementations: single-shard (TP=1), ignore-index masking only, no
+        # vocab-shard metadata, no vocab-domain LSE export.
         common_logprob_roles = frozenset({LogprobRole.TRAIN, LogprobRole.INFER})
         common_logprob_dtypes = frozenset({LogprobDType.BF16, LogprobDType.FP16, LogprobDType.FP32})
         base_logprob_capabilities = {
@@ -336,12 +332,9 @@ class KernelRegistry:
         self._adjust_priority_for_hardware()
         self._adjust_priority_from_env()
 
-        # WS2 contract-aware dispatch owns its candidate list.  It is seeded
-        # from the legacy batch_invariant_logp priority (after hardware/env
-        # adjustments) but deliberately decoupled afterwards: registering a
-        # TP-vocab backend for WS2 dispatch must not change what legacy
-        # get_op("batch_invariant_logp") returns to WS1 callers, and vice
-        # versa.
+        # WS2 dispatch owns its candidate list, seeded from the legacy
+        # batch_invariant_logp priority but decoupled afterwards: neither
+        # path's registrations may affect the other.
         self._logprob_candidates: Dict[str, list] = {
             platform: list(ops.get("batch_invariant_logp", []))
             for platform, ops in self._priority_map.items()

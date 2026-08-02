@@ -29,16 +29,10 @@ from typing import Any, TypeVar
 
 _EnumT = TypeVar("_EnumT", bound=Enum)
 
-# Dispatch policy keywords accepted by KernelRegistry.get_logprob_op; a stable
-# backend id must never shadow one of these, or it becomes unselectable by id.
-# "deterministic" stays reserved even though it is no longer a policy:
-# determinism is expressed through DeterminismScope, and requesting it as a
-# policy is a loud error rather than a silent id mismatch.
+# Policy keywords accepted by KernelRegistry.get_logprob_op; a backend id must
+# never shadow one of these, or it becomes unselectable by id.
 RESERVED_DISPATCH_POLICIES = frozenset({"auto", "production", "reference", "deterministic"})
-# Implementation tiers a backend can declare.  Determinism is deliberately a
-# separate axis (DeterminismScope): a backend can be a deterministic reference,
-# a deterministic production implementation, or a non-deterministic production
-# implementation.
+# Backend tiers; determinism is a separate axis (DeterminismScope).
 IMPLEMENTATION_KINDS = frozenset({"production", "reference"})
 
 
@@ -58,12 +52,7 @@ class LogprobDType(str, Enum):
 
 
 class LogprobMerge(str, Enum):
-    """Merge primitive for per-shard partial states.
-
-    Every rank contributes ``(local_max, local_sumexp)`` computed in the
-    accumulation dtype; the merged result is
-    ``M = max(m_l)``, ``S = sum(s_l * exp(m_l - M))``, ``LSE = M + log(S)``.
-    """
+    """Merge primitive for per-shard ``(local_max, local_sumexp)`` partials."""
 
     MAX_SUMEXP = "max_sumexp"
 
@@ -115,11 +104,9 @@ class DeterminismScope(str, Enum):
 class MaskMode(str, Enum):
     """How a backend consumes inactive-token information.
 
-    ``explicit_active_mask``: the backend honors an arbitrary active-token
-    mask.  ``ignore_index``: the backend only recognizes inactive tokens whose
-    target id equals ``ignore_index``.  The contract permits inactive targets
-    that do NOT hold ``ignore_index``, so an ignore-index-only backend cannot
-    serve a contract with inactive tokens.
+    The contract permits inactive targets that do not hold ``ignore_index``,
+    so an ``ignore_index``-only backend cannot serve a contract with inactive
+    tokens.
     """
 
     EXPLICIT_ACTIVE_MASK = "explicit_active_mask"
@@ -161,15 +148,11 @@ class ShardingSpec:
     """Logical vocab-parallel TP ownership for one logprob invocation.
 
     ``vocab_shard_bounds`` lists every TP rank's half-open ``[start, end)``
-    vocab range indexed by TP rank.  The full table is required on every rank:
-    it defines target-token ownership and the fixed global-shard-index merge
-    order without any collective, and makes an incomplete partition a loud
-    construction-time error instead of a silent runtime divergence.
-
-    ``padded_vocab_size`` is the shard-covered (weight) vocabulary;
-    ``real_vocab_size`` is the tokenizer vocabulary.  Padding columns occupy
-    ``[real_vocab_size, padded_vocab_size)`` and must be excluded from the
-    logsumexp by any conforming implementation.
+    vocab range, indexed by rank; the full table is required on every rank and
+    must form a contiguous ``[0, padded_vocab_size)`` partition.
+    ``padded_vocab_size`` is the shard-covered (weight) vocabulary,
+    ``real_vocab_size`` the tokenizer vocabulary; padding columns occupy
+    ``[real_vocab_size, padded_vocab_size)``.
     """
 
     tp_rank: int
@@ -267,11 +250,10 @@ class ShardingSpec:
 
 @dataclass(frozen=True)
 class MaskSpec:
-    """Active-token ownership for one logprob invocation.
+    """Active-token mask and ignore index for one logprob invocation.
 
-    Inactive tokens are excluded from every drift aggregate and are exempt
-    from the exactly-one-owner target gather; their targets may legally hold
-    ``ignore_index``.
+    Inactive tokens are excluded from drift aggregates and from the
+    single-owner target gather; their targets may legally hold ``ignore_index``.
     """
 
     num_tokens: int
@@ -377,12 +359,8 @@ class ReductionSpec:
 
 @dataclass(frozen=True)
 class LogprobOutputSpec:
-    """Output surface every conforming backend must produce.
-
-    Selected logprob and vocab-domain LSE are fp32 and replicated across the
-    TP group; the ``downcast_at: final_write`` rule applies to any consumer
-    downcast after these outputs, never inside the reduction.
-    """
+    """Output surface every conforming backend must produce: fp32 selected
+    logprob and fp32 vocab-domain LSE, replicated across the TP group."""
 
     selected_logp_dtype: LogprobDType = LogprobDType.FP32
     lse_dtype: LogprobDType = LogprobDType.FP32
@@ -466,10 +444,8 @@ class LogprobContract:
             "determinism_scope": self.reduction.determinism_scope.value,
             "cp_is_merge_axis": False,
         }
-        # The per-token mask is deliberately summarized: provenance exists for
-        # logging/serialization and the raw mask would dominate its size.  The
-        # digest keeps the mask *identity* observable, so two masks with the
-        # same active count still produce distinguishable provenance.
+        # The digest stands in for the raw per-token mask, which would
+        # dominate the provenance size.
         mask = {
             "num_tokens": self.mask.num_tokens,
             "active_token_count": self.mask.active_token_count,
@@ -614,8 +590,7 @@ class LogprobBackendCapability:
             contract.mask.active_token_count != contract.mask.num_tokens
             and MaskMode.EXPLICIT_ACTIVE_MASK not in self.mask_modes
         ):
-            # The contract does not require inactive targets to hold
-            # ignore_index, so ignore-index-only masking is insufficient.
+            # Inactive targets need not hold ignore_index (see MaskMode).
             reasons.append("explicit active-token masking is unsupported")
         if contract.export_lse and not self.exports_vocab_lse:
             reasons.append("vocab-domain LSE export is unsupported")
