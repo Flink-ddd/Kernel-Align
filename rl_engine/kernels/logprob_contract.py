@@ -21,6 +21,8 @@ metadata is carried for provenance and must never widen the merge.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, TypeVar
@@ -29,10 +31,15 @@ _EnumT = TypeVar("_EnumT", bound=Enum)
 
 # Dispatch policy keywords accepted by KernelRegistry.get_logprob_op; a stable
 # backend id must never shadow one of these, or it becomes unselectable by id.
+# "deterministic" stays reserved even though it is no longer a policy:
+# determinism is expressed through DeterminismScope, and requesting it as a
+# policy is a loud error rather than a silent id mismatch.
 RESERVED_DISPATCH_POLICIES = frozenset({"auto", "production", "reference", "deterministic"})
-# Policies a backend can declare as its implementation kind; "auto" is a
-# selection strategy, not an implementation kind.
-IMPLEMENTATION_KINDS = RESERVED_DISPATCH_POLICIES - {"auto"}
+# Implementation tiers a backend can declare.  Determinism is deliberately a
+# separate axis (DeterminismScope): a backend can be a deterministic reference,
+# a deterministic production implementation, or a non-deterministic production
+# implementation.
+IMPLEMENTATION_KINDS = frozenset({"production", "reference"})
 
 
 class LogprobContractError(ValueError):
@@ -83,6 +90,40 @@ class DowncastPoint(str, Enum):
 
 class ReductionEngine(str, Enum):
     IN_OP_REFERENCE = "in_op_reference"
+
+
+class DeterminismScope(str, Enum):
+    """Strength of the reduction's determinism guarantee.
+
+    ``fixed_topology``: bitwise-reproducible for one fixed TP degree; results
+    at different TP degrees are compared against the #108 tolerance table.
+
+    ``cross_tp_bitwise``: additionally bitwise-equal across TP degrees.  This
+    requires the entire reduction to follow a global tile-level structure that
+    is independent of TP partitioning (see the design doc); fixed shard-order
+    merging alone is not sufficient.
+    """
+
+    FIXED_TOPOLOGY = "fixed_topology"
+    CROSS_TP_BITWISE = "cross_tp_bitwise"
+
+
+class MaskMode(str, Enum):
+    """How a backend consumes inactive-token information.
+
+    ``explicit_active_mask``: the backend honors an arbitrary active-token
+    mask.  ``ignore_index``: the backend only recognizes inactive tokens whose
+    target id equals ``ignore_index``.  The contract permits inactive targets
+    that do NOT hold ``ignore_index``, so an ignore-index-only backend cannot
+    serve a contract with inactive tokens.
+    """
+
+    EXPLICIT_ACTIVE_MASK = "explicit_active_mask"
+    IGNORE_INDEX = "ignore_index"
+
+
+class TPPlacement(str, Enum):
+    REPLICATED = "replicated"
 
 
 def _enum_value(enum_type: type[_EnumT], value: Any, field: str) -> _EnumT:
@@ -233,6 +274,7 @@ class MaskSpec:
     active_mask: tuple[bool, ...]
     ignore_index: int = -100
     _active_token_count: int = field(init=False, repr=False, compare=False)
+    _active_mask_sha256: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         num_tokens = _positive_int(self.num_tokens, "num_tokens")
@@ -251,10 +293,18 @@ class MaskSpec:
             )
         object.__setattr__(self, "active_mask", active_mask)
         object.__setattr__(self, "_active_token_count", sum(active_mask))
+        object.__setattr__(
+            self, "_active_mask_sha256", hashlib.sha256(bytes(active_mask)).hexdigest()
+        )
 
     @property
     def active_token_count(self) -> int:
         return self._active_token_count
+
+    @property
+    def active_mask_sha256(self) -> str:
+        """Compact mask identity for provenance and cross-rank agreement."""
+        return self._active_mask_sha256
 
 
 @dataclass(frozen=True)
@@ -268,8 +318,14 @@ class ReductionSpec:
     transport: ReductionTransport = ReductionTransport.ALL_GATHER
     downcast_at: DowncastPoint = DowncastPoint.FINAL_WRITE
     engine: ReductionEngine = ReductionEngine.IN_OP_REFERENCE
+    determinism_scope: DeterminismScope = DeterminismScope.CROSS_TP_BITWISE
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "determinism_scope",
+            _enum_value(DeterminismScope, self.determinism_scope, "determinism_scope"),
+        )
         object.__setattr__(self, "merge", _enum_value(LogprobMerge, self.merge, "merge"))
         object.__setattr__(
             self, "merge_axis", _enum_value(MergeAxis, self.merge_axis, "merge_axis")
@@ -292,6 +348,39 @@ class ReductionSpec:
 
 
 @dataclass(frozen=True)
+class LogprobOutputSpec:
+    """Output surface every conforming backend must produce.
+
+    Selected logprob and vocab-domain LSE are fp32 and replicated across the
+    TP group; the ``downcast_at: final_write`` rule applies to any consumer
+    downcast after these outputs, never inside the reduction.
+    """
+
+    selected_logp_dtype: LogprobDType = LogprobDType.FP32
+    lse_dtype: LogprobDType = LogprobDType.FP32
+    tp_placement: TPPlacement = TPPlacement.REPLICATED
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "selected_logp_dtype",
+            _enum_value(LogprobDType, self.selected_logp_dtype, "selected_logp_dtype"),
+        )
+        object.__setattr__(
+            self, "lse_dtype", _enum_value(LogprobDType, self.lse_dtype, "lse_dtype")
+        )
+        object.__setattr__(
+            self, "tp_placement", _enum_value(TPPlacement, self.tp_placement, "tp_placement")
+        )
+        if self.selected_logp_dtype is not LogprobDType.FP32:
+            raise LogprobContractError(
+                f"selected logprob output must be fp32; got {self.selected_logp_dtype.value}"
+            )
+        if self.lse_dtype is not LogprobDType.FP32:
+            raise LogprobContractError(f"vocab LSE output must be fp32; got {self.lse_dtype.value}")
+
+
+@dataclass(frozen=True)
 class LogprobContract:
     """Complete semantic request consumed by contract-aware dispatch."""
 
@@ -300,6 +389,7 @@ class LogprobContract:
     mask: MaskSpec
     sharding: ShardingSpec
     reduction: ReductionSpec
+    output: LogprobOutputSpec = field(default_factory=LogprobOutputSpec)
     export_lse: bool = True
 
     def __post_init__(self) -> None:
@@ -311,6 +401,8 @@ class LogprobContract:
             raise LogprobContractError("sharding must be a ShardingSpec")
         if not isinstance(self.reduction, ReductionSpec):
             raise LogprobContractError("reduction must be a ReductionSpec")
+        if not isinstance(self.output, LogprobOutputSpec):
+            raise LogprobContractError("output must be a LogprobOutputSpec")
         if not isinstance(self.export_lse, bool) or not self.export_lse:
             raise LogprobContractError(
                 "export_lse must be True for the WS2 vocab-domain LSE drift contract"
@@ -343,14 +435,23 @@ class LogprobContract:
             "transport": self.reduction.transport.value,
             "downcast_at": self.reduction.downcast_at.value,
             "engine": self.reduction.engine.value,
+            "determinism_scope": self.reduction.determinism_scope.value,
             "cp_is_merge_axis": False,
         }
         # The per-token mask is deliberately summarized: provenance exists for
-        # logging/serialization and the raw mask would dominate its size.
+        # logging/serialization and the raw mask would dominate its size.  The
+        # digest keeps the mask *identity* observable, so two masks with the
+        # same active count still produce distinguishable provenance.
         mask = {
             "num_tokens": self.mask.num_tokens,
             "active_token_count": self.mask.active_token_count,
+            "active_mask_sha256": self.mask.active_mask_sha256,
             "ignore_index": self.mask.ignore_index,
+        }
+        output = {
+            "selected_logp_dtype": self.output.selected_logp_dtype.value,
+            "lse_dtype": self.output.lse_dtype.value,
+            "tp_placement": self.output.tp_placement.value,
         }
         return {
             "semantic_operator": "selected_token_logprob",
@@ -361,7 +462,28 @@ class LogprobContract:
             "mask": mask,
             "sharding": sharding,
             "reduction": reduction,
+            "output": output,
         }
+
+    def cross_rank_fingerprint(self) -> str:
+        """Rank-independent identity for preflight agreement across ranks.
+
+        Excludes ``tp_rank``/``cp_rank`` (and their derived local bounds) so
+        every rank of one logical invocation computes the same value.
+        All-gathering this fingerprint together with the resolved backend id
+        and aborting on mismatch is the documented preflight for distributed
+        dispatch; ``requested_backend="auto"`` is not distributed-safe
+        without it.
+        """
+
+        payload = self.to_dict()
+        payload["sharding"] = {
+            key: value
+            for key, value in payload["sharding"].items()
+            if key not in {"tp_rank", "cp_rank", "local_vocab_start", "local_vocab_end"}
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -374,9 +496,9 @@ class LogprobBackendCapability:
     tp_world_sizes: tuple[int, ...] | None = None
     cp_world_sizes: tuple[int, ...] | None = None
     supports_vocab_padding: bool = False
-    supports_inactive_tokens: bool = False
+    mask_modes: frozenset[MaskMode] = frozenset()
     exports_vocab_lse: bool = False
-    deterministic_tp_merge: bool = False
+    determinism_scopes: frozenset[DeterminismScope] = frozenset()
     implementation_kind: str = "production"
 
     def __post_init__(self) -> None:
@@ -396,12 +518,19 @@ class LogprobBackendCapability:
             raise LogprobContractError("backend roles and dtypes must not be empty")
         tp_world_sizes = self._validated_world_sizes(self.tp_world_sizes, "tp_world_sizes")
         cp_world_sizes = self._validated_world_sizes(self.cp_world_sizes, "cp_world_sizes")
-        for flag_name in (
-            "supports_vocab_padding",
-            "supports_inactive_tokens",
-            "exports_vocab_lse",
-            "deterministic_tp_merge",
-        ):
+        try:
+            mask_modes = frozenset(
+                _enum_value(MaskMode, value, "mask_modes") for value in self.mask_modes
+            )
+            determinism_scopes = frozenset(
+                _enum_value(DeterminismScope, value, "determinism_scopes")
+                for value in self.determinism_scopes
+            )
+        except TypeError as exc:
+            raise LogprobContractError(
+                "mask_modes and determinism_scopes must be iterables of enum values"
+            ) from exc
+        for flag_name in ("supports_vocab_padding", "exports_vocab_lse"):
             if not isinstance(getattr(self, flag_name), bool):
                 raise LogprobContractError(f"{flag_name} must be a bool")
         if self.implementation_kind not in IMPLEMENTATION_KINDS:
@@ -412,6 +541,8 @@ class LogprobBackendCapability:
         object.__setattr__(self, "dtypes", dtypes)
         object.__setattr__(self, "tp_world_sizes", tp_world_sizes)
         object.__setattr__(self, "cp_world_sizes", cp_world_sizes)
+        object.__setattr__(self, "mask_modes", mask_modes)
+        object.__setattr__(self, "determinism_scopes", determinism_scopes)
 
     @staticmethod
     def _validated_world_sizes(
@@ -453,13 +584,17 @@ class LogprobBackendCapability:
             reasons.append("padded-vs-real vocab masking is unsupported")
         if (
             contract.mask.active_token_count != contract.mask.num_tokens
-            and not self.supports_inactive_tokens
+            and MaskMode.EXPLICIT_ACTIVE_MASK not in self.mask_modes
         ):
-            reasons.append("inactive-token (ignore_index) masking is unsupported")
+            # The contract does not require inactive targets to hold
+            # ignore_index, so ignore-index-only masking is insufficient.
+            reasons.append("explicit active-token masking is unsupported")
         if contract.export_lse and not self.exports_vocab_lse:
             reasons.append("vocab-domain LSE export is unsupported")
-        if tp_size > 1 and not self.deterministic_tp_merge:
-            reasons.append("deterministic TP (max, sumexp) merge is unsupported")
+        if contract.reduction.determinism_scope not in self.determinism_scopes:
+            reasons.append(
+                f"determinism_scope={contract.reduction.determinism_scope.value} is unsupported"
+            )
         return tuple(reasons)
 
     def supports(self, contract: LogprobContract) -> bool:
@@ -473,9 +608,9 @@ class LogprobBackendCapability:
             "tp_world_sizes": list(self.tp_world_sizes) if self.tp_world_sizes else None,
             "cp_world_sizes": list(self.cp_world_sizes) if self.cp_world_sizes else None,
             "supports_vocab_padding": self.supports_vocab_padding,
-            "supports_inactive_tokens": self.supports_inactive_tokens,
+            "mask_modes": sorted(mode.value for mode in self.mask_modes),
             "exports_vocab_lse": self.exports_vocab_lse,
-            "deterministic_tp_merge": self.deterministic_tp_merge,
+            "determinism_scopes": sorted(scope.value for scope in self.determinism_scopes),
             "implementation_kind": self.implementation_kind,
         }
 
@@ -492,6 +627,7 @@ class LogprobDispatchResult:
 __all__ = [
     "IMPLEMENTATION_KINDS",
     "RESERVED_DISPATCH_POLICIES",
+    "DeterminismScope",
     "DowncastPoint",
     "LogprobBackendCapability",
     "LogprobContract",
@@ -499,7 +635,9 @@ __all__ = [
     "LogprobDType",
     "LogprobDispatchResult",
     "LogprobMerge",
+    "LogprobOutputSpec",
     "LogprobRole",
+    "MaskMode",
     "MaskSpec",
     "MergeAxis",
     "ReductionEngine",
@@ -507,4 +645,5 @@ __all__ = [
     "ReductionSpec",
     "ReductionTransport",
     "ShardingSpec",
+    "TPPlacement",
 ]

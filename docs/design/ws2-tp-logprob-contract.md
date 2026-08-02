@@ -36,12 +36,17 @@ for provenance and must never widen the merge.
 
 `rl_engine.kernels.logprob_contract` defines:
 
-- `LogprobContract`: role, logits dtype, mask, sharding, reduction, and LSE export;
+- `LogprobContract`: role, logits dtype, mask, sharding, reduction, output surface, and
+  LSE export, plus a rank-independent `cross_rank_fingerprint()`;
 - `ShardingSpec`: per-rank vocab-shard bounds, padded-vs-real vocabulary, TP/CP rank
   metadata, and target-token ownership;
 - `MaskSpec`: active-token mask and ignore index;
-- `ReductionSpec`: fixed `(max, sumexp)` merge semantics;
-- `LogprobBackendCapability`: the layouts and semantics a backend explicitly supports.
+- `ReductionSpec`: fixed `(max, sumexp)` merge semantics and the requested determinism
+  scope;
+- `LogprobOutputSpec`: the output surface — fp32 selected logprob and fp32 vocab-domain
+  LSE, replicated across the TP group;
+- `LogprobBackendCapability`: the layouts and semantics a backend explicitly supports,
+  including its mask modes and determinism scopes.
 
 Construction performs validation immediately. A structurally valid contract means that the
 request is complete and internally consistent; it does not mean that an installed backend can
@@ -140,8 +145,21 @@ decomposition inside each shard is not sufficient on its own, because shard boun
 would still group the combines differently across degrees. Providing that global structure
 is an obligation of the deterministic reference implementation; a backend without it is
 still deterministic per degree, and its cross-degree drift is judged against the #108
-tolerance table instead. Averaging per-rank logsumexp values or letting a collective reduce
-numerically is not conformant in either case.
+tolerance table instead. The contract expresses this distinction as
+`ReductionSpec.determinism_scope`: `cross_tp_bitwise` (the #241 target and the default)
+versus `fixed_topology`. A backend declares the scopes it honors in
+`LogprobBackendCapability.determinism_scopes`, and dispatch rejects a backend that cannot
+honor the requested scope — prose obligations are not enough; the guarantee is part of the
+typed contract.
+
+A shard may lie entirely inside the padded region, and a row's local columns may all be
+`-inf` after masking. The identity partial for these cases is defined as
+`(m_l, s_l) = (-inf, 0)`: a partial with `s_l = 0` contributes nothing to the merge
+regardless of its `m_l`, and implementations must use this identity directly rather than
+evaluating `exp(-inf - (-inf))`, which would poison the merge with NaN.
+
+Averaging per-rank logsumexp values or letting a collective reduce numerically is never
+conformant, at either determinism scope.
 
 The acceptable LSE and selected-token drift thresholds remain owned by #108, and drift
 reports follow the #116 format. This contract does not introduce another tolerance table.
@@ -164,16 +182,20 @@ provenance = result.provenance
 ```
 
 Dispatch considers only backends with a `LogprobBackendCapability`. It checks role, dtype,
-TP/CP degree, padded-vs-real vocab masking, inactive-token support, vocab-domain LSE export,
-and deterministic TP merge. An undeclared or incompatible backend is skipped with an
-explicit rejection reason; there is no silent fallback.
+TP/CP degree, padded-vs-real vocab masking, explicit active-mask support, vocab-domain LSE
+export, and the requested determinism scope. An undeclared or incompatible backend is
+skipped with an explicit rejection reason; there is no silent fallback.
 
 `requested_backend` accepts a case-insensitive policy keyword (`auto` | `production` |
-`reference` | `deterministic`; default `auto`) or an exact, case-sensitive stable backend
-id. Strictness comes from the contract's capability checks, not from the policy string. A
-backend id may never shadow a policy keyword; capability construction rejects that. The
-provenance `fallback` flag reports only capability or load rejections of otherwise-eligible
-candidates — skips caused purely by the caller's own policy filter are not fallbacks.
+`reference`; default `auto`) or an exact, case-sensitive stable backend id. The keywords
+select an implementation tier; determinism is not a tier — it is requested through
+`ReductionSpec.determinism_scope`, so `requested_backend="deterministic"` raises a loud
+error instead of silently matching nothing. Strictness comes from the contract's
+capability checks, not from the policy string. A backend id may never shadow a reserved
+keyword; capability construction rejects that. The provenance `fallback` flag reports only
+capability or load rejections of policy-eligible candidates — a candidate excluded by the
+caller's own policy never counts as a fallback, even if it would also have failed
+capability checks.
 
 WS2 dispatch resolves from its own candidate list, seeded from but decoupled from the legacy
 `batch_invariant_logp` priority list: registering a TP-vocab backend for WS2 dispatch does
@@ -192,9 +214,25 @@ Successful dispatch provenance records:
 - requested and actual backend ids;
 - platform and fallback status;
 - prior candidate rejection reasons;
-- the complete requested contract, including shard bounds, padded and real vocab sizes,
-  merge semantics, and the explicit `cp_is_merge_axis: false` declaration;
+- the complete dispatch-relevant contract, including shard bounds, padded and real vocab
+  sizes, merge and output semantics, the explicit `cp_is_merge_axis: false` declaration,
+  and the active-mask digest (`active_mask_sha256`) — the mask's identity without its
+  per-token payload;
 - the selected backend capability descriptor.
+
+### Distributed dispatch safety
+
+`get_logprob_op` resolves locally on each rank, so `requested_backend="auto"` is not
+distributed-safe on its own: a load failure on one rank can resolve a different backend
+than its peers, which for a collective-bearing implementation means divergent numerical
+schedules or a deadlock. For `tp_world_size > 1` a caller must either request an exact
+backend id or run a preflight agreement before any collective: all-gather the resolved
+backend id together with `LogprobContract.cross_rank_fingerprint()` — a rank-independent
+hash covering the shard-bounds table, vocab sizes, reduction/output semantics, and the
+active-mask digest, excluding rank-local fields — and abort on any mismatch. Implementing
+this preflight is an obligation of the #241 PR 3/PR 4 work; the backend invocation
+protocol (how the contract and mask reach the implementation) is likewise defined there,
+against this contract.
 
 ## Validation
 

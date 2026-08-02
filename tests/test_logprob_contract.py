@@ -11,14 +11,18 @@ from dataclasses import replace
 import pytest
 
 from rl_engine.kernels.logprob_contract import (
+    DeterminismScope,
     LogprobBackendCapability,
     LogprobContract,
     LogprobContractError,
     LogprobDType,
+    LogprobOutputSpec,
     LogprobRole,
+    MaskMode,
     MaskSpec,
     ReductionSpec,
     ShardingSpec,
+    TPPlacement,
 )
 from rl_engine.kernels.registry import KernelRegistry, OpBackend
 
@@ -101,10 +105,12 @@ def _declared_tp_backend() -> LogprobBackendCapability:
         tp_world_sizes=(1, 2, 4),
         cp_world_sizes=None,
         supports_vocab_padding=True,
-        supports_inactive_tokens=True,
+        mask_modes=frozenset({MaskMode.EXPLICIT_ACTIVE_MASK, MaskMode.IGNORE_INDEX}),
         exports_vocab_lse=True,
-        deterministic_tp_merge=True,
-        implementation_kind="deterministic",
+        determinism_scopes=frozenset(
+            {DeterminismScope.CROSS_TP_BITWISE, DeterminismScope.FIXED_TOPOLOGY}
+        ),
+        implementation_kind="reference",
     )
 
 
@@ -126,6 +132,7 @@ def test_qwen3_tp2_bf16_contract_is_representable_and_serializable():
         "transport": "all_gather",
         "downcast_at": "final_write",
         "engine": "in_op_reference",
+        "determinism_scope": "cross_tp_bitwise",
         "cp_is_merge_axis": False,
     }
     json.dumps(contract.to_dict())
@@ -249,7 +256,7 @@ def test_current_ws1_backend_rejects_strict_tp_contract_without_fallback():
     message = str(exc_info.value)
     assert "TP=2 is unsupported" in message
     assert "vocab-domain LSE export is unsupported" in message
-    assert "deterministic TP (max, sumexp) merge is unsupported" in message
+    assert "determinism_scope=cross_tp_bitwise is unsupported" in message
     assert "padded-vs-real vocab masking is unsupported" in message
 
 
@@ -282,11 +289,11 @@ def test_declared_compatible_backend_resolves_and_records_provenance():
         OpBackend.PYTORCH_BATCH_INVARIANT_LOGP, _declared_tp_backend(), platform=platform
     )
 
-    result = registry.get_logprob_op(_contract(), requested_backend="deterministic")
+    result = registry.get_logprob_op(_contract(), requested_backend="reference")
 
     assert result.op is not None
     assert result.capability.backend_id == "test-deterministic-tp-logprob"
-    assert result.provenance["requested_backend"] == "deterministic"
+    assert result.provenance["requested_backend"] == "reference"
     assert result.provenance["actual_backend"] == "test-deterministic-tp-logprob"
     assert result.provenance["fallback"] is False
     assert result.provenance["contract"]["sharding"]["tp_world_size"] == 2
@@ -320,11 +327,11 @@ def test_cp_is_a_non_merge_axis_and_cp_agnostic_backends_accept_any_cp_degree():
     assert cp_restricted.incompatibilities(cp2_contract) == ("CP=2 is unsupported",)
 
 
-def test_inactive_tokens_require_declared_backend_support():
-    capability = replace(_declared_tp_backend(), supports_inactive_tokens=False)
+def test_inactive_tokens_require_explicit_active_mask_support():
+    capability = replace(_declared_tp_backend(), mask_modes=frozenset({MaskMode.IGNORE_INDEX}))
     contract = _contract()
 
-    assert "inactive-token (ignore_index) masking is unsupported" in (
+    assert "explicit active-token masking is unsupported" in (
         capability.incompatibilities(contract)
     )
 
@@ -361,7 +368,7 @@ def test_policy_keywords_are_case_insensitive_but_backend_ids_are_exact():
         OpBackend.PYTORCH_BATCH_INVARIANT_LOGP, _declared_tp_backend(), platform=platform
     )
 
-    result = registry.get_logprob_op(_contract(), requested_backend="DETERMINISTIC")
+    result = registry.get_logprob_op(_contract(), requested_backend="REFERENCE")
     assert result.capability.backend_id == "test-deterministic-tp-logprob"
 
     with pytest.raises(RuntimeError, match="does not match requested_backend"):
@@ -486,3 +493,92 @@ def test_non_iterable_roles_and_dtypes_raise_contract_errors():
 
     with pytest.raises(LogprobContractError, match="roles and dtypes must be iterables"):
         replace(_declared_tp_backend(), dtypes=42)
+
+
+def test_requested_deterministic_policy_is_a_loud_error():
+    registry = KernelRegistry()
+
+    with pytest.raises(LogprobContractError, match="determinism_scope"):
+        registry.get_logprob_op(_contract(), requested_backend="deterministic")
+
+
+def test_determinism_scope_is_part_of_the_typed_contract():
+    fixed_only = replace(
+        _declared_tp_backend(),
+        determinism_scopes=frozenset({DeterminismScope.FIXED_TOPOLOGY}),
+    )
+
+    assert "determinism_scope=cross_tp_bitwise is unsupported" in (
+        fixed_only.incompatibilities(_contract())
+    )
+
+    relaxed = _contract(reduction=ReductionSpec(determinism_scope="fixed_topology"))
+    assert fixed_only.incompatibilities(relaxed) == ()
+
+
+def test_policy_filtered_candidates_never_count_toward_fallback():
+    registry = KernelRegistry()
+    platform = registry._platform()
+    registry._logprob_candidates[platform] = []
+    registry.register_logprob_backend(
+        OpBackend.TRITON_BATCH_INVARIANT_LOGP,
+        replace(_declared_tp_backend(), backend_id="tp1-only-backend", tp_world_sizes=(1,)),
+        platform=platform,
+    )
+    registry.register_logprob_backend(
+        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP, _declared_tp_backend(), platform=platform
+    )
+
+    result = registry.get_logprob_op(_contract(), requested_backend="test-deterministic-tp-logprob")
+
+    assert result.provenance["fallback"] is False
+    assert len(result.provenance["prior_rejections"]) == 1
+
+
+def test_output_spec_is_pinned_to_fp32_replicated():
+    with pytest.raises(LogprobContractError, match="must be fp32"):
+        LogprobOutputSpec(selected_logp_dtype="bf16")
+    with pytest.raises(LogprobContractError, match="must be fp32"):
+        LogprobOutputSpec(lse_dtype="bf16")
+
+    assert LogprobOutputSpec().tp_placement is TPPlacement.REPLICATED
+    assert _contract().to_dict()["output"] == {
+        "selected_logp_dtype": "fp32",
+        "lse_dtype": "fp32",
+        "tp_placement": "replicated",
+    }
+
+
+def test_cross_rank_fingerprint_is_rank_independent_and_content_sensitive():
+    rank0 = _contract(sharding=_sharding(tp_rank=0))
+    rank1 = _contract(sharding=_sharding(tp_rank=1, cp_rank=1))
+
+    assert rank0.cross_rank_fingerprint() == rank1.cross_rank_fingerprint()
+
+    different_mask = _contract(
+        mask=_mask(active_mask=(True, True, True, True, True, True, True, False))
+    )
+    assert rank0.cross_rank_fingerprint() != different_mask.cross_rank_fingerprint()
+
+
+def test_provenance_records_the_active_mask_digest():
+    provenance_mask = _contract().to_dict()["mask"]
+
+    assert provenance_mask["active_mask_sha256"] == _mask().active_mask_sha256
+    assert len(provenance_mask["active_mask_sha256"]) == 64
+
+    same_count_different_mask = _mask(
+        active_mask=(True, True, True, True, True, False, False, False)
+    )
+    assert same_count_different_mask.active_token_count == _mask().active_token_count
+    assert same_count_different_mask.active_mask_sha256 != _mask().active_mask_sha256
+
+
+def test_padding_only_shard_is_constructible_for_the_identity_partial():
+    sharding = _sharding(
+        vocab_shard_bounds=((0, QWEN3_REAL_VOCAB), (QWEN3_REAL_VOCAB, QWEN3_PADDED_VOCAB)),
+    )
+
+    assert sharding.local_vocab_start == 0
+    assert sharding.vocab_shard_bounds[1] == (QWEN3_REAL_VOCAB, QWEN3_PADDED_VOCAB)
+    assert sharding.owner_rank(QWEN3_REAL_VOCAB - 1) == 0

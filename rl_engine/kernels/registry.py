@@ -9,12 +9,15 @@ from typing import Any, Dict, Optional, Set, Type
 import torch
 
 from rl_engine.kernels.logprob_contract import (
+    IMPLEMENTATION_KINDS,
+    DeterminismScope,
     LogprobBackendCapability,
     LogprobContract,
     LogprobContractError,
     LogprobDispatchResult,
     LogprobDType,
     LogprobRole,
+    MaskMode,
 )
 from rl_engine.platforms.device import device_ctx
 from rl_engine.utils.logger import logger
@@ -188,9 +191,9 @@ class KernelRegistry:
                 dtypes=common_logprob_dtypes,
                 tp_world_sizes=(1,),
                 supports_vocab_padding=False,
-                supports_inactive_tokens=True,
+                mask_modes=frozenset({MaskMode.IGNORE_INDEX}),
                 exports_vocab_lse=False,
-                deterministic_tp_merge=False,
+                determinism_scopes=frozenset({DeterminismScope.FIXED_TOPOLOGY}),
                 implementation_kind="reference",
             ),
             OpBackend.TRITON_BATCH_INVARIANT_LOGP: LogprobBackendCapability(
@@ -199,10 +202,10 @@ class KernelRegistry:
                 dtypes=common_logprob_dtypes,
                 tp_world_sizes=(1,),
                 supports_vocab_padding=False,
-                supports_inactive_tokens=True,
+                mask_modes=frozenset({MaskMode.IGNORE_INDEX}),
                 exports_vocab_lse=False,
-                deterministic_tp_merge=False,
-                implementation_kind="deterministic",
+                determinism_scopes=frozenset({DeterminismScope.FIXED_TOPOLOGY}),
+                implementation_kind="production",
             ),
             OpBackend.CUDA_BATCH_INVARIANT_LOGP_SM90: LogprobBackendCapability(
                 backend_id="cuda-batch-invariant-logp-sm90-ws1",
@@ -210,10 +213,10 @@ class KernelRegistry:
                 dtypes=frozenset({LogprobDType.BF16, LogprobDType.FP32}),
                 tp_world_sizes=(1,),
                 supports_vocab_padding=False,
-                supports_inactive_tokens=True,
+                mask_modes=frozenset({MaskMode.IGNORE_INDEX}),
                 exports_vocab_lse=False,
-                deterministic_tp_merge=False,
-                implementation_kind="deterministic",
+                determinism_scopes=frozenset({DeterminismScope.FIXED_TOPOLOGY}),
+                implementation_kind="production",
             ),
         }
 
@@ -508,6 +511,12 @@ class KernelRegistry:
         if not isinstance(requested_backend, str) or not requested_backend.strip():
             raise LogprobContractError("requested_backend must be a non-empty string")
         requested_backend = requested_backend.strip()
+        if requested_backend.lower() == "deterministic":
+            raise LogprobContractError(
+                'requested_backend="deterministic" is not a dispatch policy; request '
+                "determinism through ReductionSpec.determinism_scope and match it against "
+                "backend determinism_scopes instead"
+            )
 
         platform = self._platform()
         candidates = self._logprob_candidates.get(platform, [])
@@ -524,13 +533,16 @@ class KernelRegistry:
                 rejected.append(f"{backend.name}: no LogprobBackendCapability declared")
                 capability_rejections += 1
                 continue
-            capability_incompat = list(capability.incompatibilities(contract))
             policy_mismatch = self._logprob_policy_mismatch(requested_backend, capability)
-            reasons = capability_incompat + ([policy_mismatch] if policy_mismatch else [])
-            if reasons:
-                rejected.append(f"{backend.name}: " + "; ".join(reasons))
-                if capability_incompat:
-                    capability_rejections += 1
+            if policy_mismatch is not None:
+                # Excluded by the caller's own policy: never a fallback, even
+                # if the candidate would also have failed capability checks.
+                rejected.append(f"{backend.name}: {policy_mismatch}")
+                continue
+            capability_incompat = list(capability.incompatibilities(contract))
+            if capability_incompat:
+                rejected.append(f"{backend.name}: " + "; ".join(capability_incompat))
+                capability_rejections += 1
                 continue
 
             op = self._get_or_create_backend(backend)
@@ -573,7 +585,7 @@ class KernelRegistry:
         policy = requested_backend.lower()
         if policy == "auto":
             return None
-        if policy in {"production", "reference", "deterministic"}:
+        if policy in IMPLEMENTATION_KINDS:
             if capability.implementation_kind == policy:
                 return None
             return (
