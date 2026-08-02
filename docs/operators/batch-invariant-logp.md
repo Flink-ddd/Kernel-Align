@@ -64,8 +64,8 @@ remains unchanged.
 
 The backends above are single-shard (TP=1) references and do not yet export vocab-domain
 LSE or carry vocab-shard metadata, so they are declared incompatible with strict WS2
-requests instead of being selected as a silent fallback. See
-[WS2 TP-aware logprob contract](../design/ws2-tp-logprob-contract.md).
+requests instead of being selected as a silent fallback. The contract objects are
+documented in `rl_engine.kernels.logprob_contract`.
 
 ## Benchmarks
 

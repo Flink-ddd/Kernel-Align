@@ -100,8 +100,12 @@ class DeterminismScope(str, Enum):
 
     ``cross_tp_bitwise``: additionally bitwise-equal across TP degrees.  This
     requires the entire reduction to follow a global tile-level structure that
-    is independent of TP partitioning (see the design doc); fixed shard-order
-    merging alone is not sufficient.
+    is independent of TP partitioning: a fixed tile decomposition of the
+    vocabulary plus a fixed merge order and rescaling tree over those tiles,
+    identical at every TP degree, so the TP degree only selects which rank
+    computes which tiles and never changes the floating-point grouping.
+    Fixed shard-order merging alone is not sufficient, because shard
+    boundaries would still group the combines differently across degrees.
     """
 
     FIXED_TOPOLOGY = "fixed_topology"
@@ -309,7 +313,31 @@ class MaskSpec:
 
 @dataclass(frozen=True)
 class ReductionSpec:
-    """Deterministic TP-vocab ``(max, sumexp)`` merge semantics."""
+    """Deterministic TP-vocab ``(max, sumexp)`` merge semantics.
+
+    Every rank first masks local columns whose global id lies in
+    ``[real_vocab_size, padded_vocab_size)`` to ``-inf`` (padding never
+    contributes to the logsumexp), then computes ``m_l = max(local_logits)``
+    and ``s_l = sum(exp(local_logits - m_l))`` in fp32.  Partials travel by
+    all-gather -- collectives are transport only, never a numerical
+    reduction -- and every rank merges in fixed global vocab-shard index
+    order::
+
+        M   = max_l(m_l)
+        S   = sum_l(s_l * exp(m_l - M))
+        LSE = M + log(S)
+        selected_logp = target_logit - LSE
+
+    The selected target logit comes from a masked single-owner gather;
+    downcast happens only at the final write.  The identity partial for a
+    padding-only shard, or a row whose local columns are all ``-inf`` after
+    masking, is ``(m_l, s_l) = (-inf, 0)``: a partial with ``s_l = 0``
+    contributes nothing to the merge regardless of its ``m_l``, and
+    implementations must use this identity directly rather than evaluate
+    ``exp(-inf - (-inf))``, which would poison the merge with NaN.  Averaging
+    per-rank logsumexp values, or letting a collective reduce numerically, is
+    never conformant at either determinism scope.
+    """
 
     merge: LogprobMerge = LogprobMerge.MAX_SUMEXP
     merge_axis: MergeAxis = MergeAxis.TP_VOCAB

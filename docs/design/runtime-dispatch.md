@@ -16,7 +16,8 @@ addition to platform priority, this path requires a backend capability descripto
 the requested role, dtype, TP/CP layout, padded-vs-real vocab masking, inactive-token
 support, vocab-domain LSE export, and deterministic TP merge semantics. Incompatible
 candidates produce explicit rejection reasons and are never used as an undeclared fallback.
-See [WS2 TP-aware logprob contract](ws2-tp-logprob-contract.md).
+The contract objects and their normative reduction semantics are documented in
+`rl_engine.kernels.logprob_contract`.
 
 ## LogP Priority
 
