@@ -444,3 +444,45 @@ def test_register_logprob_backend_is_the_public_registration_seam():
 def test_backend_id_whitespace_is_normalized_for_dispatch():
     capability = replace(_declared_tp_backend(), backend_id="  padded-id  ")
     assert capability.backend_id == "padded-id"
+
+
+def test_capabilities_are_scoped_per_platform():
+    registry = KernelRegistry()
+    platform = registry._platform()
+    other = "rocm" if platform != "rocm" else "cpu"
+    registry._logprob_candidates[platform] = []
+    registry.register_logprob_backend(
+        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP, _declared_tp_backend(), platform=platform
+    )
+    registry.register_logprob_backend(
+        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
+        replace(_declared_tp_backend(), backend_id="other-platform-backend"),
+        platform=other,
+    )
+
+    result = registry.get_logprob_op(_contract())
+
+    assert result.capability.backend_id == "test-deterministic-tp-logprob"
+    assert (
+        registry._logprob_capabilities[other][OpBackend.PYTORCH_BATCH_INVARIANT_LOGP].backend_id
+        == "other-platform-backend"
+    )
+
+
+def test_register_logprob_backend_rejects_unknown_platform():
+    registry = KernelRegistry()
+
+    with pytest.raises(LogprobContractError, match="unsupported platform"):
+        registry.register_logprob_backend(
+            OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
+            _declared_tp_backend(),
+            platform="cuda-typo",
+        )
+
+
+def test_non_iterable_roles_and_dtypes_raise_contract_errors():
+    with pytest.raises(LogprobContractError, match="roles and dtypes must be iterables"):
+        replace(_declared_tp_backend(), roles=None)
+
+    with pytest.raises(LogprobContractError, match="roles and dtypes must be iterables"):
+        replace(_declared_tp_backend(), dtypes=42)

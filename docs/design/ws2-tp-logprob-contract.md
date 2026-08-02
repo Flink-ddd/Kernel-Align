@@ -114,9 +114,11 @@ downcast_at: final_write
 engine: in_op_reference
 ```
 
-Every rank computes `m_l = max(local_logits)` and `s_l = sum(exp(local_logits - m_l))` in
-fp32, the partials travel by all-gather (collectives are transport only, never a numerical
-reduction), and every rank merges in fixed global vocab-shard index order:
+Every rank first masks every local column whose global id lies in
+`[real_vocab_size, padded_vocab_size)` to `-inf`, so padding never contributes to the
+logsumexp, then computes `m_l = max(local_logits)` and `s_l = sum(exp(local_logits - m_l))`
+in fp32. The partials travel by all-gather (collectives are transport only, never a
+numerical reduction), and every rank merges in fixed global vocab-shard index order:
 
 ```text
 M = max_l(m_l)
@@ -129,12 +131,16 @@ The selected target logit comes from a masked single-owner gather: exactly one r
 each active token's target column. Downcast happens only at the final write. Because the
 merge order is fixed by shard index, the result is deterministic and reproducible at every
 TP degree by construction. Cross-degree bitwise equality (TP=2 equal to TP=1, the #241 PR 3
-acceptance target) requires one further condition: the local per-shard reduction must use a
-TP-degree-independent tile decomposition, so that the same partial sums are formed in the
-same order regardless of how the vocabulary is sharded. Providing that decomposition is an
-obligation of the deterministic reference implementation; a backend without it is still
-deterministic per degree, and its cross-degree drift is judged against the #108 tolerance
-table instead. Averaging per-rank logsumexp values or letting a collective reduce
+acceptance target) requires one further condition: the entire reduction must follow a
+global tile-level structure that is independent of TP partitioning — a fixed tile
+decomposition of the vocabulary plus a fixed merge order and rescaling tree over those
+tiles, identical at every TP degree, so that the TP degree only selects which rank computes
+which tiles and never changes the floating-point grouping. A TP-degree-independent
+decomposition inside each shard is not sufficient on its own, because shard boundaries
+would still group the combines differently across degrees. Providing that global structure
+is an obligation of the deterministic reference implementation; a backend without it is
+still deterministic per degree, and its cross-degree drift is judged against the #108
+tolerance table instead. Averaging per-rank logsumexp values or letting a collective reduce
 numerically is not conformant in either case.
 
 The acceptable LSE and selected-token drift thresholds remain owned by #108, and drift

@@ -30,6 +30,9 @@ _EnumT = TypeVar("_EnumT", bound=Enum)
 # Dispatch policy keywords accepted by KernelRegistry.get_logprob_op; a stable
 # backend id must never shadow one of these, or it becomes unselectable by id.
 RESERVED_DISPATCH_POLICIES = frozenset({"auto", "production", "reference", "deterministic"})
+# Policies a backend can declare as its implementation kind; "auto" is a
+# selection strategy, not an implementation kind.
+IMPLEMENTATION_KINDS = RESERVED_DISPATCH_POLICIES - {"auto"}
 
 
 class LogprobContractError(ValueError):
@@ -384,8 +387,11 @@ class LogprobBackendCapability:
                 f"backend_id={self.backend_id!r} shadows a reserved dispatch policy keyword"
             )
         object.__setattr__(self, "backend_id", self.backend_id.strip())
-        roles = frozenset(_enum_value(LogprobRole, value, "roles") for value in self.roles)
-        dtypes = frozenset(_enum_value(LogprobDType, value, "dtypes") for value in self.dtypes)
+        try:
+            roles = frozenset(_enum_value(LogprobRole, value, "roles") for value in self.roles)
+            dtypes = frozenset(_enum_value(LogprobDType, value, "dtypes") for value in self.dtypes)
+        except TypeError as exc:
+            raise LogprobContractError("roles and dtypes must be iterables of enum values") from exc
         if not roles or not dtypes:
             raise LogprobContractError("backend roles and dtypes must not be empty")
         tp_world_sizes = self._validated_world_sizes(self.tp_world_sizes, "tp_world_sizes")
@@ -398,9 +404,9 @@ class LogprobBackendCapability:
         ):
             if not isinstance(getattr(self, flag_name), bool):
                 raise LogprobContractError(f"{flag_name} must be a bool")
-        if self.implementation_kind not in {"production", "reference", "deterministic"}:
+        if self.implementation_kind not in IMPLEMENTATION_KINDS:
             raise LogprobContractError(
-                "implementation_kind must be production, reference, or deterministic"
+                f"implementation_kind must be one of: {', '.join(sorted(IMPLEMENTATION_KINDS))}"
             )
         object.__setattr__(self, "roles", roles)
         object.__setattr__(self, "dtypes", dtypes)
@@ -484,6 +490,7 @@ class LogprobDispatchResult:
 
 
 __all__ = [
+    "IMPLEMENTATION_KINDS",
     "RESERVED_DISPATCH_POLICIES",
     "DowncastPoint",
     "LogprobBackendCapability",

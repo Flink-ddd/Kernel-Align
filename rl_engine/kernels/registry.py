@@ -181,7 +181,7 @@ class KernelRegistry:
         # of silently selecting an incompatible fallback.
         common_logprob_roles = frozenset({LogprobRole.TRAIN, LogprobRole.INFER})
         common_logprob_dtypes = frozenset({LogprobDType.BF16, LogprobDType.FP16, LogprobDType.FP32})
-        self._logprob_capabilities = {
+        base_logprob_capabilities = {
             OpBackend.PYTORCH_BATCH_INVARIANT_LOGP: LogprobBackendCapability(
                 backend_id="pytorch-batch-invariant-logp-ws1",
                 roles=common_logprob_roles,
@@ -343,6 +343,16 @@ class KernelRegistry:
             platform: list(ops.get("batch_invariant_logp", []))
             for platform, ops in self._priority_map.items()
         }
+        # Capabilities are scoped per platform: the same backend enum may
+        # truthfully declare different support on cuda vs rocm vs cpu.
+        self._logprob_capabilities: Dict[str, Dict[OpBackend, LogprobBackendCapability]] = {
+            platform: {
+                backend: base_logprob_capabilities[backend]
+                for backend in candidates
+                if backend in base_logprob_capabilities
+            }
+            for platform, candidates in self._logprob_candidates.items()
+        }
 
     def _adjust_priority_from_env(self):
         rocm_attn_backend = os.getenv("RL_KERNEL_ROCM_ATTN_BACKEND", "").strip().lower()
@@ -461,8 +471,13 @@ class KernelRegistry:
         if not isinstance(capability, LogprobBackendCapability):
             raise LogprobContractError("capability must be a LogprobBackendCapability")
         resolved_platform = platform if platform is not None else self._platform()
+        if resolved_platform not in self._priority_map:
+            raise LogprobContractError(
+                f"unsupported platform {resolved_platform!r}; expected one of "
+                f"{sorted(self._priority_map)}"
+            )
         candidates = self._logprob_candidates.setdefault(resolved_platform, [])
-        self._logprob_capabilities[backend] = capability
+        self._logprob_capabilities.setdefault(resolved_platform, {})[backend] = capability
         if backend not in candidates:
             if prepend:
                 candidates.insert(0, backend)
@@ -502,8 +517,9 @@ class KernelRegistry:
         # own requested_backend policy filter are not fallbacks.
         capability_rejections = 0
 
+        platform_capabilities = self._logprob_capabilities.get(platform, {})
         for backend in candidates:
-            capability = self._logprob_capabilities.get(backend)
+            capability = platform_capabilities.get(backend)
             if capability is None:
                 rejected.append(f"{backend.name}: no LogprobBackendCapability declared")
                 capability_rejections += 1
