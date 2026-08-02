@@ -28,7 +28,10 @@ QWEN3_PADDED_VOCAB = 152064
 
 def _even_bounds(padded_vocab: int, tp_world_size: int) -> tuple[tuple[int, int], ...]:
     shard = padded_vocab // tp_world_size
-    return tuple((rank * shard, (rank + 1) * shard) for rank in range(tp_world_size))
+    return tuple(
+        (rank * shard, padded_vocab if rank == tp_world_size - 1 else (rank + 1) * shard)
+        for rank in range(tp_world_size)
+    )
 
 
 def _sharding(
@@ -274,8 +277,10 @@ def test_undeclared_backend_capability_is_never_selected():
 def test_declared_compatible_backend_resolves_and_records_provenance():
     registry = KernelRegistry()
     platform = registry._platform()
-    registry._logprob_candidates[platform] = [OpBackend.PYTORCH_BATCH_INVARIANT_LOGP]
-    registry._logprob_capabilities[OpBackend.PYTORCH_BATCH_INVARIANT_LOGP] = _declared_tp_backend()
+    registry._logprob_candidates[platform] = []
+    registry.register_logprob_backend(
+        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP, _declared_tp_backend(), platform=platform
+    )
 
     result = registry.get_logprob_op(_contract(), requested_backend="deterministic")
 
@@ -293,8 +298,10 @@ def test_declared_compatible_backend_resolves_and_records_provenance():
 def test_requested_stable_backend_id_is_enforced():
     registry = KernelRegistry()
     platform = registry._platform()
-    registry._logprob_candidates[platform] = [OpBackend.PYTORCH_BATCH_INVARIANT_LOGP]
-    registry._logprob_capabilities[OpBackend.PYTORCH_BATCH_INVARIANT_LOGP] = _declared_tp_backend()
+    registry._logprob_candidates[platform] = []
+    registry.register_logprob_backend(
+        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP, _declared_tp_backend(), platform=platform
+    )
 
     with pytest.raises(RuntimeError, match="does not match requested_backend=another-backend"):
         registry.get_logprob_op(_contract(), requested_backend="another-backend")
@@ -333,9 +340,11 @@ def test_backend_id_must_not_shadow_a_reserved_policy_keyword():
 def test_default_auto_policy_resolves_any_compatible_implementation_kind():
     registry = KernelRegistry()
     platform = registry._platform()
-    registry._logprob_candidates[platform] = [OpBackend.PYTORCH_BATCH_INVARIANT_LOGP]
-    registry._logprob_capabilities[OpBackend.PYTORCH_BATCH_INVARIANT_LOGP] = replace(
-        _declared_tp_backend(), implementation_kind="reference"
+    registry._logprob_candidates[platform] = []
+    registry.register_logprob_backend(
+        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
+        replace(_declared_tp_backend(), implementation_kind="reference"),
+        platform=platform,
     )
 
     result = registry.get_logprob_op(_contract())
@@ -347,8 +356,10 @@ def test_default_auto_policy_resolves_any_compatible_implementation_kind():
 def test_policy_keywords_are_case_insensitive_but_backend_ids_are_exact():
     registry = KernelRegistry()
     platform = registry._platform()
-    registry._logprob_candidates[platform] = [OpBackend.PYTORCH_BATCH_INVARIANT_LOGP]
-    registry._logprob_capabilities[OpBackend.PYTORCH_BATCH_INVARIANT_LOGP] = _declared_tp_backend()
+    registry._logprob_candidates[platform] = []
+    registry.register_logprob_backend(
+        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP, _declared_tp_backend(), platform=platform
+    )
 
     result = registry.get_logprob_op(_contract(), requested_backend="DETERMINISTIC")
     assert result.capability.backend_id == "test-deterministic-tp-logprob"
@@ -360,14 +371,15 @@ def test_policy_keywords_are_case_insensitive_but_backend_ids_are_exact():
 def test_policy_only_skips_are_not_reported_as_fallback():
     registry = KernelRegistry()
     platform = registry._platform()
-    registry._logprob_candidates[platform] = [
+    registry._logprob_candidates[platform] = []
+    registry.register_logprob_backend(
         OpBackend.TRITON_BATCH_INVARIANT_LOGP,
-        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
-    ]
-    registry._logprob_capabilities[OpBackend.TRITON_BATCH_INVARIANT_LOGP] = replace(
-        _declared_tp_backend(), backend_id="other-compatible-backend"
+        replace(_declared_tp_backend(), backend_id="other-compatible-backend"),
+        platform=platform,
     )
-    registry._logprob_capabilities[OpBackend.PYTORCH_BATCH_INVARIANT_LOGP] = _declared_tp_backend()
+    registry.register_logprob_backend(
+        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP, _declared_tp_backend(), platform=platform
+    )
 
     result = registry.get_logprob_op(_contract(), requested_backend="test-deterministic-tp-logprob")
 
@@ -378,14 +390,15 @@ def test_policy_only_skips_are_not_reported_as_fallback():
 def test_capability_rejections_are_reported_as_fallback():
     registry = KernelRegistry()
     platform = registry._platform()
-    registry._logprob_candidates[platform] = [
+    registry._logprob_candidates[platform] = []
+    registry.register_logprob_backend(
         OpBackend.TRITON_BATCH_INVARIANT_LOGP,
-        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
-    ]
-    registry._logprob_capabilities[OpBackend.TRITON_BATCH_INVARIANT_LOGP] = replace(
-        _declared_tp_backend(), backend_id="tp1-only-backend", tp_world_sizes=(1,)
+        replace(_declared_tp_backend(), backend_id="tp1-only-backend", tp_world_sizes=(1,)),
+        platform=platform,
     )
-    registry._logprob_capabilities[OpBackend.PYTORCH_BATCH_INVARIANT_LOGP] = _declared_tp_backend()
+    registry.register_logprob_backend(
+        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP, _declared_tp_backend(), platform=platform
+    )
 
     result = registry.get_logprob_op(_contract())
 
@@ -400,3 +413,34 @@ def test_ws2_candidate_list_is_decoupled_from_the_legacy_priority_map():
 
     legacy = registry._priority_map[platform]["batch_invariant_logp"]
     assert OpBackend.PYTORCH_NATIVE not in legacy
+
+    legacy.insert(0, OpBackend.PYTORCH_GEMM)
+    assert OpBackend.PYTORCH_GEMM not in registry._logprob_candidates[platform]
+
+
+def test_register_logprob_backend_is_the_public_registration_seam():
+    registry = KernelRegistry()
+    platform = registry._platform()
+    registry._logprob_candidates[platform] = []
+    capability = _declared_tp_backend()
+
+    registry.register_logprob_backend(
+        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP, capability, platform=platform
+    )
+    registry.register_logprob_backend(
+        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
+        replace(capability, backend_id="replacement-backend"),
+        platform=platform,
+    )
+
+    assert registry._logprob_candidates[platform] == [OpBackend.PYTORCH_BATCH_INVARIANT_LOGP]
+    result = registry.get_logprob_op(_contract())
+    assert result.capability.backend_id == "replacement-backend"
+
+    with pytest.raises(LogprobContractError, match="capability must be"):
+        registry.register_logprob_backend(OpBackend.PYTORCH_BATCH_INVARIANT_LOGP, None)
+
+
+def test_backend_id_whitespace_is_normalized_for_dispatch():
+    capability = replace(_declared_tp_backend(), backend_id="  padded-id  ")
+    assert capability.backend_id == "padded-id"

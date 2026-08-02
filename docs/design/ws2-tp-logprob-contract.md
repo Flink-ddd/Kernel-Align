@@ -127,8 +127,15 @@ selected_logp = target_logit - LSE
 
 The selected target logit comes from a masked single-owner gather: exactly one rank holds
 each active token's target column. Downcast happens only at the final write. Because the
-merge order is fixed by shard index, TP=2 is bitwise-equal to TP=1 by construction; averaging
-per-rank logsumexp values or letting a collective reduce numerically is not conformant.
+merge order is fixed by shard index, the result is deterministic and reproducible at every
+TP degree by construction. Cross-degree bitwise equality (TP=2 equal to TP=1, the #241 PR 3
+acceptance target) requires one further condition: the local per-shard reduction must use a
+TP-degree-independent tile decomposition, so that the same partial sums are formed in the
+same order regardless of how the vocabulary is sharded. Providing that decomposition is an
+obligation of the deterministic reference implementation; a backend without it is still
+deterministic per degree, and its cross-degree drift is judged against the #108 tolerance
+table instead. Averaging per-rank logsumexp values or letting a collective reduce
+numerically is not conformant in either case.
 
 The acceptable LSE and selected-token drift thresholds remain owned by #108, and drift
 reports follow the #116 format. This contract does not introduce another tolerance table.
@@ -170,8 +177,9 @@ The current WS1 batch-invariant logp implementations are single-shard (TP=1) ref
 they accept full-vocabulary logits with ignore-index masking but carry no vocab-shard
 metadata, no padded-vs-real vocab distinction, and no public vocab-domain LSE export. Strict
 WS2 requests therefore fail clearly today. The later deterministic vocab-parallel reference
-becomes selectable by registering a capability that truthfully declares those features; no
-controller branch or silent fallback is required.
+becomes selectable through `KernelRegistry.register_logprob_backend(backend, capability)`
+by declaring a capability that truthfully describes those features; no controller branch or
+silent fallback is required.
 
 Successful dispatch provenance records:
 

@@ -342,10 +342,11 @@ class LogprobContract:
             "engine": self.reduction.engine.value,
             "cp_is_merge_axis": False,
         }
+        # The per-token mask is deliberately summarized: provenance exists for
+        # logging/serialization and the raw mask would dominate its size.
         mask = {
             "num_tokens": self.mask.num_tokens,
             "active_token_count": self.mask.active_token_count,
-            "active_mask": list(self.mask.active_mask),
             "ignore_index": self.mask.ignore_index,
         }
         return {
@@ -382,6 +383,7 @@ class LogprobBackendCapability:
             raise LogprobContractError(
                 f"backend_id={self.backend_id!r} shadows a reserved dispatch policy keyword"
             )
+        object.__setattr__(self, "backend_id", self.backend_id.strip())
         roles = frozenset(_enum_value(LogprobRole, value, "roles") for value in self.roles)
         dtypes = frozenset(_enum_value(LogprobDType, value, "dtypes") for value in self.dtypes)
         if not roles or not dtypes:
@@ -482,17 +484,17 @@ class LogprobDispatchResult:
 
 
 __all__ = [
+    "RESERVED_DISPATCH_POLICIES",
     "DowncastPoint",
     "LogprobBackendCapability",
     "LogprobContract",
     "LogprobContractError",
-    "LogprobDispatchResult",
     "LogprobDType",
+    "LogprobDispatchResult",
     "LogprobMerge",
     "LogprobRole",
     "MaskSpec",
     "MergeAxis",
-    "RESERVED_DISPATCH_POLICIES",
     "ReductionEngine",
     "ReductionOrder",
     "ReductionSpec",

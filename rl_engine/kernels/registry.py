@@ -433,25 +433,41 @@ class KernelRegistry:
         candidates = self._priority_map.get(platform, {}).get(op_type, [OpBackend.PYTORCH_NATIVE])
 
         for backend in candidates:
-            if backend.name in self._instance_cache:
-                return self._instance_cache[backend.name]
-
-            if backend.name in self._failed_backends:
-                continue
-
-            op_class = self._load_backend(backend)
-            if op_class:
-                try:
-                    op_instance = op_class()
-                    self._instance_cache[backend.name] = op_instance
-                    return op_instance
-                except Exception as e:
-                    logger.error(f"Failed to instantiate {backend.name}: {e}")
-                    self._failed_backends.add(backend.name)
-            else:
-                self._failed_backends.add(backend.name)
+            op_instance = self._get_or_create_backend(backend)
+            if op_instance is not None:
+                return op_instance
 
         raise RuntimeError(f"No functional backend found for {op_type} on {platform}")
+
+    def register_logprob_backend(
+        self,
+        backend: OpBackend,
+        capability: LogprobBackendCapability,
+        *,
+        platform: Optional[str] = None,
+        prepend: bool = False,
+    ) -> None:
+        """Register (or replace) a backend for WS2 contract-aware logprob dispatch.
+
+        This is the supported seam for making a new backend selectable by
+        ``get_logprob_op`` (e.g. the deterministic vocab-parallel TP reference
+        from issue #241 PR 3) without touching the legacy ``get_op`` priority
+        lists.  Registering the same backend again replaces its capability
+        without duplicating the candidate entry.
+        """
+
+        if not isinstance(backend, OpBackend):
+            raise LogprobContractError("backend must be an OpBackend")
+        if not isinstance(capability, LogprobBackendCapability):
+            raise LogprobContractError("capability must be a LogprobBackendCapability")
+        resolved_platform = platform if platform is not None else self._platform()
+        candidates = self._logprob_candidates.setdefault(resolved_platform, [])
+        self._logprob_capabilities[backend] = capability
+        if backend not in candidates:
+            if prepend:
+                candidates.insert(0, backend)
+            else:
+                candidates.append(backend)
 
     def get_logprob_op(
         self,
@@ -556,11 +572,7 @@ class KernelRegistry:
         )
 
     def _platform(self) -> str:
-        if device_ctx.is_rocm:
-            return "rocm"
-        if device_ctx.device_type == "cuda":
-            return "cuda"
-        return "cpu"
+        return self._platform_for_device(None)
 
     def _get_or_create_backend(self, backend: OpBackend) -> Any | None:
         if backend.name in self._instance_cache:
