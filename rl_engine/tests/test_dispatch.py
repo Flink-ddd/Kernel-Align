@@ -42,6 +42,28 @@ def test_rocm_attention_native_sdpa_opt_out(monkeypatch):
     assert registry._priority_map["rocm"]["attn"][1] == OpBackend.ROCM_FLASH_ATTN
 
 
+def test_registry_explicit_device_selects_device_platform(monkeypatch):
+    registry = KernelRegistry()
+    loaded = []
+
+    class DummyOp:
+        pass
+
+    def fake_load_backend(backend):
+        loaded.append(backend)
+        return DummyOp
+
+    monkeypatch.setattr(registry, "_load_backend", fake_load_backend)
+
+    op = registry.get_op("logp", device="cuda:0")
+
+    assert isinstance(op, DummyOp)
+    expected = (
+        OpBackend.ROCM_AITER if torch.version.hip is not None else OpBackend.CUDA_FUSED_LOGP_GENERIC
+    )
+    assert loaded[0] == expected
+
+
 def test_executor_flow():
     executor = RolloutExecutor()
     mock_input_ids = torch.ones((1, 16), dtype=torch.long)

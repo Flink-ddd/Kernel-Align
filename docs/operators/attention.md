@@ -48,7 +48,7 @@ The op exposes the WS1 dual-path contract:
 | Backend | Wrapper | Native symbol | Status |
 | --- | --- | --- | --- |
 | PyTorch fallback | `NativeAttentionOp` | None | fp32 ground-truth reference; CPU and any GPU. |
-| CUDA / ROCm / Triton | — | — | Planned: downstream fused attention kernels validate against this reference. |
+| CUDA deterministic | `DeterministicAttentionOp` | `_C.deterministic_attention_forward/backward` | Batch-invariant CUDA implementation (issue #147). |
 
 ## Tensor Contract
 
@@ -76,12 +76,14 @@ the inputs' device.
 ## Dispatch Behavior
 
 `kernel_registry.get_op("attention")` resolves through the `OpBackend` priority map. On
-`cuda` / `rocm` / `cpu` the only registered backend today is the PyTorch native op
-(`PYTORCH_NATIVE_ATTENTION`), so every device dispatches to this op. Calling it (`__call__` ->
-`forward(...)`) computes in the input dtype; `forward_fp32(...)` is the explicit fp32 golden
-path. When fused attention kernels land, they are prepended to the priority list and the native
-op becomes the fallback. The production `"attn"` op_type (SDPA-based `PYTORCH_ATTN`, FlashAttention, etc.) is
-a separate dispatch chain and is unaffected.
+`cuda` the priority is:
+
+1. `CUDA_DETERMINISTIC_ATTENTION` — `DeterministicAttentionOp` (batch-invariant, fixed-order).
+2. `PYTORCH_NATIVE_ATTENTION` — `NativeAttentionOp` (fallback).
+
+Calling it (`__call__` -> `forward(...)`) computes in the input dtype; `forward_fp32(...)` is
+the explicit fp32 golden path (NativeAttentionOp only). The production `"attn"` op_type
+(SDPA-based `PYTORCH_ATTN`, FlashAttention, etc.) is a separate dispatch chain and is unaffected.
 
 ## Accuracy
 
@@ -146,14 +148,76 @@ GPU-only LARGE Qwen3-8B real-shape smoke test.
 
 ## Implementation Files
 
-- `rl_engine/kernels/ops/pytorch/attention/standard_attn.py`
+- `rl_engine/kernels/ops/pytorch/attention/standard_attn.py` — ground-truth reference
+- `rl_engine/kernels/ops/cuda/attention/deterministic_attn.py` — CUDA deterministic op
+- `csrc/cuda/attention/deterministic_attention.cu` — CUDA kernels
 - `rl_engine/kernels/registry.py`
 - `tests/test_attention.py`
+- `tests/test_deterministic_attention_cuda.py`
+
+## Fixed Reduction Order (CUDA Deterministic Backend)
+
+The CUDA `DeterministicAttentionOp` pins reduction order for batch-invariance:
+
+**QK kernel**: D-dimension FP32 accumulation, `d = 0 .. D-1`. Each `scores[b,hq,q,k]` has
+exactly one writer thread.
+
+**Softmax + LSE kernel**: Each `(b, hq, q)` row processed by one CTA with fixed 256 threads.
+Max and sum-exp use a fixed shared-memory tree reduction (power-of-two stride). No split by
+batch size, sequence length, or SM count.
+
+**PV kernel**: K-dimension FP32 accumulation, `k = 0 .. Skv-1`. Each `out[b,hq,q,d]` has
+exactly one writer thread.
+
+**Backward dK/dV**: Per `(b, hkv, k, d)` output element, a single thread accumulates over
+query heads in group order then query positions:
+```text
+for local = 0 .. g-1:       # g = Hq / Hkv
+  hq = hkv * g + local
+  for q = 0 .. Sq-1:
+    acc += ...
+```
+No cross-CTA atomics. No launch-order dependent accumulation.
+
+## Prefill / Decode / KV-cache Shared Contract
+
+All inference modes use **the same standard attention kernels** (only Sq/Skv differ):
+
+- **Prefill**: `Sq == Skv`. Causal mask `key_index <= Skv - Sq + query_index`.
+- **Chunked-prefill**: each chunk uses `Sq = chunk_size`, `Skv = past + chunk_size`.
+  Same causal offset formula produces identical results to full prefill at matching positions.
+- **Decode**: `Sq = 1` (or few), `Skv = full_context`. Same kernel, same offset.
+- **KV-cache**: caller does `k_full = cat([k_cache, k_new], dim=2)` then calls this op.
+  No separate KV-cache softmax implementation allowed.
+
+Hooks:
+- `forward(q, k, v, ...)` — main path (registry, #108 harness). Differentiable.
+- `forward_with_lse(q, k, v, ...)` — returns `(out, lse)` for LSE verification, debugging,
+  and future KV-cache / training integration.
+
+## Tolerance
+
+| Scenario | Comparison | Tolerance |
+| --- | --- | --- |
+| Same physical shape, varying batch position/size/chunk | bitwise | `batch_invariance` (atol=0, rtol=0) |
+| Chunked-prefill on/off at same position | bitwise | `batch_invariance` |
+| Prefill tail vs decode slice | bitwise | `batch_invariance` |
+| CUDA vs `forward_fp32` output/grad | tolerance | `accuracy.default.attention` |
+| Valid-only vs padded (reduction width differs) | near-equal | accuracy tolerance (NOT bitwise) |
+
+## Memory Tradeoff (First Version)
+
+The first version materializes full FP32 `scores [B, Hq, Sq, Skv]` and `P [B, Hq, Sq, Skv]`.
+Memory cost: `4 * B * Hq * Sq * Skv` bytes per tensor. For Qwen3-8B at B=8, Sq=Skv=4096,
+Hq=32: each tensor is ~17 GB. This is acceptable for correctness verification and moderate
+sequence lengths but OOM-prone for long sequences. See `benchmarks/benchmark_deterministic_attention.py`
+for measured peak memory at representative shapes.
 
 ## Known Limitations
 
-- PyTorch fallback only; no fused CUDA/Triton backend yet (downstream work).
+- First version: `D=128` only (Qwen3-8B alignment).
+- Supported dtypes: BF16, FP16.
+- Full materialization of scores/P limits practical sequence length.
 - `Hq` must be divisible by `Hkv` (raises `ValueError` otherwise).
-- The naive path materializes the full `[B, Hq, Sq, Skv]` scores tensor — no query-chunking,
-  so the LARGE load point is memory-heavy and GPU-only.
-- Covers softmax attention only; QK-Norm and RoPE are applied before the call.
+- CUDA KV-cache op wrapper is not in scope (caller does cat + calls this op).
+- No FP8, no multi-GPU / sequence-parallel.

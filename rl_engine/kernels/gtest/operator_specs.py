@@ -32,6 +32,37 @@ def _load_object(path: str) -> Any:
 
 
 OP_SPECS = {
+    "rms_norm": OperatorSpec(
+        name="rms_norm",
+        op_class="reduction",
+        gold_path="rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp",
+            "triton": "rl_engine.kernels.ops.triton.rmsnorm_triton.RMSNormTritonOp",
+            "cuda": "rl_engine.kernels.ops.cuda.norm.rmsnorm.RMSNormCudaOp",
+            "cuda-sm90": "rl_engine.kernels.ops.cuda.norm.rmsnorm.RMSNormCudaOp",
+        },
+        grad_input_names=("x", "weight"),
+    ),
+    "attention": OperatorSpec(
+        name="attention",
+        op_class="attention",
+        gold_path="rl_engine.kernels.ops.pytorch.attention.standard_attn.NativeAttentionOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.attention.standard_attn.NativeAttentionOp",
+            "triton": (
+                "rl_engine.kernels.ops.triton.attention.standard_attn."
+                "TritonBatchInvariantAttentionOp"
+            ),
+            "cuda": (
+                "rl_engine.kernels.ops.cuda.attention.deterministic_attn."
+                "DeterministicAttentionOp"
+            ),
+        },
+        grad_input_names=("q", "k", "v"),
+    ),
     "logp": OperatorSpec(
         name="logp",
         op_class="logprob",
@@ -56,6 +87,68 @@ OP_SPECS = {
             "cuda-sm90": "rl_engine.kernels.ops.cuda.loss.linear_logp.FusedLinearLogpSM90Op",
         },
         grad_input_names=("hidden", "lm_head_weight"),
+    ),
+    "embedding": OperatorSpec(
+        name="embedding",
+        op_class="elementwise",
+        gold_path="rl_engine.kernels.ops.pytorch.linear.embedding.NativeEmbeddingOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.linear.embedding.NativeEmbeddingOp",
+            "cuda-sm90": "rl_engine.kernels.ops.cuda.linear.embedding.SM90EmbeddingOp",
+        },
+        grad_input_names=("weight",),
+    ),
+    "lm_head": OperatorSpec(
+        name="lm_head",
+        op_class="reduction",
+        gold_path="rl_engine.kernels.ops.pytorch.linear.lm_head.NativeLMHeadOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.linear.lm_head.NativeLMHeadOp",
+            "cuda-sm90": "rl_engine.kernels.ops.cuda.linear.lm_head.SM90LMHeadOp",
+        },
+        grad_input_names=("hidden", "weight"),
+    ),
+    "det_gemm": OperatorSpec(
+        name="det_gemm",
+        op_class="reduction",
+        gold_path="rl_engine.kernels.ops.pytorch.matmul.det_gemm.NativeGemmOp",
+        gold_method="__call__",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.matmul.det_gemm.NativeGemmOp",
+            "cuda": "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp",
+            "triton": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
+        },
+        grad_input_names=("a", "b"),
+    ),
+    "rope": OperatorSpec(
+        name="rope",
+        op_class="elementwise",
+        gold_path="rl_engine.kernels.ops.pytorch.rotary_embedding.rope.NativeRoPEOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.rotary_embedding.rope.NativeRoPEOp",
+            "triton": "rl_engine.kernels.ops.triton.rotary_embedding.rope.TritonRoPEOp",
+            "cuda-sm90": "rl_engine.kernels.ops.cuda.rotary_embedding.rope.RoPESM90Op",
+        },
+        grad_input_names=("x",),
+    ),
+    "batch_invariant_logp": OperatorSpec(
+        name="batch_invariant_logp",
+        op_class="logprob",
+        gold_path="rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp."
+        "NativeBatchInvariantLogpOp",
+        gold_method="apply",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp."
+            "NativeBatchInvariantLogpOp",
+            "triton": "rl_engine.kernels.ops.triton.loss.batch_invariant_logp."
+            "TritonBatchInvariantLogpOp",
+            "cuda-sm90": "rl_engine.kernels.ops.cuda.loss.batch_invariant_logp."
+            "BatchInvariantLogpSM90Op",
+        },
+        grad_input_names=("logits",),
     ),
 }
 

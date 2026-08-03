@@ -1,14 +1,14 @@
 # Token Embedding
 
-The embedding operator maps integer token ids to their hidden-state rows — the first
+The embedding operator maps integer token ids to their hidden-state rows, the first
 layer of the Qwen3/Llama stack. It is a **WS1 ground-truth reference** (issue #108):
 a pure-PyTorch definition of the "correct answer" that downstream fused CUDA/Triton
 kernels are validated against.
 
-- **Embedding** (`NativeEmbeddingOp`): `out = weight[token_ids]` — a plain row gather.
+- **Embedding** (`NativeEmbeddingOp`): `out = weight[token_ids]`, a plain row gather.
 
 For Qwen3-8B the table is the input embedding `[vocab=151936, hidden=4096]` and is
-**independent** from the lm_head weight (`tie_word_embeddings=false`) — the two weights
+**independent** from the lm_head weight (`tie_word_embeddings=false`); the two weights
 are not shared.
 
 ## Entry Point
@@ -22,9 +22,9 @@ h = embedding(token_ids, weight)   # [B, S], [vocab, hidden]  ->  [B, S, hidden]
 
 The op exposes the WS1 dual-path contract:
 
-- `forward(...)` — gathers in the weight's native dtype, casts the gathered rows back to
+- `forward(...)` gathers in the weight's native dtype, casts the gathered rows back to
   the weight dtype (Axis-B accuracy candidate / dtype-behavior path).
-- `forward_fp32(...)` — native-dtype gather, then upcasts the result to fp32 (the
+- `forward_fp32(...)` uses native-dtype gather, then upcasts the result to fp32 (the
   ground-truth golden path).
 
 ## Backends
@@ -32,7 +32,8 @@ The op exposes the WS1 dual-path contract:
 | Backend | Wrapper | Native symbol | Status |
 | --- | --- | --- | --- |
 | PyTorch fallback | `NativeEmbeddingOp` | None | fp32 ground-truth reference; CPU and any GPU. |
-| CUDA / ROCm / Triton | — | — | Planned: downstream fused kernels validate against this reference. |
+| CUDA SM90 (H200/Hopper) | `SM90EmbeddingOp` | `_C.embedding_sm90_forward` | Single-card batch-invariant forward backend; deterministic duplicate-id backward in the wrapper. |
+| ROCm / Triton | N/A | N/A | Falls back to the PyTorch native reference. |
 
 ## Tensor Contract
 
@@ -40,17 +41,18 @@ The op exposes the WS1 dual-path contract:
 | --- | --- | --- | --- |
 | `token_ids` | `[B, S]` (any shape) | integer | Index dtype; cast to int64 internally. Values in `[0, vocab)`. |
 | `weight` | `[vocab, hidden]` | float (fp16/bf16/fp32) | Embedding table (Qwen3-8B `[151936, 4096]`). |
-| output | `token_ids.shape + (hidden,)` | `forward`: weight dtype · `forward_fp32`: float32 | Gathered rows. |
+| output | `token_ids.shape + (hidden,)` | `forward`: weight dtype; `forward_fp32`: float32 | Gathered rows. |
 
 Output dtype follows `weight` (the float operand); `token_ids` stay integer. Pure
-function — no randomness, no in-place mutation, device/dtype follow the inputs.
+function: no randomness, no in-place mutation, device/dtype follow the inputs.
 
 ## Dispatch Behavior
 
 `kernel_registry.get_op("embedding")` resolves through the `OpBackend` priority map. On
-`cuda` / `rocm` / `cpu` the only registered backend today is the PyTorch native op
-(`PYTORCH_NATIVE_EMBEDDING`), so every device dispatches to the fp32 reference. When fused
-kernels land, they are prepended to the priority list and the native op becomes the fallback.
+CPU, ROCm, and CUDA devices without the SM90 extension, dispatch uses the PyTorch native op
+(`PYTORCH_NATIVE_EMBEDDING`). On H200/Hopper-class builds that expose `_C.embedding_sm90_forward`,
+the CUDA SM90 single-card batch-invariant backend is prepended and the native op remains
+the fallback.
 
 ## Accuracy
 
@@ -62,20 +64,24 @@ out = F.embedding(token_ids.long(), weight).to(torch.float32)
 
 - **Ground truth**: `forward_fp32` gathers in the native dtype, then upcasts to fp32.
   Because a gather is a lossless row copy, this is bitwise-identical to upcasting the
-  whole table first — but it never allocates a multi-GB fp32 copy of the full vocab
+  whole table first, but it never allocates a multi-GB fp32 copy of the full vocab
   table for a tiny lookup; only the gathered rows are upcast.
 - **Dtype path**: `forward` runs the same gather, then casts back to the weight dtype;
   it is bitwise-equal to `forward_fp32(...).to(dtype)`.
-- **Lossless gather — no accuracy drift**: a row gather performs no reduction and no
+- **Lossless gather, no accuracy drift**: a row gather performs no reduction and no
   floating-point accumulation, so the result is **bit-exact** at every dtype. There is no
   Axis-B tolerance to calibrate; the gathered rows equal direct indexing exactly.
-- **Axis A — batch invariance**: each token's row is independent, so the output is
+- **Axis A batch invariance**: each token's row is independent, so the output is
   bitwise-identical regardless of batch size or padding (`torch.equal`, `atol=0`).
 
 ## Performance Notes
 
-Reference operator — no fused kernel or benchmark yet. Downstream fused kernels carry their
-own benchmarks and are measured against this reference for correctness.
+The SM90 backend is a simple single-card forward gather for H200/Hopper builds. It is
+not a TP/vocab-parallel integration path; downstream fused kernels carry their own
+benchmarks and are measured against the PyTorch reference for correctness. Its backward
+path is intentionally conservative: token ids are sorted, duplicate ids are reduced in
+a fixed order, and only unique rows are written back. That avoids CUDA atomic-add
+nondeterminism for repeated token ids at the cost of throughput.
 
 ## Tests
 
@@ -92,19 +98,15 @@ test at the real Qwen3-8B dims (`vocab=151936, hidden=4096`, boundary ids `0` an
 ## Implementation Files
 
 - `rl_engine/kernels/ops/pytorch/linear/embedding.py`
+- `rl_engine/kernels/ops/cuda/linear/embedding.py`
+- `csrc/cuda/embedding_lm_head_sm90.cu`
 - `rl_engine/kernels/registry.py`
 - `tests/test_embedding.py`
 
 ## Known Limitations
 
-- PyTorch fallback only; no fused CUDA/Triton backend yet (downstream work).
-- Out-of-range token ids are not validated; callers must keep ids in `[0, vocab)`.
-- **GPU backward is bitwise-reproducible only under deterministic algorithms.** The
-  forward is a lossless gather (always reproducible), but `∂L/∂weight` is a scatter-add:
-  every repeated token id (padding, common tokens) accumulates into the same `weight.grad`
-  row. On CUDA that accumulation uses atomic adds, whose ordering is nondeterministic, so
-  the weight gradient is not bit-exact across runs when ids collide. PyTorch documents
-  `embedding` backward as a nondeterministic CUDA op for this reason. Since `forward_fp32`
-  is the backward golden source, callers that need a reproducible GPU gradient must enable
-  `torch.use_deterministic_algorithms(True)` (the gradient test does this). CPU backward is
-  always deterministic.
+- The CUDA SM90 path is single-card coverage; TP/vocab-parallel and Triton embedding
+  backends are outside this PR.
+- Token ids must be in `[0, vocab)`. The SM90 host path validates the range before the
+  kernel launch and raises instead of masking invalid ids.
+- The deterministic SM90 backward is a reference path, not a tuned training kernel.

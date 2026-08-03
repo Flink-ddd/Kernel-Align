@@ -17,7 +17,7 @@ dependencies = [
     "tabulate",
     "numpy",
     "accelerate",
-    "transformers",
+    "transformers==5.13.1",
 ]
 
 [project.optional-dependencies]

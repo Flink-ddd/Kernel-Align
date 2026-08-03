@@ -180,6 +180,9 @@ void check_deterministic_logp_inputs(
 void check_deterministic_logp_indices(
     const torch::Tensor& logits,
     const torch::Tensor& row_indices) {
+    TORCH_CHECK(
+        reinterpret_cast<uintptr_t>(logits.data_ptr()) % 16 == 0,
+        "logits must be 16-byte aligned");
     TORCH_CHECK(row_indices.is_cuda(), "row_indices must be a CUDA tensor");
     TORCH_CHECK(
         logits.device() == row_indices.device(),
