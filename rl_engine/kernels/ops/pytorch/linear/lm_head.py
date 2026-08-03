@@ -28,7 +28,9 @@ class NativeLMHeadOp:
     input dtype and therefore drifts from the fp32 ``forward_fp32`` ground
     truth. Axis-B accuracy uses a tolerance (``torch.allclose``), not bitwise
     equality. Axis-A batch invariance still holds bitwise within a single dtype
-    (each output row reduces over ``hidden`` independently of the batch).
+    because each flattened output row is projected through the same GEMV-shaped
+    reduction over ``hidden``. The reduction path therefore depends on K and V,
+    not on how many other rows share the batch.
     """
 
     def __init__(self) -> None:
@@ -101,15 +103,24 @@ class NativeLMHeadOp:
         """
         h = hidden.to(compute_dtype)
         w = weight.to(compute_dtype)
-        # [..., hidden] @ [hidden, vocab] -> [..., vocab]; weight is [vocab, hidden] (HF [out, in]).
         if strict_fp32:
             with NativeLMHeadOp._strict_fp32_matmul(h.device.type):
-                out = h @ w.t()
+                out = NativeLMHeadOp._fixed_k_projection(h, w)
         else:
-            out = h @ w.t()
+            out = NativeLMHeadOp._fixed_k_projection(h, w)
         if bias is not None:
             out = out + bias.to(compute_dtype)
         return out.to(output_dtype)
+
+    @staticmethod
+    def _fixed_k_projection(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        flat_hidden = hidden.reshape(-1, hidden.size(-1))
+        if flat_hidden.size(0) == 0:
+            flat_out = flat_hidden @ weight.t()
+            return flat_out.reshape(*hidden.shape[:-1], weight.size(0))
+        rows = [torch.mv(weight, row) for row in flat_hidden]
+        flat_out = torch.stack(rows, dim=0)
+        return flat_out.reshape(*hidden.shape[:-1], weight.size(0))
 
     @staticmethod
     @contextmanager

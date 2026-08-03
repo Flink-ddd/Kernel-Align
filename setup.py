@@ -150,7 +150,9 @@ def get_extensions():
         sm90_srcs = [
             "csrc/cuda/fused_logp_sm90.cu",
             "csrc/cuda/fused_linear_logp_sm90.cu",  # TMA + WGMMA fused linear log-prob
+            "csrc/cuda/batch_invariant_logp_kernel_sm90.cu",  # TMA batch-invariant logp
             "csrc/cuda/rope_sm90.cu",  # RoPE rotate-half apply, gated to SM90 build
+            "csrc/cuda/embedding_lm_head_sm90.cu",  # single-card batch-invariant embedding/lm-head
         ]
         enable_sm90 = envs.env_flag(envs.KERNEL_ALIGN_FORCE_SM90)
         present_sm90 = [s for s in sm90_srcs if os.path.exists(s)]
@@ -161,7 +163,7 @@ def get_extensions():
             cxx_flags.append("-DKERNEL_ALIGN_WITH_SM90")
             extra_link_args.append("-lcuda")
 
-        # det_gemm SM90 (mma.sync + TMA) path — independent of the fused_logp
+        # det_gemm SM90 (mma.sync + TMA) path: independent of the fused_logp
         # SM90 sources, which currently fail ptxas on CUDA 12.4 (shared::cta in
         # the shared tma_utils.cuh). det_gemm uses its own gemm/det_gemm_tma.cuh.
         enable_det_gemm_sm90 = os.environ.get("KERNEL_ALIGN_DET_GEMM_SM90") == "1"

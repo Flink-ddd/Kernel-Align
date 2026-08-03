@@ -40,6 +40,31 @@ requires_triton = pytest.mark.skipif(
 )
 
 
+def _sm90_kernel_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
+    except Exception:
+        return False
+    return (
+        _EXT_AVAILABLE
+        and hasattr(_C, "batch_invariant_logp_sm90")
+        and torch.cuda.get_device_capability()[0] == 9
+    )
+
+
+requires_sm90 = pytest.mark.skipif(
+    not _sm90_kernel_available(),
+    reason="batch_invariant_logp_sm90 kernel not compiled "
+    "(needs KERNEL_ALIGN_FORCE_SM90=1 on an SM90/Hopper device).",
+)
+
+# 16-byte-aligned vocab so the TMA forward runs directly (not the fallback):
+# bf16 needs V % 8 == 0, fp32 needs V % 4 == 0.
+_VC = 1024
+
+
 def _reference_logp(logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
     """Canonical reference: log_softmax(fp32) + gather."""
     logits_2d = logits.reshape(-1, logits.size(-1)).float()
@@ -798,6 +823,197 @@ class TestTritonValidation:
 
 
 # ---------------------------------------------------------------------------
+# 7b. CUDA SM90 TMA kernel backend
+# ---------------------------------------------------------------------------
+
+
+@requires_sm90
+class TestCudaSM90Correctness:
+    """Compiled SM90 TMA kernel output must match log_softmax + gather."""
+
+    def _get_op(self):
+        from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import BatchInvariantLogpSM90Op
+
+        return BatchInvariantLogpSM90Op()
+
+    def test_matches_reference_fp32(self):
+        op = self._get_op()
+        logits = torch.randn(8, _VC, device="cuda")
+        target = torch.randint(0, _VC, (8,), device="cuda")
+        out = op(logits, target)
+        ref = _reference_logp(logits, target)
+        assert out.dtype == torch.float32
+        assert torch.allclose(out, ref, atol=1e-4)
+
+    def test_matches_reference_bf16(self):
+        op = self._get_op()
+        logits = torch.randn(8, _VC, device="cuda", dtype=torch.bfloat16)
+        target = torch.randint(0, _VC, (8,), device="cuda")
+        out = op(logits, target)
+        ref = _reference_logp(logits.float(), target)
+        assert out.dtype == torch.float32
+        assert torch.allclose(out, ref, atol=1e-3)
+
+    def test_large_vocab(self):
+        op = self._get_op()
+        logits = torch.randn(4, 128256, device="cuda", dtype=torch.bfloat16)
+        target = torch.randint(0, 128256, (4,), device="cuda")
+        out = op(logits, target)
+        ref = _reference_logp(logits.float(), target)
+        assert torch.allclose(out, ref, atol=2e-3)
+
+    def test_unaligned_vocab(self):
+        # V not a multiple of the TMA box: exercises the global-read tail path.
+        op = self._get_op()
+        logits = torch.randn(8, 50257, device="cuda", dtype=torch.bfloat16)
+        target = torch.randint(0, 50257, (8,), device="cuda")
+        out = op(logits, target)
+        ref = _reference_logp(logits.float(), target)
+        assert torch.allclose(out, ref, atol=2e-3)
+
+    def test_single_token(self):
+        op = self._get_op()
+        logits = torch.randn(1, _VC, device="cuda")
+        target = torch.randint(0, _VC, (1,), device="cuda")
+        out = op(logits, target)
+        ref = _reference_logp(logits, target)
+        assert torch.allclose(out, ref, atol=1e-4)
+
+    def test_3d_logits(self):
+        op = self._get_op()
+        logits = torch.randn(2, 3, _VC, device="cuda", dtype=torch.bfloat16)
+        target = torch.randint(0, _VC, (2, 3), device="cuda")
+        out = op(logits, target)
+        assert out.shape == (2, 3)
+        ref = _reference_logp(logits.float(), target)
+        assert torch.allclose(out, ref, atol=1e-3)
+
+    def test_matches_pytorch_op(self):
+        op = self._get_op()
+        pytorch_op = NativeBatchInvariantLogpOp()
+        logits = torch.randn(16, _VC, device="cuda")
+        target = torch.randint(0, _VC, (16,), device="cuda")
+        assert torch.allclose(op(logits, target), pytorch_op(logits, target), atol=1e-4)
+
+
+@requires_sm90
+class TestCudaSM90BatchInvariance:
+    """SM90 kernel must be bitwise batch-invariant (one CTA per row)."""
+
+    def _get_op(self):
+        from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import BatchInvariantLogpSM90Op
+
+        return BatchInvariantLogpSM90Op()
+
+    def test_batch_size_1_vs_n(self):
+        op = self._get_op()
+        row = _make_row(42, vocab=_VC, device="cuda")
+        target = torch.tensor([7], device="cuda")
+        result_alone = op(row, target).item()
+
+        for batch_size in [2, 4, 8, 16, 32, 64, 128]:
+            batch_logits = torch.randn(batch_size, _VC, device="cuda")
+            batch_target = torch.randint(0, _VC, (batch_size,), device="cuda")
+            batch_logits[0] = row.squeeze(0)
+            batch_target[0] = target.squeeze(0)
+            result_in_batch = op(batch_logits, batch_target)[0].item()
+            assert result_alone == result_in_batch, (
+                f"SM90 drift at batch_size={batch_size}: "
+                f"alone={result_alone}, in_batch={result_in_batch}"
+            )
+
+    def test_different_positions(self):
+        op = self._get_op()
+        row = _make_row(99, vocab=_VC, device="cuda")
+        target = torch.tensor([13], device="cuda")
+        batch_size = 16
+        results = []
+        for pos in range(batch_size):
+            batch_logits = torch.randn(batch_size, _VC, device="cuda")
+            batch_target = torch.randint(0, _VC, (batch_size,), device="cuda")
+            batch_logits[pos] = row.squeeze(0)
+            batch_target[pos] = target.squeeze(0)
+            results.append(op(batch_logits, batch_target)[pos].item())
+        assert all(
+            r == results[0] for r in results
+        ), f"SM90 position drift: unique = {set(results)}"
+
+    def test_repeated_runs(self):
+        op = self._get_op()
+        logits = torch.randn(16, _VC, device="cuda", dtype=torch.bfloat16)
+        target = torch.randint(0, _VC, (16,), device="cuda")
+        results = [op(logits, target) for _ in range(50)]
+        for i, r in enumerate(results[1:], 1):
+            assert torch.equal(r, results[0]), f"SM90 run {i} differs from run 0"
+
+
+@requires_sm90
+class TestCudaSM90Backward:
+    """Gradient through the SM90 op must match reference."""
+
+    def _get_op(self):
+        from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import BatchInvariantLogpSM90Op
+
+        return BatchInvariantLogpSM90Op()
+
+    def test_backward_matches_reference(self):
+        op = self._get_op()
+        logits = torch.randn(4, _VC, device="cuda", requires_grad=True)
+        target = torch.randint(0, _VC, (4,), device="cuda")
+        op(logits, target).sum().backward()
+        grad = logits.grad.detach().clone()
+
+        ref_logits = logits.detach().clone().requires_grad_(True)
+        _reference_logp(ref_logits, target).sum().backward()
+        assert torch.allclose(grad, ref_logits.grad, atol=1e-4)
+
+    def test_ignored_row_grad_is_zero(self):
+        op = self._get_op()
+        logits = torch.randn(4, _VC, device="cuda", requires_grad=True)
+        target = torch.tensor([0, -100, 2, -100], device="cuda")
+        op(logits, target).sum().backward()
+        assert torch.equal(logits.grad[1], torch.zeros(_VC, device="cuda"))
+        assert torch.equal(logits.grad[3], torch.zeros(_VC, device="cuda"))
+
+
+@requires_sm90
+class TestCudaSM90IgnoreIndex:
+
+    def _get_op(self):
+        from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import BatchInvariantLogpSM90Op
+
+        return BatchInvariantLogpSM90Op()
+
+    def test_ignore_outputs_zero(self):
+        op = self._get_op()
+        logits = torch.randn(4, _VC, device="cuda")
+        target = torch.tensor([0, -100, 2, -100], device="cuda")
+        out = op(logits, target)
+        assert out[1].item() == 0.0
+        assert out[3].item() == 0.0
+        ref = _reference_logp(logits[[0, 2]], target[[0, 2]])
+        assert torch.allclose(out[[0, 2]], ref, atol=1e-4)
+
+
+@requires_sm90
+class TestCudaSM90Fallback:
+    """Inputs the TMA path can't take must silently fall back and stay correct."""
+
+    def _get_op(self):
+        from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import BatchInvariantLogpSM90Op
+
+        return BatchInvariantLogpSM90Op()
+
+    def test_fp16_falls_back(self):
+        op = self._get_op()
+        logits = torch.randn(8, _VC, device="cuda", dtype=torch.float16)
+        target = torch.randint(0, _VC, (8,), device="cuda")
+        out = op(logits, target)
+        ref = _reference_logp(logits.float(), target)
+        assert torch.allclose(out, ref, atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
 # 8. Registry dispatch test
 # ---------------------------------------------------------------------------
 
@@ -809,6 +1025,7 @@ def test_registry_dispatches_correctly():
     assert (
         isinstance(op, NativeBatchInvariantLogpOp)
         or type(op).__name__ == "TritonBatchInvariantLogpOp"
+        or type(op).__name__ == "BatchInvariantLogpSM90Op"
     )
     logits = torch.randn(4, _V, device="cuda" if torch.cuda.is_available() else "cpu")
     target = torch.randint(0, _V, (4,), device=logits.device)

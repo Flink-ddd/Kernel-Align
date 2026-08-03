@@ -102,7 +102,10 @@ def test_stateless_reference_scores_real_hf_causal_lm_without_kv_cache():
 def test_stateless_reward_scores_real_hf_sequence_classifier():
     torch.manual_seed(48)
     model = _tiny_bert_reward_model()
-    executor = StatelessForwardExecutor(model, StatelessForwardConfig(mode="reward"))
+    executor = StatelessForwardExecutor(
+        model,
+        StatelessForwardConfig(mode="reward", attention_backend="eager"),
+    )
 
     result = executor.score(_inputs())
 
@@ -110,7 +113,7 @@ def test_stateless_reward_scores_real_hf_sequence_classifier():
     assert result.rewards.shape == (2,)
     assert result.rewards.requires_grad is False
     assert result.metrics["zero_kv_cache"] is True
-    assert result.metrics["attention_backend_fallback"] is True
+    assert result.metrics["attention_backend_fallback"] is False
     assert result.metrics["attention_backend"] == "eager"
 
 

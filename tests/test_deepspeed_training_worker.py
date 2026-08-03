@@ -393,7 +393,9 @@ def test_extract_hidden_states_rejects_ambiguous_multi_tensor_tuple():
         _extract_hidden_states((torch.randn(2, 3, 11), torch.randn(2, 3, 5)))
 
 
-def test_deepspeed_training_worker_routes_linear_logp_and_zeroes_masked_targets(monkeypatch):
+def test_deepspeed_training_worker_routes_linear_logp_and_zeroes_masked_targets(
+    monkeypatch,
+):
     _install_fake_deepspeed(monkeypatch)
     from rl_engine.executors import deepspeed_trainer
 
@@ -463,6 +465,23 @@ def test_deepspeed_training_worker_routes_linear_logp_and_zeroes_masked_targets(
     assert math.isfinite(result.metrics["loss"])
 
 
+def test_deepspeed_linear_logp_device_lookup_uses_explicit_worker_device(monkeypatch):
+    from rl_engine.executors import deepspeed_trainer
+
+    sentinel = object()
+    call = {}
+
+    def fake_get_op(op_type, *, device=None):
+        call["op_type"] = op_type
+        call["device"] = device
+        return sentinel
+
+    monkeypatch.setattr(deepspeed_trainer.kernel_registry, "get_op", fake_get_op)
+
+    assert deepspeed_trainer._linear_logp_op_for_device("cuda:0") is sentinel
+    assert call == {"op_type": "linear_logp", "device": torch.device("cuda:0")}
+
+
 def test_deepspeed_training_worker_rejects_ignore_index_in_model_inputs(monkeypatch):
     _install_fake_deepspeed(monkeypatch)
     from rl_engine.executors import deepspeed_trainer
@@ -503,7 +522,9 @@ def test_deepspeed_training_worker_rejects_ignore_index_in_model_inputs(monkeypa
         worker.train(_rollout())
 
 
-def test_deepspeed_zero3_training_gathers_lm_head_parameters_during_backward(monkeypatch):
+def test_deepspeed_zero3_training_gathers_lm_head_parameters_during_backward(
+    monkeypatch,
+):
     _install_fake_deepspeed_with_gather(monkeypatch)
     from rl_engine.executors import deepspeed_trainer
 

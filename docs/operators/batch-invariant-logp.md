@@ -37,19 +37,68 @@ logp.sum().backward()  # gradients flow into logits only
 
 | Backend | Wrapper | Status |
 | --- | --- | --- |
+| CUDA (SM90 TMA) | `BatchInvariantLogpSM90Op` | Hopper TMA online-softmax forward. |
 | CUDA / ROCm (Triton) | `TritonBatchInvariantLogpOp` | Triton online-softmax forward and tile-wise backward. Requires a GPU tensor. |
 | PyTorch native | `NativeBatchInvariantLogpOp` | FP32 reference path; CPU fallback and Triton-less fallback. |
 
 Current dispatch:
 
 ```text
-CUDA / ROCm: Triton -> PyTorch
-CPU:         PyTorch
+CUDA (Hopper, SM90 kernel compiled): CUDA (SM90 TMA) -> Triton -> PyTorch
+CUDA / ROCm (otherwise):             Triton -> PyTorch
+CPU:                                 PyTorch
 ```
 
-A compiled CUDA backend and benchmark suite are planned follow-up work.
-Benchmarks are not included in this PR; they will be added alongside the CUDA
-backend in a subsequent PR.
+The SM90 backend is hardware-gated: it is only inserted at the front of the
+CUDA priority list when the extension exposes `_C.batch_invariant_logp_sm90`
+(built with `KERNEL_ALIGN_FORCE_SM90=1`) on an SM90 device. On any other build
+or device, dispatch is unchanged (Triton -> PyTorch).
+
+## Benchmarks
+
+`benchmarks/benchmark_batch_invariant_logp.py` compares Native, Triton, and the
+CUDA SM90 backend (forward latency and peak VRAM across a vocab sweep, bf16):
+
+```bash
+python benchmarks/benchmark_batch_invariant_logp.py
+python benchmarks/benchmark_batch_invariant_logp.py --configs "4096,128256;8192,151936"
+```
+
+The CUDA column is only shown when the SM90 kernel is compiled in; otherwise the
+benchmark reports Native vs Triton only.
+
+### Measured results
+
+Environment: NVIDIA H200 (Hopper, SM90, cc 9.0), CUDA 12.8 / `nvcc` 12.8.93,
+PyTorch 2.11.0+cu128, `KERNEL_ALIGN_FORCE_SM90=1`. dtype bf16, 20 iters + 5
+warmup. "MB" is peak extra device memory above baseline. Both tables are
+reproduced by `benchmarks/benchmark_batch_invariant_logp.py --backward`.
+
+**Forward**
+
+| shape (N x V) | native ms | triton ms | cuda ms | cuda vs native | cuda vs triton | native MB | triton MB | cuda MB |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 4096 x 32768 | 1.355 | 0.148 | 0.091 | 14.9x | 1.63x | 1536 | 0 | 0 |
+| 4096 x 128256 | 5.011 | 0.567 | 0.324 | 15.5x | 1.75x | 6012 | 0 | 0 |
+| 4096 x 151936 | 5.961 | 0.669 | 0.384 | 15.5x | 1.74x | 7122 | 0 | 0 |
+| 8192 x 128256 | 9.991 | 1.056 | 0.597 | 16.7x | 1.77x | 12024 | 0 | 0 |
+
+**Forward + backward**
+
+| shape (N x V) | native ms | triton ms | cuda ms | cuda vs native | cuda vs triton | native MB | triton MB | cuda MB |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 4096 x 32768 | 3.400 | 0.305 | 0.242 | 14.1x | 1.26x | 1536 | 256 | 256 |
+| 4096 x 128256 | 12.581 | 1.117 | 0.871 | 14.5x | 1.28x | 6012 | 1002 | 1002 |
+| 4096 x 151936 | 14.943 | 1.319 | 1.032 | 14.5x | 1.28x | 7122 | 1188 | 1188 |
+| 8192 x 128256 | 25.036 | 2.144 | 1.684 | 14.9x | 1.27x | 12024 | 2004 | 2004 |
+
+- Forward: ~1.7x vs Triton, ~15x vs native, with ~0 extra VRAM — the vocab is
+  reduced to per-row scalars, so no `[N, V]` intermediate is materialized.
+- Forward + backward: ~1.27x vs Triton, ~14x vs native, with memory equal to
+  Triton. The backward's `[N, V]` cost is `grad_logits` itself (one gradient per
+  input logit, unavoidable for any backend); the streamed backends avoid native's
+  extra `[N, V]` `softmax` / `log_softmax` intermediates by recomputing from the
+  saved per-row `lse`.
 
 ## Tensor Contract
 
@@ -170,5 +219,8 @@ WSL/Linux with CUDA.
 
 - `rl_engine/kernels/ops/pytorch/loss/batch_invariant_logp.py`
 - `rl_engine/kernels/ops/triton/loss/batch_invariant_logp.py`
+- `rl_engine/kernels/ops/cuda/loss/batch_invariant_logp.py`
+- `csrc/cuda/batch_invariant_logp_kernel_sm90.cu`
 - `rl_engine/kernels/registry.py`
 - `tests/test_batch_invariant_logp.py`
+- `benchmarks/benchmark_batch_invariant_logp.py`

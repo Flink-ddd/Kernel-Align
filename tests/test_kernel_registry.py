@@ -82,3 +82,40 @@ def test_rocm_attention_unknown_env_value_uses_default_and_warns(monkeypatch):
         OpBackend.TRITON_GENERIC,
     ]
     assert any("Unknown RL_KERNEL_ROCM_ATTN_BACKEND=unknown" in warning for warning in warnings)
+
+
+def test_sm90_linear_ops_prioritize_cuda_when_extension_symbols_exist(monkeypatch):
+    from rl_engine.kernels.ops import base as base_module
+
+    class FakeExtension:
+        fused_linear_logp_sm90 = object()
+        embedding_sm90_forward = object()
+        lm_head_sm90_forward = object()
+
+    monkeypatch.setattr(registry_module.device_ctx, "device_type", "cuda")
+    monkeypatch.setattr(registry_module.torch.cuda, "get_device_capability", lambda: (9, 0))
+    monkeypatch.setattr(base_module, "_EXT_AVAILABLE", True)
+    monkeypatch.setattr(base_module, "_C", FakeExtension())
+
+    registry = KernelRegistry()
+
+    assert registry._priority_map["cuda"]["embedding"][0] is OpBackend.CUDA_SM90_EMBEDDING
+    assert registry._priority_map["cuda"]["lm_head"][0] is OpBackend.CUDA_SM90_LM_HEAD
+
+
+def test_sm90_linear_ops_do_not_prioritize_cuda_on_non_hopper(monkeypatch):
+    from rl_engine.kernels.ops import base as base_module
+
+    class FakeExtension:
+        embedding_sm90_forward = object()
+        lm_head_sm90_forward = object()
+
+    monkeypatch.setattr(registry_module.device_ctx, "device_type", "cuda")
+    monkeypatch.setattr(registry_module.torch.cuda, "get_device_capability", lambda: (8, 0))
+    monkeypatch.setattr(base_module, "_EXT_AVAILABLE", True)
+    monkeypatch.setattr(base_module, "_C", FakeExtension())
+
+    registry = KernelRegistry()
+
+    assert OpBackend.CUDA_SM90_EMBEDDING not in registry._priority_map["cuda"]["embedding"]
+    assert OpBackend.CUDA_SM90_LM_HEAD not in registry._priority_map["cuda"]["lm_head"]

@@ -4,6 +4,11 @@ import torch
 
 def fused_logp(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor: ...
 def fused_logp_sm90(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor: ...
+def batch_invariant_logp_sm90(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int,
+) -> list[torch.Tensor]: ...
 def fused_linear_logp_sm90(
     hidden: torch.Tensor,
     weight: torch.Tensor,
@@ -71,6 +76,18 @@ def linear_logp_logits_bf16_to_dlogits(
     grad_logp: torch.Tensor,
     lse: torch.Tensor,
     vocab_start_index: int,
+) -> torch.Tensor: ...
+def embedding_sm90_forward(token_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor: ...
+def embedding_sm90_forward_fp32(token_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor: ...
+def lm_head_sm90_forward(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor: ...
+def lm_head_sm90_forward_fp32(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
 ) -> torch.Tensor: ...
 def fused_logp_forward_out(
     logits: torch.Tensor,

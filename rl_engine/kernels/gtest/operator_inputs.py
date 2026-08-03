@@ -59,8 +59,8 @@ def operator_shape_name(op_name: str, args: argparse.Namespace) -> str:
         "rope": f"{batch}x{DEFAULT_N_HEADS}x{seq}x{DEFAULT_HEAD_DIM}",
         "silu": f"{batch}x{seq}x{DEFAULT_INTERMEDIATE}",
         "swiglu": f"{batch}x{seq}x{DEFAULT_INTERMEDIATE}",
-        "embedding": f"{batch}x{seq}x{vocab}x{DEFAULT_HIDDEN}",
-        "lm_head": f"{batch}x{seq}x{vocab}",
+        "embedding": f"{batch}x{seq}x{vocab}x{_normalized_dim(args)}",
+        "lm_head": f"{batch}x{seq}x{_normalized_dim(args)}x{vocab}",
         "kv_cache_attention": f"{batch}x{DEFAULT_N_HEADS}x1x{seq + 1}x{DEFAULT_HEAD_DIM}",
     }
     try:
@@ -212,9 +212,10 @@ def _make_embedding_inputs(
 ) -> dict[str, Any]:
     batch, seq = _batch_seq(args)
     vocab = _arg_int(args, "vocab", DEFAULT_VOCAB)
+    hidden_dim = _normalized_dim(args)
     return {
         "token_ids": _token_ids((batch, seq), vocab, args, device),
-        "weight": _floating_tensor((vocab, DEFAULT_HIDDEN), args, dtype, device, 0),
+        "weight": _floating_tensor((vocab, hidden_dim), args, dtype, device, 0),
     }
 
 
@@ -223,9 +224,10 @@ def _make_lm_head_inputs(
 ) -> dict[str, Any]:
     batch, seq = _batch_seq(args)
     vocab = _arg_int(args, "vocab", DEFAULT_VOCAB)
+    hidden_dim = _normalized_dim(args)
     return {
-        "hidden": _floating_tensor((batch, seq, DEFAULT_HIDDEN), args, dtype, device, 0),
-        "weight": _floating_tensor((vocab, DEFAULT_HIDDEN), args, dtype, device, 1),
+        "hidden": _floating_tensor((batch, seq, hidden_dim), args, dtype, device, 0),
+        "weight": _floating_tensor((vocab, hidden_dim), args, dtype, device, 1),
         "bias": None,
     }
 
