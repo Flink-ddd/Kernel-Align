@@ -11,7 +11,8 @@ import triton.language as tl
 from rl_engine.kernels.ops.pytorch.loss.linear_logp import (
     _require_distributed_initialized,
     _validate_global_targets,
-    _validate_tp_vocab_partition,
+    _validate_tp_targets_enabled,
+    _validate_tp_vocab_partition_cached,
     chunked_linear_logp_backward,
     should_use_tensor_parallel_linear_logp,
     tensor_parallel_linear_logp_backward,
@@ -201,14 +202,15 @@ class _TensorParallelTritonLinearLogpFunction(torch.autograd.Function):
         )
         bias_t = bias.contiguous() if bias is not None else hidden_2d
         vocab_start_index = int(vocab_start_index)
-        global_vocab_size = _validate_tp_vocab_partition(
+        global_vocab_size = _validate_tp_vocab_partition_cached(
             tp_group=tp_group,
             device=hidden_2d.device,
             vocab_start_index=vocab_start_index,
             local_vocab_size=weight.size(0),
             global_vocab_size=global_vocab_size,
         )
-        _validate_global_targets(target_1d, global_vocab_size, tp_group)
+        if _validate_tp_targets_enabled():
+            _validate_global_targets(target_1d, global_vocab_size, tp_group)
 
         # Clamp the global target to a valid local column
         local_vocab = weight.size(0)
