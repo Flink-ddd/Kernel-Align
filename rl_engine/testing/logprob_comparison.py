@@ -1,24 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Single-GPU WS2 selected-logprob cross-implementation harness."""
+"""Single-GPU selected-logprob comparison."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 import torch
 
 
 class LogprobBackendUnavailable(RuntimeError):
-    """Raised when an explicitly requested comparison backend cannot run exactly."""
+    pass
 
 
 @dataclass(frozen=True)
 class LogprobComparisonInputs:
-    """Logical TP=1 inputs shared by every comparison path."""
-
     logits: torch.Tensor
     target_ids: torch.Tensor
     active_token_mask: torch.Tensor | None = None
@@ -26,19 +25,7 @@ class LogprobComparisonInputs:
 
 
 @dataclass(frozen=True)
-class LogprobPathResult:
-    """Direct selected-logprob and vocab-LSE outputs from one backend."""
-
-    name: str
-    logp: torch.Tensor
-    lse: torch.Tensor
-    provenance: dict[str, Any]
-
-
-@dataclass(frozen=True)
 class LogprobCandidate:
-    """One exact backend materialization used by the harness."""
-
     name: str
     requested_backend: str
     actual_backend: str
@@ -47,64 +34,34 @@ class LogprobCandidate:
 
 
 @dataclass(frozen=True)
-class DriftStats:
-    """Absolute drift statistics over a declared comparison population."""
-
+class _DriftStats:
     max_abs: float
     mean_abs: float
     p95_abs: float
     p99_abs: float
     active_count: int
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "max_abs": self.max_abs,
-            "mean_abs": self.mean_abs,
-            "p95_abs": self.p95_abs,
-            "p99_abs": self.p99_abs,
-            "active_count": self.active_count,
-        }
-
 
 @dataclass(frozen=True)
-class LogprobPathDrift:
-    """Candidate-vs-reference LSE and active-token dlogp drift."""
-
+class _LogprobPathDrift:
     candidate_name: str
-    lse: DriftStats
-    dlogp: DriftStats
+    lse: _DriftStats
+    dlogp: _DriftStats
     bitwise_logp: bool
     provenance: dict[str, Any]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "candidate_name": self.candidate_name,
-            "lse": self.lse.to_dict(),
-            "dlogp": self.dlogp.to_dict(),
-            "bitwise_logp": self.bitwise_logp,
-            "provenance": self.provenance,
-        }
 
 
 @dataclass(frozen=True)
 class LogprobComparisonReport:
-    """Structured single-GPU report consumed by later WS2 integration."""
-
     reference_name: str
-    drifts: tuple[LogprobPathDrift, ...]
+    drifts: tuple[_LogprobPathDrift, ...]
     input_provenance: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "reference_name": self.reference_name,
-            "drifts": [drift.to_dict() for drift in self.drifts],
-            "input_provenance": self.input_provenance,
-        }
+        return asdict(self)
 
 
 def make_logprob_candidate(backend: str) -> LogprobCandidate:
-    """Materialize an exact built-in backend without registry fallback."""
-
     normalized = backend.strip().lower().replace("_", "-")
     if normalized in {"pytorch", "native"}:
         from rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp import (
@@ -172,35 +129,38 @@ def compare_single_gpu_logprob(
     *,
     candidates: Sequence[str | LogprobCandidate] = ("pytorch",),
 ) -> LogprobComparisonReport:
-    """Compare exact TP=1 implementations against the WS1 deterministic path."""
-
     active_mask, effective_targets = _validate_inputs(inputs)
-    reference = _run_ws1_reference(inputs.logits, effective_targets, inputs.ignore_index)
-
-    drifts = tuple(
-        _compare_path(
-            _run_candidate(
-                (
-                    candidate
-                    if isinstance(candidate, LogprobCandidate)
-                    else make_logprob_candidate(candidate)
-                ),
-                inputs.logits,
-                effective_targets,
-                inputs.ignore_index,
-            ),
-            reference,
-            active_mask,
-        )
-        for candidate in candidates
+    reference_logp, reference_lse = _run_ws1_reference(
+        inputs.logits, effective_targets, inputs.ignore_index
     )
+
+    drifts = []
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            candidate = make_logprob_candidate(candidate)
+        logp, lse = _run_candidate(
+            candidate,
+            inputs.logits,
+            effective_targets,
+            inputs.ignore_index,
+        )
+        drifts.append(
+            _LogprobPathDrift(
+                candidate_name=candidate.name,
+                lse=_drift_stats(lse, reference_lse),
+                dlogp=_drift_stats(logp, reference_logp, mask=active_mask),
+                bitwise_logp=torch.equal(logp, reference_logp),
+                provenance=_candidate_provenance(candidate),
+            )
+        )
+
     return LogprobComparisonReport(
-        reference_name=reference.name,
-        drifts=drifts,
+        reference_name="pytorch-batch-invariant-logp",
+        drifts=tuple(drifts),
         input_provenance={
             "device": str(inputs.logits.device),
             "input_dtype": str(inputs.logits.dtype),
-            "output_dtype": str(reference.logp.dtype),
+            "output_dtype": str(reference_logp.dtype),
             "shape": list(inputs.logits.shape),
             "ignore_index": inputs.ignore_index,
             "active_token_count": int(active_mask.sum().item()),
@@ -214,8 +174,7 @@ def _run_ws1_reference(
     logits: torch.Tensor,
     target_ids: torch.Tensor,
     ignore_index: int,
-) -> LogprobPathResult:
-    """Run the existing deterministic logp path and its direct-LSE diagnostic."""
+) -> tuple[torch.Tensor, torch.Tensor]:
     from rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp import (
         NativeBatchInvariantLogpOp,
     )
@@ -225,19 +184,7 @@ def _run_ws1_reference(
     _, lse = op.forward_with_lse(
         logits, target_ids, ignore_index=ignore_index, validate=True
     )
-    return LogprobPathResult(
-        name="pytorch-batch-invariant-logp",
-        logp=logp.detach(),
-        lse=lse.detach(),
-        provenance={
-            "requested_backend": "pytorch",
-            "actual_backend": "pytorch",
-            "tp_world": 1,
-            "communication": "none",
-            "logp_source": "production",
-            "lse_source": "direct",
-        },
-    )
+    return logp.detach(), lse.detach()
 
 
 def _run_candidate(
@@ -245,7 +192,7 @@ def _run_candidate(
     logits: torch.Tensor,
     target_ids: torch.Tensor,
     ignore_index: int,
-) -> LogprobPathResult:
+) -> tuple[torch.Tensor, torch.Tensor]:
     if candidate.requested_backend != candidate.actual_backend:
         raise LogprobBackendUnavailable(
             f"requested backend {candidate.requested_backend!r} materialized as "
@@ -263,33 +210,18 @@ def _run_candidate(
             )
         if value.dtype != torch.float32:
             raise ValueError(f"candidate {candidate.name!r} {name} must be FP32")
-    return LogprobPathResult(
-        name=candidate.name,
-        logp=logp.detach(),
-        lse=lse.detach(),
-        provenance={
-            "requested_backend": candidate.requested_backend,
-            "actual_backend": candidate.actual_backend,
-            "tp_world": 1,
-            "communication": "none",
-            "lse_source": "direct",
-            **candidate.provenance,
-        },
-    )
+    return logp.detach(), lse.detach()
 
 
-def _compare_path(
-    candidate: LogprobPathResult,
-    reference: LogprobPathResult,
-    active_mask: torch.Tensor,
-) -> LogprobPathDrift:
-    return LogprobPathDrift(
-        candidate_name=candidate.name,
-        lse=_drift_stats(candidate.lse, reference.lse),
-        dlogp=_drift_stats(candidate.logp, reference.logp, mask=active_mask),
-        bitwise_logp=torch.equal(candidate.logp, reference.logp),
-        provenance=candidate.provenance,
-    )
+def _candidate_provenance(candidate: LogprobCandidate) -> dict[str, Any]:
+    return {
+        "requested_backend": candidate.requested_backend,
+        "actual_backend": candidate.actual_backend,
+        "tp_world": 1,
+        "communication": "none",
+        "lse_source": "direct",
+        **candidate.provenance,
+    }
 
 
 def _drift_stats(
@@ -297,7 +229,7 @@ def _drift_stats(
     reference: torch.Tensor,
     *,
     mask: torch.Tensor | None = None,
-) -> DriftStats:
+) -> _DriftStats:
     if candidate.shape != reference.shape:
         raise ValueError(
             f"candidate shape {tuple(candidate.shape)} must match reference shape "
@@ -307,8 +239,8 @@ def _drift_stats(
     values = diff.reshape(-1) if mask is None else diff[mask.to(device=diff.device)]
     count = int(values.numel())
     if count == 0:
-        return DriftStats(0.0, 0.0, 0.0, 0.0, 0)
-    return DriftStats(
+        return _DriftStats(0.0, 0.0, 0.0, 0.0, 0)
+    return _DriftStats(
         max_abs=float(values.max().item()),
         mean_abs=float(values.mean().item()),
         p95_abs=float(torch.quantile(values, 0.95).item()),
@@ -349,13 +281,10 @@ def _validate_inputs(
 
 
 __all__ = [
-    "DriftStats",
     "LogprobBackendUnavailable",
     "LogprobCandidate",
     "LogprobComparisonInputs",
     "LogprobComparisonReport",
-    "LogprobPathDrift",
-    "LogprobPathResult",
     "compare_single_gpu_logprob",
     "make_logprob_candidate",
 ]
