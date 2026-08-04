@@ -12,9 +12,7 @@ import torch
 
 from rl_engine.kernels.gtest import run_operator_suite
 from rl_engine.kernels.gtest.operator_specs import make_candidate, make_operator_case
-from rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp import (
-    NativeBatchInvariantLogpOp,
-)
+from rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp import NativeBatchInvariantLogpOp
 from rl_engine.testing.logprob_comparison import (
     LogprobBackendUnavailable,
     LogprobCandidate,
@@ -79,6 +77,31 @@ def test_report_serializes_lse_and_active_token_percentiles():
     assert drift["dlogp"]["p99_abs"] == pytest.approx(0.96)
     assert drift["lse"]["active_count"] == 8
     assert drift["lse"]["p99_abs"] == pytest.approx(0.693, abs=1e-5)
+
+
+def test_canonical_provenance_cannot_be_overridden():
+    native = make_logprob_candidate("pytorch")
+    candidate = LogprobCandidate(
+        name="custom",
+        requested_backend="pytorch",
+        actual_backend="pytorch",
+        fn=native.fn,
+        provenance={
+            "actual_backend": "fallback",
+            "tp_world": 8,
+            "communication": "all-gather",
+            "lse_source": "reconstructed",
+            "implementation": "custom",
+        },
+    )
+
+    provenance = compare_single_gpu_logprob(_inputs(), candidates=(candidate,)).drifts[0].provenance
+
+    assert provenance["actual_backend"] == "pytorch"
+    assert provenance["tp_world"] == 1
+    assert provenance["communication"] == "none"
+    assert provenance["lse_source"] == "direct"
+    assert provenance["implementation"] == "custom"
 
 
 def test_all_inactive_tokens_produce_zero_dlogp_statistics():
@@ -194,9 +217,7 @@ def test_operator_comparison_specs_register_batch_invariant_logp():
 
     case = make_operator_case(args, torch.float32, torch.device("cpu"))
     candidate = make_candidate(args)
-    report = run_operator_suite(
-        "batch_invariant_logp", candidates=[candidate], cases=[case]
-    )
+    report = run_operator_suite("batch_invariant_logp", candidates=[candidate], cases=[case])
 
     assert report.passed
     assert report.candidates[0].cases[0].op_class == "logprob"

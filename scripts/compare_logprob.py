@@ -16,10 +16,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from rl_engine.testing import (  # noqa: E402
-    LogprobComparisonInputs,
-    compare_single_gpu_logprob,
-)
+from rl_engine.testing import LogprobComparisonInputs, compare_single_gpu_logprob  # noqa: E402
 from rl_engine.utils.logger import logger  # noqa: E402
 
 

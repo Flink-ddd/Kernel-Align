@@ -175,15 +175,11 @@ def _run_ws1_reference(
     target_ids: torch.Tensor,
     ignore_index: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp import (
-        NativeBatchInvariantLogpOp,
-    )
+    from rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp import NativeBatchInvariantLogpOp
 
     op = NativeBatchInvariantLogpOp()
     logp = op(logits, target_ids, ignore_index=ignore_index, validate=True)
-    _, lse = op.forward_with_lse(
-        logits, target_ids, ignore_index=ignore_index, validate=True
-    )
+    _, lse = op.forward_with_lse(logits, target_ids, ignore_index=ignore_index, validate=True)
     return logp.detach(), lse.detach()
 
 
@@ -215,12 +211,12 @@ def _run_candidate(
 
 def _candidate_provenance(candidate: LogprobCandidate) -> dict[str, Any]:
     return {
+        **candidate.provenance,
         "requested_backend": candidate.requested_backend,
         "actual_backend": candidate.actual_backend,
         "tp_world": 1,
         "communication": "none",
         "lse_source": "direct",
-        **candidate.provenance,
     }
 
 
