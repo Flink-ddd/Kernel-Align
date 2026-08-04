@@ -3,6 +3,17 @@
 
 """Testing helpers for RL-shaped kernel validation."""
 
+from .logprob_comparison import (
+    DriftStats,
+    LogprobBackendUnavailable,
+    LogprobCandidate,
+    LogprobComparisonInputs,
+    LogprobComparisonReport,
+    LogprobPathDrift,
+    LogprobPathResult,
+    compare_single_gpu_logprob,
+    make_logprob_candidate,
+)
 from .reference_ops import (
     active_token_count,
     compute_policy_ratio,
@@ -15,10 +26,19 @@ from .reference_ops import (
 from .rl_batch import SyntheticRLKernelBatch, make_synthetic_rl_kernel_batch
 
 __all__ = [
+    "DriftStats",
+    "LogprobBackendUnavailable",
+    "LogprobCandidate",
+    "LogprobComparisonInputs",
+    "LogprobComparisonReport",
+    "LogprobPathDrift",
+    "LogprobPathResult",
     "SyntheticRLKernelBatch",
     "active_token_count",
+    "compare_single_gpu_logprob",
     "compute_policy_ratio",
     "compute_reference_kl",
+    "make_logprob_candidate",
     "make_synthetic_rl_kernel_batch",
     "masked_mean",
     "masked_sum",

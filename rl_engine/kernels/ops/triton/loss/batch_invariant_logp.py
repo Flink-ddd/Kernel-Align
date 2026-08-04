@@ -10,6 +10,27 @@ import triton.language as tl
 _BLOCK_V: int = 1024
 
 
+def _launch_batch_invariant_logp(
+    logits_2d: torch.Tensor, target_1d: torch.Tensor, ignore_index: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = logits_2d.shape[0]
+    vocab_size = logits_2d.shape[1]
+    output = torch.empty(num_tokens, device=logits_2d.device, dtype=torch.float32)
+    lse = torch.empty(num_tokens, device=logits_2d.device, dtype=torch.float32)
+    _batch_invariant_logp_kernel[(num_tokens,)](
+        logits_2d,
+        target_1d,
+        output,
+        lse,
+        num_tokens,
+        vocab_size,
+        logits_2d.stride(0),
+        ignore_index=ignore_index,
+        BLOCK_V=_BLOCK_V,
+    )
+    return output, lse
+
+
 @triton.jit
 def _batch_invariant_logp_kernel(
     logits_ptr,  # logits [N, V]
@@ -126,22 +147,7 @@ class _BatchInvariantLogpFunction(torch.autograd.Function):
         logits_2d = logits.reshape(-1, vocab_size).contiguous()
         target_1d = target_ids.reshape(-1).to(device=logits.device, dtype=torch.int64).contiguous()
 
-        num_tokens = logits_2d.shape[0]
-        output = torch.empty(num_tokens, device=logits.device, dtype=torch.float32)
-        lse = torch.empty(num_tokens, device=logits.device, dtype=torch.float32)
-
-        grid = (num_tokens,)
-        _batch_invariant_logp_kernel[grid](
-            logits_2d,
-            target_1d,
-            output,
-            lse,
-            num_tokens,
-            vocab_size,
-            logits_2d.stride(0),
-            ignore_index=ignore_index,
-            BLOCK_V=_BLOCK_V,
-        )
+        output, lse = _launch_batch_invariant_logp(logits_2d, target_1d, ignore_index)
 
         ctx.save_for_backward(logits_2d, target_1d, lse)
         ctx.ignore_index = ignore_index
@@ -237,3 +243,53 @@ class TritonBatchInvariantLogpOp:
                 )
 
         return _BatchInvariantLogpFunction.apply(logits, target_ids, ignore_index)
+
+    def forward_with_lse(
+        self,
+        logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        ignore_index: int = -100,
+        *,
+        validate: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return direct FP32 logprob/LSE outputs without an autograd wrapper."""
+        self._validate_inputs(logits, target_ids, ignore_index=ignore_index, validate=validate)
+        lead_shape = logits.shape[:-1]
+        logits_2d = logits.reshape(-1, logits.size(-1)).contiguous()
+        target_1d = target_ids.reshape(-1).to(device=logits.device, dtype=torch.int64).contiguous()
+        logp, lse = _launch_batch_invariant_logp(logits_2d, target_1d, ignore_index)
+        return logp.reshape(lead_shape), lse.reshape(lead_shape)
+
+    @staticmethod
+    def _validate_inputs(
+        logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        *,
+        ignore_index: int,
+        validate: bool,
+    ) -> None:
+        if logits.device.type not in ("cuda", "xpu", "hip"):
+            raise RuntimeError(
+                "TritonBatchInvariantLogpOp requires a GPU tensor "
+                f"(CUDA / ROCm / XPU), got device '{logits.device}'."
+            )
+        if logits.dim() < 2:
+            raise ValueError(
+                f"logits must be at least 2-D ([*lead, V]), got shape {tuple(logits.shape)}"
+            )
+        if logits.shape[:-1] != target_ids.shape:
+            raise ValueError(
+                f"logits leading shape {tuple(logits.shape[:-1])} must match "
+                f"target_ids shape {tuple(target_ids.shape)}"
+            )
+        if validate:
+            vocab_size = logits.size(-1)
+            valid_targets = target_ids.reshape(-1)
+            valid_targets = valid_targets[valid_targets != ignore_index]
+            if valid_targets.numel() and (
+                (valid_targets < 0).any() or (valid_targets >= vocab_size).any()
+            ):
+                bad = valid_targets[(valid_targets < 0) | (valid_targets >= vocab_size)]
+                raise ValueError(
+                    f"target_ids contains values outside [0, {vocab_size}): {bad.tolist()}"
+                )
