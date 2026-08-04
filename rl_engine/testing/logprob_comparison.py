@@ -63,6 +63,7 @@ class LogprobComparisonReport:
 
 def make_logprob_candidate(backend: str) -> LogprobCandidate:
     normalized = backend.strip().lower().replace("_", "-")
+    op: Any
     if normalized in {"pytorch", "native"}:
         from rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp import (
             NativeBatchInvariantLogpOp,
