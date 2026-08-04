@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import pathlib
 import sys
 
@@ -19,6 +20,7 @@ from rl_engine.testing import (  # noqa: E402
     LogprobComparisonInputs,
     compare_single_gpu_logprob,
 )
+from rl_engine.utils.logger import logger  # noqa: E402
 
 
 def _dtype(name: str) -> torch.dtype:
@@ -33,6 +35,13 @@ def _device(name: str) -> torch.device:
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(name)
+
+
+def _route_rl_kernel_logs_to_stderr() -> None:
+    """Keep stdout machine-readable while preserving backend diagnostics."""
+    for handler in logger.handlers:
+        if isinstance(handler, logging.StreamHandler):
+            handler.setStream(sys.stderr)
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +65,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    _route_rl_kernel_logs_to_stderr()
     args = parse_args()
     device = _device(args.device)
     if args.batch < 1 or args.seq < 1 or args.vocab < 1:

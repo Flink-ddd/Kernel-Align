@@ -2,6 +2,10 @@
 # Copyright (c) 2026 RL-Kernel Contributors
 
 import argparse
+import io
+import json
+import logging
+import sys
 
 import pytest
 import torch
@@ -18,7 +22,8 @@ from rl_engine.testing.logprob_comparison import (
     compare_single_gpu_logprob,
     make_logprob_candidate,
 )
-from scripts.compare_logprob import _device
+from rl_engine.utils.logger import logger
+from scripts.compare_logprob import _device, _route_rl_kernel_logs_to_stderr
 
 
 def _inputs() -> LogprobComparisonInputs:
@@ -143,6 +148,29 @@ def test_cli_auto_device_resolves_without_constructing_auto(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
     assert _device("auto") == torch.device("cpu")
+
+
+def test_cli_routes_rl_kernel_logs_to_stderr_for_machine_readable_stdout(monkeypatch):
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    original_streams = [
+        (handler, handler.stream)
+        for handler in logger.handlers
+        if isinstance(handler, logging.StreamHandler)
+    ]
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    try:
+        _route_rl_kernel_logs_to_stderr()
+        logger.info("test backend diagnostic")
+        print(json.dumps({"ok": True}))
+    finally:
+        for handler, stream in original_streams:
+            handler.setStream(stream)
+
+    assert json.loads(stdout.getvalue()) == {"ok": True}
+    assert "test backend diagnostic" in stderr.getvalue()
 
 
 def test_operator_comparison_specs_register_batch_invariant_logp():

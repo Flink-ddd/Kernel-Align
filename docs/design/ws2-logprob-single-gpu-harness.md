@@ -71,9 +71,10 @@ python scripts/compare_logprob.py \
   --vocab 151936
 ```
 
-The command prints a structured JSON report containing input dtype/shape, active-token
-count, TP world size, communication mode, requested and actual backends, direct-LSE
-provenance, bitwise logp status, and LSE/dlogp drift statistics.
+The command prints a structured JSON report to stdout containing input dtype/shape,
+active-token count, TP world size, communication mode, requested and actual backends,
+direct-LSE provenance, bitwise logp status, and LSE/dlogp drift statistics. Backend
+diagnostic logs are routed to stderr so redirected stdout remains valid JSON.
 
 ## Scope Boundary
 
