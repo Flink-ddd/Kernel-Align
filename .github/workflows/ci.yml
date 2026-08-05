@@ -79,6 +79,9 @@ jobs:
       - name: Run WS2 Logprob Contract Tests (CPU-safe)
         run: python -m pytest tests/test_logprob_contract.py -v
 
+      - name: Run WS2 Vocab-Parallel Logprob Tests (CPU-safe)
+        run: python -m pytest tests/test_vocab_parallel_logp.py -v
+
   docs:
     runs-on: ubuntu-latest
     steps:
