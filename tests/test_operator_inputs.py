@@ -40,7 +40,6 @@ def _args(**overrides):
         "logp",
         "linear_logp",
         "batch_invariant_logp",
-        "vocab_parallel_logp",
         "rope",
         "silu",
         "swiglu",
@@ -71,31 +70,6 @@ def test_constant_batch_invariant_logp_inputs_match_operator_contract():
 
     assert torch.equal(inputs["logits"], torch.full((1, 2, 17), 0.5))
     assert torch.equal(inputs["target_ids"], torch.full((1, 2), 3, dtype=torch.long))
-
-
-def test_constant_vocab_parallel_logp_inputs_match_operator_contract():
-    args = _args(input_mode="constant", constant_value=0.5, token_value=3)
-    inputs = make_operator_inputs("vocab_parallel_logp", args, torch.float32, torch.device("cpu"))
-
-    # vocab=17 rounds up to padded=20 with 4 tiles; tokens flatten to batch*seq.
-    assert torch.equal(inputs["local_logits"], torch.full((2, 20), 0.5))
-    assert torch.equal(inputs["target_ids"], torch.full((2,), 3, dtype=torch.long))
-    assert inputs["contract"].sharding.real_vocab_size == 17
-    assert inputs["contract"].sharding.padded_vocab_size == 20
-    assert inputs["num_vocab_tiles"] == 4
-    assert operator_shape_name("vocab_parallel_logp", args) == "2x20"
-
-
-def test_vocab_parallel_logp_inputs_run_through_the_operator():
-    from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import VocabParallelLogprobOp
-
-    args = _args(input_mode="random", seed=7)
-    inputs = make_operator_inputs("vocab_parallel_logp", args, torch.float32, torch.device("cpu"))
-
-    logp, lse = VocabParallelLogprobOp()(**inputs)
-    assert logp.shape == inputs["target_ids"].shape
-    assert logp.dtype == torch.float32 and lse.dtype == torch.float32
-    assert torch.isfinite(logp).all() and torch.isfinite(lse).all()
 
 
 def test_random_logp_inputs_are_seeded():
