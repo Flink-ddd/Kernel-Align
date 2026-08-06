@@ -486,6 +486,9 @@ class LogprobContract:
             for key, value in payload["sharding"].items()
             if key not in {"tp_rank", "cp_rank", "local_vocab_start", "local_vocab_end"}
         }
+        # Note: Any future extensions to this payload MUST maintain strict JSON
+        # serialization determinism across environments to prevent cross-rank
+        # hashing mismatches.
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 

@@ -510,6 +510,11 @@ class KernelRegistry:
                 "determinism through ReductionSpec.determinism_scope and match it against "
                 "backend determinism_scopes instead"
             )
+        if requested_backend.strip().lower() == "auto" and contract.sharding.tp_world_size > 1:
+            raise LogprobContractError(
+                "Unsafe dispatch: requested_backend='auto' is not permitted when tp_world_size > 1 "
+                "without explicit cross-rank preflighting."
+            )
 
         platform = self._platform()
         candidates = self._logprob_candidates.get(platform, [])
