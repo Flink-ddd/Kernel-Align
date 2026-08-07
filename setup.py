@@ -183,7 +183,9 @@ def get_extensions():
         # umbrella switch for users that intentionally build every SM90 op.
         enable_activation_sm90 = enable_sm90 or envs.env_flag(envs.KERNEL_ALIGN_ACTIVATION_SM90)
         activation_sm90_source = "csrc/cuda/activation/swiglu_sm90.cu"
-        if enable_activation_sm90 and os.path.exists(activation_sm90_source):
+        if enable_activation_sm90 and not os.path.exists(activation_sm90_source):
+            raise FileNotFoundError(f"SM90 activation source is missing: {activation_sm90_source}")
+        if enable_activation_sm90:
             cuda_sources.append(activation_sm90_source)
             nvcc_flags.append("-DRL_KERNEL_ENABLE_ACTIVATION_SM90")
             cxx_flags.append("-DRL_KERNEL_ENABLE_ACTIVATION_SM90")

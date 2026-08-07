@@ -216,7 +216,11 @@ class KernelRegistry:
                 "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
                 "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
                 "silu": [OpBackend.PYTORCH_NATIVE_SILU],
-                "swiglu": [OpBackend.TRITON_SWIGLU, OpBackend.PYTORCH_NATIVE_SWIGLU],
+                "swiglu": [
+                    OpBackend.CUDA_SWIGLU_SM90,
+                    OpBackend.TRITON_SWIGLU,
+                    OpBackend.PYTORCH_NATIVE_SWIGLU,
+                ],
                 # Default dispatch logic for new operators
                 "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
                 "rope": [
@@ -361,16 +365,6 @@ class KernelRegistry:
                 if OpBackend.CUDA_SM90_LM_HEAD not in lm_head_list:
                     lm_head_list.insert(0, OpBackend.CUDA_SM90_LM_HEAD)
 
-            activation_compiled = _EXT_AVAILABLE and hasattr(_C, "swiglu_forward_sm90")
-            if activation_compiled and cc_major == 9:
-                swiglu_list = self._priority_map["cuda"]["swiglu"]
-                if OpBackend.CUDA_SWIGLU_SM90 not in swiglu_list:
-                    swiglu_list.insert(0, OpBackend.CUDA_SWIGLU_SM90)
-            elif cc >= 90:
-                logger.debug(
-                    f"SM{cc}: CUDA SM90 SwiGLU is not compiled into _C; "
-                    "using the Triton backend."
-                )
         except Exception as e:
             logger.warning(f"Failed to probe device capability: {e}")
 
@@ -382,6 +376,9 @@ class KernelRegistry:
         candidates = self._priority_map.get(platform, {}).get(op_type, [OpBackend.PYTORCH_NATIVE])
 
         for backend in candidates:
+            if not self._backend_supports_device(backend, device):
+                continue
+
             if backend.name in self._instance_cache:
                 return self._instance_cache[backend.name]
 
@@ -401,6 +398,22 @@ class KernelRegistry:
                 self._failed_backends.add(backend.name)
 
         raise RuntimeError(f"No functional backend found for {op_type} on {platform}")
+
+    @staticmethod
+    def _backend_supports_device(backend: OpBackend, device: torch.device | str | None) -> bool:
+        """Return whether a hardware-specific backend can serve the requested device."""
+        if backend is not OpBackend.CUDA_SWIGLU_SM90:
+            return True
+
+        try:
+            requested = torch.device(device) if device is not None else None
+            if requested is not None and requested.type != "cuda":
+                return False
+            capability = torch.cuda.get_device_capability(requested)
+            return capability[0] == 9
+        except Exception as e:
+            logger.warning(f"Failed to probe requested device for {backend.name}: {e}")
+            return False
 
     def _platform_for_device(self, device: torch.device | str | None) -> str:
         if device is None:

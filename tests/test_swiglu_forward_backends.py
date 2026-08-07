@@ -24,12 +24,13 @@ except ImportError:
     _HAS_CUDA_SM90_OP = False
 
 _IS_SM90 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+_HAS_CUDA_BF16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 requires_cuda_sm90 = pytest.mark.skipif(
     not (_IS_SM90 and _HAS_CUDA_SM90_OP),
     reason="requires Hopper and the compiled SM90 SwiGLU forward kernel",
 )
-requires_triton_sm90 = pytest.mark.skipif(
-    not (_IS_SM90 and _HAS_TRITON), reason="requires Hopper and Triton"
+requires_triton_cuda = pytest.mark.skipif(
+    not (_HAS_CUDA_BF16 and _HAS_TRITON), reason="requires CUDA with BF16 support and Triton"
 )
 
 _ELEMENTWISE_ATOL = 2e-2
@@ -61,7 +62,7 @@ def test_cuda_sm90_forward_matches_fp32_reference(shape):
     _assert_matches_reference(SwiGLUSM90Op(), *_inputs(shape))
 
 
-@requires_triton_sm90
+@requires_triton_cuda
 @pytest.mark.parametrize("shape", [(3, 257), (2, _TP_LOCAL_INTERMEDIATE)])
 def test_triton_forward_matches_fp32_reference(shape):
     _assert_matches_reference(TritonSwiGLUOp(), *_inputs(shape))
@@ -71,8 +72,8 @@ def test_triton_forward_matches_fp32_reference(shape):
 def test_forward_is_batch_and_padding_invariant(backend):
     if backend == "cuda" and not (_IS_SM90 and _HAS_CUDA_SM90_OP):
         pytest.skip("requires Hopper and the compiled SM90 SwiGLU forward kernel")
-    if backend == "triton" and not (_IS_SM90 and _HAS_TRITON):
-        pytest.skip("requires Hopper and Triton")
+    if backend == "triton" and not (_HAS_CUDA_BF16 and _HAS_TRITON):
+        pytest.skip("requires CUDA with BF16 support and Triton")
 
     op = SwiGLUSM90Op() if backend == "cuda" else TritonSwiGLUOp()
     gate, up = _inputs((8, 257), seed=240)
@@ -91,8 +92,8 @@ def test_forward_is_batch_and_padding_invariant(backend):
 def test_forward_contract_guards(backend):
     if backend == "cuda" and not (_IS_SM90 and _HAS_CUDA_SM90_OP):
         pytest.skip("requires Hopper and the compiled SM90 SwiGLU forward kernel")
-    if backend == "triton" and not (_IS_SM90 and _HAS_TRITON):
-        pytest.skip("requires Hopper and Triton")
+    if backend == "triton" and not (_HAS_CUDA_BF16 and _HAS_TRITON):
+        pytest.skip("requires CUDA with BF16 support and Triton")
 
     op = SwiGLUSM90Op() if backend == "cuda" else TritonSwiGLUOp()
     gate, up = _inputs((2, 8), seed=242)

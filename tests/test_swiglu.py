@@ -167,3 +167,7 @@ def test_swiglu_backward_batch_invariance_slice():
 
 def test_registry_dispatches_native_silu():
     assert isinstance(kernel_registry.get_op("silu"), NativeSiLUOp)
+
+
+def test_registry_dispatches_native_swiglu_on_cpu():
+    assert isinstance(kernel_registry.get_op("swiglu", device="cpu"), NativeSwiGLUOp)

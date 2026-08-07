@@ -119,3 +119,32 @@ def test_sm90_linear_ops_do_not_prioritize_cuda_on_non_hopper(monkeypatch):
 
     assert OpBackend.CUDA_SM90_EMBEDDING not in registry._priority_map["cuda"]["embedding"]
     assert OpBackend.CUDA_SM90_LM_HEAD not in registry._priority_map["cuda"]["lm_head"]
+
+
+def test_swiglu_dispatch_checks_requested_device_before_using_cached_backend(monkeypatch):
+    class FakeCudaSwiGLU:
+        pass
+
+    class FakeTritonSwiGLU:
+        pass
+
+    classes = {
+        OpBackend.CUDA_SWIGLU_SM90: FakeCudaSwiGLU,
+        OpBackend.TRITON_SWIGLU: FakeTritonSwiGLU,
+    }
+    capabilities = {"cuda:0": (9, 0), "cuda:1": (8, 6)}
+
+    registry = KernelRegistry()
+    registry._priority_map["cuda"]["swiglu"] = [
+        OpBackend.CUDA_SWIGLU_SM90,
+        OpBackend.TRITON_SWIGLU,
+    ]
+    monkeypatch.setattr(registry, "_load_backend", lambda backend: classes[backend])
+    monkeypatch.setattr(
+        registry_module.torch.cuda,
+        "get_device_capability",
+        lambda device=None: capabilities[str(device)],
+    )
+
+    assert isinstance(registry.get_op("swiglu", device="cuda:0"), FakeCudaSwiGLU)
+    assert isinstance(registry.get_op("swiglu", device="cuda:1"), FakeTritonSwiGLU)
