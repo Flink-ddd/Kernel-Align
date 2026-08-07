@@ -251,7 +251,7 @@ def test_current_ws1_backend_rejects_strict_tp_contract_without_fallback():
     registry = KernelRegistry()
 
     with pytest.raises(RuntimeError) as exc_info:
-        registry.get_logprob_op(_contract())
+        registry.get_logprob_op(_contract(), requested_backend="reference")
 
     message = str(exc_info.value)
     assert "TP=2 is unsupported" in message
@@ -277,8 +277,9 @@ def test_undeclared_backend_capability_is_never_selected():
     platform = registry._platform()
     registry._logprob_candidates[platform] = [OpBackend.PYTORCH_NATIVE]
 
+    tp1_contract = _contract(sharding=_sharding(tp_world_size=1, cp_world_size=1))
     with pytest.raises(RuntimeError, match="no LogprobBackendCapability declared"):
-        registry.get_logprob_op(_contract())
+        registry.get_logprob_op(tp1_contract)
 
 
 def test_declared_compatible_backend_resolves_and_records_provenance():
@@ -354,7 +355,8 @@ def test_default_auto_policy_resolves_any_compatible_implementation_kind():
         platform=platform,
     )
 
-    result = registry.get_logprob_op(_contract())
+    tp1_contract = _contract(sharding=_sharding(tp_world_size=1, cp_world_size=1))
+    result = registry.get_logprob_op(tp1_contract)
 
     assert result.provenance["requested_backend"] == "auto"
     assert result.capability.implementation_kind == "reference"
@@ -407,7 +409,7 @@ def test_capability_rejections_are_reported_as_fallback():
         OpBackend.PYTORCH_BATCH_INVARIANT_LOGP, _declared_tp_backend(), platform=platform
     )
 
-    result = registry.get_logprob_op(_contract())
+    result = registry.get_logprob_op(_contract(), requested_backend="reference")
 
     assert result.provenance["fallback"] is True
     assert "TP=2 is unsupported" in result.provenance["prior_rejections"][0]
@@ -441,7 +443,7 @@ def test_register_logprob_backend_is_the_public_registration_seam():
     )
 
     assert registry._logprob_candidates[platform] == [OpBackend.PYTORCH_BATCH_INVARIANT_LOGP]
-    result = registry.get_logprob_op(_contract())
+    result = registry.get_logprob_op(_contract(), requested_backend="reference")
     assert result.capability.backend_id == "replacement-backend"
 
     with pytest.raises(LogprobContractError, match="capability must be"):
@@ -467,7 +469,7 @@ def test_capabilities_are_scoped_per_platform():
         platform=other,
     )
 
-    result = registry.get_logprob_op(_contract())
+    result = registry.get_logprob_op(_contract(), requested_backend="reference")
 
     assert result.capability.backend_id == "test-deterministic-tp-logprob"
     assert (
@@ -500,6 +502,24 @@ def test_requested_deterministic_policy_is_a_loud_error():
 
     with pytest.raises(LogprobContractError, match="determinism_scope"):
         registry.get_logprob_op(_contract(), requested_backend="deterministic")
+
+
+def test_auto_policy_is_rejected_for_tp_sharded_contracts():
+    registry = KernelRegistry()
+    platform = registry._platform()
+    registry._logprob_candidates[platform] = []
+    registry.register_logprob_backend(
+        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP, _declared_tp_backend(), platform=platform
+    )
+
+    with pytest.raises(LogprobContractError, match="Unsafe dispatch"):
+        registry.get_logprob_op(_contract())
+
+    with pytest.raises(LogprobContractError, match="Unsafe dispatch"):
+        registry.get_logprob_op(_contract(), requested_backend="  AUTO  ")
+
+    tp1_contract = _contract(sharding=_sharding(tp_world_size=1, cp_world_size=1))
+    assert registry.get_logprob_op(tp1_contract).provenance["requested_backend"] == "auto"
 
 
 def test_determinism_scope_is_part_of_the_typed_contract():

@@ -496,7 +496,10 @@ class KernelRegistry:
         (``auto`` | ``production`` | ``reference`` | ``deterministic``) or an
         exact, case-sensitive stable backend id.  Strictness comes from the
         contract's capability checks, not from this policy string, so the
-        default is ``auto``.
+        default is ``auto``.  With ``tp_world_size > 1``, ``auto`` is rejected:
+        per-rank auto resolution can diverge across ranks, so distributed
+        callers must name a policy or backend id and preflight agreement via
+        ``LogprobContract.cross_rank_fingerprint``.
         """
 
         if not isinstance(contract, LogprobContract):
@@ -510,7 +513,7 @@ class KernelRegistry:
                 "determinism through ReductionSpec.determinism_scope and match it against "
                 "backend determinism_scopes instead"
             )
-        if requested_backend.strip().lower() == "auto" and contract.sharding.tp_world_size > 1:
+        if requested_backend.lower() == "auto" and contract.sharding.tp_world_size > 1:
             raise LogprobContractError(
                 "Unsafe dispatch: requested_backend='auto' is not permitted when tp_world_size > 1 "
                 "without explicit cross-rank preflighting."
