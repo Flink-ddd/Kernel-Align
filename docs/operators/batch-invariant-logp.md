@@ -54,6 +54,19 @@ CUDA priority list when the extension exposes `_C.batch_invariant_logp_sm90`
 (built with `KERNEL_ALIGN_FORCE_SM90=1`) on an SM90 device. On any other build
 or device, dispatch is unchanged (Triton -> PyTorch).
 
+### WS2 TP-aware dispatch
+
+WS2 distributed callers use a separate contract-aware entry point,
+`kernel_registry.get_logprob_op(contract)`. It validates explicit vocab-shard ownership,
+padded-vs-real vocab metadata, active-token masking, and fixed `(max, sumexp)` merge
+semantics before selecting a backend. Legacy `get_op("batch_invariant_logp")` behavior
+remains unchanged.
+
+The backends above are single-shard (TP=1) references and do not yet export vocab-domain
+LSE or carry vocab-shard metadata, so they are declared incompatible with strict WS2
+requests instead of being selected as a silent fallback. The contract objects are
+documented in `rl_engine.kernels.logprob_contract`.
+
 ## Benchmarks
 
 `benchmarks/benchmark_batch_invariant_logp.py` compares Native, Triton, and the
