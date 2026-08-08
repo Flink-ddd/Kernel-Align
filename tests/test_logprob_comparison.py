@@ -7,6 +7,7 @@ import json
 import logging
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -199,10 +200,11 @@ def test_cli_routes_rl_kernel_logs_to_stderr_for_machine_readable_stdout(monkeyp
 
 
 def test_cli_runs_directly_from_testing_module():
+    script = Path(__file__).resolve().parents[1] / "rl_engine" / "testing" / "logprob_comparison.py"
     result = subprocess.run(
         [
             sys.executable,
-            "rl_engine/testing/logprob_comparison.py",
+            str(script),
             "--candidate",
             "pytorch",
             "--device",
