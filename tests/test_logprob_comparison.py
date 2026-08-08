@@ -5,6 +5,7 @@ import argparse
 import io
 import json
 import logging
+import subprocess
 import sys
 
 import pytest
@@ -17,11 +18,12 @@ from rl_engine.testing.logprob_comparison import (
     LogprobBackendUnavailable,
     LogprobCandidate,
     LogprobComparisonInputs,
+    _device,
+    _route_rl_kernel_logs_to_stderr,
     compare_single_gpu_logprob,
     make_logprob_candidate,
 )
 from rl_engine.utils.logger import logger
-from scripts.compare_logprob import _device, _route_rl_kernel_logs_to_stderr
 
 
 def _inputs() -> LogprobComparisonInputs:
@@ -194,6 +196,34 @@ def test_cli_routes_rl_kernel_logs_to_stderr_for_machine_readable_stdout(monkeyp
 
     assert json.loads(stdout.getvalue()) == {"ok": True}
     assert "test backend diagnostic" in stderr.getvalue()
+
+
+def test_cli_runs_directly_from_testing_module():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "rl_engine/testing/logprob_comparison.py",
+            "--candidate",
+            "pytorch",
+            "--device",
+            "cpu",
+            "--batch",
+            "1",
+            "--seq",
+            "2",
+            "--vocab",
+            "17",
+            "--prompt-tokens",
+            "1",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["drifts"][0]["provenance"]["actual_backend"] == "pytorch"
+    assert payload["input_provenance"]["communication"] == "none"
 
 
 def test_operator_comparison_specs_register_batch_invariant_logp():
