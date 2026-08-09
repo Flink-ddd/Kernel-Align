@@ -165,8 +165,6 @@ class MismatchFactor:
     call_sites: tuple[str, ...] = ()  # one factor acting in several places
     pitfalls: tuple[KnownPitfall, ...] = ()
     variants: tuple[Any, ...] = ()  # empty -> expand the standard set
-    owner: str = ""  # "" = unclaimed
-    tracked_by: tuple[str, ...] = ()  # issues or PRs following this factor
 
 
 def declared_collectives(factor: MismatchFactor) -> tuple[CollectiveContract, ...]:

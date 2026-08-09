@@ -48,8 +48,6 @@ One ``FACTOR`` constant and nothing else -- declarations, no behaviour::
         reference=TE_ROPE_REFERENCE,        # from _common.py
         pitfalls=(KnownPitfall(...),),
         required_evidence=(Evidence.EFFECTIVE_CONFIG_READBACK.value, POSITION_CACHE),
-        owner="",
-        tracked_by=(),                       # issues or PRs following this factor
     )
 
 What ``__init__.py`` contains

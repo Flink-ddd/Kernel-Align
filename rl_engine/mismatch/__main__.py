@@ -28,9 +28,9 @@ from rl_engine.mismatch.schema import NoiseFloor
 # Operator plugins are listed here and nowhere else. An operator that is not
 # imported simply does not exist as far as the framework is concerned.
 _OPERATOR_PACKAGES: tuple[str, ...] = (
-    # "rl_engine.mismatch.operator_checks.gemm",
-    # "rl_engine.mismatch.operator_checks.attention",
-    # "rl_engine.mismatch.operator_checks.logprob",
+    "rl_engine.mismatch.operator_checks.gemm",
+    "rl_engine.mismatch.operator_checks.attention",
+    "rl_engine.mismatch.operator_checks.logprob",
 )
 
 
@@ -83,8 +83,7 @@ def command_list(operator: str | None) -> int:
         factors = OPERATOR_CHECKS.factors_for(name)
         print(f"{name}: {len(factors)} factors")
         for factor in factors:
-            owner = factor.owner or "unclaimed"
-            print(f"  {factor.id:<40} {factor.category.value:<24} owner={owner}")
+            print(f"  {factor.id:<40} {factor.category.value}")
     return 0
 
 

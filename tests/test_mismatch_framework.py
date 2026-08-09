@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from rl_engine.mismatch.engines.cpu_reference import CpuScoringBackend
+from tests.mismatch_cpu_backend import CpuScoringBackend
 from rl_engine.mismatch.pipeline import (
     ContradictoryFactor,
     PluginRegistry,
