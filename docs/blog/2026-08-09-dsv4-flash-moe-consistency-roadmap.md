@@ -146,7 +146,7 @@ The experiment matrix should stay restrained. It is used to isolate implementati
 
 DSV4 Flash MoE train-inference consistency is not a single-kernel task. It spans Megatron, vLLM, MoE routing, expert parallelism, Hopper kernels, low-precision numerics, and RL logprob diagnostics. We will continue development around the WS1 / WS2 issue buckets above.
 
-If you are familiar with CUDA / Triton / Hopper, vLLM fused MoE, Megatron MoE, distributed communication, or logprob / KL / ratio diagnostics in RL post-training, we welcome you to join the DSV4 MoE consistency effort. We want to make this work reusable operator-level infrastructure. To join the MoE development work, contact WeChat: `iZzy07Zoey12`.
+If you are familiar with CUDA / Triton / Hopper, vLLM fused MoE, Megatron MoE, distributed communication, or logprob / KL / ratio diagnostics in RL post-training, we welcome you to join the DSV4 MoE consistency effort. We want to make this work reusable operator-level infrastructure. To join the MoE development work, contact the official email at [team@rl-align.org](mailto:team@rl-align.org), the project initiator at [vensenmu@gmail.com](mailto:vensenmu@gmail.com), or WeChat at `iZzy07Zoey12`.
 
 ## Acknowledgments
 
