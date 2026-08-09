@@ -20,11 +20,9 @@ from rl_engine.mismatch.schema.values import LibraryPin, PolicyRole, RebindCost
 
 @dataclass(frozen=True)
 class ReuseKey:
-    """Whether an already-built runtime can be reused. Four parts matching the
-    four ``RebindCost`` levels, coarse to fine.
+    """Whether an already-built runtime can be reused.
 
-    Compared coarse to fine: a different ``process`` means restarting the whole
-    process; equal process but different engine means only rebuilding the engine.
+    Four parts matching the four ``RebindCost`` levels, compared coarse to fine.
     """
 
     process: str  # env vars, determinism switches, compile-time flags
@@ -35,8 +33,7 @@ class ReuseKey:
 
 @dataclass(frozen=True)
 class EnvironmentFingerprint:
-    """The execution environment. When this layer changes, every numerical
-    conclusion has to be re-run."""
+    """The execution environment. Change this layer and every number is stale."""
 
     python_version: str
     torch_version: str
@@ -53,15 +50,11 @@ class ExecutionFingerprint:
     """One execution's full identity. Any part differing makes two runs
     incomparable.
 
-    Three rules:
-
-    1. **What goes in is the value read back, not the value requested.**
-       Requesting ``num_splits=1`` and the backend actually using 1 are two
-       different facts.
-    2. **Library versions belong here, not in a footnote.**
-    3. **Thresholds go in too.** Change a threshold and every historical
-       pass/fail must go stale -- which is why thresholds are code constants: a
-       configurable value cannot be pinned into an identity.
+    What goes in is the value read back, never the value requested: asking for
+    ``num_splits=1`` and the backend using 1 are two different facts. Thresholds
+    go in too, so changing one makes every historical pass/fail stale -- which is
+    why thresholds are code constants, a configurable value cannot be pinned into
+    an identity.
     """
 
     identity: str  # fingerprint of the ComparisonIdentity
@@ -75,15 +68,10 @@ class ExecutionFingerprint:
 
 @dataclass(frozen=True)
 class VariantRecord:
-    """One variant's immutable on-disk record. Append-only, never edited.
+    """One variant's archived record: a ``VariantResult`` plus its identity.
 
-    Difference from ``VariantResult``: a Result is what was just computed in
-    memory, a Record is archived -- it additionally carries the execution
-    identity and a content hash, the latter being its integrity seal. Only a
-    record whose hash verifies may be reused on resume.
-
-    Not ``VariantArtifact`` -- in an ML context, "artifact" usually means model
-    weights or checkpoints (MLflow artifacts); this stores an execution record.
+    ``content_hash`` is its integrity seal. Only a record whose hash verifies may
+    be reused on resume.
     """
 
     variant_name: str
@@ -93,11 +81,7 @@ class VariantRecord:
 
 
 def canonical_fingerprint(payload: Any) -> str:
-    """Stable hash of a JSON-serialisable payload.
-
-    Key order is normalised so the same content always hashes the same, whatever
-    order the dict was built in.
-    """
+    """Hash a JSON-serialisable payload, normalising key order."""
 
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

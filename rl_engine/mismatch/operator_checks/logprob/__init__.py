@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Logprob operator plugin. Adding a factor drops a file into ``factors/``."""
+"""The logprob operator plugin."""
 
 from rl_engine.mismatch.operator_checks.logprob import adapter
 from rl_engine.mismatch.pipeline import OPERATOR_CHECKS, discover_factors
@@ -12,7 +12,7 @@ class LogprobChecks:
     operator = "logprob"
 
     def declare_factors(self):
-        return discover_factors(__package__)  # scans factors/*.py
+        return discover_factors(__package__)
 
     build_contract = staticmethod(adapter.build_contract)
     read_effective_config = staticmethod(adapter.read_effective_config)

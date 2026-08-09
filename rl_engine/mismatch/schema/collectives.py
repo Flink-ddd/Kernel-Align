@@ -4,11 +4,9 @@
 """Collective communication as a first-class concept.
 
 Mismatch comes from floating-point addition not being associative, and the
-accumulation order is almost entirely decided by collective communication.
-``gemm.forward_reduce``, ``gemm.dgrad_reduce``, ``attn.cp_split_k_merge_order``,
-``logp.reduce_topology``, ``moe.tp_forces_sp_reduce`` and
-``gemm.rollout_all_reduce_backend`` are six instances of *one* semantic model --
-writing each separately guarantees they drift apart.
+accumulation order is almost entirely decided by collective communication. Six
+factors across gemm, attention, logprob and MoE are instances of this one
+semantic model; written separately they would drift apart.
 """
 
 from __future__ import annotations
@@ -26,15 +24,13 @@ class CollectiveOp(str, Enum):
     ALL_TO_ALL = "all_to_all"
     BROADCAST = "broadcast"
     POINT_TO_POINT = "point_to_point"
-    NONE = "none"  # single-device path, recorded explicitly rather than left blank
+    NONE = "none"  # single-device path, recorded rather than left blank
 
 
 class ParallelDim(str, Enum):
     """Which parallel dimension the communication happens on.
 
-    Not ``ProcessGroupKind`` -- ``ProcessGroup`` is an existing
-    ``torch.distributed`` type, and this describes a parallel dimension, not the
-    process group object.
+    Not ``ProcessGroupKind``: ``ProcessGroup`` is an existing torch type.
     """
 
     TENSOR = "tensor"
@@ -48,8 +44,8 @@ class ParallelDim(str, Enum):
 class ReductionOrder(str, Enum):
     """Accumulation order -- the direct root of mismatch, not the collective."""
 
-    ARRIVAL = "arrival"  # first to arrive is first added. Control group only
-    NCCL_ALGORITHM = "nccl_algorithm"  # ring/tree, varies with world size and message size
+    ARRIVAL = "arrival"  # control group only
+    NCCL_ALGORITHM = "nccl_algorithm"  # varies with world size and message size
     GLOBAL_RANK_INDEX = "global_rank_index"
     GLOBAL_BLOCK_INDEX = "global_block_index"  # CP / split-K merge
     GLOBAL_VOCAB_SHARD_INDEX = "global_vocab_shard_index"
@@ -68,14 +64,9 @@ class DeterminismLevel(str, Enum):
 class CollectiveContract:
     """The full numerical semantics of one collective.
 
-    Called a contract rather than a spec: it shares the word with
-    ``OperatorContract``, and it really is "what both sides must agree on",
-    not merely a description.
-
-    A self-contradictory combination must be rejected at planning time: claiming
-    ``determinism == STABLE_ACROSS_TOPOLOGY`` while setting ``reduction_order``
-    to ``NCCL_ALGORITHM`` or ``ARRIVAL`` produces numbers that mean nothing.
-    Static check, no run needed -- see ``reject_contradictory_factors()``.
+    Claiming ``STABLE_ACROSS_TOPOLOGY`` while reducing with ``NCCL_ALGORITHM`` or
+    ``ARRIVAL`` produces numbers that mean nothing;
+    ``reject_contradictory_factors()`` rejects that at planning time.
     """
 
     op: CollectiveOp
@@ -91,12 +82,10 @@ class CollectiveContract:
 
 @dataclass(frozen=True)
 class CollectiveRewrite:
-    """A mathematically identical rewrite of a collective -- equal in algebra,
-    unequal in floating point.
+    """A rewrite that is equal in algebra and unequal in floating point.
 
-    Megatron replacing ``all_reduce`` with ``reduce_scatter + all_gather`` when
-    sequence parallelism is on is exactly this rule applied. Whether the two
-    sides apply it is itself a source of mismatch, so it has to be declarable.
+    Whether each side applies one is itself a source of mismatch, so it has to be
+    declarable.
     """
 
     name: str

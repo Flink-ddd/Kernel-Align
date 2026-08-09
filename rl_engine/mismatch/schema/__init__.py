@@ -3,31 +3,15 @@
 
 """Pure data structures: public fields, frozen, no meaningful methods.
 
-All behaviour lives in free functions under ``pipeline/``. This is a deliberate
-trade-off, not an accident of using dataclasses:
+Behaviour lives in free functions under ``pipeline/``. The framework grows by
+adding functions while the set of types stays stable, which is the side
+procedural code is good at -- so do not hang methods on these structures. Write
+``requires_fixed_order(contract)``, not ``contract.requires_fixed_order()``.
 
-======================  ==================  ==================
-                        add a new function  add a new type
-======================  ==================  ==================
-data + procedural       easy                hard
-objects + polymorphism  hard                easy
-======================  ==================  ==================
+Chained field access such as ``factor.switch.path`` is fine: Demeter constrains
+an object's internals, and plain data is meant to expose its fields.
 
-This framework grows by **adding functions** (new diagnosis rules, new report
-views, new ordering strategies, new evidence checks) while the set of types
-stays stable -- so procedural is the correct side.
-
-Two consequences:
-
-* Do not hang methods on these structures. ``spec.requires_fixed_order()`` turns
-  a data structure into a half-object hybrid, which is the worst of both worlds.
-  Write ``requires_fixed_order(spec)`` instead.
-* Chained field access such as ``factor.switch.path`` is **fine** here and does
-  not violate the Law of Demeter -- Demeter constrains an object's internals,
-  and plain data structures are supposed to expose their fields. Do not wrap
-  them in getters for the sake of it.
-
-Modules are ordered by dependency; each only imports from the ones above it.
+Modules are ordered by dependency; each imports only from the ones above it.
 """
 
 from rl_engine.mismatch.schema.collectives import (

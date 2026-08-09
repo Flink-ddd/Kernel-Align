@@ -3,10 +3,9 @@
 
 """Plugin registration and factor discovery.
 
-Adding an operator is adding a directory; adding a factor is adding a file. No
-existing file changes. If you find yourself having to edit the planner, a global
-dict, or another operator's file, the abstraction is missing something -- raise
-it and fix the framework rather than patching in place.
+Adding an operator is adding a directory; adding a factor is adding a file. If
+you find yourself editing the planner, a global dict, or another operator's file,
+the abstraction is missing something -- raise it rather than patching in place.
 """
 
 from __future__ import annotations
@@ -28,17 +27,15 @@ from rl_engine.mismatch.schema import (
 class OperatorChecks(Protocol):
     """Everything one operator needs checked. The plugin itself.
 
-    The four methods below are **operator-level**, not factor-level: how to read
-    configuration back from an engine and how to observe collectives is the same
-    logic for all of an operator's factors. Pushing them down would make every
-    factor file copy them. Factor files hold **declarations only, no behaviour**.
+    These four are operator-level, not factor-level: reading configuration back
+    from an engine is the same logic for all of an operator's factors. Factor
+    files hold declarations only.
     """
 
     operator: str
 
     def declare_factors(self) -> tuple[MismatchFactor, ...]:
-        """Which factors this operator has. The only thing that must be written
-        by hand."""
+        """Which factors this operator has."""
         ...
 
     def build_contract(
@@ -48,12 +45,12 @@ class OperatorChecks(Protocol):
         ...
 
     def read_effective_config(self, role: PolicyRole, adapter: Any) -> Mapping[str, Any]:
-        """Read the switches' effective values back from the engine. A requested
-        value is not evidence."""
+        """Read the switches' effective values back. A requested value is not
+        evidence."""
         ...
 
     def observe_collectives(self, role: PolicyRole, adapter: Any) -> tuple[CollectiveContract, ...]:
-        """Which collectives actually ran. Feeds ``COLLECTIVE_CONTRACT``."""
+        """Which collectives actually ran."""
         ...
 
     def resolve_implementation(
@@ -61,8 +58,7 @@ class OperatorChecks(Protocol):
     ) -> tuple[Callable[..., Any] | None, ImplementationResolution]:
         """Resolve the name a variant asks for into a callable.
 
-        **Return the trace even when resolution fails** -- which candidates were
-        tried and why each was rejected. Returning a bare ``None`` leaves a
+        Return the trace even when resolution fails: a bare ``None`` leaves a
         silent fallback with nothing to investigate.
         """
         ...
@@ -79,7 +75,7 @@ class PluginRegistry:
         self._plugins: dict[str, OperatorChecks] = {}
 
     def register(self, plugin_cls: type) -> type:
-        """Decorator. Instantiates and registers, checking for conflicts."""
+        """Instantiate and register a plugin, checking for conflicts."""
 
         plugin = plugin_cls()
         name = getattr(plugin, "operator", "")
@@ -93,8 +89,8 @@ class PluginRegistry:
         return plugin_cls
 
     def _check_factor_conflicts(self, plugin: OperatorChecks) -> None:
-        """Reject duplicate factor ids, duplicate switch paths, and one contract
-        field claimed at two different comparison rules."""
+        """Reject duplicate ids, duplicate switch paths, and one contract field
+        claimed at two different comparison rules."""
 
         known_ids = {factor.id for p in self._plugins.values() for factor in p.declare_factors()}
         known_paths = {
@@ -152,9 +148,9 @@ class FactorDiscoveryError(ValueError):
 def discover_factors(package: str) -> tuple[MismatchFactor, ...]:
     """Collect the ``FACTOR`` constant from every module under ``<package>.factors``.
 
-    The convention: **file name equals the factor id with the operator prefix
-    stripped**. It is enforced here so that renaming an id without renaming the
-    file fails at import rather than silently.
+    A file's name must equal its factor id with the operator prefix stripped, so
+    that renaming an id without renaming the file fails at import rather than
+    silently dropping the factor.
     """
 
     factors_package = f"{package}.factors"

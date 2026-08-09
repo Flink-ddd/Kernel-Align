@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Four gates plus the diagnosis matrix. Step 6 of the pipeline.
+"""Four gates plus the diagnosis matrix.
 
 The framework draws the conclusion; nobody reads the numbers by hand.
 """
@@ -45,10 +45,9 @@ def diagnose(
 ) -> FactorReport:
     """Run four gates, then the matrix.
 
-    **"Not measured" and "measured and clean" are two different things** --
-    confusing them is the mistake an attribution framework is most likely to
-    make, so the gates come first and nothing reaches the matrix without passing
-    them.
+    "Not measured" and "measured and clean" are different things, and confusing
+    them is the mistake an attribution framework is most likely to make. Nothing
+    reaches the matrix without passing the gates.
     """
 
     outcome = (
@@ -71,9 +70,9 @@ def diagnose(
 def _gate_variants_applied(variants: Sequence[VariantResult]) -> _Outcome | None:
     """Gate 1: did every variant actually take effect?
 
-    ``FELL_BACK`` is the dangerous one -- the reference was requested, the engine
-    silently reverted to native, and "the deviation did not change" then reads as
-    ``NOT_THIS_FACTOR``. A false negative that looks exactly like a clean result.
+    ``FELL_BACK`` is the dangerous one: the engine silently reverted to native,
+    and "the deviation did not change" then reads as ``NOT_THIS_FACTOR`` -- a
+    false negative that looks exactly like a clean result.
     """
 
     for result in variants:
@@ -110,9 +109,8 @@ def _gate_evidence_complete(
 def _gate_shards_complete(variants: Sequence[VariantResult]) -> _Outcome | None:
     """Gate 3: were all logprob shards collected?
 
-    Under TP/CP each rank holds one slice. Missing a slice makes the combined
-    number wrong in a way that does not show: one vocab shard short and the LSE
-    denominator loses a chunk, so logp comes out systematically high.
+    One vocab shard short and the LSE denominator loses a chunk, so logp comes
+    out systematically high with nothing to show for it.
     """
 
     for result in variants:
@@ -185,9 +183,8 @@ def _run_matrix(
             "both one-sided swaps converged; the reference is the only anchor",
         )
 
-    # Neither converged. Before calling it clean, check the tail: the mean stays
-    # far below the clip edge at every production floor, so judging on the mean
-    # alone would mark almost everything NOT_THIS_FACTOR.
+    # Neither converged. Check the tail before calling it clean: the mean stays
+    # far below the clip edge at every production floor.
     for candidate in (training_only, rollout_only):
         if candidate.metrics is not None and is_silent_failure(candidate.metrics):
             return _Outcome(

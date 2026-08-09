@@ -25,9 +25,9 @@ from rl_engine.mismatch.schema import (
 
 _REF = DETERMINISTIC_REDUCE_REFERENCE
 
-# The standard four arms, declared explicitly so the self-check gate can also
-# carry ``repeat_under``: an implementation claiming topology independence must
-# survive NCCL choosing a different algorithm.
+# The standard four arms, spelled out so the self-check gate can also carry
+# repeat_under: an implementation claiming topology independence must survive
+# NCCL choosing a different algorithm.
 _VARIANTS = (
     FactorVariant(
         name="both_native",
@@ -78,13 +78,13 @@ FACTOR = MismatchFactor(
         "collectives[0].reduction_order": ComparisonRule.MUST_MATCH_SEMANTICALLY,
         "collectives[0].accumulate_precision": ComparisonRule.MUST_MATCH_SEMANTICALLY,
         "collectives[0].group_size": ComparisonRule.MUST_MATCH_BITWISE,
+        # Two backends may legitimately differ; what must agree is the order.
         "collectives[0].backend": ComparisonRule.RECORD_ONLY,
     },
     prerequisites=Prerequisites(required_ops=("ordered_reduce_scatter",), min_gpu_count=2),
     required_evidence=(Evidence.EFFECTIVE_CONFIG_READBACK.value, COLLECTIVE_CONTRACT),
     reference=_REF,
-    # One factor, three physical sites: all row parallel linears, all eating the
-    # same accumulation-order problem.
+    # All three are row parallel linears eating the same accumulation order.
     call_sites=("attention.o_linear", "mlp.down_linear", "moe.output"),
     variants=_VARIANTS,
     pitfalls=(

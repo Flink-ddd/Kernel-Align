@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Shared across the attention factors: reference implementations, contract helpers."""
+"""Reference implementations shared by attention's factors."""
 
 from __future__ import annotations
 
@@ -32,10 +32,6 @@ TE_ROPE_REFERENCE = ReferenceImplementation(
         ),
     ),
     pinned_libraries=(
-        LibraryPin(
-            "transformer_engine",
-            "2.9.0.dev0",
-            commit="8260f49",  # zhangj1an/TransformerEngine
-        ),
+        LibraryPin("transformer_engine", "2.9.0.dev0", commit="8260f49"),
     ),
 )

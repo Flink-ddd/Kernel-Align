@@ -68,10 +68,9 @@ def expected_range(
 ) -> ExpectedRange:
     """Look up the normal band for one combination.
 
-    Reading a low floor with the production table hides real bugs: at
-    SINGLE_LAYER_ANCHOR the expectation is bitwise, and judging it against
-    0.002-0.008 would call a definite operator error "normal". So the lookup is
-    always keyed by noise floor, and an exact model family beats the wildcard.
+    Always keyed by noise floor: judging an anchor-floor run against the
+    production band would call a definite operator error normal. An exact model
+    family beats the wildcard.
     """
 
     exact = [
@@ -99,10 +98,7 @@ def expected_range(
 
 
 def tolerance_floor(model_family: str, noise_floor: NoiseFloor) -> float:
-    """The absolute floor below which a difference is not treated as a signal.
-
-    Used by the diagnosis matrix as ``tol_floor`` when deciding convergence.
-    """
+    """The floor below which a difference is not treated as a signal."""
 
     return expected_range(model_family, noise_floor).suspect_above
 

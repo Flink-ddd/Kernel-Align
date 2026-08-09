@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Planning: filter, statically reject, expand variants, order by rebuild cost.
-
-Steps 2 to 4 of the pipeline.
-"""
+"""Planning: filter, statically reject, expand variants, order by rebuild cost."""
 
 from __future__ import annotations
 
@@ -48,11 +45,10 @@ class UnmetPrerequisite:
 
 
 def reject_contradictory_factors(factors: Sequence[MismatchFactor]) -> None:
-    """Static check, run between steps 2 and 3. Nothing executes.
+    """Reject a factor whose declaration contradicts itself. Nothing executes.
 
-    Claiming topology independence while using a non-deterministic reduction
-    order produces numbers that mean nothing. Reject at planning time rather
-    than explaining it away after a full run.
+    Claiming topology independence while reducing non-deterministically produces
+    numbers that mean nothing, and that is knowable before running.
     """
 
     for factor in factors:
@@ -73,10 +69,7 @@ def missing_prerequisites(
     gpu_count: int = 0,
     model_traits: frozenset[str] = frozenset(),
 ) -> tuple[UnmetPrerequisite, ...]:
-    """What this factor is still missing: operators, devices, packages, model traits.
-
-    A whitelist probe, not a hand-maintained blacklist of "unsupported" strings.
-    """
+    """What this factor is still missing: operators, devices, packages, traits."""
 
     needs = factor.prerequisites
     unmet: list[UnmetPrerequisite] = []
@@ -110,9 +103,8 @@ def missing_prerequisites(
 def build_variants(factor: MismatchFactor) -> tuple[FactorVariant, ...]:
     """Expand one factor into its variants.
 
-    A single swap is not enough: **only a one-sided swap tells you which side is
-    at fault, and only a two-sided swap proves the reference itself is sound.**
-    Hence four arms rather than on/off.
+    Four arms rather than on/off: only a one-sided swap tells you which side is
+    at fault, and only a two-sided swap proves the reference itself is sound.
     """
 
     if factor.variants:
@@ -121,7 +113,7 @@ def build_variants(factor: MismatchFactor) -> tuple[FactorVariant, ...]:
     path = factor.switch.path
     reference = factor.reference
 
-    if reference is None:  # no reference implementation means a parameter sweep
+    if reference is None:  # a parameter sweep
         allowed = factor.switch.allowed_values or ()
         return tuple(
             FactorVariant(
@@ -187,18 +179,18 @@ def order_cases_by_rebind_cost(
 ) -> tuple[tuple[MismatchFactor, FactorVariant], ...]:
     """Order cases so rebuild cost never decreases, maximising reuse.
 
-    **Ordering is required, not a nicety**: run 160 cases in a random order and
-    the worst case restarts the process for every one of them.
+    Required, not a nicety: 160 cases in a random order restart the process for
+    every one of them in the worst case.
     """
 
     return tuple(sorted(cases, key=lambda item: _REBIND_ORDER[item[0].switch.rebind_cost]))
 
 
 def suggested_floor_is_lowest(factor: MismatchFactor, floor: NoiseFloor) -> bool:
-    """Whether this factor can even show anything at the given floor.
+    """Whether this factor can show anything at the given floor.
 
-    A factor whose switch is process-level is identical on a single device, so
-    running it at the anchor floor wastes machine time.
+    A process-level switch is identical on a single device, so running it at the
+    anchor floor wastes machine time.
     """
 
     if factor.switch.rebind_cost is RebindCost.PROCESS_GROUP_REBUILD:

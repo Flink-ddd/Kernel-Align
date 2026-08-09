@@ -23,34 +23,28 @@ from rl_engine.mismatch.schema.values import (
 
 
 class FactorCategory(str, Enum):
-    """Which family a factor belongs to -- decides where to look when it fires.
-
-    Deliberately not ``Layer``: in this domain a layer is a model layer.
-    """
+    """Which family a factor belongs to, and so where to look when it fires."""
 
     INPUT_IDENTITY = "input_identity"  # tokens / mask / position_ids / eps
     ENVIRONMENT = "environment"  # framework versions, NCCL, determinism switches
-    KERNEL_IMPLEMENTATION = "kernel_implementation"  # backend choice, fusion, inner precision
+    KERNEL_IMPLEMENTATION = "kernel_implementation"  # backend, fusion, inner precision
     SHARDING_AND_REDUCTION = "sharding_and_reduction"  # TP/CP/SP, reduction order, split-K
     OUTPUT_NUMERICS = "output_numerics"  # logits / logp / (out, lse) / gradients
 
 
 class Evidence(str, Enum):
-    """Evidence **every** factor must have before a verdict is allowed.
+    """Evidence every factor must have before a verdict is allowed.
 
-    General items only. Operator-specific evidence does not belong in this enum:
-    putting it here would turn "add an operator" into "change the framework".
-    Plugins declare their own as plain strings (see the constants below).
+    Operator-specific evidence stays out of this enum: putting it here would turn
+    "add an operator" into "change the framework". Plugins declare their own as
+    plain strings, like the constants below.
     """
 
     EFFECTIVE_CONFIG_READBACK = "effective_config_readback"  # read back, not requested
-    MODEL_STATE_FINGERPRINT = "model_state_fingerprint"  # all variants share one set of weights
+    MODEL_STATE_FINGERPRINT = "model_state_fingerprint"
     LIBRARY_VERSIONS = "library_versions"
 
 
-# Operator-specific evidence: plugins define constants in their own module and
-# the framework treats them as plain strings. Adding an operator adds a new set
-# of constants; the framework does not change.
 COLLECTIVE_CONTRACT = "collective_contract"
 BATCH_PLACEMENT = "batch_placement"
 MODEL_SHAPE = "model_shape"
@@ -62,21 +56,18 @@ LSE_EXPORT = "lse_export"
 class ReferenceAuthority(str, Enum):
     """Where a reference implementation comes from, most authoritative first.
 
-    Not ``ReferenceTier``: "tier" says there are levels without saying what
-    orders them. What orders these is authority.
-
-    This is a decision order, not a description: look for a SHARED_BACKEND
-    first, and only write SELF_WRITTEN when the first two cannot cover it.
+    A decision order, not a description: look for a SHARED_BACKEND first, and
+    write SELF_WRITTEN only when the first two cannot cover it.
     """
 
-    FP64_ORACLE = "fp64_oracle"  # slow, mathematically exact, lowest noise floor only
+    FP64_ORACLE = "fp64_oracle"  # slow, exact, lowest noise floor only
     SHARED_BACKEND = "shared_backend"  # TransformerEngine / FlashInfer
     SELF_WRITTEN = "self_written"
 
 
 @dataclass(frozen=True)
 class Switch:
-    """The one definition of a switch. Allowed values and parser declared once."""
+    """A switch's one definition: allowed values and parser declared together."""
 
     path: str  # "gemm.forward_reduce"
     rebind_cost: RebindCost
@@ -91,10 +82,7 @@ class Switch:
 
 @dataclass(frozen=True)
 class Prerequisites:
-    """What this factor needs in order to run. A whitelist, not a blacklist.
-
-    Capability probing itself is delegated: this only declares what is needed.
-    """
+    """What a factor needs in order to run. A whitelist, not a blacklist."""
 
     required_ops: tuple[str, ...] = ()
     min_gpu_count: int = 1
@@ -105,31 +93,15 @@ class Prerequisites:
 
 @dataclass(frozen=True)
 class ReferenceImplementation:
-    """What replaces the native implementation, and which execution paths it covers.
+    """What replaces the native implementation, and which paths it covers.
 
-    **``covers_paths`` defines the shape of the self-check gate**, the field most
-    easily overlooked: the gate is not "both sides use the same implementation",
-    it is "**every path this reference covers must agree bitwise on the same
-    sequence**".
+    ``covers_paths`` defines the shape of the self-check gate: every path this
+    reference covers must agree bitwise on the same sequence. Covering two paths
+    puts the gate across the two sides; a reference that also covers
+    ``ROLLOUT_DECODE`` puts it inside the rollout side, and then no decode stub is
+    needed on the training side.
 
-    Most factors cover two paths (training full-prefill plus rollout
-    full-prefill) and the gate holds across the two sides. But an attention
-    FlashInfer reference also covers ROLLOUT_DECODE -- so the gate holds *inside
-    the rollout side*: with full-prefill and decode both switched to FlashInfer
-    and ``num_splits=1`` pinned, ``(out, lse)`` must agree on the same sequence.
-    A disagreement is the reference's fault, unrelated to the training side.
-    **No decode stub is needed on the training side.**
-
-    Covering several paths also gives the attribution split directly:
-
-        dlogp(training, real rollout)
-          = dlogp(TRAINING_FULL_PREFILL, ROLLOUT_FULL_PREFILL)   cross-framework
-          + dlogp(ROLLOUT_FULL_PREFILL,  ROLLOUT_DECODE)         rollout-side path
-
-    The two terms are fixed in completely different ways: the first by swapping
-    the kernel backend, the second by changing decode's softmax block size to
-    match prefill. Without the middle path, attribution stops at the combined
-    "cross-framework plus cross-path" answer.
+    See ``docs/add-a-kernel-factor.md`` for how that shapes attribution.
     """
 
     name: str
@@ -139,7 +111,7 @@ class ReferenceImplementation:
     covers_paths: tuple[ExecutionPath, ...]
     fp64_oracle: str | None = None
     required_settings: tuple[RequiredSetting, ...] = ()
-    pinned_libraries: tuple[LibraryPin, ...] = ()  # **required**, see LibraryPin
+    pinned_libraries: tuple[LibraryPin, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -148,9 +120,9 @@ class MismatchFactor:
 
     Not ``DivergenceFactor``: in an RL context, divergence means KL divergence.
 
-    A factor with ``reference is None`` is a parameter sweep; with a reference it
-    is an implementation swap. There is no separate ``kind`` field -- derivable
-    state is state that can disagree with itself.
+    ``reference is None`` makes it a parameter sweep, otherwise an implementation
+    swap. There is no separate ``kind`` field -- derivable state is state that can
+    disagree with itself.
     """
 
     id: str  # "gemm.forward_reduce", globally unique
@@ -168,28 +140,20 @@ class MismatchFactor:
 
 
 def declared_collectives(factor: MismatchFactor) -> tuple[CollectiveContract, ...]:
-    """Collectives a factor's reference implementation pins, if any.
-
-    Used by the planner's static check; returns empty when the factor does not
-    touch collective communication.
-    """
+    """Collectives a factor's reference pins, for the planner's static check."""
 
     reference = factor.reference
     if reference is None:
         return ()
-    pinned = tuple(
+    return tuple(
         setting.value
         for setting in reference.required_settings
         if isinstance(setting.value, CollectiveContract)
     )
-    return pinned
 
 
 def requires_fixed_order(contract: CollectiveContract) -> bool:
-    """Whether this contract claims its result is independent of topology.
-
-    Claiming it means it must survive the assertion in ``pipeline/planner.py``.
-    """
+    """Whether this contract claims its result is independent of topology."""
 
     return contract.determinism is DeterminismLevel.STABLE_ACROSS_TOPOLOGY
 

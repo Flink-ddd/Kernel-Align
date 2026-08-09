@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Shared across the gemm factors: collective contracts and the ordered reference."""
+"""Collective contracts and the ordered reference, shared by gemm's factors."""
 
 from __future__ import annotations
 
@@ -23,8 +23,6 @@ from rl_engine.mismatch.schema import (
 
 TP_SIZE = 2
 
-# What the reference pins: a reduce_scatter whose accumulation order is keyed on
-# global rank, which is what makes the result independent of topology.
 ORDERED_REDUCE_SCATTER = CollectiveContract(
     op=CollectiveOp.REDUCE_SCATTER,
     group=ParallelDim.TENSOR,
@@ -36,8 +34,8 @@ ORDERED_REDUCE_SCATTER = CollectiveContract(
     backend="rl_kernel",
 )
 
-# Megatron with sequence parallelism on: all_reduce is rewritten into
-# reduce_scatter + all_gather, and NCCL picks the order.
+# Megatron with sequence parallelism on: all_reduce rewritten as
+# reduce_scatter + all_gather, ordered by whatever NCCL picks.
 NATIVE_TRAINING_REDUCE = CollectiveContract(
     op=CollectiveOp.REDUCE_SCATTER,
     group=ParallelDim.TENSOR,
@@ -49,8 +47,8 @@ NATIVE_TRAINING_REDUCE = CollectiveContract(
     backend="nccl",
 )
 
-# vLLM without sequence parallelism: a plain all_reduce, and the backend is
-# chosen by world size and topology at runtime.
+# vLLM without sequence parallelism: a plain all_reduce, backend chosen at
+# runtime from world size and topology.
 NATIVE_ROLLOUT_REDUCE = CollectiveContract(
     op=CollectiveOp.ALL_REDUCE,
     group=ParallelDim.TENSOR,
@@ -62,10 +60,10 @@ NATIVE_ROLLOUT_REDUCE = CollectiveContract(
     backend="vllm_custom_ipc",
 )
 
+# SELF_WRITTEN because neither TE nor FlashInfer exposes a reduction whose order
+# is fixed across topologies.
 DETERMINISTIC_REDUCE_REFERENCE = ReferenceImplementation(
     name="rl_kernel",
-    # SELF_WRITTEN because neither TE nor FlashInfer exposes a reduction whose
-    # order is fixed across topologies -- see the PR body.
     tier=ReferenceAuthority.SELF_WRITTEN,
     training_impl="rl_engine.kernels.collectives.ordered_reduce_scatter",
     rollout_impl="rl_engine.kernels.collectives.ordered_reduce_scatter",
@@ -76,7 +74,7 @@ DETERMINISTIC_REDUCE_REFERENCE = ReferenceImplementation(
     required_settings=(
         RequiredSetting(
             "forward_reduce_contract",
-            ORDERED_REDUCE_SCATTER,  # the contract itself, pinned as a value
+            ORDERED_REDUCE_SCATTER,
             SettingChannel.CALL_ARG,
             readback="module.last_collective_contract",
         ),

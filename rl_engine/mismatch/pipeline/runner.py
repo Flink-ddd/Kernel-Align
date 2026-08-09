@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""The execution loop: reuse decisions, variant repeats, metric computation.
-
-Step 5 of the pipeline.
-"""
+"""The execution loop: reuse decisions, variant repeats, metric computation."""
 
 from __future__ import annotations
 
@@ -33,8 +30,8 @@ from rl_engine.mismatch.schema import (
 class ScoringBackend(Protocol):
     """What the runner needs from an engine: logprobs for a fixed sequence.
 
-    Deliberately minimal so a CPU stub can satisfy it -- the framework's
-    plumbing is testable without a GPU.
+    Minimal enough that a CPU stub can satisfy it, so the plumbing is testable
+    without a GPU.
     """
 
     def score(
@@ -67,9 +64,8 @@ class RunContext:
 def assert_comparison_is_read_only(before: str, after: str) -> None:
     """Model tensor fingerprints must match before and after scoring.
 
-    If a kernel mutates weights in place, the first and second run differ, so
-    ``both_reference`` fails bitwise at random and gets blamed on the reference
-    -- attribution then points somewhere entirely wrong. This assertion is the
+    A kernel that mutates weights in place makes ``both_reference`` fail bitwise
+    at random, and the blame lands on the reference. This assertion is the
     self-check gate's own premise.
     """
 
@@ -89,9 +85,8 @@ def compute_metrics(
 ) -> MismatchMetrics:
     """Per-token metrics over active tokens only.
 
-    ``dlogp = log pi_theta - log pi_old``, so ``rho = exp(dlogp)``. The objective
-    clips ``rho`` at ``1 +/- eps``, which is ``|dlogp| > ln(1 + eps)`` -- past
-    that edge a token's gradient signal is discarded.
+    ``dlogp = log pi_theta - log pi_old``, so ``rho = exp(dlogp)``, clipped at
+    ``1 +/- eps``. Past that edge a token's gradient signal is discarded.
     """
 
     deltas: list[float] = []
@@ -123,7 +118,7 @@ def compute_metrics(
     lower_edge = -math.log1p(-clip_eps) if clip_eps < 1.0 else float("inf")
     clipped = sum(1 for delta in deltas if delta > upper_edge or delta < -abs(lower_edge))
 
-    # k3 estimator, the standard PPO/GRPO diagnostic: rho - 1 - ln(rho).
+    # k3 estimator: rho - 1 - ln(rho)
     approx_kl = sum(ratio - 1.0 - math.log(ratio) for ratio in ratios) / len(ratios)
 
     worst_index = max(range(len(deltas)), key=lambda i: magnitudes[i])
@@ -157,10 +152,7 @@ def _percentile(values: Sequence[float], q: float) -> float:
 def expand_repeats(variant: FactorVariant) -> tuple[Mapping[str, Any], ...]:
     """Expand ``repeat_under`` into the cartesian product of environments.
 
-    The only exception to "one variant, one execution". It never compares across
-    frameworks, so it is cheap; what it verifies is the **premise of the
-    self-check gate** -- ``both_reference`` can only anchor if the fixed-order
-    implementation really did fix the order.
+    The only exception to "one variant, one execution".
     """
 
     if not variant.repeat_under:
@@ -173,8 +165,7 @@ def expand_repeats(variant: FactorVariant) -> tuple[Mapping[str, Any], ...]:
 def assert_order_is_topology_independent(results: Sequence[Sequence[float]]) -> bool:
     """Runs of a topology-independent collective must agree bitwise.
 
-    Single-sided reruns, no cross-framework comparison -- the cheapest check in
-    the whole set.
+    Single-sided reruns, so the cheapest check in the whole set.
     """
 
     if len(results) < 2:

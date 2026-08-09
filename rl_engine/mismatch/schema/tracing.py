@@ -16,21 +16,11 @@ from rl_engine.mismatch.schema.variants import NoiseFloor
 
 @dataclass(frozen=True)
 class ModuleCorrespondence:
-    """A training-side module paired with its rollout-side counterpart, plus any
-    known structural difference between them.
+    """A training-side module paired with its rollout-side counterpart.
 
-    Without this table the two sides' tensors cannot even be matched up, let
-    alone compared entry by entry.
-
-    A non-empty ``equivalence`` means "different in form, equal in arithmetic" --
-    the basis for filtering false positives. Without it, a difference like fused
-    QKV turns every weight comparison red and buries the real problem.
-
-    Filled once per model by whoever brings the model up, and shared by every
-    operator: "Megatron's ``linear_fc1`` corresponds to vLLM's ``gate_up_proj``"
-    is the same fact for attention, gemm and logprob alike. Swap in GLM5 or
-    DSv3.2 and it has to be redone -- so it lives in ``model_meta/``, not in any
-    ``operator_checks/``.
+    A non-empty ``equivalence`` means "different in form, equal in arithmetic",
+    which is what lets a false positive be filtered. Without it a difference like
+    fused QKV turns every weight comparison red and buries the real problem.
     """
 
     semantic_name: str  # "mlp.gate_up" -- framework-independent
@@ -42,20 +32,13 @@ class ModuleCorrespondence:
 
 @dataclass(frozen=True)
 class PropagationEdge:
-    """One directed edge of the call chain: mismatch at ``upstream`` propagates
-    to ``downstream``.
-
-    Tracing walks these backwards: start from the last still-aligned module and
-    look downstream for the first mismatched one.
-    """
+    """One directed edge of the call chain, followed backwards when tracing."""
 
     upstream: str  # semantic_name
     downstream: str
 
 
 class RootCauseCategory(str, Enum):
-    """How a root cause is classified."""
-
     MISSING_OPERATOR = "missing_operator"  # one side does not have it at all
     DIFFERENT_IMPLEMENTATION = "different_implementation"
     DIFFERENT_PARAMETER = "different_parameter"
@@ -64,11 +47,10 @@ class RootCauseCategory(str, Enum):
 
 @dataclass(frozen=True)
 class RootCauseHypothesis:
-    """One root-cause hypothesis, produced by walking the call chain after a
-    ``NOT_THIS_FACTOR``.
+    """One hypothesis from walking the call chain after a ``NOT_THIS_FACTOR``.
 
-    ``anchor_module`` is the last position where the two sides still agree --
-    the root cause must be downstream of it.
+    The root cause must be downstream of ``anchor_module``, the last position
+    where the two sides still agree.
     """
 
     suspected_module: str
@@ -81,34 +63,19 @@ class RootCauseHypothesis:
 
 @dataclass(frozen=True)
 class MismatchReport:
-    """The final report for one run. **Three levels away from a Diagnosis**::
+    """The final report for one run.
 
-        one factor's variants  ->  VariantResult x N
-                                       | diagnose()
-                                 FactorReport  (holds one Diagnosis enum value)
-                                       | x 30 factors
-                                 trace_root_causes()
-                                       v
-                                 MismatchReport  (ranked hypotheses)
-
-    * ``Diagnosis`` is **one factor's** conclusion, one of eight values;
-    * ``FactorReport`` is that factor's full record: every variant plus that one
-      diagnosis plus the reason;
-    * ``MismatchReport`` is the **whole run**, answering what a Diagnosis cannot.
-
-    Thirty factors give thirty diagnoses -- say three ``CAUSED_BY_TRAINING_SIDE``,
-    twenty-five ``NOT_THIS_FACTOR``, two ``INSUFFICIENT_EVIDENCE``. That pile is
-    not the answer. **The report's job is to combine them with the module
-    correspondence table and the call chain into "the few most suspicious
-    modules, ranked"** -- the ``hypotheses`` field. The rest is the evidence
-    supporting it.
+    Thirty factors give thirty diagnoses, and that pile is not the answer. This
+    combines them with the module correspondence table and the call chain into
+    ``hypotheses`` -- the few most suspicious modules, ranked. The other fields
+    are the evidence supporting it.
     """
 
     noise_floor: NoiseFloor
     library_pins: tuple[LibraryPin, ...]
     factor_reports: tuple[FactorReport, ...]
     hypotheses: tuple[RootCauseHypothesis, ...]  # sorted by rank
-    filtered_false_positives: tuple[ModuleCorrespondence, ...]  # those with equivalence set
+    filtered_false_positives: tuple[ModuleCorrespondence, ...]
     failed_guards: tuple[KnownPitfall, ...]
 
 

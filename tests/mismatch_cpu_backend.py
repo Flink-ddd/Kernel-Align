@@ -1,18 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""A CPU scoring backend used to exercise the framework without a GPU.
+"""A CPU scoring backend for exercising the framework without a GPU.
 
-This validates plumbing only. It does not claim anything about real Megatron or
-vLLM numerics -- those live in ``megatron.py`` and ``vllm.py`` and need devices.
-
-It is deliberately able to *simulate* the failure modes the framework is built to
-catch, so the gates and the matrix can be tested for real:
-
-* a configurable per-side bias, so one-sided attribution can be checked;
-* a switch that silently does nothing, so ``FELL_BACK`` is reachable;
-* an unstable mode whose output changes with the environment, so the
-  topology-independence assertion can actually fail.
+Plumbing only: it says nothing about real Megatron or vLLM numerics. What it can
+do is simulate the failure modes the framework exists to catch -- a per-side
+bias, a switch that silently does nothing, and output that changes with the
+environment -- so the gates and the matrix are tested against something that
+really fails.
 """
 
 from __future__ import annotations
@@ -33,8 +28,7 @@ from rl_engine.mismatch.schema import (
 class CpuScoringBackend:
     """Deterministic synthetic logprobs, with injectable deviation.
 
-    ``bias`` is the deviation this side adds on top of the shared base signal.
-    Setting it on one side only is how a one-sided root cause is simulated.
+    Setting ``bias`` on one side only simulates a one-sided root cause.
     """
 
     role: PolicyRole
@@ -59,16 +53,14 @@ class CpuScoringBackend:
     ) -> tuple[Sequence[float], Mapping[str, Any]]:
         """Produce logprobs for the fixed sequence.
 
-        The base signal only depends on the identity, so both sides agree unless
-        a bias is injected -- which is what makes an injected deviation the only
-        thing the metrics can see.
+        The base signal depends only on the identity, so both sides agree unless
+        a bias is injected.
         """
 
         self.applied_calls.append(dict(switch_values))
         base = _base_signal(identity)
 
-        # A replacement callable means the reference implementation is in play;
-        # the reference is defined to have no bias of its own.
+        # The reference is defined to have no bias of its own.
         bias = 0.0 if replacement is not None else self.bias
 
         drift = 0.0
@@ -86,10 +78,7 @@ class CpuScoringBackend:
         return logprobs, effective
 
     def reuse_key(self, switch_values: Mapping[str, Any]) -> ReuseKey:
-        """Group switches by how expensive they are to change.
-
-        Mirrors the four ``RebindCost`` levels so case ordering can be tested.
-        """
+        """Group switches by tier, mirroring the four ``RebindCost`` levels."""
 
         def digest(prefix: str) -> str:
             payload = sorted(

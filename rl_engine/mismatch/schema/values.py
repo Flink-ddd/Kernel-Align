@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Base value types. This module imports nothing from the project.
+"""Base value types. Imports nothing from the project.
 
 Everything here is a plain data structure: public fields, ``frozen=True``, no
 meaningful methods. Behaviour lives in free functions under ``pipeline/``.
@@ -17,22 +17,18 @@ from typing import Any, Callable
 class PolicyRole(str, Enum):
     """Which of the two compared policies this side plays.
 
-    Not ``Side``: that only says "one of the sides" without saying of what.
-    Not ``Policy`` either -- in RL that means the policy itself (network and
-    distribution), not the part it plays in this comparison.
+    Not ``Policy``: in RL that means the policy itself, not the part it plays.
     """
 
-    ROLLOUT = "rollout"  # pi_old -- the policy that produced the trajectory
-    TRAINING = "training"  # pi_theta -- the policy being updated
+    ROLLOUT = "rollout"  # pi_old -- produced the trajectory
+    TRAINING = "training"  # pi_theta -- being updated
 
 
 class ExecutionPath(str, Enum):
     """Which physical path produced a set of logprobs.
 
-    The same mathematical quantity (a token's conditional probability) can come
-    out of several different physical paths: feed the whole sequence at once,
-    feed it in chunks, or generate token by token. Mathematically equivalent,
-    not equal in floating point.
+    Whole sequence at once, in chunks, or token by token: mathematically
+    equivalent, not equal in floating point.
     """
 
     TRAINING_FULL_PREFILL = "training_full_prefill"
@@ -53,23 +49,17 @@ class Precision(str, Enum):
 class DowncastPoint(str, Enum):
     """When a high-precision accumulator is written back at lower precision.
 
-    ``downcast`` here means numerical precision reduction (fp32 -> bf16), not
-    the C++ sense of casting down a class hierarchy.
+    Numerical precision reduction, not the C++ sense of casting down a hierarchy.
     """
 
     NEVER = "never"
-    PER_BLOCK = "per_block"  # right after each block (largest error)
-    PER_PARTIAL = "per_partial"  # each shard's partial sum
-    FINAL_WRITE = "final_write"  # only on the final write (smallest error)
+    PER_BLOCK = "per_block"  # largest error
+    PER_PARTIAL = "per_partial"
+    FINAL_WRITE = "final_write"  # smallest error
 
 
 class RebindCost(str, Enum):
-    """What it costs to change this switch.
-
-    Named after the cost rather than an isolation level because its only job is
-    to answer "is this one expensive?", which drives case ordering and therefore
-    the wall-clock of the whole run.
-    """
+    """What it costs to change a switch. Drives case ordering."""
 
     PER_REQUEST = "per_request"
     ENGINE_REBUILD = "engine_rebuild"
@@ -78,12 +68,7 @@ class RebindCost(str, Enum):
 
 
 class SettingChannel(str, Enum):
-    """How a setting reaches the engine, which decides when it takes effect.
-
-    These three are delivered in completely different ways. Flattening them into
-    one dict leaves the framework unable to deliver them, and unable to derive
-    the rebind cost that case ordering depends on.
-    """
+    """How a setting reaches the engine, which decides when it takes effect."""
 
     ENV_VAR = "env_var"  # read once at process start -> PROCESS_RESTART
     TORCH_GLOBAL = "torch_global"  # torch.backends.* -> PROCESS_RESTART
@@ -95,10 +80,9 @@ class SettingChannel(str, Enum):
 class LibraryPin:
     """A pinned library version.
 
-    TransformerEngine and FlashInfer change kernel selection across versions --
-    the same factor can reach the *opposite* conclusion on a different version.
-    So the version is part of the experiment's identity, not a footnote: it goes
-    into the fingerprint, and changing it invalidates historical results.
+    TransformerEngine and FlashInfer change kernel selection across versions, so
+    the same factor can reach the opposite conclusion on a different one. The pin
+    goes into the execution fingerprint rather than a footnote.
     """
 
     package: str
@@ -109,12 +93,10 @@ class LibraryPin:
 
 @dataclass(frozen=True)
 class RequiredSetting:
-    """A setting that must be pinned: what to pin, how to deliver it, how to
-    read it back, and which pitfall it guards against.
+    """A setting that must be pinned, and how to prove it was.
 
-    ``readback`` is the main reason this type exists: **a requested value is not
-    evidence**. A setting that cannot be read back can only be recorded as
-    ``UNOBSERVABLE`` -- delivered but unverifiable is the same as not delivered.
+    A setting that cannot be read back can only be recorded ``UNOBSERVABLE``:
+    delivered but unverifiable is the same as not delivered.
     """
 
     key: str
@@ -128,13 +110,7 @@ class RequiredSetting:
 class PrecisionProfile:
     """Which precision this side uses at each point in the computation.
 
-    Not ``PrecisionPolicy`` -- in RL, ``Policy`` is pi, the one word this domain
-    must not borrow.
-
-    Reserved for the precision factors that get wired in later. Today
-    ``rollout.dtype`` and ``training.compute_dtype`` are two independent
-    switches with inconsistent names and no way to express "both sides should
-    match"; this type converges them.
+    Not ``PrecisionPolicy``: in RL, ``Policy`` is pi.
     """
 
     compute: Precision
@@ -147,10 +123,7 @@ class PrecisionProfile:
 
 
 def choice_parser(*allowed: Any) -> Callable[[Any], Any]:
-    """Build a parser that accepts only the given values.
-
-    Used by ``Switch`` so the allowed set and the parser are declared once.
-    """
+    """Build a parser accepting only the given values."""
 
     permitted = tuple(allowed)
 

@@ -1,23 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""The two sides under test: process and engine lifetime, configuration readback.
+"""The two sides under test: engine lifetime and configuration readback.
 
-**This package holds exactly two things: ``megatron.py`` and ``vllm.py``.** They
-are the training side and the rollout side as they really run -- how the engine
-is constructed, how a switch is delivered to it, and how its *effective* value is
-read back out.
+This package holds ``megatron.py`` and ``vllm.py`` and nothing else. Adding an
+operator never adds a file here; all of attention's factors use the one
+``vllm.py``.
 
-Shared across operators: all of attention's factors use one ``vllm.py``, and
-adding an operator never adds a file here.
-
-Not to be confused with:
-
-* ``reference_adapters/`` -- wires *reference* implementations in and contains no
-  operator code;
-* ``tests/mismatch_cpu_backend.py`` -- a harness that satisfies the same
-  ``ScoringBackend`` protocol so the framework can be exercised without a real
-  engine. It is not a side under test, so it does not live here.
+Anything that merely satisfies ``ScoringBackend`` is a harness, not a side under
+test, and lives in ``tests/`` -- see ``tests/mismatch_cpu_backend.py``.
 """
 
 from rl_engine.mismatch.engines.megatron import MegatronBackend

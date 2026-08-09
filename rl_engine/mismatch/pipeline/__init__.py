@@ -3,20 +3,15 @@
 
 """The execution pipeline: free functions only, no state.
 
-One file per step, in the order they run:
+One file per step, in the order they run::
 
-1. ``registry``   -- plugin registration, factor discovery, import-time conflicts
-2--4. ``planner`` -- filter, statically reject, expand variants, order by cost
-5. ``runner``     -- execution loop, reuse decisions, variant repeats
-6. ``diagnosis``  -- four gates plus the matrix
-7. ``report``     -- filter false positives, trace root causes, emit the report
+    registry    plugin registration and factor discovery
+    planner     filter, statically reject, expand variants, order by cost
+    runner      execution loop, reuse decisions, variant repeats
+    diagnosis   four gates plus the matrix
+    report      filter false positives, trace root causes, emit the report
 
-``comparison`` is used by the runner and holds the declaration-driven contract
-comparison.
-
-Dependency rules: ``schema/`` never imports ``pipeline/``; ``pipeline/`` never
-imports ``operator_checks/``. Breaking the second rule turns "add an operator"
-into "change the framework".
+``comparison`` holds the declaration-driven contract comparison the runner uses.
 """
 
 from rl_engine.mismatch.pipeline.comparison import compare_contracts, resolve_field_path

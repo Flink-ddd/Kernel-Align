@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Command line entry point. **The only place that imports operator plugins.**
+"""Command line entry point, and the only place that imports operator plugins.
 
-The framework does not know which operators exist -- importing them here is what
-triggers self-registration, and it keeps the dependency arrow pointing one way:
-``pipeline/`` never reaches into ``operator_checks/``.
+Importing them here is what triggers self-registration, and it keeps the
+dependency arrow pointing one way: ``pipeline/`` never reaches into
+``operator_checks/``.
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ from rl_engine.mismatch.pipeline import (
 )
 from rl_engine.mismatch.schema import NoiseFloor
 
-# Operator plugins are listed here and nowhere else. An operator that is not
-# imported simply does not exist as far as the framework is concerned.
+# An operator that is not listed here does not exist as far as the framework
+# is concerned.
 _OPERATOR_PACKAGES: tuple[str, ...] = (
     "rl_engine.mismatch.operator_checks.gemm",
     "rl_engine.mismatch.operator_checks.attention",
@@ -94,9 +94,6 @@ def command_plan(operator: str | None, noise_floor: str, gpu_count: int, as_json
         print("nothing to plan: no operator plugins are registered.")
         return 0
 
-    # Static rejection before anything is expanded: a factor that claims topology
-    # independence while reducing non-deterministically produces numbers that
-    # mean nothing, and that is knowable without running.
     reject_contradictory_factors(factors)
 
     runnable = []

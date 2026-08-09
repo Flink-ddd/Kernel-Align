@@ -15,7 +15,7 @@ from rl_engine.mismatch.schema.values import PolicyRole
 class VariantExpansion(str, Enum):
     """Which variants a factor expands into."""
 
-    STANDARD_FOUR = "standard_four"  # swap factors: both_native / both_reference / two one-sided
+    STANDARD_FOUR = "standard_four"  # swap factors
     VALUE_SWEEP = "value_sweep"  # sweep factors: one run per allowed value
     PAIRWISE = "pairwise"  # only after COUPLED_WITH_OTHER_FACTORS is diagnosed
 
@@ -26,12 +26,9 @@ class ExpectedOutcome(str, Enum):
 
 
 class SwitchStatus(str, Enum):
-    """Whether the switch actually reached the engine. A silent fallback is far
-    more harmful than an error.
+    """Whether the switch actually reached the engine.
 
-    Not ``MaterializationStatus`` -- it describes a **switch**'s state (did it
-    get delivered), which "materialization" neither reveals nor keeps separate
-    from attention's execution path.
+    A silent fallback is far more harmful than an error.
     """
 
     APPLIED = "applied"
@@ -42,13 +39,11 @@ class SwitchStatus(str, Enum):
 
 
 class Diagnosis(str, Enum):
-    """The conclusion for **one factor** after its variants have run -- an enum
-    value, not a report.
+    """One factor's conclusion after its variants have run.
 
-    The first three are "cannot judge" and must stay strictly separate from
-    "judged, nothing here". It answers "is this one factor the culprit"; it
-    cannot answer "what causes the mismatch" -- that needs cross-factor
-    synthesis, which is what ``MismatchReport`` is for.
+    The first three mean "cannot judge" and must stay strictly separate from
+    "judged, nothing here". Answering what causes the mismatch overall needs
+    cross-factor synthesis, which is ``MismatchReport``.
     """
 
     VARIANT_DID_NOT_APPLY = "variant_did_not_apply"
@@ -62,47 +57,41 @@ class Diagnosis(str, Enum):
 
 
 class NoiseFloor(str, Enum):
-    """The experiment's noise floor: how small a difference this run can resolve.
-    Orthogonal to factors. A floor that has not passed blocks the next one.
+    """How small a difference this run can resolve. Orthogonal to factors.
 
-    From signal processing: a signal below the noise floor cannot be measured.
-    Same here -- at the production floor, an e-6 difference drowns in parallel
-    reduction noise. Deliberately not named after scale: the levels are graded
-    by noise, not by size.
-
-    The four are arranged so that **each step down introduces exactly one new
-    noise source**. When a floor starts failing, the suspect set is decided: it
-    is whatever that floor just added.
+    Each step down introduces exactly one new noise source, so when a floor
+    starts failing the suspect set is whatever that floor just added. A floor
+    that has not passed blocks the next one.
     """
 
     SINGLE_LAYER_ANCHOR = "single_layer_anchor"
-    # 1 layer / single device / determinism fully on / batch=1 / one token.
-    # Noise sources: none, only the operator itself.
-    # Called an anchor because it is the reference point for the other three:
-    # **failing bitwise here is an operator bug, not "training-inference
-    # mismatch"**, and the other three floors need not run at all.
+    # 1 layer, single device, determinism on, one token. No noise sources at all,
+    # which is why failing bitwise here is an operator bug rather than mismatch,
+    # and the other three floors need not run.
 
     FULL_MODEL_SINGLE_GPU = "full_model_single_gpu"
-    # All layers / still single device / determinism still on.
-    # New: accumulation over depth. Tests whether error grows linearly or
-    # exponentially with layer count.
+    # All layers, still single device. New: accumulation over depth. Tests
+    # whether error grows linearly or exponentially with layer count.
 
     SHARDED_SINGLE_NODE = "sharded_single_node"
-    # All layers / TP + SP on one node / determinism still on.
-    # New: reduction-order differences from sharding.
-    # **This is the first floor with "real" training-inference mismatch.**
+    # TP + SP on one node. New: reduction-order differences from sharding, so
+    # this is the first floor with real training-inference mismatch.
 
     PRODUCTION = "production"
-    # Target TP/CP/PP / determinism off / target batch / 2k-8k, decode path.
-    # New: everything else (cross-node comms, non-deterministic kernels, the
-    # real generation path). The floor reports are written from, and the only
-    # one whose numbers may be read against the threshold table.
+    # Target TP/CP/PP, determinism off, decode path. New: everything else. The
+    # only floor whose numbers may be read against the threshold table.
 
 
 @dataclass(frozen=True)
 class FactorVariant:
-    """One arm of a controlled experiment -- the machine-readable form of
-    "how do I configure this ablation"."""
+    """One arm of a controlled experiment, as pasteable switch values.
+
+    ``repeat_under`` runs this same arm once per environment and requires bitwise
+    equality -- the only exception to "one variant, one execution", expanded by
+    the runner as a cartesian product. It never compares across frameworks, so it
+    is cheap, and it verifies the premise of the self-check gate: an arm can only
+    anchor the others if its fixed-order implementation really did fix the order.
+    """
 
     name: str
     switch_values: Mapping[str, Any]
@@ -110,27 +99,15 @@ class FactorVariant:
     expected: ExpectedOutcome = ExpectedOutcome.MEASURE_ONLY
     why: str = ""
     repeat_under: Mapping[str, tuple[Any, ...]] | None = None
-    # Run this same variant once under each environment and require bitwise
-    # equality -- **the only exception to "one variant, one execution"**. The
-    # runner expands the cartesian product automatically.
-    #
-    #   repeat_under = {"NCCL_ALGO": ("Ring", "Tree"), "NCCL_PROTO": ("Simple", "LL")}
-    #     -> four runs, asserted bitwise identical.
-    #
-    # It never compares across frameworks, so it is very cheap; and what it
-    # verifies is the **premise of the self-check gate**: both_reference can
-    # only serve as an anchor if the "fixed-order implementation" really did fix
-    # the order. Without this, REFERENCE_ITSELF_IS_BROKEN is itself unreliable.
 
 
 @dataclass(frozen=True)
 class ExpectedRange:
     """The normal band for a metric under one (model family, noise floor, config).
 
-    **Must be a code constant, never a config file** -- a tunable threshold means
-    somebody can tune it until the test passes. It enters the execution
-    fingerprint: changing a threshold requires a code change and review, and
-    invalidates every historical pass/fail.
+    A code constant, never configuration: a tunable threshold is one somebody
+    tunes until the test passes. It enters the execution fingerprint, so changing
+    it invalidates every historical pass/fail.
     """
 
     model_family: str  # "dense" / "moe" / "large_moe" / "*"

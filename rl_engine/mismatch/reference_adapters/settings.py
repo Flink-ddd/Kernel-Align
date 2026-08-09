@@ -3,10 +3,9 @@
 
 """Delivering pinned settings by channel, and reading them back.
 
-Neither TransformerEngine nor FlashInfer is deterministic by default, so the
-settings have to be pinned explicitly. But pinning alone is not enough: **a
-setting that cannot be read back can only be recorded as ``UNOBSERVABLE``** --
-delivered but unverifiable is the same as not delivered.
+Neither TransformerEngine nor FlashInfer is deterministic by default, so these
+have to be pinned explicitly -- and pinning alone is not enough, since a setting
+that cannot be read back is only ``UNOBSERVABLE``.
 """
 
 from __future__ import annotations
@@ -30,10 +29,8 @@ def apply_required_settings(
 ) -> dict[SettingChannel, dict[str, Any]]:
     """Route each setting to the right place for its channel.
 
-    Which channel a setting uses decides when it can take effect, and therefore
-    its rebind cost -- an env var needs a process restart, a call argument does
-    not. Flattening them into one dict leaves the framework unable to deliver
-    them at all.
+    The channel decides when a setting can take effect and therefore its rebind
+    cost: an env var needs a process restart, a call argument does not.
     """
 
     target_env = environ if environ is not None else os.environ
@@ -85,8 +82,7 @@ def verify_required_settings(
 ) -> tuple[SwitchStatus, tuple[str, ...]]:
     """Check the values that came back against what was pinned.
 
-    Returns ``UNOBSERVABLE`` when a setting declares no readback path: it was
-    delivered but cannot be proven, which is not evidence.
+    A setting with no readback path is ``UNOBSERVABLE``: delivered, unproven.
     """
 
     unobservable: list[str] = []

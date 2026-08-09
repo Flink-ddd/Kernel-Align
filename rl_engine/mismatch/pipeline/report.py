@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""False-positive filtering, root-cause tracing, and the final report. Step 7."""
+"""False-positive filtering, root-cause tracing, and the final report."""
 
 from __future__ import annotations
 
@@ -33,9 +33,8 @@ def filter_known_equivalences(
 ) -> tuple[tuple[str, ...], tuple[ModuleCorrespondence, ...]]:
     """Drop findings explained by a known structural equivalence.
 
-    Without this, a difference like fused QKV turns every weight comparison red
-    and buries the real problem. An equivalence may only be claimed with a test
-    that proves it -- one without ``verified_by`` is not trusted here.
+    An equivalence without ``verified_by`` is not trusted: unproven, "filtering
+    false positives" quietly becomes "hiding real findings".
     """
 
     proven = tuple(
@@ -53,12 +52,8 @@ def trace_root_causes(
     correspondences: Sequence[ModuleCorrespondence],
     edges: Sequence[PropagationEdge],
 ) -> tuple[RootCauseHypothesis, ...]:
-    """Walk from the still-aligned anchor down the call chain into ranked hypotheses.
-
-    Thirty factors give thirty diagnoses, and that pile is not the answer. The
-    job here is to combine them with the module correspondence table and the
-    call chain into "the few most suspicious modules, ranked".
-    """
+    """Walk from the still-aligned anchor down the call chain into ranked
+    hypotheses."""
 
     downstream_of: dict[str, list[str]] = {}
     for edge in edges:
@@ -150,8 +145,7 @@ def build_report(
 
 
 def render_summary(report: MismatchReport) -> str:
-    """A short human-readable summary. The hypotheses are what you want to read;
-    everything else is the evidence supporting them."""
+    """A short human-readable summary, led by the ranked hypotheses."""
 
     lines = [
         f"noise floor: {report.noise_floor.value}",

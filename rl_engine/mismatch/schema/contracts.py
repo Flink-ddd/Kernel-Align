@@ -24,12 +24,8 @@ class ComparisonRule(str, Enum):
 class ComparisonIssueCode(str, Enum):
     """Stable reason codes for the two sides disagreeing.
 
-    **These strings go into the artifact schema and callers branch on them --
-    renaming one requires a schema version bump.**
-
-    Deliberately excludes "the declaration contradicts itself": that is rejected
-    by the planner before anything runs (``reject_contradictory_factors()``) and
-    has nothing to do with comparing the two sides.
+    These strings go into the artifact schema and callers branch on them, so
+    renaming one requires a schema version bump.
     """
 
     REQUIRED_FIELD_MISSING = "required_field_missing"
@@ -40,8 +36,7 @@ class ComparisonIssueCode(str, Enum):
 
 @dataclass(frozen=True)
 class ComparisonIssue:
-    """One record of the two sides disagreeing -- an element of what
-    ``compare_contracts()`` returns."""
+    """One record of the two sides disagreeing."""
 
     code: ComparisonIssueCode
     rule: ComparisonRule  # which tier this field was declared at
@@ -54,22 +49,16 @@ class ComparisonIssue:
 class OperatorContract:
     """One operator's numerical contract on one side.
 
-    Only three things are common to every operator and live here; the rest (RoPE
-    state, vocab shard map, GQA head mapping, ...) belongs to each plugin and
-    goes in ``extra``.
-
-    Field path convention: the keys of ``comparison_rules`` are paths counted
-    from the contract root --
+    Only the three fields common to every operator live here; the rest goes in
+    ``extra``, keyed by the paths a factor's ``comparison_rules`` declare::
 
         "precision.accumulate"
         "collectives[0].reduction_order"
         "extra.rope_theta"
 
-    The framework indexes both contracts by path and compares entry by entry. So
-    a plugin only has to put fields in the right place inside
-    ``build_contract()``; it never needs to write a function that "collects the
-    comparable fields". Keep ``extra`` flat -- nesting dicts makes paths long
-    and unreadable.
+    The framework indexes both contracts by path, so a plugin only has to put
+    fields in the right place. Keep ``extra`` flat -- nesting makes paths long and
+    unreadable.
     """
 
     operator: str

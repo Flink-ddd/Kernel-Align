@@ -3,23 +3,14 @@
 
 """Metrics and per-variant results.
 
-``dlogp`` is an intermediate quantity. GRPO's gradient enters the objective
-through the importance sampling ratio::
+``dlogp`` is an intermediate quantity; what the objective acts on is
+``rho = exp(dlogp)``, clipped at ``1 +/- eps``. Past ``ln(1 + eps) ~= 0.182`` a
+token's gradient signal is discarded, which is how mismatch breaks training: not
+random samples are dropped, the most mismatched ones are.
 
-    rho_{i,t}(theta) = pi_theta(y | x) / pi_old(y | x) = exp(dlogp_{i,t})
-
-The objective clips rho, typically at eps = 0.2, i.e. rho in [0.8, 1.2]. Back in
-dlogp terms, anything past ``ln(1 + eps) ~= 0.182`` **gets clipped**.
-
-That is the actual mechanism by which mismatch breaks training: it raises the
-clip fraction, and clipped tokens have their gradient signal cut -- **RL discards
-samples it should have learned from**, and not random ones, the ones with the
-largest mismatch.
-
-Against the threshold table: dense sits at ``dlogp_mean ~= 0.002-0.008`` and
-large MoE at ``0.01-0.03`` -- all far below 0.182. **So the mean never triggers
-clipping, and looking only at the mean necessarily concludes "everything is
-fine".** The danger is entirely in the tail.
+Healthy means run 0.002-0.008 (dense) and 0.01-0.03 (large MoE), all far below
+that edge, so judging on the mean alone always concludes everything is fine. The
+danger is entirely in the tail.
 """
 
 from __future__ import annotations
@@ -42,8 +33,7 @@ DEFAULT_CLIP_EPS = 0.2
 
 @dataclass(frozen=True)
 class WorstToken:
-    """The largest-deviation token -- the entry point for attribution, since it
-    often points straight at a layer or an expert."""
+    """The largest-deviation token, which often points straight at a layer."""
 
     position: int
     token_id: int
@@ -77,13 +67,10 @@ class RejectedCandidate:
 
 @dataclass(frozen=True)
 class ImplementationResolution:
-    """Which candidates were tried and why each was rejected -- what you look at
-    when the status is ``FELL_BACK``.
+    """Which candidates were tried and why each was rejected.
 
-    A single ``fallback_reason: str`` is not enough: what you actually want is
-    "was the first choice rejected for a missing library, missing devices, or a
-    version mismatch", plus "which candidate did it land on". Without this trace,
-    a silent fallback leaves nothing to go on.
+    What you look at when the status is ``FELL_BACK``. A single reason string is
+    not enough -- a silent fallback leaves nothing to investigate.
     """
 
     requested: str
@@ -95,14 +82,9 @@ class ImplementationResolution:
 class LogprobShard:
     """The slice of logprobs one rank holds under TP/CP.
 
-    With TP/CP on, logprobs are not computed by any single rank -- each holds one
-    slice. **Missing any slice makes the combined result wrong in a way that does
-    not show**: drop one vocab shard and the LSE denominator loses a chunk, so
-    logp is systematically too high. Slices must be collected per rank and
-    checked against ``world_size`` before merging.
-
-    Not ``RankObservation`` -- in RL, an observation is what the agent sees of
-    the environment.
+    Missing a slice is wrong in a way that does not show: drop one vocab shard
+    and the LSE denominator loses a chunk, so logp comes out systematically high.
+    Slices are counted against ``world_size`` before merging.
     """
 
     rank: int
@@ -149,11 +131,7 @@ def is_silent_failure(metrics: MismatchMetrics) -> bool:
 
 
 def missing_evidence(collected: frozenset[str], required: tuple[str, ...]) -> frozenset[str]:
-    """Which required evidence is absent.
-
-    A free function rather than a method on a bundle type: making a data
-    structure reach into a factor's fields would be feature envy.
-    """
+    """Which required evidence is absent."""
 
     return frozenset(required) - collected
 

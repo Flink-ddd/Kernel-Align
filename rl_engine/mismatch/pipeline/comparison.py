@@ -3,8 +3,8 @@
 
 """Contract comparison, driven entirely by declarations.
 
-The comparison loop is generic; the per-operator part is putting fields in the
-right place inside ``build_contract()``. There are no operator branches here.
+The loop is generic; the per-operator part is putting fields in the right place
+inside ``build_contract()``. There are no operator branches here.
 """
 
 from __future__ import annotations
@@ -31,8 +31,7 @@ _INDEX = re.compile(r"^(?P<name>[^\[]+)\[(?P<index>\d+)\]$")
 def resolve_field_path(contract: OperatorContract, path: str) -> Any:
     """Index a contract by a dotted path such as ``collectives[0].reduction_order``.
 
-    Returns a sentinel when the path is absent so a missing field is reported
-    rather than raising.
+    Absent paths return a sentinel, so a missing field is reported not raised.
     """
 
     current: Any = contract
@@ -77,9 +76,8 @@ def compare_contracts(
 ) -> tuple[ComparisonIssue, ...]:
     """Compare the two contracts field by field, per ``comparison_rules``.
 
-    Returns every disagreement. ``RECORD_ONLY`` fields are never compared -- that
-    tier exists precisely so structural differences (packed QKV and the like) do
-    not drown the real problems in false positives.
+    ``RECORD_ONLY`` fields are never compared: that tier exists so structural
+    differences like packed QKV do not drown the real problems.
     """
 
     rules: dict[str, ComparisonRule] = {}
@@ -140,9 +138,8 @@ def _determinism_issues(
 ) -> tuple[ComparisonIssue, ...]:
     """One side claiming a stronger reproducibility guarantee than the other.
 
-    Comparing a topology-independent implementation against one that is not
-    reproducible even across runs measures the weaker side's noise, not the gap
-    between them.
+    Comparing against an implementation that is not reproducible across runs
+    measures the weaker side's noise, not the gap between the two.
     """
 
     strength = {
@@ -152,8 +149,7 @@ def _determinism_issues(
         DeterminismLevel.STABLE_ACROSS_TOPOLOGY: 3,
     }
     issues: list[ComparisonIssue] = []
-    # strict=False: the two sides may legitimately declare different numbers of
-    # collectives; the overlap is what can be compared here.
+    # strict=False: the two sides may declare different numbers of collectives.
     paired = zip(rollout.collectives, training.collectives, strict=False)
     for index, (left, right) in enumerate(paired):
         if strength[left.determinism] != strength[right.determinism]:

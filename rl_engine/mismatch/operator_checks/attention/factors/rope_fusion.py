@@ -40,6 +40,8 @@ FACTOR = MismatchFactor(
         "extra.position_ids_digest": ComparisonRule.MUST_MATCH_SEMANTICALLY,
         "extra.post_rope_qk_digest": ComparisonRule.MUST_MATCH_SEMANTICALLY,
         "precision.downcast_at": ComparisonRule.MUST_MATCH_SEMANTICALLY,
+        # Fused vs unfused is what this factor ablates, so comparing it would
+        # fail every arm by construction.
         "extra.fusion_boundary": ComparisonRule.RECORD_ONLY,
     },
     prerequisites=Prerequisites(

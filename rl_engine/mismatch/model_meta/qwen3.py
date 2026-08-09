@@ -3,9 +3,8 @@
 
 """Qwen3 module correspondence and call chain.
 
-Every entry with an ``equivalence`` also carries ``verified_by``: **an
-equivalence may not be claimed without a test that proves it**, otherwise
-"filtering false positives" quietly becomes "hiding real findings".
+Every ``equivalence`` carries a ``verified_by``: unproven, "filtering false
+positives" quietly becomes "hiding real findings".
 """
 
 from __future__ import annotations
