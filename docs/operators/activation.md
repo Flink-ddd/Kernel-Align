@@ -1,13 +1,15 @@
 # SiLU / SwiGLU Activation
 
-The activation operators are the element-wise core of the Qwen3/Llama gated MLP. They are
-**WS1 ground-truth references** (issue #108): pure-PyTorch, fp32-accumulating definitions of
-the "correct answer" that downstream fused CUDA/Triton MLP kernels are validated against.
+The activation operators are the element-wise core of the Qwen3/Llama gated MLP. They
+implement the WS1 dual-path contract (issue #108): pure-PyTorch fp32 ground truth, plus
+CUDA and Triton candidates that validate against it.
 
-- **SiLU** (`NativeSiLUOp`): `silu(x) = x * sigmoid(x)` — the `hidden_act="silu"` gate.
-- **SwiGLU** (`NativeSwiGLUOp`): `swiglu(gate, up) = silu(gate) * up` — the gated MLP middle
-  stage. `gate` / `up` are the `gate_proj` / `up_proj` outputs (already at the intermediate
-  width); the following `down_proj` is a plain Matmul and is **not** part of this operator.
+- **SiLU** (`NativeSiLUOp` / `SiLUCudaOp` / `TritonSiLUOp`): `silu(x) = x * sigmoid(x)` —
+  the `hidden_act="silu"` gate.
+- **SwiGLU** (`NativeSwiGLUOp` / `SwiGLUCudaOp` / `TritonSwiGLUOp`):
+  `swiglu(gate, up) = silu(gate) * up` — the gated MLP middle stage. `gate` / `up` are the
+  `gate_proj` / `up_proj` outputs (already at the intermediate width); the following
+  `down_proj` is a plain Matmul and is **not** part of this operator.
 
 ```text
 hidden --gate_proj--> gate --\
@@ -29,7 +31,7 @@ y = silu(x)                       # [..., N]  ->  [..., N]
 h = swiglu(gate, up)              # [..., I], [..., I]  ->  [..., I]
 ```
 
-Both ops expose the WS1 dual-path contract:
+All backends expose the WS1 dual-path contract:
 
 - `forward(...)` — computes in fp32, casts back to the input dtype (Axis-B accuracy
   candidate / dtype-behavior path).
@@ -40,7 +42,8 @@ Both ops expose the WS1 dual-path contract:
 | Backend | Wrapper | Native symbol | Status |
 | --- | --- | --- | --- |
 | PyTorch fallback | `NativeSiLUOp` / `NativeSwiGLUOp` | None | fp32 ground-truth reference; CPU and any GPU. |
-| CUDA / ROCm / Triton | — | — | Planned: downstream fused MLP kernels validate against this reference. |
+| CUDA | `SiLUCudaOp` / `SwiGLUCudaOp` | `_C.silu_*` / `_C.swiglu_*` | General CUDA (fp16/bf16/fp32); math in fp32. |
+| Triton | `TritonSiLUOp` / `TritonSwiGLUOp` | Triton JIT | Portable GPU baseline; same fp32 math contract. |
 
 ## Tensor Contract
 
@@ -48,7 +51,7 @@ Both ops expose the WS1 dual-path contract:
 | --- | --- | --- | --- |
 | `x` (SiLU) | `[..., N]` | float (fp16/bf16/fp32) | Any shape; last dim arbitrary (Qwen3-8B `I=12288`). |
 | `gate` (SwiGLU) | `[..., I]` | float | `gate_proj` output. |
-| `up` (SwiGLU) | `[..., I]` | float | `up_proj` output; **must share `gate`'s shape**. |
+| `up` (SwiGLU) | `[..., I]` | float | `up_proj` output; **must share `gate`'s shape, dtype, and device**. |
 | output | same as input | `forward`: input dtype · `forward_fp32`: float32 | Same shape as input. |
 
 Element-wise and shape-agnostic: the Qwen3-8B intermediate dim `I=12288` is just one valid
@@ -57,11 +60,16 @@ mutation, device/dtype follow the inputs.
 
 ## Dispatch Behavior
 
-`kernel_registry.get_op("silu" | "swiglu")` resolves through the `OpBackend` priority map.
-On `cuda` / `rocm` / `cpu` the only registered backend today is the PyTorch native op
-(`PYTORCH_NATIVE_SILU` / `PYTORCH_NATIVE_SWIGLU`), so every device dispatches to the
-fp32 reference. When fused kernels land, they are prepended to the priority list and the
-native op becomes the fallback.
+`kernel_registry.get_op("silu" | "swiglu")` resolves through the `OpBackend` priority map:
+
+| Platform | Priority |
+| --- | --- |
+| `cuda` | CUDA → Triton → PyTorch native |
+| `rocm` | Triton → PyTorch native |
+| `cpu` | PyTorch native |
+
+If the CUDA extension is not built (or symbols are missing), the registry falls back to
+Triton, then to the native gold.
 
 ## Accuracy
 
@@ -77,17 +85,30 @@ out = gate_f * torch.sigmoid(gate_f) * up.float()
 ```
 
 - **Ground truth**: `forward_fp32` always accumulates in and returns fp32.
-- **Dtype path**: `forward` runs the same fp32 math, then casts back to the input dtype;
-  it is bitwise-equal to `forward_fp32(x).to(dtype)`.
+- **Dtype path**: `forward` runs the same fp32 math, then casts back to the input dtype.
 - **Axis A — batch invariance**: element-wise and row-independent, so a row's output is
   bitwise-identical regardless of batch size or padding (`torch.equal`, `atol=0`).
 - **Axis B — tolerance**: as `elementwise` ops, low-precision tolerance follows the
-  `elementwise` row of the WS1 numerical contract.
+  `elementwise` row of the WS1 numerical contract (`tolerance_contract.json`).
+
+## Ground-truth harness
+
+CUDA and Triton candidates are registered in `OP_SPECS` and can be checked with the
+shared issue-#108 CLI:
+
+```bash
+python scripts/check_operator.py --op silu --candidate cuda --dtype bf16 --device cuda
+python scripts/check_operator.py --op swiglu --candidate triton --dtype bf16 --device cuda --check-grad
+python scripts/check_operator.py --op silu --candidate pytorch --dtype fp32 --device cpu --check-grad
+```
+
+Gold path: `NativeSiLUOp.forward_fp32` / `NativeSwiGLUOp.forward_fp32`.
 
 ## Performance Notes
 
-Reference operators — no fused kernel or benchmark yet. Downstream fused MLP kernels carry
-their own benchmarks and are measured against this reference for correctness.
+Element-wise kernels with a fixed 1-D grid (CUDA) / `BLOCK=1024` (Triton). Suitable as the
+standalone WS1 activation path; fused bias+SiLU MLP kernels remain a separate future work
+item and should continue to validate against this reference.
 
 ## Tests
 
@@ -96,17 +117,22 @@ python -m pytest tests/test_swiglu.py -v
 ```
 
 Covers: correctness vs an independent fp32 formula, dtype paths, Axis-A batch invariance
-(slice + padding), input purity, gradient flow, the SwiGLU shape guard, and registry
-dispatch.
+(slice + padding), input purity, gradient flow, the SwiGLU shape guard, CUDA/Triton vs
+native forward+backward, registry dispatch, and the issue-#108 `OP_SPECS` harness.
 
 ## Implementation Files
 
-- `rl_engine/kernels/ops/pytorch/activation/swiglu.py`
+- `rl_engine/kernels/ops/pytorch/activation/swiglu.py` — gold
+- `rl_engine/kernels/ops/cuda/activation/swiglu.py` — CUDA wrappers
+- `rl_engine/kernels/ops/triton/activation/swiglu.py` — Triton kernels
+- `csrc/cuda/activation.cu` — CUDA kernels
 - `rl_engine/kernels/registry.py`
+- `rl_engine/kernels/gtest/operator_specs.py`
 - `tests/test_swiglu.py`
 
 ## Known Limitations
 
-- PyTorch fallback only; no fused CUDA/Triton backend yet (downstream work).
-- SwiGLU requires `gate` and `up` to share shape (raises `ValueError` otherwise); no
-  broadcasting.
+- SwiGLU requires `gate` and `up` to share shape, dtype, and device; no broadcasting.
+- No fused `bias + SiLU` or `chunk(y,2) + silu_and_mul` variant yet (vLLM-style
+  `SiluAndMul` on a packed gate/up tensor). Callers that hold a packed tensor should
+  split first, then call `swiglu`.
