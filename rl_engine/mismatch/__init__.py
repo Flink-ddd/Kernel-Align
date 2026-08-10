@@ -20,3 +20,8 @@ See ``README.md`` for the layout and ``docs/`` for how to add a factor.
 """
 
 from rl_engine.mismatch import pipeline, schema
+
+__all__ = [
+    "pipeline",
+    "schema",
+]

@@ -55,6 +55,4 @@ def resolve_implementation(
     FlashInfer when it is available, so which one answered is itself evidence.
     """
 
-    raise NotImplementedError(
-        "Import the candidates in order and return (callable, resolution)."
-    )
+    raise NotImplementedError("Import the candidates in order and return (callable, resolution).")

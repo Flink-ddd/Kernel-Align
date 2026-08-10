@@ -31,7 +31,5 @@ TE_ROPE_REFERENCE = ReferenceImplementation(
             readback="os.environ",
         ),
     ),
-    pinned_libraries=(
-        LibraryPin("transformer_engine", "2.9.0.dev0", commit="8260f49"),
-    ),
+    pinned_libraries=(LibraryPin("transformer_engine", "2.9.0.dev0", commit="8260f49"),),
 )

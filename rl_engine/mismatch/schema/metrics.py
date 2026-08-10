@@ -21,12 +21,7 @@ from typing import Any, Mapping
 from rl_engine.mismatch.schema.collectives import CollectiveContract
 from rl_engine.mismatch.schema.contracts import ComparisonIssue
 from rl_engine.mismatch.schema.values import ExecutionPath
-from rl_engine.mismatch.schema.variants import (
-    Diagnosis,
-    FactorVariant,
-    NoiseFloor,
-    SwitchStatus,
-)
+from rl_engine.mismatch.schema.variants import Diagnosis, FactorVariant, NoiseFloor, SwitchStatus
 
 DEFAULT_CLIP_EPS = 0.2
 

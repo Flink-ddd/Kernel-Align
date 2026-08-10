@@ -10,3 +10,8 @@ here rather than in any ``operator_checks/``.
 """
 
 from rl_engine.mismatch.model_meta.qwen3 import QWEN3_CORRESPONDENCES, QWEN3_EDGES
+
+__all__ = [
+    "QWEN3_CORRESPONDENCES",
+    "QWEN3_EDGES",
+]

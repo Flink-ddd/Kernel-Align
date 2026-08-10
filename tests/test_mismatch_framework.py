@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import pytest
 
-from tests.mismatch_cpu_backend import CpuScoringBackend
 from rl_engine.mismatch.pipeline import (
     ContradictoryFactor,
     PluginRegistry,
@@ -79,6 +78,7 @@ from rl_engine.mismatch.schema import (
     reuse_level,
     tolerance_floor,
 )
+from tests.mismatch_cpu_backend import CpuScoringBackend
 
 # ---------------------------------------------------------------- fixtures --
 

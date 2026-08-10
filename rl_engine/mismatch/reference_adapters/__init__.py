@@ -13,3 +13,9 @@ from rl_engine.mismatch.reference_adapters.settings import (
     apply_required_settings,
     verify_required_settings,
 )
+
+__all__ = [
+    "SettingDeliveryError",
+    "apply_required_settings",
+    "verify_required_settings",
+]

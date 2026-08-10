@@ -16,12 +16,7 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
-from rl_engine.mismatch.schema import (
-    ComparisonIdentity,
-    Evidence,
-    PolicyRole,
-    ReuseKey,
-)
+from rl_engine.mismatch.schema import ComparisonIdentity, Evidence, PolicyRole, ReuseKey
 
 
 @dataclass
