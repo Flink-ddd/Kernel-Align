@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime
 import hashlib
 import json
 import os
@@ -56,6 +57,8 @@ _TOLERANCE_DTYPES = {
     "fp16": "float16",
     "fp32": "float32",
 }
+_PROCESS_GROUP_TIMEOUT = datetime.timedelta(minutes=5)
+_RELATIVE_ERROR_FLOOR = 1.0e-12
 
 
 @dataclass(frozen=True)
@@ -188,6 +191,10 @@ class _RankPayload:
     active_mask: torch.Tensor
     target_ids: torch.Tensor
     global_positions: torch.Tensor
+
+
+def _strict_report_json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
 
 
 def plan_distributed_logprob_cases(
@@ -385,7 +392,7 @@ def _drift_detail(
 
     selected_diff = diff[selected]
     selected_ref = reference.float()[selected]
-    relative = selected_diff / selected_ref.abs().clamp_min(torch.finfo(torch.float32).tiny)
+    relative = selected_diff.double() / selected_ref.double().abs().clamp_min(_RELATIVE_ERROR_FLOOR)
     selected_indices = torch.arange(diff.numel(), device=diff.device)[selected]
     worst_selected = int(selected_diff.argmax().item())
     worst_local = int(selected_indices[worst_selected].item())
@@ -620,7 +627,7 @@ def run_distributed_logprob_case(
         )
     initialized_here = False
     if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group(backend=backend)
+        dist.init_process_group(backend=backend, timeout=_PROCESS_GROUP_TIMEOUT)
         initialized_here = True
     if dist.is_initialized():
         if dist.get_world_size() != world_size or dist.get_rank() != rank:
@@ -700,7 +707,7 @@ def run_distributed_logprob_case(
             output_path = pathlib.Path(output)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(
-                json.dumps(report.to_dict(), indent=2, sort_keys=True) + "\n",
+                _strict_report_json(report.to_dict()) + "\n",
                 encoding="utf-8",
             )
         if world_size > 1:
@@ -783,7 +790,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         output=args.output,
     )
     if report is not None:
-        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        print(_strict_report_json(report.to_dict()))
         if not report.passed:
             raise SystemExit(1)
 

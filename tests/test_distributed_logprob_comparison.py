@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -12,9 +13,12 @@ from pathlib import Path
 import pytest
 import torch
 
+from rl_engine.kernels.logprob_contract import ShardingSpec
 from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import BACKEND_ID
 from rl_engine.testing.distributed_logprob_comparison import (
     DistributedLogprobCase,
+    _drift_detail,
+    _strict_report_json,
     format_launch_command,
     plan_distributed_logprob_cases,
     rank_topology,
@@ -114,6 +118,33 @@ def test_shared_pr2_drift_summary_preserves_active_mask_semantics():
     assert stats.active_count == 2
     assert stats.max_abs == 2.0
     assert stats.mean_abs == 1.5
+
+
+def test_relative_drift_near_zero_stays_finite():
+    sharding = ShardingSpec(
+        tp_rank=0,
+        tp_world_size=1,
+        vocab_shard_bounds=((0, 16),),
+        real_vocab_size=13,
+        padded_vocab_size=16,
+    )
+    detail = _drift_detail(
+        torch.tensor([1.0]),
+        torch.tensor([0.0]),
+        target_ids=torch.tensor([1]),
+        global_positions=torch.tensor([3]),
+        sharding=sharding,
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    assert math.isfinite(detail.max_rel)
+    assert detail.max_rel == pytest.approx(1.0e12)
+    assert json.loads(_strict_report_json({"max_rel": detail.max_rel}))["max_rel"] == pytest.approx(
+        1.0e12
+    )
+    with pytest.raises(ValueError, match="Out of range float values"):
+        _strict_report_json({"max_rel": float("nan")})
 
 
 def test_tp1_cpu_case_writes_116_compatible_artifact(tmp_path, monkeypatch):

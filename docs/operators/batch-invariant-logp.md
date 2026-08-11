@@ -58,7 +58,10 @@ or device, dispatch is unchanged (Triton -> PyTorch).
 
 `VocabParallelLogprobOp`
 (`rl_engine/kernels/ops/pytorch/loss/vocab_parallel_logp.py`)
-**TP=1, TP=2, and TP=4 produce bit-identical results.**
+defines a cross-TP bitwise contract for TP=1, TP=2, and TP=4 when
+`num_vocab_tiles` is fixed and every vocabulary-shard boundary is tile-aligned.
+The complete BF16 CUDA/NCCL validation matrix for this contract is tracked by
+issue #241 PR4.
 
 1. Split the padded vocabulary into `num_vocab_tiles` fixed tiles.
 2. Each rank computes fp32 `(max, sumexp)` for the tiles it owns. Every tile
