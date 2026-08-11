@@ -10,7 +10,9 @@ from .logprob_comparison import (
     LogprobComparisonReport,
     compare_single_gpu_logprob,
     make_logprob_candidate,
+    route_rl_kernel_logs_to_stderr,
 )
+from .logprob_drift import LogprobDriftStats, summarize_logprob_drift
 from .reference_ops import (
     active_token_count,
     compute_policy_ratio,
@@ -27,6 +29,7 @@ __all__ = [
     "LogprobCandidate",
     "LogprobComparisonInputs",
     "LogprobComparisonReport",
+    "LogprobDriftStats",
     "SyntheticRLKernelBatch",
     "active_token_count",
     "compare_single_gpu_logprob",
@@ -37,5 +40,7 @@ __all__ = [
     "masked_mean",
     "masked_sum",
     "selected_logprobs_reference",
+    "route_rl_kernel_logs_to_stderr",
+    "summarize_logprob_drift",
     "summarize_kernel_drift",
 ]

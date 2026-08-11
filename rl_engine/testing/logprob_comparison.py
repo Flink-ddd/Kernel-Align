@@ -20,6 +20,9 @@ if __package__ in (None, ""):
     repo_root = pathlib.Path(__file__).resolve().parents[2]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
+    from logprob_drift import LogprobDriftStats, summarize_logprob_drift
+else:
+    from .logprob_drift import LogprobDriftStats, summarize_logprob_drift
 
 
 class LogprobBackendUnavailable(RuntimeError):
@@ -44,19 +47,10 @@ class LogprobCandidate:
 
 
 @dataclass(frozen=True)
-class _DriftStats:
-    max_abs: float
-    mean_abs: float
-    p95_abs: float
-    p99_abs: float
-    active_count: int
-
-
-@dataclass(frozen=True)
 class _LogprobPathDrift:
     candidate_name: str
-    lse: _DriftStats
-    dlogp: _DriftStats
+    lse: LogprobDriftStats
+    dlogp: LogprobDriftStats
     bitwise_logp: bool
     provenance: dict[str, Any]
 
@@ -158,8 +152,8 @@ def compare_single_gpu_logprob(
         drifts.append(
             _LogprobPathDrift(
                 candidate_name=candidate.name,
-                lse=_drift_stats(lse, reference_lse),
-                dlogp=_drift_stats(logp, reference_logp, mask=active_mask),
+                lse=summarize_logprob_drift(lse, reference_lse),
+                dlogp=summarize_logprob_drift(logp, reference_logp, mask=active_mask),
                 bitwise_logp=torch.equal(logp, reference_logp),
                 provenance=_candidate_provenance(candidate),
             )
@@ -231,31 +225,6 @@ def _candidate_provenance(candidate: LogprobCandidate) -> dict[str, Any]:
     }
 
 
-def _drift_stats(
-    candidate: torch.Tensor,
-    reference: torch.Tensor,
-    *,
-    mask: torch.Tensor | None = None,
-) -> _DriftStats:
-    if candidate.shape != reference.shape:
-        raise ValueError(
-            f"candidate shape {tuple(candidate.shape)} must match reference shape "
-            f"{tuple(reference.shape)}"
-        )
-    diff = (candidate.float() - reference.float()).abs()
-    values = diff.reshape(-1) if mask is None else diff[mask.to(device=diff.device)]
-    count = int(values.numel())
-    if count == 0:
-        return _DriftStats(0.0, 0.0, 0.0, 0.0, 0)
-    return _DriftStats(
-        max_abs=float(values.max().item()),
-        mean_abs=float(values.mean().item()),
-        p95_abs=float(torch.quantile(values, 0.95).item()),
-        p99_abs=float(torch.quantile(values, 0.99).item()),
-        active_count=count,
-    )
-
-
 def _validate_inputs(
     inputs: LogprobComparisonInputs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -301,12 +270,16 @@ def _device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def _route_rl_kernel_logs_to_stderr() -> None:
+def route_rl_kernel_logs_to_stderr() -> None:
     from rl_engine.utils.logger import logger
 
     for handler in logger.handlers:
         if isinstance(handler, logging.StreamHandler):
             handler.setStream(sys.stderr)
+
+
+def _route_rl_kernel_logs_to_stderr() -> None:
+    route_rl_kernel_logs_to_stderr()
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -330,7 +303,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    _route_rl_kernel_logs_to_stderr()
+    route_rl_kernel_logs_to_stderr()
     args = _parse_args(argv)
     device = _device(args.device)
     if args.batch < 1 or args.seq < 1 or args.vocab < 1:
@@ -374,6 +347,7 @@ __all__ = [
     "LogprobComparisonReport",
     "compare_single_gpu_logprob",
     "make_logprob_candidate",
+    "route_rl_kernel_logs_to_stderr",
 ]
 
 
