@@ -6,6 +6,13 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def _validate_dtype(x: torch.Tensor, name: str) -> None:
+    if x.dtype not in _SUPPORTED_DTYPES:
+        raise TypeError(f"{name} must have dtype fp16, bf16, or fp32, got {x.dtype}.")
+
 
 class NativeSiLUOp(nn.Module):
     """
@@ -36,6 +43,7 @@ class NativeSiLUOp(nn.Module):
     # ------------------------------------------------------------------ #
     @staticmethod
     def _silu(x: torch.Tensor, *, output_dtype: torch.dtype) -> torch.Tensor:
+        _validate_dtype(x, "x")
         x_f = x.float()
         out = x_f * torch.sigmoid(x_f)
         return out.to(output_dtype)
@@ -81,6 +89,15 @@ class NativeSwiGLUOp(nn.Module):
                 f"gate and up must share shape, got tuple(gate.shape)="
                 f"{tuple(gate.shape)} vs tuple(up.shape)={tuple(up.shape)}"
             )
+        if gate.device != up.device:
+            raise RuntimeError(
+                f"gate and up must be on the same device, got '{gate.device}' and '{up.device}'."
+            )
+        _validate_dtype(gate, "gate")
+        _validate_dtype(up, "up")
+        if gate.dtype != up.dtype:
+            raise TypeError(f"gate and up must share dtype, got {gate.dtype} and {up.dtype}.")
+
         gate_f = gate.float()
         out = gate_f * torch.sigmoid(gate_f) * up.float()
         return out.to(output_dtype)

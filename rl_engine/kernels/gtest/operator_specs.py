@@ -134,6 +134,30 @@ OP_SPECS = {
         },
         grad_input_names=("x",),
     ),
+    "silu": OperatorSpec(
+        name="silu",
+        op_class="elementwise",
+        gold_path="rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSiLUOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSiLUOp",
+            "triton": "rl_engine.kernels.ops.triton.activation.swiglu.TritonSiLUOp",
+            "cuda": "rl_engine.kernels.ops.cuda.activation.swiglu.SiLUCudaOp",
+        },
+        grad_input_names=("x",),
+    ),
+    "swiglu": OperatorSpec(
+        name="swiglu",
+        op_class="elementwise",
+        gold_path="rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSwiGLUOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSwiGLUOp",
+            "triton": "rl_engine.kernels.ops.triton.activation.swiglu.TritonSwiGLUOp",
+            "cuda": "rl_engine.kernels.ops.cuda.activation.swiglu.SwiGLUCudaOp",
+        },
+        grad_input_names=("gate", "up"),
+    ),
     "batch_invariant_logp": OperatorSpec(
         name="batch_invariant_logp",
         op_class="logprob",
