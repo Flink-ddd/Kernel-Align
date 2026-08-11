@@ -12,7 +12,9 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.distributed as dist
 
+import rl_engine.testing.distributed_logprob_comparison as distributed_comparison
 from rl_engine.kernels.logprob_contract import ShardingSpec
 from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import BACKEND_ID
 from rl_engine.testing.distributed_logprob_comparison import (
@@ -187,6 +189,69 @@ def test_world_size_mismatch_fails_before_process_group_init(tmp_path, monkeypat
             dist_backend="gloo",
             output=tmp_path / "unused.json",
         )
+
+
+def test_setup_failure_destroys_owned_process_group(tmp_path, monkeypatch):
+    state = {"initialized": False, "destroyed": False}
+
+    def init_process_group(*, backend, timeout):
+        state["initialized"] = True
+
+    def destroy_process_group():
+        state["destroyed"] = True
+        state["initialized"] = False
+
+    def fail_group_setup(case, topology):
+        raise RuntimeError("group setup failed")
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(dist, "is_initialized", lambda: state["initialized"])
+    monkeypatch.setattr(dist, "init_process_group", init_process_group)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "destroy_process_group", destroy_process_group)
+    monkeypatch.setattr(distributed_comparison, "_create_tp_group", fail_group_setup)
+
+    with pytest.raises(RuntimeError, match="group setup failed"):
+        run_distributed_logprob_case(
+            _small_case(tp=2),
+            device_name="cpu",
+            dist_backend="gloo",
+            output=tmp_path / "unused.json",
+        )
+
+    assert state == {"initialized": False, "destroyed": True}
+
+
+def test_partial_initialization_failure_destroys_owned_process_group(tmp_path, monkeypatch):
+    state = {"initialized": False, "destroyed": False}
+
+    def fail_initialization(*, backend, timeout):
+        state["initialized"] = True
+        raise RuntimeError("initialization failed")
+
+    def destroy_process_group():
+        state["destroyed"] = True
+        state["initialized"] = False
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(dist, "is_initialized", lambda: state["initialized"])
+    monkeypatch.setattr(dist, "init_process_group", fail_initialization)
+    monkeypatch.setattr(dist, "destroy_process_group", destroy_process_group)
+
+    with pytest.raises(RuntimeError, match="initialization failed"):
+        run_distributed_logprob_case(
+            _small_case(tp=2),
+            device_name="cpu",
+            dist_backend="gloo",
+            output=tmp_path / "unused.json",
+        )
+
+    assert state == {"initialized": False, "destroyed": True}
 
 
 @pytest.mark.skipif(not torch.distributed.is_available(), reason="torch.distributed required")

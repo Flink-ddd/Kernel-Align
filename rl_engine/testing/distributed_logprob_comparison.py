@@ -625,27 +625,26 @@ def run_distributed_logprob_case(
             f"WORLD_SIZE={world_size} does not match TP*CP={case.world_size}; "
             "launch exactly the topology declared by the case"
         )
-    initialized_here = False
-    if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group(backend=backend, timeout=_PROCESS_GROUP_TIMEOUT)
-        initialized_here = True
-    if dist.is_initialized():
-        if dist.get_world_size() != world_size or dist.get_rank() != rank:
-            raise RuntimeError("initialized process group does not match RANK/WORLD_SIZE")
-
-    if device_name == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA was requested but is unavailable")
-        device = torch.device("cuda", local_rank)
-        torch.cuda.set_device(device)
-    elif device_name == "cpu":
-        device = torch.device("cpu")
-    else:
-        raise ValueError("device must be cuda or cpu")
-
-    topology = rank_topology(case, rank)
-    tp_group = _create_tp_group(case, topology)
+    owns_process_group = world_size > 1 and not dist.is_initialized()
     try:
+        if device_name == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA was requested but is unavailable")
+            device = torch.device("cuda", local_rank)
+            torch.cuda.set_device(device)
+        elif device_name == "cpu":
+            device = torch.device("cpu")
+        else:
+            raise ValueError("device must be cuda or cpu")
+
+        if owns_process_group:
+            dist.init_process_group(backend=backend, timeout=_PROCESS_GROUP_TIMEOUT)
+        if dist.is_initialized():
+            if dist.get_world_size() != world_size or dist.get_rank() != rank:
+                raise RuntimeError("initialized process group does not match RANK/WORLD_SIZE")
+
+        topology = rank_topology(case, rank)
+        tp_group = _create_tp_group(case, topology)
         payload = _execute_rank(case, topology, device=device, tp_group=tp_group)
         if world_size == 1:
             payloads = [payload]
@@ -714,7 +713,7 @@ def run_distributed_logprob_case(
             dist.barrier()
         return report
     finally:
-        if initialized_here and dist.is_initialized():
+        if owns_process_group and dist.is_initialized():
             dist.destroy_process_group()
 
 
