@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Tensor-parallel Qwen3-style SwiGLU FFN orchestration.
+"""Tensor- and context-parallel Qwen3-style SwiGLU FFN orchestration.
 
 The module implements the non-sequence-parallel TP ownership contract used by
 the Qwen3 dense MLP:
@@ -17,8 +17,10 @@ backward TP SUM occurs after the local Gate and Up input-gradient
 contributions have been accumulated, exactly as required by the TP FFN
 derivation.  There is no TP reduction for Down's feature-sharded ``dHidden``.
 
-CP/SP configuration and CP weight-gradient reductions intentionally do not
-belong in this PR3 module.
+CP shards token rows. It has no forward activation collective: each CP rank
+keeps its own rows. In backward, each TP-local parameter shard is replicated
+across its CP lane, so Gate, Up, and Down each perform one CP SUM of ``dW``.
+SP activation AllGather/ReduceScatter is intentionally out of scope.
 """
 
 from __future__ import annotations
@@ -46,48 +48,78 @@ def _missing_deterministic_gemm(input_: Tensor, weight: Tensor) -> Tensor:
     )
 
 
+def _resolve_parallel_coordinates(
+    name: str,
+    group: Any,
+    size: Optional[int],
+    rank: Optional[int],
+) -> tuple[int, int]:
+    """Validate one explicit parallel group and return concrete coordinates."""
+
+    if group is None:
+        resolved_size = 1 if size is None else int(size)
+        resolved_rank = 0 if rank is None else int(rank)
+        if resolved_size != 1 or resolved_rank != 0:
+            raise ValueError(
+                f"FFNContext({name}_group=None) only supports {name}_size=1 and "
+                f"{name}_rank=0. Supply an explicit initialized {name}_group for "
+                f"{name.upper()} > 1."
+            )
+    else:
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError(
+                f"FFNContext({name}_group=...) requires torch.distributed to be initialized."
+            )
+        group_size = dist.get_world_size(group=group)
+        group_rank = dist.get_rank(group=group)
+        resolved_size = group_size if size is None else int(size)
+        resolved_rank = group_rank if rank is None else int(rank)
+        if resolved_size != group_size:
+            raise ValueError(
+                f"ctx.{name}_size={resolved_size} does not match {name}_group "
+                f"world size={group_size}."
+            )
+        if resolved_rank != group_rank:
+            raise ValueError(
+                f"ctx.{name}_rank={resolved_rank} does not match {name}_group "
+                f"rank={group_rank}."
+            )
+
+    if resolved_size < 1 or not 0 <= resolved_rank < resolved_size:
+        raise ValueError(
+            f"invalid {name.upper()} coordinates: {name}_size={resolved_size}, "
+            f"{name}_rank={resolved_rank}."
+        )
+    return resolved_size, resolved_rank
+
+
 @dataclass(frozen=True)
 class FFNContext:
-    """Explicit tensor-parallel configuration owned by an FFN caller.
+    """Explicit TP/CP configuration owned by an FFN caller.
 
-    ``tp_group`` is never created or inferred by this module.  A multi-rank
-    configuration must supply an initialized explicit process group; this is
-    important because later PRs add distinct CP and SP groups.
+    Neither group is created or inferred by this module.  A multi-rank
+    configuration must supply initialized explicit groups, which preserves the
+    fixed TP/CP topology and leaves SP group ownership to the next PR.
     """
 
     tp_group: Any = None
     tp_size: Optional[int] = None
     tp_rank: Optional[int] = None
+    cp_group: Any = None
+    cp_size: Optional[int] = None
+    cp_rank: Optional[int] = None
 
     def __post_init__(self) -> None:
-        if self.tp_group is None:
-            size = 1 if self.tp_size is None else int(self.tp_size)
-            rank = 0 if self.tp_rank is None else int(self.tp_rank)
-            if size != 1 or rank != 0:
-                raise ValueError(
-                    "FFNContext(tp_group=None) only supports tp_size=1 and tp_rank=0. "
-                    "Supply an explicit initialized tp_group for TP > 1."
-                )
-        else:
-            if not dist.is_available() or not dist.is_initialized():
-                raise RuntimeError(
-                    "FFNContext(tp_group=...) requires torch.distributed to be initialized."
-                )
-            group_size = dist.get_world_size(group=self.tp_group)
-            group_rank = dist.get_rank(group=self.tp_group)
-            size = group_size if self.tp_size is None else int(self.tp_size)
-            rank = group_rank if self.tp_rank is None else int(self.tp_rank)
-            if size != group_size:
-                raise ValueError(
-                    f"ctx.tp_size={size} does not match tp_group world size={group_size}."
-                )
-            if rank != group_rank:
-                raise ValueError(f"ctx.tp_rank={rank} does not match tp_group rank={group_rank}.")
-
-        if size < 1 or not 0 <= rank < size:
-            raise ValueError(f"invalid TP coordinates: tp_size={size}, tp_rank={rank}.")
-        object.__setattr__(self, "tp_size", size)
-        object.__setattr__(self, "tp_rank", rank)
+        tp_size, tp_rank = _resolve_parallel_coordinates(
+            "tp", self.tp_group, self.tp_size, self.tp_rank
+        )
+        cp_size, cp_rank = _resolve_parallel_coordinates(
+            "cp", self.cp_group, self.cp_size, self.cp_rank
+        )
+        object.__setattr__(self, "tp_size", tp_size)
+        object.__setattr__(self, "tp_rank", tp_rank)
+        object.__setattr__(self, "cp_size", cp_size)
+        object.__setattr__(self, "cp_rank", cp_rank)
 
     @property
     def is_tensor_parallel(self) -> bool:
@@ -96,14 +128,31 @@ class FFNContext:
         assert self.tp_size is not None
         return self.tp_size > 1
 
+    @property
+    def is_context_parallel(self) -> bool:
+        """Whether this context owns more than one context-parallel token shard."""
 
-def _all_reduce_sum(tensor: Tensor, ctx: FFNContext) -> Tensor:
-    """Synchronously sum a tensor over the explicitly configured TP group."""
+        assert self.cp_size is not None
+        return self.cp_size > 1
 
-    if ctx.is_tensor_parallel:
+
+def _all_reduce_sum(tensor: Tensor, group: Any, world_size: int) -> Tensor:
+    """Synchronously sum a tensor over an explicitly configured process group."""
+
+    if world_size > 1:
         # TODO(WS2): replace NCCL/Gloo with the deterministic collective once it lands.
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=ctx.tp_group)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
     return tensor
+
+
+def _all_reduce_tp_sum(tensor: Tensor, ctx: FFNContext) -> Tensor:
+    assert ctx.tp_size is not None
+    return _all_reduce_sum(tensor, ctx.tp_group, ctx.tp_size)
+
+
+def _all_reduce_cp_sum(tensor: Tensor, ctx: FFNContext) -> Tensor:
+    assert ctx.cp_size is not None
+    return _all_reduce_sum(tensor, ctx.cp_group, ctx.cp_size)
 
 
 class _CopyToTensorParallelRegion(torch.autograd.Function):
@@ -124,7 +173,7 @@ class _CopyToTensorParallelRegion(torch.autograd.Function):
     def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, None]:
         # Do not mutate a gradient owned by a downstream autograd node.
         grad_input = grad_output.contiguous().clone()
-        return _all_reduce_sum(grad_input, ctx.tp_ctx), None
+        return _all_reduce_tp_sum(grad_input, ctx.tp_ctx), None
 
 
 class _ReduceFromTensorParallelRegion(torch.autograd.Function):
@@ -139,7 +188,7 @@ class _ReduceFromTensorParallelRegion(torch.autograd.Function):
     def forward(ctx: Any, input_: Tensor, tp_ctx: FFNContext) -> Tensor:
         # The local Down partial is useful to callers through ``forward_local``;
         # preserve it by reducing a clone rather than modifying it in place.
-        return _all_reduce_sum(input_.contiguous().clone(), tp_ctx)
+        return _all_reduce_tp_sum(input_.contiguous().clone(), tp_ctx)
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, None]:
@@ -152,6 +201,31 @@ def _copy_to_tensor_parallel_region(input_: Tensor, ctx: FFNContext) -> Tensor:
 
 def _reduce_from_tensor_parallel_region(input_: Tensor, ctx: FFNContext) -> Tensor:
     return _ReduceFromTensorParallelRegion.apply(input_, ctx)
+
+
+class _CopyWeightToContextParallelRegion(torch.autograd.Function):
+    """Replicated parameter: identity forward, CP SUM of its local ``dW`` backward.
+
+    CP shards token rows, not parameter coordinates.  Each rank therefore
+    computes a local contribution to the same TP-local weight shard.  This
+    function is attached individually to Down, Gate, and Up weights so their
+    three logical gradient tensors each reduce over the explicit same-TP-lane
+    CP group.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, weight: Tensor, cp_ctx: FFNContext) -> Tensor:
+        ctx.cp_ctx = cp_ctx
+        return weight
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, None]:
+        grad_weight = grad_output.contiguous().clone()
+        return _all_reduce_cp_sum(grad_weight, ctx.cp_ctx), None
+
+
+def _copy_weight_to_context_parallel_region(weight: Tensor, ctx: FFNContext) -> Tensor:
+    return _CopyWeightToContextParallelRegion.apply(weight, ctx)
 
 
 def shard_qwen3_ffn_weights(
@@ -204,11 +278,12 @@ def shard_qwen3_ffn_weights(
 
 
 class TensorParallelFFN(nn.Module):
-    """Qwen3 SwiGLU FFN with ColumnParallel Gate/Up and RowParallel Down.
+    """Qwen3 SwiGLU FFN with TP feature shards and CP-local token rows.
 
     Parameters use the normal ``torch.nn.Linear`` ``[out, in]`` layout.  This
-    module owns one TP shard only; use :meth:`from_full_weights` in tests or a
-    model loader to materialize rank-local parameter shards from full weights.
+    module owns one TP shard; that shard is replicated across CP ranks. The
+    caller provides CP-local token rows and can use :meth:`from_full_weights`
+    in tests or a model loader to materialize rank-local parameter shards.
 
     ``gemm`` has the deterministic-GEMM-compatible signature
     ``gemm(a[M, K], b[K, N]) -> [M, N]``.  Production BF16 callers must inject
@@ -364,10 +439,13 @@ class TensorParallelFFN(nn.Module):
             )
 
         replicated_input = _copy_to_tensor_parallel_region(input_, self.ctx)
-        gate = self._local_linear(replicated_input, self.gate_weight)
-        up = self._local_linear(replicated_input, self.up_weight)
+        gate_weight = _copy_weight_to_context_parallel_region(self.gate_weight, self.ctx)
+        up_weight = _copy_weight_to_context_parallel_region(self.up_weight, self.ctx)
+        down_weight = _copy_weight_to_context_parallel_region(self.down_weight, self.ctx)
+        gate = self._local_linear(replicated_input, gate_weight)
+        up = self._local_linear(replicated_input, up_weight)
         hidden = self.activation(gate, up)
-        return self._local_linear(hidden, self.down_weight)
+        return self._local_linear(hidden, down_weight)
 
     def forward(self, input_: Tensor) -> Tensor:
         """Compute the replicated hidden output after the one Down TP SUM."""

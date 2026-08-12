@@ -236,6 +236,267 @@ def _run_tp_workers(worker: Any) -> list[dict[str, Any]]:
         return results
 
 
+def _make_tp_cp_groups(rank: int) -> tuple[Any, Any]:
+    """Create the fixed PR4 topology in identical order on every rank."""
+
+    tp_group = None
+    for ranks in ((0, 1), (2, 3)):
+        group = dist.new_group(ranks=list(ranks))
+        if rank in ranks:
+            tp_group = group
+
+    cp_group = None
+    for ranks in ((0, 2), (1, 3)):
+        group = dist.new_group(ranks=list(ranks))
+        if rank in ranks:
+            cp_group = group
+
+    assert tp_group is not None
+    assert cp_group is not None
+    return tp_group, cp_group
+
+
+def _tp_cp_ffn_worker(rank: int, world_size: int, init_method: str, result_queue: Any) -> None:
+    try:
+        torch.set_num_threads(1)
+        _configure_gloo_loopback()
+        dist.init_process_group(
+            backend="gloo",
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size,
+        )
+        tp_group, cp_group = _make_tp_cp_groups(rank)
+        ctx = FFNContext(tp_group=tp_group, cp_group=cp_group)
+        assert (ctx.tp_size, ctx.cp_size) == (2, 2)
+        assert ctx.tp_rank == rank % 2
+        assert ctx.cp_rank == rank // 2
+
+        hidden_size, intermediate_size = 8, 24
+        batch_size, sequence_size = 3, 4
+        generator = torch.Generator().manual_seed(20260813)
+        input_full = torch.randn(batch_size, sequence_size, hidden_size, generator=generator)
+        gate_full = torch.randn(intermediate_size, hidden_size, generator=generator)
+        up_full = torch.randn(intermediate_size, hidden_size, generator=generator)
+        down_full = torch.randn(hidden_size, intermediate_size, generator=generator)
+        grad_output_full = torch.randn(batch_size, sequence_size, hidden_size, generator=generator)
+
+        reference_input = input_full.detach().clone().requires_grad_(True)
+        reference_gate = gate_full.detach().clone().requires_grad_(True)
+        reference_up = up_full.detach().clone().requires_grad_(True)
+        reference_down = down_full.detach().clone().requires_grad_(True)
+        reference_output = _full_ffn(reference_input, reference_gate, reference_up, reference_down)
+        reference_output.backward(grad_output_full)
+
+        cp_index = rank // 2
+        local_sequence = sequence_size // 2
+        sequence_start = cp_index * local_sequence
+        sequence_stop = sequence_start + local_sequence
+        local_input = input_full[:, sequence_start:sequence_stop].detach().clone()
+        local_input.requires_grad_(True)
+        local_grad_output = grad_output_full[:, sequence_start:sequence_stop]
+        ffn = TensorParallelFFN.from_full_weights(
+            gate_full, up_full, down_full, ctx=ctx, gemm=_fixed_row_gemm
+        )
+
+        observed_collectives: list[tuple[str, tuple[int, ...]]] = []
+        original_all_reduce = dist.all_reduce
+
+        def traced_all_reduce(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+            group = kwargs.get("group")
+            if group is tp_group:
+                group_name = "tp"
+            elif group is cp_group:
+                group_name = "cp"
+            else:
+                raise AssertionError("FFN used an unexpected process group for all_reduce.")
+            observed_collectives.append((group_name, tuple(tensor.shape)))
+            return original_all_reduce(tensor, *args, **kwargs)
+
+        dist.all_reduce = traced_all_reduce  # type: ignore[assignment]
+        try:
+            local_output = ffn(local_input)
+            local_output.backward(local_grad_output)
+        finally:
+            dist.all_reduce = original_all_reduce  # type: ignore[assignment]
+
+        gathered_outputs = [torch.empty_like(local_output) for _ in range(world_size)]
+        dist.all_gather(gathered_outputs, local_output)
+        reconstructed_output = torch.cat((gathered_outputs[0], gathered_outputs[2]), dim=1)
+
+        local_intermediate = intermediate_size // 2
+        intermediate_start = (rank % 2) * local_intermediate
+        intermediate_stop = intermediate_start + local_intermediate
+        result_queue.put(
+            {
+                "ok": True,
+                "rank": rank,
+                "output_error": float(
+                    (local_output - reference_output[:, sequence_start:sequence_stop])
+                    .abs()
+                    .max()
+                    .item()
+                ),
+                "reconstructed_output_error": float(
+                    (reconstructed_output - reference_output).abs().max().item()
+                ),
+                "input_grad_error": float(
+                    (local_input.grad - reference_input.grad[:, sequence_start:sequence_stop])
+                    .abs()
+                    .max()
+                    .item()
+                ),
+                "gate_grad_error": float(
+                    (
+                        ffn.gate_weight.grad
+                        - reference_gate.grad[intermediate_start:intermediate_stop]
+                    )
+                    .abs()
+                    .max()
+                    .item()
+                ),
+                "up_grad_error": float(
+                    (ffn.up_weight.grad - reference_up.grad[intermediate_start:intermediate_stop])
+                    .abs()
+                    .max()
+                    .item()
+                ),
+                "down_grad_error": float(
+                    (
+                        ffn.down_weight.grad
+                        - reference_down.grad[:, intermediate_start:intermediate_stop]
+                    )
+                    .abs()
+                    .max()
+                    .item()
+                ),
+                "collectives": observed_collectives,
+                "activation_shape": tuple(local_input.shape),
+                "gate_weight_shape": tuple(ffn.gate_weight.shape),
+                "down_weight_shape": tuple(ffn.down_weight.shape),
+            }
+        )
+    except Exception:
+        result_queue.put({"ok": False, "rank": rank, "traceback": traceback.format_exc()})
+        raise
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _tp_cp_batch_invariance_worker(
+    rank: int, world_size: int, init_method: str, result_queue: Any
+) -> None:
+    try:
+        torch.set_num_threads(1)
+        _configure_gloo_loopback()
+        dist.init_process_group(
+            backend="gloo",
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size,
+        )
+        tp_group, cp_group = _make_tp_cp_groups(rank)
+        ctx = FFNContext(tp_group=tp_group, cp_group=cp_group)
+        hidden_size, intermediate_size = 8, 24
+        batch_size, sequence_size = 4, 4
+        generator = torch.Generator().manual_seed(20260814)
+        input_valid = torch.randn(batch_size, sequence_size, hidden_size, generator=generator)
+        padding = torch.randn(3, sequence_size, hidden_size, generator=generator)
+        gate_full = torch.randn(intermediate_size, hidden_size, generator=generator)
+        up_full = torch.randn(intermediate_size, hidden_size, generator=generator)
+        down_full = torch.randn(hidden_size, intermediate_size, generator=generator)
+        ffn = TensorParallelFFN.from_full_weights(
+            gate_full, up_full, down_full, ctx=ctx, gemm=_fixed_row_gemm
+        )
+
+        local_sequence = sequence_size // 2
+        sequence_start = (rank // 2) * local_sequence
+        sequence_stop = sequence_start + local_sequence
+        valid_local = input_valid[:, sequence_start:sequence_stop]
+        padded_local = torch.cat((input_valid, padding), dim=0)[:, sequence_start:sequence_stop]
+        full_input = valid_local.detach().clone().requires_grad_(True)
+        single_input = valid_local[:1].detach().clone().requires_grad_(True)
+        padded_input = padded_local.detach().clone().requires_grad_(True)
+
+        full_output = ffn(full_input)
+        full_grad_output = torch.randn(full_output.shape, generator=generator)
+        full_output.backward(full_grad_output)
+
+        single_output = ffn(single_input)
+        single_output.backward(full_grad_output[:1])
+
+        padded_output = ffn(padded_input)
+        padded_grad_output = torch.cat(
+            (
+                full_grad_output,
+                torch.randn(
+                    padded_output.shape[0] - batch_size,
+                    *padded_output.shape[1:],
+                    generator=generator,
+                ),
+            ),
+            dim=0,
+        )
+        padded_output.backward(padded_grad_output)
+        result_queue.put(
+            {
+                "ok": True,
+                "rank": rank,
+                "slice_equal": bool(torch.equal(full_output[:1], single_output)),
+                "padding_equal": bool(torch.equal(full_output, padded_output[:batch_size])),
+                "backward_slice_equal": bool(torch.equal(full_input.grad[:1], single_input.grad)),
+                "backward_padding_equal": bool(
+                    torch.equal(full_input.grad, padded_input.grad[:batch_size])
+                ),
+            }
+        )
+    except Exception:
+        result_queue.put({"ok": False, "rank": rank, "traceback": traceback.format_exc()})
+        raise
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_tp_cp_workers(worker: Any) -> list[dict[str, Any]]:
+    world_size = 4
+    mp_context = mp.get_context("spawn")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        init_file = Path(tmp_dir) / "tp_cp_ffn_init"
+        init_method = init_file.as_uri()
+        result_queue = mp_context.Queue()
+        workers = [
+            mp_context.Process(target=worker, args=(rank, world_size, init_method, result_queue))
+            for rank in range(world_size)
+        ]
+        for process in workers:
+            process.start()
+
+        results: list[dict[str, Any]] = []
+        try:
+            for _ in workers:
+                results.append(result_queue.get(timeout=30))
+        except queue.Empty:
+            pytest.fail("timed out waiting for TP+CP Gloo FFN workers")
+        finally:
+            for process in workers:
+                process.join(timeout=30)
+                if process.is_alive():
+                    process.terminate()
+                    process.join()
+
+        failures = [result for result in results if not result["ok"]]
+        if failures:
+            pytest.fail("\n".join(result["traceback"] for result in failures))
+        failed_workers = [process for process in workers if process.exitcode != 0]
+        if failed_workers:
+            pytest.fail(
+                f"TP+CP Gloo workers failed: {[process.exitcode for process in failed_workers]}"
+            )
+        return results
+
+
 @requires_gloo
 def test_tensor_parallel_ffn_matches_full_reference_and_tp_backward_contract() -> None:
     """TP=2 FFN agrees with full FFN and reduces only at the documented sites."""
@@ -268,9 +529,57 @@ def test_tensor_parallel_ffn_is_batch_invariant() -> None:
     assert all(result["slice_equal"] and result["padding_equal"] for result in results)
 
 
+@requires_gloo
+def test_tp_cp_ffn_matches_full_reference_and_cp_weight_gradient_contract() -> None:
+    """TP=2, CP=2 matches the global FFN and reduces all three replica dWs."""
+
+    results = _run_tp_cp_workers(_tp_cp_ffn_worker)
+    for result in results:
+        assert result["output_error"] <= 1e-4
+        assert result["reconstructed_output_error"] <= 1e-4
+        assert result["input_grad_error"] <= 1e-4
+        assert result["gate_grad_error"] <= 1e-4
+        assert result["up_grad_error"] <= 1e-4
+        assert result["down_grad_error"] <= 1e-4
+
+        tp_collectives = [shape for group, shape in result["collectives"] if group == "tp"]
+        cp_collectives = [shape for group, shape in result["collectives"] if group == "cp"]
+        # TP: Down forward and the combined Gate+Up dX backward. CP: one
+        # replica-gradient reduction for each logical Down/Gate/Up parameter.
+        assert tp_collectives == [result["activation_shape"], result["activation_shape"]]
+        assert sorted(cp_collectives) == sorted(
+            [
+                result["down_weight_shape"],
+                result["gate_weight_shape"],
+                result["gate_weight_shape"],
+            ]
+        )
+        assert len(result["collectives"]) == 5
+        assert result["activation_shape"] not in cp_collectives
+
+
+@requires_gloo
+def test_tp_cp_ffn_is_batch_invariant() -> None:
+    """TP+CP local rows and their input gradients are batch/padding invariant."""
+
+    results = _run_tp_cp_workers(_tp_cp_batch_invariance_worker)
+    assert all(
+        result["slice_equal"]
+        and result["padding_equal"]
+        and result["backward_slice_equal"]
+        and result["backward_padding_equal"]
+        for result in results
+    )
+
+
 def test_ffn_context_rejects_unbound_multi_rank_tp() -> None:
     with pytest.raises(ValueError, match="explicit initialized tp_group"):
         FFNContext(tp_size=2)
+
+
+def test_ffn_context_rejects_unbound_multi_rank_cp() -> None:
+    with pytest.raises(ValueError, match="explicit initialized cp_group"):
+        FFNContext(cp_size=2)
 
 
 def test_qwen_weight_shards_follow_column_and_row_parallel_dimensions() -> None:
