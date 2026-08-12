@@ -102,8 +102,11 @@ python -m rl_engine.mismatch plan --gpu-count 2      # expand into cases, cheape
 python -m rl_engine.mismatch plan --json
 ```
 
-Every `adapter.py` currently raises `NotImplementedError`, but the declaration
-layer works — so a factor can be checked as wired before anything is implemented.
+The gemm and attention `adapter.py` files still raise `NotImplementedError`, but
+the declaration layer works — so a factor can be checked as wired before
+anything is implemented. Logprob's four methods are implemented against the WS2
+TP-aware contract semantics (issue #241) and are the worked example of the
+adapter layer.
 
 ## Adding to this package
 
