@@ -19,6 +19,15 @@ from rl_engine.kernels.logprob_contract import (
     LogprobRole,
     MaskMode,
 )
+from rl_engine.kernels.loss_contract import (
+    AdvantageNormalizer,
+    GRPOLossContract,
+    KLEstimator,
+    LossBackendCapability,
+    LossContractError,
+    LossDispatchResult,
+    TokenNormalizer,
+)
 from rl_engine.platforms.device import device_ctx
 from rl_engine.utils.logger import logger
 
@@ -88,6 +97,10 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     # Deterministic vocab-parallel TP logprob reference (WS2 #241 PR3)
     PYTORCH_VOCAB_PARALLEL_LOGP = (
         "rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp.VocabParallelLogprobOp"
+    )
+    # Deterministic GRPO loss on the TP-aware logprob path (WS2 #241 PR5)
+    PYTORCH_DISTRIBUTED_GRPO_LOSS = (
+        "rl_engine.kernels.ops.pytorch.loss.distributed_grpo_loss.DistributedGRPOLossOp"
     )
 
     # RMSNorm(pre-norm / QK-Norm) - pure Pytorch reference(ws1 ground-truth)
@@ -377,6 +390,34 @@ class KernelRegistry:
                 prepend=True,
             )
 
+        # WS2 loss dispatch starts empty: the existing single-GPU GRPO ops
+        # declare no LossBackendCapability, so they are unreachable from
+        # get_loss_op and cannot be picked up as a silent fallback for a
+        # contract that asks for deterministic mesh-wide reduction.
+        self._loss_candidates: Dict[str, list] = {platform: [] for platform in self._priority_map}
+        self._loss_capabilities: Dict[str, Dict[OpBackend, LossBackendCapability]] = {
+            platform: {} for platform in self._priority_map
+        }
+        ws2_grpo_loss_capability = LossBackendCapability(
+            backend_id="pytorch-distributed-grpo-loss-ws2",
+            token_normalizers=frozenset(TokenNormalizer),
+            kl_estimators=frozenset(KLEstimator),
+            advantage_normalizers=frozenset(AdvantageNormalizer),
+            determinism_scopes=frozenset(
+                {DeterminismScope.CROSS_TP_BITWISE, DeterminismScope.FIXED_TOPOLOGY}
+            ),
+            dp_world_sizes=None,
+            supports_variable_group_sizes=True,
+            supports_asymmetric_clip=True,
+            implementation_kind="reference",
+        )
+        for ws2_platform in self._priority_map:
+            self.register_loss_backend(
+                OpBackend.PYTORCH_DISTRIBUTED_GRPO_LOSS,
+                ws2_grpo_loss_capability,
+                platform=ws2_platform,
+            )
+
     def _adjust_priority_from_env(self):
         rocm_attn_backend = os.getenv("RL_KERNEL_ROCM_ATTN_BACKEND", "").strip().lower()
         if rocm_attn_backend in {"flash_attn", "flash-attn", "flash_attention"}:
@@ -595,6 +636,138 @@ class KernelRegistry:
             f"TP={contract.sharding.tp_world_size}, CP={contract.sharding.cp_world_size}, "
             f"padded_vocab={contract.sharding.padded_vocab_size}, "
             f"real_vocab={contract.sharding.real_vocab_size}. Rejections: {details}"
+        )
+
+    def register_loss_backend(
+        self,
+        backend: OpBackend,
+        capability: LossBackendCapability,
+        *,
+        platform: Optional[str] = None,
+        prepend: bool = False,
+    ) -> None:
+        """Register (or replace) a backend for WS2 contract-aware loss dispatch.
+
+        The seam that makes a loss backend selectable by ``get_loss_op``.  It is
+        deliberately separate from the logprob registry: a backend may serve one
+        contract and not the other, and the deterministic GRPO loss consumes a
+        logprob backend rather than being one.
+        """
+
+        if not isinstance(backend, OpBackend):
+            raise LossContractError("backend must be an OpBackend")
+        if not isinstance(capability, LossBackendCapability):
+            raise LossContractError("capability must be a LossBackendCapability")
+        resolved_platform = platform if platform is not None else self._platform()
+        if resolved_platform not in self._priority_map:
+            raise LossContractError(
+                f"unsupported platform {resolved_platform!r}; expected one of "
+                f"{sorted(self._priority_map)}"
+            )
+        candidates = self._loss_candidates.setdefault(resolved_platform, [])
+        self._loss_capabilities.setdefault(resolved_platform, {})[backend] = capability
+        if backend not in candidates:
+            if prepend:
+                candidates.insert(0, backend)
+            else:
+                candidates.append(backend)
+
+    def get_loss_op(
+        self,
+        contract: GRPOLossContract,
+        *,
+        requested_backend: str = "auto",
+    ) -> LossDispatchResult:
+        """Resolve only a backend that explicitly supports the WS2 loss contract.
+
+        Mirrors ``get_logprob_op``: strictness comes from the contract's
+        capability checks rather than from the policy string, and a contract no
+        registered backend can serve fails loudly instead of falling back to an
+        op with different reduction semantics.
+        """
+
+        if not isinstance(contract, GRPOLossContract):
+            raise LossContractError("contract must be a GRPOLossContract")
+        if not isinstance(requested_backend, str) or not requested_backend.strip():
+            raise LossContractError("requested_backend must be a non-empty string")
+        requested_backend = requested_backend.strip()
+        if requested_backend.lower() == "deterministic":
+            raise LossContractError(
+                'requested_backend="deterministic" is not a dispatch policy; request '
+                "determinism through LossReductionSpec.determinism_scope and match it "
+                "against backend determinism_scopes instead"
+            )
+
+        platform = self._platform()
+        candidates = self._loss_candidates.get(platform, [])
+        rejected: list[str] = []
+        capability_rejections = 0
+
+        platform_capabilities = self._loss_capabilities.get(platform, {})
+        for backend in candidates:
+            capability = platform_capabilities.get(backend)
+            if capability is None:
+                rejected.append(f"{backend.name}: no LossBackendCapability declared")
+                capability_rejections += 1
+                continue
+            policy_mismatch = self._loss_policy_mismatch(requested_backend, capability)
+            if policy_mismatch is not None:
+                rejected.append(f"{backend.name}: {policy_mismatch}")
+                continue
+            capability_incompat = list(capability.incompatibilities(contract))
+            if capability_incompat:
+                rejected.append(f"{backend.name}: " + "; ".join(capability_incompat))
+                capability_rejections += 1
+                continue
+
+            op = self._get_or_create_backend(backend)
+            if op is None:
+                rejected.append(f"{backend.name}: backend could not be loaded or instantiated")
+                capability_rejections += 1
+                continue
+
+            provenance = {
+                "requested_backend": requested_backend,
+                "actual_backend": capability.backend_id,
+                "backend_enum": backend.name,
+                "platform": platform,
+                "fallback": capability_rejections > 0,
+                "prior_rejections": list(rejected),
+                "contract": contract.to_dict(),
+                "capability": capability.to_dict(),
+            }
+            return LossDispatchResult(op=op, capability=capability, provenance=provenance)
+
+        details = " | ".join(rejected) if rejected else "no candidates registered"
+        raise RuntimeError(
+            "No loss backend supports the requested WS2 GRPO contract on "
+            f"{platform}: normalizer={contract.reduction.token_normalizer.value}, "
+            f"kl={contract.objective.kl_estimator.value}, "
+            f"TP={contract.logprob.sharding.tp_world_size}, "
+            f"DP={contract.sharding.dp_world_size}, CP={contract.sharding.cp_world_size}. "
+            f"Rejections: {details}"
+        )
+
+    @staticmethod
+    def _loss_policy_mismatch(
+        requested_backend: str,
+        capability: LossBackendCapability,
+    ) -> str | None:
+        policy = requested_backend.lower()
+        if policy == "auto":
+            return None
+        if policy in IMPLEMENTATION_KINDS:
+            if capability.implementation_kind == policy:
+                return None
+            return (
+                f"implementation_kind={capability.implementation_kind} does not satisfy "
+                f"requested_backend={policy}"
+            )
+        if capability.backend_id == requested_backend:
+            return None
+        return (
+            f"backend_id={capability.backend_id} does not match "
+            f"requested_backend={requested_backend}"
         )
 
     @staticmethod
