@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Tensor- and context-parallel Qwen3-style SwiGLU FFN orchestration.
+"""Tensor-, context-, and sequence-parallel Qwen3 SwiGLU FFN orchestration.
 
 The module implements the non-sequence-parallel TP ownership contract used by
 the Qwen3 dense MLP:
@@ -10,17 +10,23 @@ the Qwen3 dense MLP:
 * ``down`` is RowParallel (its input/intermediate dimension is sharded); its
   same-coordinate hidden outputs are summed once over the explicit TP group.
 
-The autograd collective mappings are deliberately asymmetric.  A RowParallel
-forward reduction has an identity backward, while the replicated FFN input is
-copied in the forward and reduced in the backward.  Consequently the sole
-backward TP SUM occurs after the local Gate and Up input-gradient
-contributions have been accumulated, exactly as required by the TP FFN
-derivation.  There is no TP reduction for Down's feature-sharded ``dHidden``.
+Without SP, the autograd collective mappings are deliberately asymmetric: a
+RowParallel forward reduction has an identity backward, while the replicated
+FFN input is copied in the forward and reduced in the backward. Consequently
+the sole backward TP SUM occurs after the local Gate and Up input-gradient
+contributions have been accumulated. There is no TP reduction for Down's
+feature-sharded ``dHidden``.
 
 CP shards token rows. It has no forward activation collective: each CP rank
 keeps its own rows. In backward, each TP-local parameter shard is replicated
 across its CP lane, so Gate, Up, and Down each perform one CP SUM of ``dW``.
-SP activation AllGather/ReduceScatter is intentionally out of scope.
+
+SP reuses the two ranks in a TP row but changes activation ownership. The
+input/output residual stream is sequence-sharded; the local FFN body runs on
+the SP AllGather result. Down's SP ReduceScatter(SUM) simultaneously restores
+the sequence shard and sums the RowParallel output partials. Its autograd
+mapping is AllGather, while the input AllGather's mapping is
+ReduceScatter(SUM), so the gradient returned to RMSNorm remains SP-sharded.
 """
 
 from __future__ import annotations
@@ -95,11 +101,11 @@ def _resolve_parallel_coordinates(
 
 @dataclass(frozen=True)
 class FFNContext:
-    """Explicit TP/CP configuration owned by an FFN caller.
+    """Explicit TP/CP/SP configuration owned by an FFN caller.
 
     Neither group is created or inferred by this module.  A multi-rank
     configuration must supply initialized explicit groups, which preserves the
-    fixed TP/CP topology and leaves SP group ownership to the next PR.
+    fixed TP/CP/SP topology.
     """
 
     tp_group: Any = None
@@ -108,6 +114,9 @@ class FFNContext:
     cp_group: Any = None
     cp_size: Optional[int] = None
     cp_rank: Optional[int] = None
+    sp_group: Any = None
+    sp_size: Optional[int] = None
+    sp_rank: Optional[int] = None
 
     def __post_init__(self) -> None:
         tp_size, tp_rank = _resolve_parallel_coordinates(
@@ -116,10 +125,20 @@ class FFNContext:
         cp_size, cp_rank = _resolve_parallel_coordinates(
             "cp", self.cp_group, self.cp_size, self.cp_rank
         )
+        sp_size, sp_rank = _resolve_parallel_coordinates(
+            "sp", self.sp_group, self.sp_size, self.sp_rank
+        )
+        if sp_size > 1 and (sp_size != tp_size or sp_rank != tp_rank):
+            raise ValueError(
+                "SP must align with the TP rank dimension: sp_size/sp_rank must match "
+                "tp_size/tp_rank when sequence parallelism is enabled."
+            )
         object.__setattr__(self, "tp_size", tp_size)
         object.__setattr__(self, "tp_rank", tp_rank)
         object.__setattr__(self, "cp_size", cp_size)
         object.__setattr__(self, "cp_rank", cp_rank)
+        object.__setattr__(self, "sp_size", sp_size)
+        object.__setattr__(self, "sp_rank", sp_rank)
 
     @property
     def is_tensor_parallel(self) -> bool:
@@ -134,6 +153,13 @@ class FFNContext:
 
         assert self.cp_size is not None
         return self.cp_size > 1
+
+    @property
+    def is_sequence_parallel(self) -> bool:
+        """Whether residual-stream activations are split across the SP group."""
+
+        assert self.sp_size is not None
+        return self.sp_size > 1
 
 
 def _all_reduce_sum(tensor: Tensor, group: Any, world_size: int) -> Tensor:
@@ -155,13 +181,72 @@ def _all_reduce_cp_sum(tensor: Tensor, ctx: FFNContext) -> Tensor:
     return _all_reduce_sum(tensor, ctx.cp_group, ctx.cp_size)
 
 
+def _all_reduce_sp_sum(tensor: Tensor, ctx: FFNContext) -> Tensor:
+    assert ctx.sp_size is not None
+    return _all_reduce_sum(tensor, ctx.sp_group, ctx.sp_size)
+
+
+def _all_gather_sequence(tensor: Tensor, ctx: FFNContext) -> Tensor:
+    """Gather equal sequence shards along the penultimate tensor dimension."""
+
+    if not ctx.is_sequence_parallel:
+        return tensor
+    if tensor.ndim < 2:
+        raise ValueError(
+            f"SP AllGather requires [..., sequence, hidden], got {tuple(tensor.shape)}."
+        )
+
+    assert ctx.sp_size is not None
+    gathered = [torch.empty_like(tensor) for _ in range(ctx.sp_size)]
+    dist.all_gather(gathered, tensor.contiguous(), group=ctx.sp_group)
+    return torch.cat(gathered, dim=-2)
+
+
+def _reduce_scatter_sequence_sum(tensor: Tensor, ctx: FFNContext) -> Tensor:
+    """SUM-reduce equal full-sequence tensors then return this rank's sequence shard.
+
+    NCCL uses its native ``reduce_scatter`` collective. Gloo deployments that
+    do not implement that primitive use an equivalent all-reduce plus local
+    sequence slice solely as a portable test fallback.
+    """
+
+    if not ctx.is_sequence_parallel:
+        return tensor
+    if tensor.ndim < 2:
+        raise ValueError(
+            f"SP ReduceScatter requires [..., sequence, hidden], got {tuple(tensor.shape)}."
+        )
+
+    assert ctx.sp_size is not None
+    assert ctx.sp_rank is not None
+    sequence_size = tensor.shape[-2]
+    if sequence_size % ctx.sp_size != 0:
+        raise ValueError(
+            f"sequence size={sequence_size} must divide evenly by sp_size={ctx.sp_size}."
+        )
+
+    chunks = [chunk.contiguous() for chunk in tensor.chunk(ctx.sp_size, dim=-2)]
+    output = torch.empty_like(chunks[0])
+    try:
+        dist.reduce_scatter(output, chunks, op=dist.ReduceOp.SUM, group=ctx.sp_group)
+        return output
+    except RuntimeError as error:
+        # ProcessGroupGloo lacks reduce_scatter in some supported PyTorch builds.
+        if "does not support reduce_scatter" not in str(error).lower():
+            raise
+        reduced = _all_reduce_sp_sum(tensor.contiguous(), ctx)
+        local_sequence = sequence_size // ctx.sp_size
+        return reduced.narrow(-2, ctx.sp_rank * local_sequence, local_sequence).contiguous()
+
+
 class _CopyToTensorParallelRegion(torch.autograd.Function):
-    """Replicated input: identity forward, TP SUM backward.
+    """Replicated input: identity forward, TP SUM backward when SP is disabled.
 
     The Gate and Up ColumnParallel projections each produce a local
     same-coordinate ``dX`` contribution.  Autograd accumulates those local
     contributions before this function's backward executes, so this is one
-    logical TP all-reduce of their combined ``[... , H]`` gradient.
+    logical TP all-reduce of their combined ``[... , H]`` gradient. With SP,
+    the preceding AllGather's backward owns that SUM via ReduceScatter instead.
     """
 
     @staticmethod
@@ -173,6 +258,10 @@ class _CopyToTensorParallelRegion(torch.autograd.Function):
     def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, None]:
         # Do not mutate a gradient owned by a downstream autograd node.
         grad_input = grad_output.contiguous().clone()
+        if ctx.tp_ctx.is_sequence_parallel:
+            # The preceding SP AllGather owns the single necessary dX SUM and
+            # sequence split in its backward ReduceScatter.
+            return grad_input, None
         return _all_reduce_tp_sum(grad_input, ctx.tp_ctx), None
 
 
@@ -201,6 +290,40 @@ def _copy_to_tensor_parallel_region(input_: Tensor, ctx: FFNContext) -> Tensor:
 
 def _reduce_from_tensor_parallel_region(input_: Tensor, ctx: FFNContext) -> Tensor:
     return _ReduceFromTensorParallelRegion.apply(input_, ctx)
+
+
+class _GatherFromSequenceParallelRegion(torch.autograd.Function):
+    """SP AllGather forward; SUM ReduceScatter backward."""
+
+    @staticmethod
+    def forward(ctx: Any, input_: Tensor, sp_ctx: FFNContext) -> Tensor:
+        ctx.sp_ctx = sp_ctx
+        return _all_gather_sequence(input_, sp_ctx)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, None]:
+        return _reduce_scatter_sequence_sum(grad_output, ctx.sp_ctx), None
+
+
+class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
+    """SP SUM ReduceScatter forward; AllGather backward."""
+
+    @staticmethod
+    def forward(ctx: Any, input_: Tensor, sp_ctx: FFNContext) -> Tensor:
+        ctx.sp_ctx = sp_ctx
+        return _reduce_scatter_sequence_sum(input_, sp_ctx)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, None]:
+        return _all_gather_sequence(grad_output, ctx.sp_ctx), None
+
+
+def _gather_from_sequence_parallel_region(input_: Tensor, ctx: FFNContext) -> Tensor:
+    return _GatherFromSequenceParallelRegion.apply(input_, ctx)
+
+
+def _reduce_scatter_to_sequence_parallel_region(input_: Tensor, ctx: FFNContext) -> Tensor:
+    return _ReduceScatterToSequenceParallelRegion.apply(input_, ctx)
 
 
 class _CopyWeightToContextParallelRegion(torch.autograd.Function):
@@ -417,11 +540,12 @@ class TensorParallelFFN(nn.Module):
         return output_2d.reshape(*input_.shape[:-1], weight.shape[0])
 
     def forward_local(self, input_: Tensor) -> Tensor:
-        """Return the local pre-TP-reduction Down output partial.
+        """Return the local pre-TP/SP-reduction Down output partial.
 
         This method is primarily a validation boundary: its result has shape
         ``[..., hidden_size]`` but represents only this rank's RowParallel
-        contribution.  ``forward`` performs the required TP SUM over it.
+        contribution. ``forward`` performs the required TP SUM or SP
+        ReduceScatter(SUM) ownership conversion over it.
         """
 
         if input_.ndim < 2:
@@ -438,7 +562,8 @@ class TensorParallelFFN(nn.Module):
                 f"{self.gate_weight.dtype}."
             )
 
-        replicated_input = _copy_to_tensor_parallel_region(input_, self.ctx)
+        gathered_input = _gather_from_sequence_parallel_region(input_, self.ctx)
+        replicated_input = _copy_to_tensor_parallel_region(gathered_input, self.ctx)
         gate_weight = _copy_weight_to_context_parallel_region(self.gate_weight, self.ctx)
         up_weight = _copy_weight_to_context_parallel_region(self.up_weight, self.ctx)
         down_weight = _copy_weight_to_context_parallel_region(self.down_weight, self.ctx)
@@ -448,7 +573,11 @@ class TensorParallelFFN(nn.Module):
         return self._local_linear(hidden, down_weight)
 
     def forward(self, input_: Tensor) -> Tensor:
-        """Compute the replicated hidden output after the one Down TP SUM."""
+        """Compute the residual-stream output in the configured TP/SP ownership."""
 
         local_output_partial = self.forward_local(input_)
+        if self.ctx.is_sequence_parallel:
+            # SP RS(SUM) is the TP RowParallel output reduction and restores
+            # the residual stream's local sequence shard in one collective.
+            return _reduce_scatter_to_sequence_parallel_region(local_output_partial, self.ctx)
         return _reduce_from_tensor_parallel_region(local_output_partial, self.ctx)
