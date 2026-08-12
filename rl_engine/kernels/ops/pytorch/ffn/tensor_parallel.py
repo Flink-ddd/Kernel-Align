@@ -93,6 +93,7 @@ class FFNContext:
     def is_tensor_parallel(self) -> bool:
         """Whether this context owns more than one tensor-parallel shard."""
 
+        assert self.tp_size is not None
         return self.tp_size > 1
 
 
@@ -170,6 +171,8 @@ def shard_qwen3_ffn_weights(
     if gate_weight.ndim != 2 or up_weight.ndim != 2 or down_weight.ndim != 2:
         raise ValueError("gate_weight, up_weight, and down_weight must all be rank-2 tensors.")
 
+    assert ctx.tp_size is not None
+    assert ctx.tp_rank is not None
     intermediate_size, hidden_size = gate_weight.shape
     if up_weight.shape != (intermediate_size, hidden_size):
         raise ValueError(
@@ -234,6 +237,7 @@ class TensorParallelFFN(nn.Module):
             raise ValueError("hidden_size and intermediate_size must both be positive.")
 
         self.ctx = FFNContext() if ctx is None else ctx
+        assert self.ctx.tp_size is not None
         if intermediate_size % self.ctx.tp_size != 0:
             raise ValueError(
                 f"intermediate_size={intermediate_size} must divide evenly by "
