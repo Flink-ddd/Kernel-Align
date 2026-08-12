@@ -7,12 +7,22 @@ from rl_engine.platforms.constants import DeviceType
 from rl_engine.utils.logger import logger
 
 
+def _npu_available() -> bool:
+    """torch.npu only exists after torch_npu is imported; probe defensively."""
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
 class DeviceContext:
     """
     Hardware-aware context manager for high-performance RL tasks.
 
-    Provides transparent support for both AMD (ROCm/HIP) and NVIDIA (CUDA)
-    architectures to ensure backend-agnostic scaling for RL operators.
+    Provides transparent support for AMD (ROCm/HIP), NVIDIA (CUDA) and Huawei
+    Ascend (NPU/CANN) architectures to ensure backend-agnostic scaling for RL
+    operators.
     """
 
     def __init__(self):
@@ -41,8 +51,17 @@ class DeviceContext:
                     f" (Version: {self.backend_version})"
                 )
         else:
-            self.device_type = DeviceType.CPU.value
-            logger.warning("No GPU detected. RL-Engine is falling back to CPU mode.")
+            if _npu_available():
+                self.device = torch.device(DeviceType.NPU.value)
+                self.device_type = DeviceType.NPU.value
+                self.backend_version = getattr(torch.version, "cann", None) or "N/A"
+                logger.info_once(
+                    f"RL-Engine initialized with Huawei Ascend NPU backend"
+                    f" (CANN Version: {self.backend_version})"
+                )
+            else:
+                self.device_type = DeviceType.CPU.value
+                logger.warning("No GPU detected. RL-Engine is falling back to CPU mode.")
 
     def get_preferred_dtype(self):
         """

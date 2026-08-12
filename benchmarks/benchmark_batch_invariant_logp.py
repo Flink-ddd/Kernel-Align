@@ -1,21 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Benchmark batch-invariant logp: Native vs Triton vs CUDA (SM90 TMA).
+"""Benchmark batch-invariant logp: Native vs Triton vs CUDA (SM90 TMA) vs Ascend.
 
-All three backends compute ``logits[t, target[t]] - logsumexp(logits[t, :])``
-from a materialized ``[N, V]`` logits tensor with a locked, per-row reduction
-order (batch-invariant). The comparison here is latency and peak VRAM across a
-vocab sweep:
+All backends compute ``logits[t, target[t]] - logsumexp(logits[t, :])`` from a
+materialized ``[N, V]`` logits tensor with a locked, per-row reduction order
+(batch-invariant). The comparison here is latency and peak device memory across
+a vocab sweep:
 
 - Native materializes ``log_softmax`` over the full ``[N, V]`` tensor.
 - Triton streams the vocab through an online softmax (grid = one program/row).
 - CUDA is the Hopper TMA online-softmax kernel (one CTA/row); only present when
   the extension is built with ``KERNEL_ALIGN_FORCE_SM90=1`` on an SM90 device.
+- Ascend is the CANN two-pass streaming kernel (one AI core block/row); only
+  present when the extension is built with ``KERNEL_ALIGN_FORCE_ASCEND=1``.
 
 By default only the forward pass is timed; pass ``--backward`` to also emit the
-forward+backward table (grad w.r.t. logits). Timing uses ``torch.cuda`` events,
-so the benchmark runs on CUDA/ROCm devices.
+forward+backward table (grad w.r.t. logits). Timing and memory accounting
+dispatch through the active accelerator (``torch.cuda`` or ``torch.npu``), so
+the benchmark runs on CUDA/ROCm/NPU devices.
 
 Usage:
     python benchmarks/benchmark_batch_invariant_logp.py
@@ -29,9 +32,28 @@ import torch
 from tabulate import tabulate
 
 from rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp import NativeBatchInvariantLogpOp
-from rl_engine.kernels.ops.triton.loss.batch_invariant_logp import TritonBatchInvariantLogpOp
 from rl_engine.platforms.device import device_ctx
 from rl_engine.utils.logger import logger
+
+
+def _accel():
+    """The active accelerator module (torch.npu on Ascend, torch.cuda otherwise)."""
+    if device_ctx.device_type == "npu":
+        return torch.npu
+    return torch.cuda
+
+
+def _maybe_triton_op():
+    """The Triton op, or None when unavailable (no Triton / NPU-only host)."""
+    if device_ctx.device_type == "npu":
+        return None
+    try:
+        from rl_engine.kernels.ops.triton.loss.batch_invariant_logp import (
+            TritonBatchInvariantLogpOp,
+        )
+    except ImportError:
+        return None
+    return TritonBatchInvariantLogpOp()
 
 
 def _maybe_sm90_op():
@@ -50,6 +72,30 @@ def _maybe_sm90_op():
     return BatchInvariantLogpSM90Op()
 
 
+def _maybe_ascend_op():
+    """The Ascend C op, or None when unavailable (no NPU / not built)."""
+    if device_ctx.device_type != "npu":
+        return None
+    try:
+        from rl_engine.kernels.ops.ascend.loss.batch_invariant_logp import (
+            BatchInvariantLogpAscendOp,
+        )
+    except (ImportError, RuntimeError):
+        return None
+    return BatchInvariantLogpAscendOp()
+
+
+def _maybe_accelerated_op():
+    """(label, op) for the fastest hardware kernel on this host, else (None, None)."""
+    sm90_op = _maybe_sm90_op()
+    if sm90_op is not None:
+        return "cuda", sm90_op
+    ascend_op = _maybe_ascend_op()
+    if ascend_op is not None:
+        return "ascend", ascend_op
+    return None, None
+
+
 # (num_tokens, vocab); vocab kept a multiple of 8 so the bf16 TMA path runs.
 DEFAULT_CONFIGS = [
     (4096, 32768),
@@ -66,30 +112,32 @@ def _make_inputs(num_tokens, vocab, device, dtype):
 
 
 def _time_ms(fn, warmup, iters):
+    acc = _accel()
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    acc.synchronize()
+    start = acc.Event(enable_timing=True)
+    end = acc.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
         fn()
     end.record()
-    torch.cuda.synchronize()
+    acc.synchronize()
     return start.elapsed_time(end) / iters
 
 
 def _peak_vram_gb(fn, warmup, iters):
+    acc = _accel()
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    baseline = torch.cuda.memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
+    acc.synchronize()
+    acc.empty_cache()
+    baseline = acc.memory_allocated()
+    acc.reset_peak_memory_stats()
     for _ in range(iters):
         fn()
-    torch.cuda.synchronize()
-    return (torch.cuda.max_memory_allocated() - baseline) / (1024**3)
+    acc.synchronize()
+    return (acc.max_memory_allocated() - baseline) / (1024**3)
 
 
 def _forward_closure(op, logits, target):
@@ -111,65 +159,74 @@ def _forward_backward_closure(op, logits, target):
 
 
 def _bench_table(configs, backends, closure_factory, device, dtype, warmup, iters):
-    """Build a github-markdown table timing each backend, plus CUDA speedups.
+    """Build a github-markdown table timing each backend, plus accel speedups.
 
-    ``backends`` is ``(native_op, triton_op, sm90_op_or_None)``; ``closure_factory``
-    maps ``(op, logits, target) -> callable`` (forward-only or forward+backward).
+    ``backends`` is ``(native_op, triton_op_or_None, (accel_label, accel_op))``;
+    ``closure_factory`` maps ``(op, logits, target) -> callable`` (forward-only
+    or forward+backward).
     """
-    native, triton_op, sm90_op = backends
+    native, triton_op, (accel_label, accel_op) = backends
     label = "fwd" if closure_factory is _forward_closure else "fwd+bwd"
     rows = []
     for num_tokens, vocab in configs:
         logits, target = _make_inputs(num_tokens, vocab, device, dtype)
         n_c = closure_factory(native, logits, target)
-        t_c = closure_factory(triton_op, logits, target)
 
         n_ms = _time_ms(n_c, warmup, iters)
-        t_ms = _time_ms(t_c, warmup, iters)
         n_mb = _peak_vram_gb(n_c, warmup, iters) * 1024
-        t_mb = _peak_vram_gb(t_c, warmup, iters) * 1024
 
-        row = [
-            f"{num_tokens}x{vocab}",
-            f"{n_ms:.3f}",
-            f"{t_ms:.3f}",
-            f"{n_ms/t_ms:.2f}x",
-            f"{n_mb:.0f}",
-            f"{t_mb:.0f}",
-        ]
-        if sm90_op is not None:
-            s_c = closure_factory(sm90_op, logits, target)
-            s_ms = _time_ms(s_c, warmup, iters)
-            s_mb = _peak_vram_gb(s_c, warmup, iters) * 1024
-            row += [f"{s_ms:.3f}", f"{n_ms/s_ms:.2f}x", f"{t_ms/s_ms:.2f}x", f"{s_mb:.0f}"]
+        row = [f"{num_tokens}x{vocab}", f"{n_ms:.3f}"]
+        t_ms = None
+        if triton_op is not None:
+            t_c = closure_factory(triton_op, logits, target)
+            t_ms = _time_ms(t_c, warmup, iters)
+            t_mb = _peak_vram_gb(t_c, warmup, iters) * 1024
+            row += [f"{t_ms:.3f}", f"{n_ms/t_ms:.2f}x", f"{n_mb:.0f}", f"{t_mb:.0f}"]
+        else:
+            row += [f"{n_mb:.0f}"]
+        if accel_op is not None:
+            a_c = closure_factory(accel_op, logits, target)
+            a_ms = _time_ms(a_c, warmup, iters)
+            a_mb = _peak_vram_gb(a_c, warmup, iters) * 1024
+            row += [f"{a_ms:.3f}", f"{n_ms/a_ms:.2f}x"]
+            if t_ms is not None:
+                row += [f"{t_ms/a_ms:.2f}x"]
+            row += [f"{a_mb:.0f}"]
         rows.append(row)
 
-    headers = [
-        "shape (N x V)",
-        f"native {label} ms",
-        f"triton {label} ms",
-        f"{label} speedup",
-        f"native {label} MB",
-        f"triton {label} MB",
-    ]
-    if sm90_op is not None:
-        headers += [f"cuda {label} ms", "cuda vs native", "cuda vs triton", f"cuda {label} MB"]
+    headers = ["shape (N x V)", f"native {label} ms"]
+    if triton_op is not None:
+        headers += [
+            f"triton {label} ms",
+            f"{label} speedup",
+            f"native {label} MB",
+            f"triton {label} MB",
+        ]
+    else:
+        headers += [f"native {label} MB"]
+    if accel_op is not None:
+        headers += [f"{accel_label} {label} ms", f"{accel_label} vs native"]
+        if triton_op is not None:
+            headers += [f"{accel_label} vs triton"]
+        headers += [f"{accel_label} {label} MB"]
     print(tabulate(rows, headers=headers, tablefmt="github"))
 
 
 def run_benchmark(args):
-    if device_ctx.device_type not in ["cuda", "hip"]:
+    if device_ctx.device_type not in ["cuda", "hip", "npu"]:
         raise RuntimeError(
-            "batch_invariant_logp benchmark requires a CUDA/ROCm GPU (uses torch.cuda timing)."
+            "batch_invariant_logp benchmark requires a CUDA/ROCm/NPU device "
+            "(uses accelerator-event timing)."
         )
 
     device = device_ctx.device
     dtype = torch.bfloat16
-    backends = (NativeBatchInvariantLogpOp(), TritonBatchInvariantLogpOp(), _maybe_sm90_op())
+    accel_label, accel_op = _maybe_accelerated_op()
+    backends = (NativeBatchInvariantLogpOp(), _maybe_triton_op(), (accel_label, accel_op))
 
     logger.info(
         f"batch_invariant_logp benchmark on {device} (dtype={dtype}); "
-        f"SM90 TMA backend {'enabled' if backends[2] is not None else 'unavailable'}"
+        f"accelerated backend: {accel_label or 'unavailable'}"
     )
 
     print("Forward")

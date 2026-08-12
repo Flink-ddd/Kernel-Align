@@ -74,6 +74,9 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     CUDA_BATCH_INVARIANT_LOGP_SM90 = (
         "rl_engine.kernels.ops.cuda.loss.batch_invariant_logp.BatchInvariantLogpSM90Op"
     )
+    ASCEND_BATCH_INVARIANT_LOGP = (
+        "rl_engine.kernels.ops.ascend.loss.batch_invariant_logp.BatchInvariantLogpAscendOp"
+    )
 
     # RMSNorm(pre-norm / QK-Norm) - pure Pytorch reference(ws1 ground-truth)
     PYTORCH_NATIVE_RMS_NORM = "rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp"
@@ -287,6 +290,14 @@ class KernelRegistry:
                 "silu": [OpBackend.PYTORCH_NATIVE_SILU],
                 "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
             },
+            # Ascend NPU: op types without an entry fall back to PYTORCH_NATIVE
+            # (see get_op's default), so only Ascend-accelerated ops are listed.
+            "npu": {
+                "batch_invariant_logp": [
+                    OpBackend.ASCEND_BATCH_INVARIANT_LOGP,
+                    OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
+                ],
+            },
         }
         logger.info(f"KernelRegistry initialized for {device_ctx.device_type}")
         self._adjust_priority_for_hardware()
@@ -407,6 +418,8 @@ class KernelRegistry:
                 return "rocm"
             if device_ctx.device_type == "cuda":
                 return "cuda"
+            if device_ctx.device_type == "npu":
+                return "npu"
             return "cpu"
 
         resolved = torch.device(device)

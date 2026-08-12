@@ -60,6 +60,34 @@ requires_sm90 = pytest.mark.skipif(
     "(needs KERNEL_ALIGN_FORCE_SM90=1 on an SM90/Hopper device).",
 )
 
+
+def _npu_available() -> bool:
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
+def _ascend_kernel_available() -> bool:
+    if not _npu_available():
+        return False
+    try:
+        from rl_engine.kernels.ops.ascend.loss.batch_invariant_logp import (
+            _NPU_EXT_AVAILABLE,
+            _C_npu,
+        )
+    except ImportError:
+        return False
+    return _NPU_EXT_AVAILABLE and hasattr(_C_npu, "batch_invariant_logp_ascend")
+
+
+requires_ascend = pytest.mark.skipif(
+    not _ascend_kernel_available(),
+    reason="batch_invariant_logp_ascend kernel not compiled "
+    "(needs KERNEL_ALIGN_FORCE_ASCEND=1 on an Ascend NPU host).",
+)
+
 # 16-byte-aligned vocab so the TMA forward runs directly (not the fallback):
 # bf16 needs V % 8 == 0, fp32 needs V % 4 == 0.
 _VC = 1024
@@ -1023,6 +1051,198 @@ class TestCudaSM90UnsupportedInputs:
 
 
 # ---------------------------------------------------------------------------
+# 7c. Ascend C kernel backend
+# ---------------------------------------------------------------------------
+
+
+@requires_ascend
+class TestAscendCorrectness:
+    """Compiled Ascend C kernel output must match log_softmax + gather."""
+
+    def _get_op(self):
+        from rl_engine.kernels.ops.ascend.loss.batch_invariant_logp import (
+            BatchInvariantLogpAscendOp,
+        )
+
+        return BatchInvariantLogpAscendOp()
+
+    def test_matches_reference_fp32(self):
+        op = self._get_op()
+        logits = torch.randn(8, _VC, device="npu")
+        target = torch.randint(0, _VC, (8,), device="npu")
+        out = op(logits, target)
+        ref = _reference_logp(logits, target)
+        assert out.dtype == torch.float32
+        assert torch.allclose(out, ref, atol=1e-4)
+
+    def test_matches_reference_bf16(self):
+        op = self._get_op()
+        logits = torch.randn(8, _VC, device="npu", dtype=torch.bfloat16)
+        target = torch.randint(0, _VC, (8,), device="npu")
+        out = op(logits, target)
+        ref = _reference_logp(logits.float(), target)
+        assert out.dtype == torch.float32
+        assert torch.allclose(out, ref, atol=1e-3)
+
+    def test_large_vocab(self):
+        op = self._get_op()
+        logits = torch.randn(4, 128256, device="npu", dtype=torch.bfloat16)
+        target = torch.randint(0, 128256, (4,), device="npu")
+        out = op(logits, target)
+        ref = _reference_logp(logits.float(), target)
+        assert torch.allclose(out, ref, atol=2e-3)
+
+    def test_single_token(self):
+        op = self._get_op()
+        logits = torch.randn(1, _VC, device="npu")
+        target = torch.randint(0, _VC, (1,), device="npu")
+        out = op(logits, target)
+        ref = _reference_logp(logits, target)
+        assert torch.allclose(out, ref, atol=1e-4)
+
+    def test_3d_logits(self):
+        op = self._get_op()
+        logits = torch.randn(2, 3, _VC, device="npu", dtype=torch.bfloat16)
+        target = torch.randint(0, _VC, (2, 3), device="npu")
+        out = op(logits, target)
+        assert out.shape == (2, 3)
+        ref = _reference_logp(logits.float(), target)
+        assert torch.allclose(out, ref, atol=1e-3)
+
+    def test_matches_pytorch_op(self):
+        op = self._get_op()
+        pytorch_op = NativeBatchInvariantLogpOp()
+        logits = torch.randn(16, _VC, device="npu")
+        target = torch.randint(0, _VC, (16,), device="npu")
+        assert torch.allclose(op(logits, target), pytorch_op(logits, target), atol=1e-4)
+
+
+@requires_ascend
+class TestAscendBatchInvariance:
+    """Ascend kernel must be bitwise batch-invariant (one block per row)."""
+
+    def _get_op(self):
+        from rl_engine.kernels.ops.ascend.loss.batch_invariant_logp import (
+            BatchInvariantLogpAscendOp,
+        )
+
+        return BatchInvariantLogpAscendOp()
+
+    def test_batch_size_1_vs_n(self):
+        op = self._get_op()
+        row = _make_row(42, vocab=_VC, device="npu")
+        target = torch.tensor([7], device="npu")
+        result_alone = op(row, target).item()
+
+        for batch_size in [2, 4, 8, 16, 32, 64, 128]:
+            batch_logits = torch.randn(batch_size, _VC, device="npu")
+            batch_target = torch.randint(0, _VC, (batch_size,), device="npu")
+            batch_logits[0] = row.squeeze(0)
+            batch_target[0] = target.squeeze(0)
+            result_in_batch = op(batch_logits, batch_target)[0].item()
+            assert result_alone == result_in_batch, (
+                f"Ascend drift at batch_size={batch_size}: "
+                f"alone={result_alone}, in_batch={result_in_batch}"
+            )
+
+    def test_different_positions(self):
+        op = self._get_op()
+        row = _make_row(99, vocab=_VC, device="npu")
+        target = torch.tensor([13], device="npu")
+        batch_size = 16
+        results = []
+        for pos in range(batch_size):
+            batch_logits = torch.randn(batch_size, _VC, device="npu")
+            batch_target = torch.randint(0, _VC, (batch_size,), device="npu")
+            batch_logits[pos] = row.squeeze(0)
+            batch_target[pos] = target.squeeze(0)
+            results.append(op(batch_logits, batch_target)[pos].item())
+        assert all(
+            r == results[0] for r in results
+        ), f"Ascend position drift: unique = {set(results)}"
+
+    def test_repeated_runs(self):
+        op = self._get_op()
+        logits = torch.randn(16, _VC, device="npu", dtype=torch.bfloat16)
+        target = torch.randint(0, _VC, (16,), device="npu")
+        results = [op(logits, target) for _ in range(50)]
+        for i, r in enumerate(results[1:], 1):
+            assert torch.equal(r, results[0]), f"Ascend run {i} differs from run 0"
+
+
+@requires_ascend
+class TestAscendBackward:
+    """Gradient through the Ascend op must match reference."""
+
+    def _get_op(self):
+        from rl_engine.kernels.ops.ascend.loss.batch_invariant_logp import (
+            BatchInvariantLogpAscendOp,
+        )
+
+        return BatchInvariantLogpAscendOp()
+
+    def test_backward_matches_reference(self):
+        op = self._get_op()
+        logits = torch.randn(4, _VC, device="npu", requires_grad=True)
+        target = torch.randint(0, _VC, (4,), device="npu")
+        op(logits, target).sum().backward()
+        grad = logits.grad.detach().clone()
+
+        ref_logits = logits.detach().clone().requires_grad_(True)
+        _reference_logp(ref_logits, target).sum().backward()
+        assert torch.allclose(grad, ref_logits.grad, atol=1e-4)
+
+    def test_ignored_row_grad_is_zero(self):
+        op = self._get_op()
+        logits = torch.randn(4, _VC, device="npu", requires_grad=True)
+        target = torch.tensor([0, -100, 2, -100], device="npu")
+        op(logits, target).sum().backward()
+        assert torch.equal(logits.grad[1], torch.zeros(_VC, device="npu"))
+        assert torch.equal(logits.grad[3], torch.zeros(_VC, device="npu"))
+
+
+@requires_ascend
+class TestAscendIgnoreIndex:
+
+    def _get_op(self):
+        from rl_engine.kernels.ops.ascend.loss.batch_invariant_logp import (
+            BatchInvariantLogpAscendOp,
+        )
+
+        return BatchInvariantLogpAscendOp()
+
+    def test_ignore_outputs_zero(self):
+        op = self._get_op()
+        logits = torch.randn(4, _VC, device="npu")
+        target = torch.tensor([0, -100, 2, -100], device="npu")
+        out = op(logits, target)
+        assert out[1].item() == 0.0
+        assert out[3].item() == 0.0
+        ref = _reference_logp(logits[[0, 2]], target[[0, 2]])
+        assert torch.allclose(out[[0, 2]], ref, atol=1e-4)
+
+
+@requires_ascend
+class TestAscendFallback:
+    """Inputs the Ascend path can't take must silently fall back and stay correct."""
+
+    def _get_op(self):
+        from rl_engine.kernels.ops.ascend.loss.batch_invariant_logp import (
+            BatchInvariantLogpAscendOp,
+        )
+
+        return BatchInvariantLogpAscendOp()
+
+    def test_fp16_falls_back(self):
+        op = self._get_op()
+        logits = torch.randn(8, _VC, device="npu", dtype=torch.float16)
+        target = torch.randint(0, _VC, (8,), device="npu")
+        out = op(logits, target)
+        ref = _reference_logp(logits.float(), target)
+        assert torch.allclose(out, ref, atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
 # 8. Registry dispatch test
 # ---------------------------------------------------------------------------
 
@@ -1035,6 +1255,7 @@ def test_registry_dispatches_correctly():
         isinstance(op, NativeBatchInvariantLogpOp)
         or type(op).__name__ == "TritonBatchInvariantLogpOp"
         or type(op).__name__ == "BatchInvariantLogpSM90Op"
+        or type(op).__name__ == "BatchInvariantLogpAscendOp"
     )
     logits = torch.randn(4, _V, device="cuda" if torch.cuda.is_available() else "cpu")
     target = torch.randint(0, _V, (4,), device=logits.device)
