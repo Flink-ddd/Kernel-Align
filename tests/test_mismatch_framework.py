@@ -629,6 +629,45 @@ def test_same_contract_field_at_two_different_rules_is_rejected():
         registry.register(Loose)
 
 
+def test_duplicate_factor_inside_one_plugin_is_rejected():
+    registry = PluginRegistry()
+
+    class Broken:
+        operator = "broken"
+
+        def declare_factors(self):
+            return (make_factor("broken.same"), make_factor("broken.same"))
+
+    with pytest.raises(RegistrationError, match="duplicate factor id"):
+        registry.register(Broken)
+
+
+def test_duplicate_switch_path_inside_one_plugin_is_rejected():
+    registry = PluginRegistry()
+    first = make_factor("broken.first")
+    second = make_factor("broken.second")
+    second = MismatchFactor(
+        **{
+            **second.__dict__,
+            "switch": Switch(
+                path=first.switch.path,
+                rebind_cost=RebindCost.PER_REQUEST,
+                applies_to=(PolicyRole.ROLLOUT, PolicyRole.TRAINING),
+                allowed_values=("native", "fixture_ref"),
+            ),
+        }
+    )
+
+    class Broken:
+        operator = "broken"
+
+        def declare_factors(self):
+            return (first, second)
+
+    with pytest.raises(RegistrationError, match="duplicate switch path"):
+        registry.register(Broken)
+
+
 def test_registry_starts_empty_because_operators_ship_separately():
     assert PluginRegistry().operators() == ()
 
@@ -693,6 +732,46 @@ def test_runner_detects_a_one_sided_injected_deviation():
     result = run_variant(factor, variant, _Checks(), backends, RunContext(identity=identity))
     assert result.status is SwitchStatus.APPLIED
     assert result.metrics.dlogp_mean == pytest.approx(0.25, abs=1e-9)
+
+
+def test_runner_builds_contracts_from_effective_readback_not_requested_values():
+    class ReadbackBackend(CpuScoringBackend):
+        actual: str
+
+        def __init__(self, *, role, actual):
+            super().__init__(role=role)
+            self.actual = actual
+
+        def score(self, role, identity, switch_values, replacement):
+            scores, readback = super().score(role, identity, switch_values, replacement)
+            return scores, {**readback, "fixture.actual": self.actual}
+
+    class ReadbackChecks(_Checks):
+        def build_contract(self, role, switch_values):
+            return make_contract(role, actual=switch_values["fixture.actual"])
+
+        def read_effective_config(self, role, adapter):
+            return dict(adapter)
+
+    identity = make_identity()
+    backends = {
+        PolicyRole.ROLLOUT: ReadbackBackend(role=PolicyRole.ROLLOUT, actual="runtime-a"),
+        PolicyRole.TRAINING: ReadbackBackend(role=PolicyRole.TRAINING, actual="runtime-b"),
+    }
+    factor = make_factor(
+        rules={"extra.actual": ComparisonRule.MUST_MATCH_SEMANTICALLY}
+    )
+    variant = build_variants(factor)[0]
+
+    result = run_variant(
+        factor,
+        variant,
+        ReadbackChecks(),
+        backends,
+        RunContext(identity=identity),
+    )
+    assert result.comparison_issues[0].field_path == "extra.actual"
+    assert result.effective_config["rollout.fixture.actual"] == "runtime-a"
 
 
 def test_reference_swap_removes_the_injected_deviation():

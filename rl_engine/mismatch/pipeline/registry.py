@@ -101,10 +101,16 @@ class PluginRegistry:
             for factor in existing.declare_factors():
                 rules.update(factor.comparison_rules)
 
+        local_ids: set[str] = set()
+        local_paths: set[str] = set()
         for factor in plugin.declare_factors():
             if factor.id in known_ids:
                 raise RegistrationError(f"duplicate factor id {factor.id!r}")
             if factor.switch.path in known_paths:
+                raise RegistrationError(f"duplicate switch path {factor.switch.path!r}")
+            if factor.id in local_ids:
+                raise RegistrationError(f"duplicate factor id {factor.id!r}")
+            if factor.switch.path in local_paths:
                 raise RegistrationError(f"duplicate switch path {factor.switch.path!r}")
             for field_path, rule in factor.comparison_rules.items():
                 previous = rules.get(field_path)
@@ -113,6 +119,9 @@ class PluginRegistry:
                         f"contract field {field_path!r} is declared as {previous.value!r} "
                         f"elsewhere but {rule.value!r} by {factor.id!r}"
                     )
+                rules[field_path] = rule
+            local_ids.add(factor.id)
+            local_paths.add(factor.switch.path)
 
     def operators(self) -> tuple[str, ...]:
         return tuple(sorted(self._plugins))

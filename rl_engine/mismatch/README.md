@@ -102,11 +102,10 @@ python -m rl_engine.mismatch plan --gpu-count 2      # expand into cases, cheape
 python -m rl_engine.mismatch plan --json
 ```
 
-The gemm and attention `adapter.py` files still raise `NotImplementedError`, but
-the declaration layer works — so a factor can be checked as wired before
-anything is implemented. Logprob's four methods are implemented against the WS2
-TP-aware contract semantics (issue #241) and are the worked example of the
-adapter layer.
+The attention and logprob adapters are wired end to end; GEMM still raises
+`NotImplementedError`. Attention fails closed when an engine does not report
+the actual Split-KV plan set, CP block manifest, collective trace, or RoPE
+evidence. Logprob remains the smaller worked example of the adapter layer.
 
 ## Adding to this package
 

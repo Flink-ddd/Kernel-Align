@@ -5,7 +5,10 @@
 
 from __future__ import annotations
 
-from rl_engine.mismatch.operator_checks.attention._common import TE_ROPE_REFERENCE
+from rl_engine.mismatch.operator_checks.attention._common import (
+    POST_ROPE_QK_EVIDENCE,
+    TE_ROPE_REFERENCE,
+)
 from rl_engine.mismatch.schema import (
     POSITION_CACHE,
     ComparisonRule,
@@ -39,6 +42,9 @@ FACTOR = MismatchFactor(
         "extra.rope_theta": ComparisonRule.MUST_MATCH_BITWISE,
         "extra.position_ids_digest": ComparisonRule.MUST_MATCH_SEMANTICALLY,
         "extra.post_rope_qk_digest": ComparisonRule.MUST_MATCH_SEMANTICALLY,
+        "extra.q_rope_state": ComparisonRule.MUST_MATCH_SEMANTICALLY,
+        "extra.k_rope_state": ComparisonRule.MUST_MATCH_SEMANTICALLY,
+        "extra.k_cache_rope_state": ComparisonRule.MUST_MATCH_SEMANTICALLY,
         "precision.downcast_at": ComparisonRule.MUST_MATCH_SEMANTICALLY,
         # Fused vs unfused is what this factor ablates, so comparing it would
         # fail every arm by construction.
@@ -48,7 +54,11 @@ FACTOR = MismatchFactor(
         required_ops=("rope",),
         required_packages=("transformer_engine>=2.0",),
     ),
-    required_evidence=(Evidence.EFFECTIVE_CONFIG_READBACK.value, POSITION_CACHE),
+    required_evidence=(
+        Evidence.EFFECTIVE_CONFIG_READBACK.value,
+        POSITION_CACHE,
+        POST_ROPE_QK_EVIDENCE,
+    ),
     reference=TE_ROPE_REFERENCE,
     pitfalls=(
         KnownPitfall(

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from rl_engine.mismatch.pipeline.comparison import compare_contracts
@@ -220,10 +220,17 @@ def run_variant(
             if not assert_order_is_topology_independent(repeats[role]):
                 status = SwitchStatus.ERROR
 
-    contracts = {
-        role: checks.build_contract(role, variant.switch_values)
+    effective_configs = {
+        role: checks.read_effective_config(role, readbacks[role])
         for role in (PolicyRole.ROLLOUT, PolicyRole.TRAINING)
     }
+    contracts = {}
+    for role in (PolicyRole.ROLLOUT, PolicyRole.TRAINING):
+        contract = checks.build_contract(role, effective_configs[role])
+        # Runtime collective traces win over contracts inferred from flags.
+        # Backends may choose a different path per shape and topology.
+        observed = checks.observe_collectives(role, effective_configs[role])
+        contracts[role] = replace(contract, collectives=observed)
     issues = compare_contracts(
         contracts[PolicyRole.ROLLOUT], contracts[PolicyRole.TRAINING], (factor,)
     )
@@ -248,8 +255,8 @@ def run_variant(
         evidence=evidence,
         effective_config={
             f"{role.value}.{key}": value
-            for role, readback in readbacks.items()
-            for key, value in readback.items()
+            for role, effective in effective_configs.items()
+            for key, value in effective.items()
             if key != "evidence"
         },
         collectives_observed=tuple(
