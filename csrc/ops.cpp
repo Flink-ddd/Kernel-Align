@@ -92,6 +92,15 @@ torch::Tensor deterministic_logp_forward_indexed_fp32(torch::Tensor logits, torc
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
 torch::Tensor det_gemm_da(torch::Tensor dc, torch::Tensor b);
 torch::Tensor det_gemm_db(torch::Tensor a, torch::Tensor dc);
+// SiLU / SwiGLU Declarations (elementwise activation, general CUDA)
+torch::Tensor silu_forward_cuda(torch::Tensor x);
+torch::Tensor silu_backward_cuda(torch::Tensor dy, torch::Tensor x);
+torch::Tensor swiglu_forward_cuda(torch::Tensor gate, torch::Tensor up);
+std::vector<torch::Tensor> swiglu_backward_cuda(
+    torch::Tensor dy,
+    torch::Tensor gate,
+    torch::Tensor up);
+
 // RMSNorm Declarations & Wrappers
 
 void rmsnorm_forward_cuda(
@@ -201,6 +210,26 @@ torch::Tensor rmsnorm_backward_dw(
   rmsnorm_backward_reduce_dw_cuda(partial_dw, dw);
 
   return dw;
+}
+
+// SiLU / SwiGLU wrappers (WS1 elementwise activations)
+torch::Tensor silu_forward(torch::Tensor x) {
+  return silu_forward_cuda(x);
+}
+
+torch::Tensor silu_backward(torch::Tensor dy, torch::Tensor x) {
+  return silu_backward_cuda(dy, x);
+}
+
+torch::Tensor swiglu_forward(torch::Tensor gate, torch::Tensor up) {
+  return swiglu_forward_cuda(gate, up);
+}
+
+std::vector<torch::Tensor> swiglu_backward(
+    torch::Tensor dy,
+    torch::Tensor gate,
+    torch::Tensor up) {
+  return swiglu_backward_cuda(dy, gate, up);
 }
 
 // Deterministic standard-softmax attention (issue #147)
@@ -337,6 +366,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm_forward", &rmsnorm_forward, "Batch-invariant RMSNorm forward CUDA");
     m.def("rmsnorm_backward_dx", &rmsnorm_backward_dx, "Batch-invariant RMSNorm backward dx CUDA");
     m.def("rmsnorm_backward_dw", &rmsnorm_backward_dw, "Deterministic RMSNorm backward dweight CUDA");
+
+    // registry SiLU / SwiGLU (elementwise activation)
+    m.def("silu_forward", &silu_forward, "Batch-invariant SiLU forward CUDA");
+    m.def("silu_backward", &silu_backward, "Batch-invariant SiLU backward CUDA");
+    m.def("swiglu_forward", &swiglu_forward, "Batch-invariant SwiGLU forward CUDA");
+    m.def("swiglu_backward", &swiglu_backward, "Batch-invariant SwiGLU backward CUDA");
 
     // Deterministic standard-softmax attention (issue #147)
     m.def(

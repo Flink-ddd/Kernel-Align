@@ -81,6 +81,7 @@ def get_extensions():
             "csrc/cuda/attention/prefix_shared_attention.cu",
             "csrc/cuda/gemm/det_gemm_kernel.cu",
             "csrc/cuda/rmsnorm.cu",
+            "csrc/cuda/activation.cu",
             "csrc/cuda/attention/deterministic_attention.cu",
         ]
 

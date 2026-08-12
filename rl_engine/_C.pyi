@@ -168,3 +168,28 @@ def deterministic_attention_backward(
     scale: float,
     key_padding_mask: torch.Tensor | None,
 ) -> list[torch.Tensor]: ...
+def silu_forward(x: torch.Tensor) -> torch.Tensor: ...
+def silu_backward(dy: torch.Tensor, x: torch.Tensor) -> torch.Tensor: ...
+def swiglu_forward(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor: ...
+def swiglu_backward(
+    dy: torch.Tensor,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+) -> list[torch.Tensor]: ...
+def rmsnorm_forward(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> list[torch.Tensor]: ...
+def rmsnorm_backward_dx(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    rstd: torch.Tensor,
+) -> torch.Tensor: ...
+def rmsnorm_backward_dw(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    rstd: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor: ...
