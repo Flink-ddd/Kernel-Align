@@ -24,7 +24,6 @@ from rl_engine.mismatch.operator_checks.gemm._common import (
 )
 from rl_engine.mismatch.schema import (
     CollectiveContract,
-    DowncastPoint,
     ImplementationResolution,
     OperatorContract,
     PolicyRole,

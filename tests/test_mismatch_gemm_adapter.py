@@ -12,9 +12,7 @@ from rl_engine.mismatch.operator_checks.gemm._common import (
     FFN_CONSISTENT_REFERENCE,
     FFN_STAGE_OUTPUTS,
 )
-from rl_engine.mismatch.operator_checks.gemm.factors.ffn_implementation import (
-    FACTOR as FFN_FACTOR,
-)
+from rl_engine.mismatch.operator_checks.gemm.factors.ffn_implementation import FACTOR as FFN_FACTOR
 from rl_engine.mismatch.operator_checks.gemm.factors.forward_reduce import (
     FACTOR as FORWARD_REDUCE_FACTOR,
 )
