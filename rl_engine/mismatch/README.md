@@ -102,10 +102,11 @@ python -m rl_engine.mismatch plan --gpu-count 2      # expand into cases, cheape
 python -m rl_engine.mismatch plan --json
 ```
 
-The attention and logprob adapters are wired end to end; GEMM still raises
-`NotImplementedError`. Attention fails closed when an engine does not report
-the actual Split-KV plan set, CP block manifest, collective trace, or RoPE
-evidence. Logprob remains the smaller worked example of the adapter layer.
+The attention, GEMM and logprob adapters are wired end to end. Attention fails
+closed when an engine does not report the actual Split-KV plan set, CP block
+manifest, collective trace, or RoPE evidence. GEMM covers the Qwen3 FFN
+implementation and RowParallel forward reduction factors. Logprob remains the
+smaller worked example of the adapter layer.
 
 ## Adding to this package
 
