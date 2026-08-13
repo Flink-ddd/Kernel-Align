@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 from rl_engine.utils.logger import logger
 
-_C_npu = None
+_C_npu: Any = None
 try:
     from rl_engine import _C_npu
 
