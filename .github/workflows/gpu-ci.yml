@@ -15,67 +15,39 @@ on:
       - '.github/workflows/gpu-ci.yml'
     types: [ opened, synchronize, reopened, labeled ]
 
-concurrency:
-  group: gpu-ci-serial
-  cancel-in-progress: false
-
+# The orchestrator is checked out from the base branch, then run against the PR
+# revision in an isolated temporary worktree.  Do not grant repository-write or
+# cloud credentials to this job: it executes untrusted PR test code.
+permissions:
+  contents: read
 
 jobs:
   gpu-tests:
     if: contains(github.event.pull_request.labels.*.name, 'needs-gpu-ci')
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { gpu_id: "NVIDIA RTX A4000",      target_sm: "8.6" }   # SM86
-          - { gpu_id: "NVIDIA H100 80GB HBM3", target_sm: "9.0", force_sm90: "1" }  # SM90
+    # This label must be attached to the local eight-H100-SXM runner fleet.
+    # Multiple runner agents may share one host; ci/run_gpu_ci.sh arbitrates
+    # the four physical two-GPU pairs on that host.
+    runs-on: [self-hosted, linux, x64, h100-sxm-8x]
+    timeout-minutes: 180
 
     steps:
-      - name: Checkout secure orchestrator script from base branch
+      - name: Checkout trusted GPU CI orchestrator from base branch
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Install runpodctl
-        run: |
-          wget -qO runpodctl https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64
-          chmod +x runpodctl
-          sudo mv runpodctl /usr/local/bin/runpodctl
-          runpodctl version
-
-      - name: Configure runpodctl
-        run: runpodctl config --apiKey "${{ secrets.RUNPOD_API_KEY }}"
-
-      - name: Setup SSH key
-        run: |
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keygen -y -f ~/.ssh/id_ed25519 > /dev/null && echo "key OK" || echo "key BROKEN"
-
-      # Follow-up (#191): to test multiple architectures, add a matrix and pass
-      # GPU_ID + TARGET_SM (+ KERNEL_ALIGN_FORCE_SM90 for Hopper) through to the script.
-      # run_gpu_ci.sh reads all three, normalizes TARGET_SM, asserts the pod matches it,
-      # and forwards KERNEL_ALIGN_FORCE_SM90 into the remote build:
-      #   strategy:
-      #     matrix:
-      #       include:
-      #         - { gpu_id: "NVIDIA RTX A4000",      target_sm: "8.6" }   # Ampere
-      #         - { gpu_id: "NVIDIA A100 80GB PCIe", target_sm: "8.0" }
-      #         - { gpu_id: "NVIDIA H100 PCIe",      target_sm: "9.0", force_sm90: "1" }  # build Hopper TMA/WGMMA kernels
-      #         - { gpu_id: "NVIDIA B200",           target_sm: "10.0" }
-      # Per-arch jobs must NOT fall back to a different-capability GPU: the script
-      # fails fast when the pod arch != requested TARGET_SM, so keep fallback within
-      # the same compute capability (or unset it for these jobs).
-      - name: Run GPU tests on RunPod
+      - name: Run GPU tests on the local H100 SXM server
         env:
-          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          # These directories must be shared by every Actions runner process
+          # on the same physical server and writable by the runner account.
+          GPU_CI_LOCK_DIR: /var/tmp/rl-kernel-gpu-ci/locks
+          GPU_CI_WORK_ROOT: /var/tmp/rl-kernel-gpu-ci/workspaces
           PR_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url }}
           PR_SHA: ${{ github.event.pull_request.head.sha }}
-          GPU_ID: ${{ matrix.gpu_id }}
-          TARGET_SM: ${{ matrix.target_sm }}
-          KERNEL_ALIGN_FORCE_SM90: ${{ matrix.force_sm90 }}
+          EXPECTED_GPU_NAME: H100
+          EXPECTED_GPU_COUNT: "8"
+          TARGET_SM: "9.0"
+          KERNEL_ALIGN_FORCE_SM90: "1"
         run: bash ci/run_gpu_ci.sh
