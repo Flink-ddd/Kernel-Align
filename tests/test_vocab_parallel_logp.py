@@ -60,6 +60,7 @@ def _contract(
     num_tokens: int = NUM_TOKENS,
     active: tuple[bool, ...] = ACTIVE,
     dtype: str = "fp32",
+    determinism_scope: str = "cross_tp_bitwise",
 ) -> LogprobContract:
     return LogprobContract(
         role="train",
@@ -74,7 +75,7 @@ def _contract(
             real_vocab_size=real_vocab,
             padded_vocab_size=padded_vocab,
         ),
-        reduction=ReductionSpec(),
+        reduction=ReductionSpec(determinism_scope=determinism_scope),
     )
 
 
@@ -215,6 +216,63 @@ class TestSingleRank:
         assert torch.isfinite(lse[-1])
 
 
+class TestNonDeterministicPath:
+    """deterministic=False: the fast whole-shard reduction with no guarantee."""
+
+    def test_rejects_a_cross_tp_bitwise_contract(self):
+        logits, targets = _inputs()
+        with pytest.raises(LogprobContractError, match="cross_tp_bitwise"):
+            VocabParallelLogprobOp()(logits, targets, contract=_contract(), deterministic=False)
+
+    def test_rejects_a_non_bool_flag(self):
+        logits, targets = _inputs()
+        with pytest.raises(LogprobContractError, match="deterministic must be a bool"):
+            VocabParallelLogprobOp()(logits, targets, contract=_contract(), deterministic=1)
+
+    def test_matches_the_deterministic_path_within_tolerance(self):
+        tolerance = load_contract()["accuracy"]["default"]["logprob"]["float32"]
+        logits, targets = _inputs()
+        relaxed = _contract(determinism_scope="fixed_topology")
+        logp_fast, lse_fast = VocabParallelLogprobOp()(
+            logits, targets, contract=relaxed, deterministic=False
+        )
+        logp_det, lse_det = VocabParallelLogprobOp()(
+            logits, targets, contract=_contract(), num_vocab_tiles=NUM_TILES
+        )
+        assert torch.allclose(logp_fast, logp_det, atol=tolerance["atol"], rtol=tolerance["rtol"])
+        assert torch.allclose(lse_fast, lse_det, atol=tolerance["atol"], rtol=tolerance["rtol"])
+
+    def test_ignores_tile_constraints(self):
+        # 7 does not divide the padded vocab; the deterministic path rejects it,
+        # the fast path never looks at it.
+        logits, targets = _inputs()
+        relaxed = _contract(determinism_scope="fixed_topology")
+        logp, lse = VocabParallelLogprobOp()(
+            logits, targets, contract=relaxed, num_vocab_tiles=7, deterministic=False
+        )
+        ref_lse = torch.logsumexp(logits[:, :REAL_VOCAB].float(), dim=-1)
+        assert torch.allclose(lse, ref_lse, atol=1e-5)
+        assert torch.isfinite(logp).all()
+
+    def test_grads_match_autograd_oracle(self):
+        tolerance = load_contract()["accuracy"]["default"]["logprob"]["float32"]
+        relaxed = _contract(determinism_scope="fixed_topology")
+        logits, targets = _inputs()
+        x = logits.clone().requires_grad_(True)
+        logp, lse = VocabParallelLogprobOp()(x, targets, contract=relaxed, deterministic=False)
+        (logp.sum() + 0.5 * lse.sum()).backward()
+
+        y = logits.clone().requires_grad_(True)
+        ref_lse = torch.logsumexp(y[:, :REAL_VOCAB].float(), dim=-1)
+        safe = targets.clamp(0, REAL_VOCAB - 1)
+        ref_logp = y[torch.arange(NUM_TOKENS), safe].float() - ref_lse
+        ref_logp = torch.where(torch.tensor(ACTIVE), ref_logp, torch.zeros_like(ref_logp))
+        (ref_logp.sum() + 0.5 * ref_lse.sum()).backward()
+
+        assert torch.allclose(x.grad, y.grad, atol=tolerance["atol"], rtol=tolerance["rtol"])
+        assert bool((x.grad[:, REAL_VOCAB:] == 0).all())
+
+
 class TestBackward:
     def test_grads_match_autograd_oracle(self):
         tolerance = load_contract()["accuracy"]["default"]["logprob"]["float32"]
@@ -334,6 +392,59 @@ def _tp_worker(rank, world_size, init_method, result_queue, scenario):
                 result_queue.put({"ok": True, "rank": rank})
             return
 
+        if scenario == "mode_mismatch":
+            # Same relaxed contract everywhere; only rank 0 runs deterministic.
+            relaxed = _contract(
+                tp_rank=rank,
+                tp_world_size=world_size,
+                bounds=bounds,
+                determinism_scope="fixed_topology",
+            )
+            try:
+                op(
+                    logits[:, start:end].contiguous().clone(),
+                    targets,
+                    contract=relaxed,
+                    tp_group=dist.group.WORLD,
+                    num_vocab_tiles=NUM_TILES,
+                    deterministic=(rank == 0),
+                )
+                result_queue.put({"ok": False, "rank": rank, "traceback": "no error raised"})
+            except LogprobContractError:
+                result_queue.put({"ok": True, "rank": rank})
+            return
+
+        if scenario == "nondeterministic":
+            relaxed = _contract(
+                tp_rank=rank,
+                tp_world_size=world_size,
+                bounds=bounds,
+                determinism_scope="fixed_topology",
+            )
+            shard = logits[:, start:end].contiguous().clone().requires_grad_(True)
+            logp_tp, lse_tp = op(
+                shard, targets, contract=relaxed, tp_group=dist.group.WORLD, deterministic=False
+            )
+            (logp_tp.sum() + 0.5 * lse_tp.sum()).backward()
+
+            full = logits.clone().requires_grad_(True)
+            relaxed_tp1 = _contract(determinism_scope="fixed_topology")
+            logp_one, lse_one = op(full, targets, contract=relaxed_tp1, deterministic=False)
+            (logp_one.sum() + 0.5 * lse_one.sum()).backward()
+
+            result_queue.put(
+                {
+                    "ok": True,
+                    "rank": rank,
+                    "logp_close": torch.allclose(logp_tp, logp_one, atol=1e-6),
+                    "lse_close": torch.allclose(lse_tp, lse_one, atol=1e-6),
+                    "grad_close": torch.allclose(shard.grad, full.grad[:, start:end], atol=1e-6),
+                    "logp": logp_tp.detach().float(),
+                    "lse": lse_tp.detach().float(),
+                }
+            )
+            return
+
         shard = logits[:, start:end].contiguous().clone().requires_grad_(True)
         logp_tp, lse_tp = op(
             shard,
@@ -424,3 +535,24 @@ def test_tp4_bitwise_identical_to_tp1(scenario):
 @requires_gloo
 def test_preflight_rejects_mismatched_num_vocab_tiles():
     _run_gloo_scenario("preflight")
+
+
+@requires_gloo
+def test_preflight_rejects_mixed_deterministic_modes():
+    _run_gloo_scenario("mode_mismatch")
+
+
+@requires_gloo
+def test_tp4_nondeterministic_matches_tp1_within_tolerance():
+    """No bitwise claim: the fast path's grouping changes with the TP degree.
+    The values must still agree within fp32 tolerance, and the outputs stay
+    replicated bitwise across ranks — every rank merges the same partials."""
+
+    results = _run_gloo_scenario("nondeterministic")
+    for result in results:
+        assert result["logp_close"], f"rank {result['rank']} logp differs from TP=1 beyond atol"
+        assert result["lse_close"], f"rank {result['rank']} lse differs from TP=1 beyond atol"
+        assert result["grad_close"], f"rank {result['rank']} grads differ from TP=1 beyond atol"
+    for other in results[1:]:
+        assert _bitwise_equal(results[0]["logp"], other["logp"])
+        assert _bitwise_equal(results[0]["lse"], other["lse"])
