@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from numbers import Integral
 from typing import Any, Mapping
 
 from rl_engine.mismatch.schema import (
@@ -25,10 +26,9 @@ from rl_engine.mismatch.schema import (
 )
 
 TP_SIZE = 2
-QWEN3_8B_HIDDEN_SIZE = 4096
-QWEN3_8B_TP2_INTERMEDIATE_SIZE = 6144
 
 FFN_STAGE_OUTPUTS = "ffn_stage_outputs"
+FFN_STAGE_NAMES = ("gate", "up", "hidden", "output")
 
 DTYPES: dict[str, Precision] = {
     "bf16": Precision.BF16,
@@ -75,12 +75,9 @@ def downcast_point(value: Any, field: str) -> DowncastPoint:
 
 
 def positive_int(value: Any, field: str) -> int:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, Integral):
         raise GemmContractError(f"{field} must be a positive integer, got {value!r}")
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise GemmContractError(f"{field} must be a positive integer, got {value!r}") from exc
+    parsed = int(value)
     if parsed <= 0:
         raise GemmContractError(f"{field} must be a positive integer, got {value!r}")
     return parsed
@@ -156,7 +153,7 @@ def _normalize_collective(raw: Any, *, tp_world_size: int) -> CollectiveContract
                 raw.get("determinism"),
                 "gemm.forward_collective.determinism",
             ),
-            backend=_non_empty_string(raw.get("backend"), "gemm.forward_collective.backend"),
+            backend=non_empty_string(raw.get("backend"), "gemm.forward_collective.backend"),
         )
     else:
         raise GemmContractError(
@@ -180,7 +177,7 @@ def _enum_member(options: Mapping[str, Any], value: Any, field: str) -> Any:
     return options[key]
 
 
-def _non_empty_string(value: Any, field: str) -> str:
+def non_empty_string(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise GemmContractError(f"{field} must be a non-empty string, got {value!r}")
     return value.strip()
@@ -261,9 +258,9 @@ DETERMINISTIC_REDUCE_REFERENCE = ReferenceImplementation(
 
 
 # SELF_WRITTEN because neither Megatron nor vLLM exposes one shared Qwen3 FFN
-# path with fixed-order GEMMs and deterministic SwiGLU on both sides. The
-# builder selects CUDA by default; Triton is an alternate consistent backend
-# whose effective provenance is recorded by the same adapter.
+# path with fixed-order GEMMs and deterministic SwiGLU on both sides. This
+# reference pins the CUDA implementation exactly; another backend needs its own
+# independently attributable reference or factor arm.
 FFN_CONSISTENT_REFERENCE = ReferenceImplementation(
     name="consistent",
     tier=ReferenceAuthority.SELF_WRITTEN,
@@ -286,6 +283,12 @@ FFN_CONSISTENT_REFERENCE = ReferenceImplementation(
             "cuda.det_gemm",
             SettingChannel.CALL_ARG,
             readback="module.provenance.gemm_backend",
+        ),
+        RequiredSetting(
+            "gemm.activation_backend",
+            "cuda.swiglu",
+            SettingChannel.CALL_ARG,
+            readback="module.provenance.activation_backend",
         ),
     ),
     pinned_libraries=(LibraryPin("torch", "2.6.0"),),
@@ -328,17 +331,17 @@ def inferred_forward_collectives(
 __all__ = [
     "DETERMINISTIC_REDUCE_REFERENCE",
     "FFN_CONSISTENT_REFERENCE",
+    "FFN_STAGE_NAMES",
     "FFN_STAGE_OUTPUTS",
     "GemmContractError",
     "NATIVE_ROLLOUT_REDUCE",
     "NATIVE_TRAINING_REDUCE",
     "ORDERED_REDUCE_SCATTER",
-    "QWEN3_8B_HIDDEN_SIZE",
-    "QWEN3_8B_TP2_INTERMEDIATE_SIZE",
     "TP_SIZE",
     "downcast_point",
     "inferred_forward_collectives",
     "normalize_collectives",
+    "non_empty_string",
     "positive_int",
     "precision",
     "reference_selected",

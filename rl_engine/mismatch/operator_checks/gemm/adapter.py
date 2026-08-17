@@ -10,12 +10,13 @@ from typing import Any, Callable, Mapping
 
 from rl_engine.mismatch.operator_checks.gemm._common import (
     FFN_CONSISTENT_REFERENCE,
-    QWEN3_8B_HIDDEN_SIZE,
-    QWEN3_8B_TP2_INTERMEDIATE_SIZE,
+    FFN_STAGE_NAMES,
+    FFN_STAGE_OUTPUTS,
     TP_SIZE,
     GemmContractError,
     downcast_point,
     inferred_forward_collectives,
+    non_empty_string,
     normalize_collectives,
     positive_int,
     precision,
@@ -58,77 +59,34 @@ def build_contract(role: PolicyRole, switch_values: Mapping[str, Any]) -> Operat
     if not isinstance(switch_values, Mapping):
         raise GemmAdapterError("GEMM effective config must be a mapping")
 
-    compute = precision(switch_values.get("gemm.compute_dtype", "bf16"), "gemm.compute_dtype")
+    ffn_observed = "gemm.ffn_path" in switch_values
+    compute = precision(
+        _required(switch_values, "gemm.compute_dtype") if ffn_observed else "bf16",
+        "gemm.compute_dtype",
+    )
     accumulate = precision(
-        switch_values.get("gemm.accumulate_dtype", "fp32"),
+        _required(switch_values, "gemm.accumulate_dtype") if ffn_observed else "fp32",
         "gemm.accumulate_dtype",
     )
     if accumulate is not Precision.FP32:
         raise GemmAdapterError("the Qwen3 FFN contract requires FP32 GEMM accumulation")
     downcast = downcast_point(
-        switch_values.get("gemm.downcast_at", "per_partial"),
+        _required(switch_values, "gemm.downcast_at") if ffn_observed else "per_partial",
         "gemm.downcast_at",
     )
 
-    hidden_size = positive_int(
-        switch_values.get("gemm.hidden_size", QWEN3_8B_HIDDEN_SIZE),
-        "gemm.hidden_size",
-    )
-    intermediate_size = positive_int(
-        switch_values.get(
-            "gemm.intermediate_size",
-            QWEN3_8B_TP2_INTERMEDIATE_SIZE,
-        ),
-        "gemm.intermediate_size",
-    )
     tp_world_size = positive_int(
-        switch_values.get("gemm.tp_world_size", TP_SIZE),
+        _required(switch_values, "gemm.tp_world_size") if ffn_observed else TP_SIZE,
         "gemm.tp_world_size",
     )
-    path = _ffn_path(switch_values.get("gemm.ffn_path", "fast"), role)
-
-    default_gemm_backend = "cuda.det_gemm" if path == "consistent" else "pytorch.matmul"
-    default_activation_backend = (
-        "cuda.swiglu" if path == "consistent" else "torch.nn.functional.silu"
-    )
-    gemm_backend = _non_empty_string(
-        switch_values.get("gemm.ffn_backend", default_gemm_backend),
-        "gemm.ffn_backend",
-    )
-    activation_backend = _non_empty_string(
-        switch_values.get("gemm.activation_backend", default_activation_backend),
-        "gemm.activation_backend",
-    )
-    batch_invariant = strict_bool(
-        switch_values.get("gemm.batch_invariant", path == "consistent"),
-        "gemm.batch_invariant",
-    )
-
     collectives = inferred_forward_collectives(
         role,
         switch_values,
         tp_world_size=tp_world_size,
     )
-    extra: dict[str, Any] = {
-        "hidden_size": hidden_size,
-        "intermediate_size": intermediate_size,
-        "tp_world_size": tp_world_size,
-        "weight_layout": switch_values.get("gemm.weight_layout", "A[M,K]@B[K,N]"),
-        "gate_up_packed": strict_bool(
-            switch_values.get("gemm.gate_up_packed", False),
-            "gemm.gate_up_packed",
-        ),
-        "has_bias": strict_bool(
-            switch_values.get("gemm.has_bias", False),
-            "gemm.has_bias",
-        ),
-        "ffn_path": path,
-        "gemm_backend": gemm_backend,
-        "activation_backend": activation_backend,
-        "batch_invariant": batch_invariant,
-    }
-    if "gemm.stage_output_digests" in switch_values:
-        extra["stage_output_digests"] = switch_values["gemm.stage_output_digests"]
+    extra: dict[str, Any] = {}
+    if ffn_observed:
+        extra = _ffn_runtime_metadata(role, switch_values, tp_world_size)
 
     return OperatorContract(
         operator="gemm",
@@ -176,6 +134,11 @@ def read_effective_config(role: PolicyRole, adapter: Any) -> Mapping[str, Any]:
         raise GemmAdapterError(
             "engine returned requested_config but no effective gemm.* runtime readback"
         )
+    evidence = config.get("evidence", ())
+    if isinstance(evidence, str):
+        evidence = (evidence,)
+    if FFN_STAGE_OUTPUTS in evidence:
+        _stage_output_digests(config.get("gemm.stage_output_digests"))
     return config
 
 
@@ -213,7 +176,7 @@ def resolve_implementation(
     module_name, attribute = parsed
     try:
         module = importlib.import_module(module_name)
-    except (ImportError, OSError) as exc:
+    except Exception as exc:  # noqa: BLE001 - import failure is retained as provenance
         rejected.append(RejectedCandidate(name=impl_name, reason=f"import failed: {exc}"))
         return None, _failed_resolution(impl_name, rejected)
 
@@ -277,10 +240,72 @@ def _failed_resolution(
     )
 
 
-def _non_empty_string(value: Any, field: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise GemmAdapterError(f"{field} must be a non-empty string, got {value!r}")
-    return value.strip()
+def _required(values: Mapping[str, Any], field: str) -> Any:
+    if field not in values:
+        raise GemmAdapterError(f"missing effective runtime readback for {field}")
+    return values[field]
+
+
+def _stage_output_digests(value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise GemmAdapterError("gemm.stage_output_digests must be a mapping")
+    missing = [stage for stage in FFN_STAGE_NAMES if stage not in value]
+    if missing:
+        raise GemmAdapterError(
+            "gemm.stage_output_digests is missing required FFN stages: " + ", ".join(missing)
+        )
+    return {
+        stage: non_empty_string(value[stage], f"gemm.stage_output_digests.{stage}")
+        for stage in FFN_STAGE_NAMES
+    }
+
+
+def _ffn_runtime_metadata(
+    role: PolicyRole,
+    switch_values: Mapping[str, Any],
+    tp_world_size: int,
+) -> dict[str, Any]:
+    """Normalize only observed FFN state; never synthesize runtime evidence."""
+
+    return {
+        "hidden_size": positive_int(
+            _required(switch_values, "gemm.hidden_size"),
+            "gemm.hidden_size",
+        ),
+        "intermediate_size": positive_int(
+            _required(switch_values, "gemm.intermediate_size"),
+            "gemm.intermediate_size",
+        ),
+        "tp_world_size": tp_world_size,
+        "weight_layout": non_empty_string(
+            _required(switch_values, "gemm.weight_layout"),
+            "gemm.weight_layout",
+        ),
+        "gate_up_packed": strict_bool(
+            _required(switch_values, "gemm.gate_up_packed"),
+            "gemm.gate_up_packed",
+        ),
+        "has_bias": strict_bool(
+            _required(switch_values, "gemm.has_bias"),
+            "gemm.has_bias",
+        ),
+        "ffn_path": _ffn_path(_required(switch_values, "gemm.ffn_path"), role),
+        "gemm_backend": non_empty_string(
+            _required(switch_values, "gemm.ffn_backend"),
+            "gemm.ffn_backend",
+        ),
+        "activation_backend": non_empty_string(
+            _required(switch_values, "gemm.activation_backend"),
+            "gemm.activation_backend",
+        ),
+        "batch_invariant": strict_bool(
+            _required(switch_values, "gemm.batch_invariant"),
+            "gemm.batch_invariant",
+        ),
+        "stage_output_digests": _stage_output_digests(
+            _required(switch_values, "gemm.stage_output_digests")
+        ),
+    }
 
 
 __all__ = [

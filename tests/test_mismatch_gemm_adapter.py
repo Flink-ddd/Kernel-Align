@@ -95,16 +95,35 @@ def test_fast_ffn_contract_records_qwen3_tp2_identity_and_no_local_collective():
 def test_consistent_and_one_sided_switches_resolve_for_the_selected_role_only():
     both = adapter.build_contract(
         PolicyRole.ROLLOUT,
-        {"gemm.ffn_path": "consistent"},
+        _effective_ffn(
+            **{
+                "gemm.ffn_path": "consistent",
+                "gemm.ffn_backend": "cuda.det_gemm",
+                "gemm.activation_backend": "cuda.swiglu",
+                "gemm.batch_invariant": True,
+            }
+        ),
     )
     assert both.extra["ffn_path"] == "consistent"
     assert both.extra["gemm_backend"] == "cuda.det_gemm"
     assert both.extra["activation_backend"] == "cuda.swiglu"
     assert both.extra["batch_invariant"] is True
 
-    switches = {"gemm.ffn_path": "consistent@training"}
-    training = adapter.build_contract(PolicyRole.TRAINING, switches)
-    rollout = adapter.build_contract(PolicyRole.ROLLOUT, switches)
+    training = adapter.build_contract(
+        PolicyRole.TRAINING,
+        _effective_ffn(
+            **{
+                "gemm.ffn_path": "consistent@training",
+                "gemm.ffn_backend": "cuda.det_gemm",
+                "gemm.activation_backend": "cuda.swiglu",
+                "gemm.batch_invariant": True,
+            }
+        ),
+    )
+    rollout = adapter.build_contract(
+        PolicyRole.ROLLOUT,
+        _effective_ffn(**{"gemm.ffn_path": "consistent@training"}),
+    )
     assert training.extra["ffn_path"] == "consistent"
     assert rollout.extra["ffn_path"] == "fast"
 
@@ -116,6 +135,8 @@ def test_consistent_and_one_sided_switches_resolve_for_the_selected_role_only():
         ("gemm.accumulate_dtype", "bf16", "requires FP32"),
         ("gemm.downcast_at", "whenever", "downcast_at"),
         ("gemm.hidden_size", 0, "hidden_size"),
+        ("gemm.hidden_size", 4096.5, "hidden_size"),
+        ("gemm.hidden_size", "4096", "hidden_size"),
         ("gemm.intermediate_size", -1, "intermediate_size"),
         ("gemm.tp_world_size", True, "tp_world_size"),
         ("gemm.ffn_path", "fastest", "ffn_path"),
@@ -127,6 +148,45 @@ def test_consistent_and_one_sided_switches_resolve_for_the_selected_role_only():
 def test_invalid_effective_ffn_metadata_fails_closed(field, value, message):
     with pytest.raises(adapter.GemmAdapterError, match=message):
         adapter.build_contract(PolicyRole.TRAINING, _effective_ffn(**{field: value}))
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "gemm.compute_dtype",
+        "gemm.hidden_size",
+        "gemm.ffn_backend",
+        "gemm.activation_backend",
+        "gemm.batch_invariant",
+        "gemm.stage_output_digests",
+    ],
+)
+def test_ffn_contract_rejects_missing_runtime_readback(missing):
+    config = _effective_ffn()
+    del config[missing]
+
+    with pytest.raises(adapter.GemmAdapterError, match=missing):
+        adapter.build_contract(PolicyRole.TRAINING, config)
+
+
+def test_ffn_contract_requires_all_four_stage_output_digests():
+    digests = dict(_effective_ffn()["gemm.stage_output_digests"])
+    del digests["up"]
+
+    with pytest.raises(adapter.GemmAdapterError, match="missing required FFN stages: up"):
+        adapter.build_contract(
+            PolicyRole.TRAINING,
+            _effective_ffn(**{"gemm.stage_output_digests": digests}),
+        )
+
+
+def test_non_ffn_factor_does_not_invent_ffn_runtime_evidence():
+    contract = adapter.build_contract(
+        PolicyRole.TRAINING,
+        {"gemm.tp_world_size": 2, "gemm.forward_reduce": "native"},
+    )
+
+    assert contract.extra == {}
 
 
 # ---------------------------------------------------------- forward reduction --
@@ -226,6 +286,11 @@ def test_gemm_factors_expand_and_pass_registry_static_checks():
         FFN_STAGE_OUTPUTS,
     )
     assert FFN_FACTOR.call_sites == ("mlp.gate_up", "mlp.down")
+    required_settings = {
+        setting.key: setting.value for setting in FFN_CONSISTENT_REFERENCE.required_settings
+    }
+    assert required_settings["gemm.ffn_backend"] == "cuda.det_gemm"
+    assert required_settings["gemm.activation_backend"] == "cuda.swiglu"
 
 
 # ------------------------------------------- read_effective_config / resolve --
@@ -260,6 +325,17 @@ def test_read_effective_config_accepts_runtime_shapes_and_rejects_requested_only
         adapter.read_effective_config(PolicyRole.TRAINING, Engine())
 
 
+def test_read_effective_config_binds_ffn_stage_evidence_to_digests():
+    with pytest.raises(adapter.GemmAdapterError, match="stage_output_digests"):
+        adapter.read_effective_config(
+            PolicyRole.TRAINING,
+            {
+                "gemm.ffn_path": "fast",
+                "evidence": (FFN_STAGE_OUTPUTS,),
+            },
+        )
+
+
 def test_resolution_success_and_failures_retain_provenance():
     impl, resolution = adapter.resolve_implementation(
         FFN_FACTOR.id,
@@ -272,6 +348,7 @@ def test_resolution_success_and_failures_retain_provenance():
 
     for target, expected in (
         ("not_an_import_path", "not a dotted"),
+        ("rl_engine.kernels._missing.build", "import failed"),
         ("math.no_such_attribute", "no attribute"),
         ("math.pi", "not callable"),
     ):
@@ -293,9 +370,30 @@ def test_ws2_ffn_reference_path_resolves_or_reports_why_it_cannot():
     if impl is None:
         assert resolution.resolved is None
         assert resolution.rejected
+        assert resolution.rejected[0].name == FFN_CONSISTENT_REFERENCE.training_impl
+        assert any(
+            marker in resolution.rejected[0].reason
+            for marker in ("import failed", "has no attribute", "instantiation failed")
+        )
     else:
         assert callable(impl)
         assert resolution.resolved == FFN_CONSISTENT_REFERENCE.training_impl
+
+
+def test_resolution_records_non_importerror_extension_failures(monkeypatch):
+    def fail_import(_module_name):
+        raise RuntimeError("CUDA extension is incompatible")
+
+    monkeypatch.setattr(adapter.importlib, "import_module", fail_import)
+    impl, resolution = adapter.resolve_implementation(
+        FFN_FACTOR.id,
+        PolicyRole.TRAINING,
+        "rl_engine.kernels.ffn.build_qwen3_ffn",
+    )
+
+    assert impl is None
+    assert resolution.rejected[0].name == "rl_engine.kernels.ffn.build_qwen3_ffn"
+    assert "CUDA extension is incompatible" in resolution.rejected[0].reason
 
 
 # ----------------------------------------------------------------- the plugin --
