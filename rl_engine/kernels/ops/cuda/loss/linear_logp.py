@@ -10,6 +10,8 @@ import torch
 
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 from rl_engine.kernels.ops.pytorch.loss.linear_logp import (
+    LseVocabTileReduction,
+    _check_lse_vocab_tile_reduction,
     _merge_tp_local_logp,
     _require_distributed_initialized,
     _validate_global_targets,
@@ -807,6 +809,7 @@ class FusedLinearLogpSM90Op:
         tp_group: Any = None,
         vocab_start_index: int = 0,
         global_vocab_size: Optional[int] = None,
+        lse_vocab_tile_reduction: LseVocabTileReduction = "original",
     ) -> torch.Tensor:
         return self.apply(
             hidden,
@@ -816,6 +819,7 @@ class FusedLinearLogpSM90Op:
             tp_group=tp_group,
             vocab_start_index=vocab_start_index,
             global_vocab_size=global_vocab_size,
+            lse_vocab_tile_reduction=lse_vocab_tile_reduction,
         )
 
     def apply(
@@ -828,8 +832,10 @@ class FusedLinearLogpSM90Op:
         tp_group: Any = None,
         vocab_start_index: int = 0,
         global_vocab_size: Optional[int] = None,
+        lse_vocab_tile_reduction: LseVocabTileReduction = "original",
     ) -> torch.Tensor:
         global _SM90_SAVE_PROBS_BF16_PATH_LOGGED, _SM90_FUSED_TILE_BF16_PATH_LOGGED
+        _check_lse_vocab_tile_reduction(lse_vocab_tile_reduction)
         if lm_head_weight.size(-1) != hidden.size(-1):
             raise ValueError(
                 f"hidden dim {hidden.size(-1)} must match lm_head_weight dim "

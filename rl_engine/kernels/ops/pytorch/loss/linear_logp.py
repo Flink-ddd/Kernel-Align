@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import torch
 
@@ -14,6 +14,18 @@ import torch
 BWD_CHUNK_ELEMS = 1 << 24
 _LOW_PRECISION_DTYPES = (torch.float16, torch.bfloat16)
 _TP_VOCAB_PARTITION_CACHE: dict[tuple[int, str, int, int, Optional[int], int], int] = {}
+
+# Ablation switch ``logp.lse_vocab_tile_reduction``: ``original`` is the
+# per-shard merge ``_merge_tp_local_logp`` already does.
+LseVocabTileReduction = Literal["fixed", "original"]
+
+
+def _check_lse_vocab_tile_reduction(reduction: LseVocabTileReduction) -> None:
+    if reduction == "fixed":
+        raise NotImplementedError(
+            "lse_vocab_tile_reduction='fixed': the deterministic implementation "
+            "is not introduced yet"
+        )
 
 
 def _env_flag(name: str) -> bool:
@@ -606,6 +618,7 @@ class NativeLinearLogpOp:
         tp_group: Any = None,
         vocab_start_index: int = 0,
         global_vocab_size: Optional[int] = None,
+        lse_vocab_tile_reduction: LseVocabTileReduction = "original",
     ) -> torch.Tensor:
         return self.apply(
             hidden,
@@ -615,6 +628,7 @@ class NativeLinearLogpOp:
             tp_group=tp_group,
             vocab_start_index=vocab_start_index,
             global_vocab_size=global_vocab_size,
+            lse_vocab_tile_reduction=lse_vocab_tile_reduction,
         )
 
     def apply(
@@ -627,8 +641,10 @@ class NativeLinearLogpOp:
         tp_group: Any = None,
         vocab_start_index: int = 0,
         global_vocab_size: Optional[int] = None,
+        lse_vocab_tile_reduction: LseVocabTileReduction = "original",
     ) -> torch.Tensor:
         """Selected-token log-prob ``z[t] - logsumexp(z)``, returned in float32."""
+        _check_lse_vocab_tile_reduction(lse_vocab_tile_reduction)
         if hidden.shape[:-1] != target_ids.shape:
             raise ValueError(
                 f"hidden leading shape {tuple(hidden.shape[:-1])} must match "

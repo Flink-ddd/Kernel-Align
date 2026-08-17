@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
+import inspect
 import queue
 import tempfile
 import traceback
@@ -423,6 +424,32 @@ def test_native_rejects_shape_mismatch():
     hidden, weight, _, bias = _inputs(0, device="cpu")
     with pytest.raises(ValueError):
         native(hidden, weight, torch.zeros(_N + 1, dtype=torch.long), bias)
+
+
+def test_lse_vocab_tile_reduction_defaults_to_the_shard_order_merge():
+    """Every backend, so the ablation switch stays reachable whichever one dispatch picks."""
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
+
+    op_classes = [NativeLinearLogpOp, FusedLinearLogpSM90Op]
+    if _HAS_TRITON:
+        from rl_engine.kernels.ops.triton.loss.linear_logp import TritonLinearLogpOp
+
+        op_classes.append(TritonLinearLogpOp)
+
+    for op_class in op_classes:
+        for method in (op_class.__call__, op_class.apply):
+            parameter = inspect.signature(method).parameters["lse_vocab_tile_reduction"]
+            assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+            assert parameter.default == "original"
+
+
+def test_lse_vocab_tile_reduction_rejects_the_unimplemented_mode():
+    native = NativeLinearLogpOp()
+    hidden, weight, target, bias = _inputs(0, device="cpu")
+    assert native(hidden, weight, target, bias).shape == (_N,)
+
+    with pytest.raises(NotImplementedError, match="not introduced yet"):
+        native(hidden, weight, target, bias, lse_vocab_tile_reduction="fixed")
 
 
 def test_tensor_parallel_metadata_requires_multi_rank_group():

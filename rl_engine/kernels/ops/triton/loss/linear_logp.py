@@ -9,6 +9,8 @@ import triton
 import triton.language as tl
 
 from rl_engine.kernels.ops.pytorch.loss.linear_logp import (
+    LseVocabTileReduction,
+    _check_lse_vocab_tile_reduction,
     chunked_linear_logp_backward,
     should_use_tensor_parallel_linear_logp,
     tensor_parallel_linear_logp,
@@ -176,6 +178,7 @@ class TritonLinearLogpOp:
         tp_group: Any = None,
         vocab_start_index: int = 0,
         global_vocab_size: Optional[int] = None,
+        lse_vocab_tile_reduction: LseVocabTileReduction = "original",
     ) -> torch.Tensor:
         return self.apply(
             hidden,
@@ -185,6 +188,7 @@ class TritonLinearLogpOp:
             tp_group=tp_group,
             vocab_start_index=vocab_start_index,
             global_vocab_size=global_vocab_size,
+            lse_vocab_tile_reduction=lse_vocab_tile_reduction,
         )
 
     def apply(
@@ -197,7 +201,9 @@ class TritonLinearLogpOp:
         tp_group: Any = None,
         vocab_start_index: int = 0,
         global_vocab_size: Optional[int] = None,
+        lse_vocab_tile_reduction: LseVocabTileReduction = "original",
     ) -> torch.Tensor:
+        _check_lse_vocab_tile_reduction(lse_vocab_tile_reduction)
         if hidden.device.type not in ("cuda", "xpu", "hip"):
             raise RuntimeError(
                 "TritonLinearLogpOp requires a GPU tensor (CUDA / ROCm / XPU), got "
