@@ -100,9 +100,7 @@ def _tp_ffn_worker(
             rank=rank,
             world_size=world_size,
         )
-        tp_communication = (
-            _RecordingTPCommunication() if use_recording_tp_communication else None
-        )
+        tp_communication = _RecordingTPCommunication() if use_recording_tp_communication else None
         ctx = FFNContext(tp_group=dist.group.WORLD, tp_communication=tp_communication)
         assert ctx.tp_size == world_size
         assert ctx.tp_rank == rank

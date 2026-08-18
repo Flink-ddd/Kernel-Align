@@ -121,9 +121,7 @@ class DeterministicTensorParallelCommunication:
 
         collective_group = getattr(self._collective, "group", ctx.tp_group)
         if collective_group is not ctx.tp_group:
-            raise ValueError(
-                "DeterministicCollective group must match FFNContext.tp_group."
-            )
+            raise ValueError("DeterministicCollective group must match FFNContext.tp_group.")
         return self._collective
 
     @staticmethod
