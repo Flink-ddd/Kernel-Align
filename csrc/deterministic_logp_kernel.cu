@@ -15,6 +15,15 @@ constexpr int kDeterministicLogpMediumVocabLimit = 4096;
 constexpr int kDeterministicLogpWarpSize = 32;
 constexpr float kDeterministicLogpNegInf = -3.4028234663852886e38F;
 
+template <typename T>
+__device__ __forceinline__ T deterministic_logp_shfl_down_32(T value, unsigned int delta) {
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+    return __shfl_down(value, delta, kDeterministicLogpWarpSize);
+#else
+    return __shfl_down_sync(0xffffffffu, value, delta, kDeterministicLogpWarpSize);
+#endif
+}
+
 template <int BlockSize>
 struct DeterministicLogpBlockTraits {
     static_assert(
@@ -36,7 +45,7 @@ __device__ __forceinline__ float deterministicBlockReduceMax(float val) {
 
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+        val = fmaxf(val, deterministic_logp_shfl_down_32(val, offset));
     }
 
     if (lane == 0) {
@@ -50,7 +59,7 @@ __device__ __forceinline__ float deterministicBlockReduceMax(float val) {
     if (wid == 0) {
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+            val = fmaxf(val, deterministic_logp_shfl_down_32(val, offset));
         }
     }
     return val;
@@ -66,7 +75,7 @@ __device__ __forceinline__ float deterministicBlockReduceSum(float val) {
 
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
+        val += deterministic_logp_shfl_down_32(val, offset);
     }
 
     if (lane == 0) {
@@ -80,7 +89,7 @@ __device__ __forceinline__ float deterministicBlockReduceSum(float val) {
     if (wid == 0) {
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            val += __shfl_down_sync(0xffffffff, val, offset);
+            val += deterministic_logp_shfl_down_32(val, offset);
         }
     }
     return val;

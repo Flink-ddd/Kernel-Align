@@ -117,8 +117,12 @@ RL-Kernel sits between high-level alignment libraries and low-level GPU kernels,
 git clone https://github.com/RL-Align/RL-Kernel.git
 cd RL-Kernel
 
-# Install core dependencies (CUDA 12.4+ recommended)
-pip install -e .
+# CPU-only / pure-Python fallback
+python -m pip install -e .
+
+# Native CUDA or ROCm extension (install a matching PyTorch build first)
+RL_KERNEL_REQUIRE_EXT=1 python -m pip install --no-build-isolation -e .
+python -c "import rl_engine._C as _C; assert hasattr(_C, 'fused_logp'); print(_C.__file__)"
 ```
 
 ### Contributions
