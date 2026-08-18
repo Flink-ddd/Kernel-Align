@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 from rl_engine.kernels.ops.pytorch.activation.swiglu import NativeSwiGLUOp
 from rl_engine.kernels.ops.pytorch.ffn.tensor_parallel import (
+    DeterministicTensorParallelCommunication,
     FFNContext,
     TensorParallelFFN,
     shard_qwen3_ffn_weights,
@@ -34,6 +35,20 @@ def _gloo_available() -> bool:
 requires_gloo = pytest.mark.skipif(
     not _gloo_available(), reason="tensor-parallel FFN CPU test requires torch.distributed Gloo."
 )
+
+
+class _RecordingTPCommunication:
+    """Gloo stand-in that makes the configured TP path observable."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[int, ...], int, int]] = []
+
+    def all_reduce(self, tensor: torch.Tensor, *, ctx: FFNContext) -> torch.Tensor:
+        assert ctx.tp_size is not None
+        assert ctx.tp_rank is not None
+        self.calls.append((tuple(tensor.shape), ctx.tp_size, ctx.tp_rank))
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=ctx.tp_group)
+        return tensor
 
 
 def _configure_gloo_loopback() -> None:
@@ -69,7 +84,13 @@ def _fixed_row_gemm(input_2d: torch.Tensor, weight_2d: torch.Tensor) -> torch.Te
     return torch.stack([torch.matmul(row.unsqueeze(0), weight_2d).squeeze(0) for row in input_2d])
 
 
-def _tp_ffn_worker(rank: int, world_size: int, init_method: str, result_queue: Any) -> None:
+def _tp_ffn_worker(
+    rank: int,
+    world_size: int,
+    init_method: str,
+    result_queue: Any,
+    use_recording_tp_communication: bool = False,
+) -> None:
     try:
         torch.set_num_threads(1)
         _configure_gloo_loopback()
@@ -79,7 +100,10 @@ def _tp_ffn_worker(rank: int, world_size: int, init_method: str, result_queue: A
             rank=rank,
             world_size=world_size,
         )
-        ctx = FFNContext(tp_group=dist.group.WORLD)
+        tp_communication = (
+            _RecordingTPCommunication() if use_recording_tp_communication else None
+        )
+        ctx = FFNContext(tp_group=dist.group.WORLD, tp_communication=tp_communication)
         assert ctx.tp_size == world_size
         assert ctx.tp_rank == rank
 
@@ -143,6 +167,9 @@ def _tp_ffn_worker(rank: int, world_size: int, init_method: str, result_queue: A
                 ),
                 "collectives": observed_collectives,
                 "expected_collective_shape": expected_collective_shape,
+                "configured_collectives": (
+                    [] if tp_communication is None else tp_communication.calls
+                ),
             }
         )
     except Exception:
@@ -198,7 +225,7 @@ def _tp_batch_invariance_worker(
             dist.destroy_process_group()
 
 
-def _run_tp_workers(worker: Any) -> list[dict[str, Any]]:
+def _run_tp_workers(worker: Any, *worker_args: Any) -> list[dict[str, Any]]:
     world_size = 2
     mp_context = mp.get_context("spawn")
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -206,7 +233,10 @@ def _run_tp_workers(worker: Any) -> list[dict[str, Any]]:
         init_method = init_file.as_uri()
         result_queue = mp_context.Queue()
         workers = [
-            mp_context.Process(target=worker, args=(rank, world_size, init_method, result_queue))
+            mp_context.Process(
+                target=worker,
+                args=(rank, world_size, init_method, result_queue, *worker_args),
+            )
             for rank in range(world_size)
         ]
         for process in workers:
@@ -261,6 +291,24 @@ def test_tensor_parallel_ffn_matches_full_reference_and_tp_backward_contract() -
 
 
 @requires_gloo
+def test_tensor_parallel_ffn_routes_collectives_through_configured_communication() -> None:
+    """Configured TP communication owns exactly the forward and backward SUMs."""
+
+    results = _run_tp_workers(_tp_ffn_worker, True)
+    for result in results:
+        assert result["output_error"] <= 1e-4
+        assert result["input_grad_error"] <= 1e-4
+        assert result["collectives"] == [
+            result["expected_collective_shape"],
+            result["expected_collective_shape"],
+        ]
+        assert result["configured_collectives"] == [
+            (result["expected_collective_shape"], 2, result["rank"]),
+            (result["expected_collective_shape"], 2, result["rank"]),
+        ]
+
+
+@requires_gloo
 def test_tensor_parallel_ffn_is_batch_invariant() -> None:
     """Valid rows are bitwise unchanged by TP FFN slicing or batch padding."""
 
@@ -282,6 +330,12 @@ def test_qwen_weight_shards_follow_column_and_row_parallel_dimensions() -> None:
     assert gate_shard.shape == (24, 8)
     assert up_shard.shape == (24, 8)
     assert down_shard.shape == (8, 24)
+
+
+def test_deterministic_tp_communication_rejects_cpu_tensors() -> None:
+    communication = DeterministicTensorParallelCommunication()
+    with pytest.raises(ValueError, match="requires a CUDA tensor"):
+        communication.all_reduce(torch.zeros(2), ctx=FFNContext())
 
 
 def test_ffn_refuses_non_deterministic_default_gemm() -> None:

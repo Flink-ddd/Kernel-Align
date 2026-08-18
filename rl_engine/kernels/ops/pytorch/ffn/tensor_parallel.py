@@ -19,12 +19,18 @@ derivation.  There is no TP reduction for Down's feature-sharded ``dHidden``.
 
 CP/SP configuration and CP weight-gradient reductions intentionally do not
 belong in this PR3 module.
+
+For production CUDA execution, callers can attach
+DeterministicTensorParallelCommunication to FFNContext. The adapter lazily
+binds the deterministic all-reduce from distributed PR #310 and uses it at
+precisely the two TP SUM sites above. The default native torch.distributed path
+remains available for the CPU/Gloo reference tests.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Protocol
 
 import torch
 import torch.distributed as dist
@@ -33,6 +39,103 @@ from torch import Tensor, nn
 from rl_engine.kernels.ops.pytorch.activation.swiglu import NativeSwiGLUOp
 
 LocalGemm = Callable[[Tensor, Tensor], Tensor]
+
+
+class TensorParallelCommunication(Protocol):
+    """TP SUM interface used at the FFN's two explicit collective boundaries."""
+
+    def all_reduce(self, tensor: Tensor, *, ctx: "FFNContext") -> Tensor:
+        """Return the TP sum of tensor using ctx.tp_group."""
+
+
+class DeterministicTensorParallelCommunication:
+    """Lazy PR #310 deterministic CUDA all-reduce adapter for TP FFN.
+
+    One instance is intended to be owned by a long-lived FFNContext (or shared
+    by contexts that use the same TP process group). It caches the underlying
+    DeterministicCollective so CUDA IPC setup occurs once, not once per FFN
+    reduction. Call close() after the last use and before destroying the
+    process group.
+
+    The adapter deliberately fails closed: it accepts only CUDA tensors and
+    requires PR #310's rl_engine.distributed.DeterministicCollective. This
+    prevents an accidental fallback to an unspecified NCCL reduction order on
+    a path advertised as deterministic.
+    """
+
+    def __init__(
+        self,
+        *,
+        process_group: Any = None,
+        collective: Any = None,
+        max_size_bytes: int = 64 * 1024 * 1024,
+    ) -> None:
+        if max_size_bytes <= 0:
+            raise ValueError("max_size_bytes must be positive.")
+        self._process_group = process_group
+        self._collective = collective
+        self._max_size_bytes = int(max_size_bytes)
+
+    def all_reduce(self, tensor: Tensor, *, ctx: "FFNContext") -> Tensor:
+        """Run PR #310's in-place deterministic TP SUM for tensor."""
+
+        if not tensor.is_cuda:
+            raise ValueError(
+                "DeterministicTensorParallelCommunication requires a CUDA tensor; "
+                "use the native TP path for CPU/Gloo reference execution."
+            )
+        collective = self._get_collective(tensor, ctx)
+        self._validate_collective_coordinates(collective, ctx)
+        reduced = collective.all_reduce(tensor, out=tensor)
+        if reduced is not tensor:
+            raise RuntimeError(
+                "DeterministicCollective.all_reduce must return its aliased out tensor."
+            )
+        return reduced
+
+    def close(self) -> None:
+        """Release the cached PR #310 CUDA IPC collective, if one was created."""
+
+        close = getattr(self._collective, "close", None)
+        if close is not None:
+            close()
+
+    def _get_collective(self, tensor: Tensor, ctx: "FFNContext") -> Any:
+        if self._process_group is not None and self._process_group is not ctx.tp_group:
+            raise ValueError(
+                "Deterministic TP communication process_group must match FFNContext.tp_group."
+            )
+        if self._collective is None:
+            try:
+                from rl_engine.distributed import DeterministicCollective
+            except ImportError as exc:
+                raise RuntimeError(
+                    "deterministic TP FFN communication requires distributed PR #310 "
+                    "(rl_engine.distributed.DeterministicCollective)."
+                ) from exc
+            self._collective = DeterministicCollective(
+                group=ctx.tp_group,
+                device=tensor.device,
+                max_size_bytes=self._max_size_bytes,
+            )
+
+        collective_group = getattr(self._collective, "group", ctx.tp_group)
+        if collective_group is not ctx.tp_group:
+            raise ValueError(
+                "DeterministicCollective group must match FFNContext.tp_group."
+            )
+        return self._collective
+
+    @staticmethod
+    def _validate_collective_coordinates(collective: Any, ctx: "FFNContext") -> None:
+        collective_size = getattr(collective, "world_size", None)
+        collective_rank = getattr(collective, "rank", None)
+        if collective_size != ctx.tp_size or collective_rank != ctx.tp_rank:
+            raise ValueError(
+                "DeterministicCollective coordinates must match FFNContext: "
+                f"collective=({collective_size}, {collective_rank}), "
+                f"context=({ctx.tp_size}, {ctx.tp_rank})."
+            )
 
 
 def _missing_deterministic_gemm(input_: Tensor, weight: Tensor) -> Tensor:
@@ -53,11 +156,17 @@ class FFNContext:
     ``tp_group`` is never created or inferred by this module.  A multi-rank
     configuration must supply an initialized explicit process group; this is
     important because later PRs add distinct CP and SP groups.
+
+    ``tp_communication`` optionally replaces the native TP SUM at the two
+    FFN collective boundaries. Use
+    ``DeterministicTensorParallelCommunication(process_group=tp_group)`` for
+    the strict CUDA path backed by distributed PR #310.
     """
 
     tp_group: Any = None
     tp_size: Optional[int] = None
     tp_rank: Optional[int] = None
+    tp_communication: Optional[TensorParallelCommunication] = None
 
     def __post_init__(self) -> None:
         if self.tp_group is None:
@@ -101,7 +210,8 @@ def _all_reduce_sum(tensor: Tensor, ctx: FFNContext) -> Tensor:
     """Synchronously sum a tensor over the explicitly configured TP group."""
 
     if ctx.is_tensor_parallel:
-        # TODO(WS2): replace NCCL/Gloo with the deterministic collective once it lands.
+        if ctx.tp_communication is not None:
+            return ctx.tp_communication.all_reduce(tensor, ctx=ctx)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=ctx.tp_group)
     return tensor
 
