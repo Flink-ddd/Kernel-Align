@@ -26,7 +26,7 @@ SP activation AllGather/ReduceScatter is intentionally out of scope.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Protocol
 
 import torch
 import torch.distributed as dist
@@ -35,6 +35,123 @@ from torch import Tensor, nn
 from rl_engine.kernels.ops.pytorch.activation.swiglu import NativeSwiGLUOp
 
 LocalGemm = Callable[[Tensor, Tensor], Tensor]
+
+
+class ParallelCommunication(Protocol):
+    """One configured deterministic SUM axis owned by an FFN context."""
+
+    def all_reduce(self, tensor: Tensor, *, ctx: "FFNContext") -> Tensor:
+        """Return the configured TP or CP sum for tensor."""
+
+
+class _DeterministicAllReduceCommunication:
+    """Cached PR #310 deterministic all-reduce for exactly one parallel axis."""
+
+    _group_attribute: str
+    _size_attribute: str
+    _rank_attribute: str
+    _parallel_name: str
+
+    def __init__(
+        self,
+        *,
+        process_group: Any = None,
+        collective: Any = None,
+        max_size_bytes: int = 64 * 1024 * 1024,
+    ) -> None:
+        if max_size_bytes <= 0:
+            raise ValueError("max_size_bytes must be positive.")
+        self._process_group = process_group
+        self._collective = collective
+        self._max_size_bytes = int(max_size_bytes)
+
+    def all_reduce(self, tensor: Tensor, *, ctx: "FFNContext") -> Tensor:
+        """Run an in-place PR #310 deterministic SUM for this communication axis."""
+
+        if not tensor.is_cuda:
+            raise ValueError(
+                f"Deterministic{self._parallel_name}ParallelCommunication requires "
+                "a CUDA tensor; use the native path for CPU/Gloo reference execution."
+            )
+        group = getattr(ctx, self._group_attribute)
+        world_size = getattr(ctx, self._size_attribute)
+        rank = getattr(ctx, self._rank_attribute)
+        if world_size is None or rank is None:
+            raise RuntimeError(f"FFNContext has unresolved {self._parallel_name} coordinates.")
+        collective = self._get_collective(tensor, group)
+        self._validate_collective_coordinates(collective, int(world_size), int(rank))
+        reduced = collective.all_reduce(tensor, out=tensor)
+        if reduced is not tensor:
+            raise RuntimeError(
+                "DeterministicCollective.all_reduce must return its aliased out tensor."
+            )
+        return reduced
+
+    def close(self) -> None:
+        """Release the cached PR #310 CUDA IPC collective, if one was created."""
+
+        close = getattr(self._collective, "close", None)
+        if close is not None:
+            close()
+
+    def _get_collective(self, tensor: Tensor, group: Any) -> Any:
+        if self._process_group is not None and self._process_group is not group:
+            raise ValueError(
+                f"Deterministic {self._parallel_name} process_group must match FFNContext."
+            )
+        if self._collective is None:
+            try:
+                from rl_engine.distributed import DeterministicCollective
+            except ImportError as exc:
+                raise RuntimeError(
+                    "deterministic FFN communication requires distributed PR #310 "
+                    "(rl_engine.distributed.DeterministicCollective)."
+                ) from exc
+            self._collective = DeterministicCollective(
+                group=group,
+                device=tensor.device,
+                max_size_bytes=self._max_size_bytes,
+            )
+
+        collective_group = getattr(self._collective, "group", group)
+        if collective_group is not group:
+            raise ValueError(
+                f"DeterministicCollective group must match the FFN {self._parallel_name} group."
+            )
+        return self._collective
+
+    def _validate_collective_coordinates(
+        self,
+        collective: Any,
+        world_size: int,
+        rank: int,
+    ) -> None:
+        collective_size = getattr(collective, "world_size", None)
+        collective_rank = getattr(collective, "rank", None)
+        if collective_size != world_size or collective_rank != rank:
+            raise ValueError(
+                f"DeterministicCollective coordinates must match FFN {self._parallel_name}: "
+                f"collective=({collective_size}, {collective_rank}), "
+                f"context=({world_size}, {rank})."
+            )
+
+
+class DeterministicTensorParallelCommunication(_DeterministicAllReduceCommunication):
+    """PR #310 deterministic SUM for the FFN's TP collective boundaries."""
+
+    _group_attribute = "tp_group"
+    _size_attribute = "tp_size"
+    _rank_attribute = "tp_rank"
+    _parallel_name = "Tensor"
+
+
+class DeterministicContextParallelCommunication(_DeterministicAllReduceCommunication):
+    """PR #310 deterministic SUM for the FFN's CP parameter-gradient boundaries."""
+
+    _group_attribute = "cp_group"
+    _size_attribute = "cp_size"
+    _rank_attribute = "cp_rank"
+    _parallel_name = "Context"
 
 
 def _missing_deterministic_gemm(input_: Tensor, weight: Tensor) -> Tensor:
@@ -108,6 +225,8 @@ class FFNContext:
     cp_group: Any = None
     cp_size: Optional[int] = None
     cp_rank: Optional[int] = None
+    tp_communication: Optional[ParallelCommunication] = None
+    cp_communication: Optional[ParallelCommunication] = None
 
     def __post_init__(self) -> None:
         tp_size, tp_rank = _resolve_parallel_coordinates(
@@ -136,23 +255,42 @@ class FFNContext:
         return self.cp_size > 1
 
 
-def _all_reduce_sum(tensor: Tensor, group: Any, world_size: int) -> Tensor:
+def _all_reduce_sum(
+    tensor: Tensor,
+    group: Any,
+    world_size: int,
+    communication: Optional[ParallelCommunication],
+    ctx: FFNContext,
+) -> Tensor:
     """Synchronously sum a tensor over an explicitly configured process group."""
 
     if world_size > 1:
-        # TODO(WS2): replace NCCL/Gloo with the deterministic collective once it lands.
+        if communication is not None:
+            return communication.all_reduce(tensor, ctx=ctx)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
     return tensor
 
 
 def _all_reduce_tp_sum(tensor: Tensor, ctx: FFNContext) -> Tensor:
     assert ctx.tp_size is not None
-    return _all_reduce_sum(tensor, ctx.tp_group, ctx.tp_size)
+    return _all_reduce_sum(
+        tensor,
+        ctx.tp_group,
+        ctx.tp_size,
+        ctx.tp_communication,
+        ctx,
+    )
 
 
 def _all_reduce_cp_sum(tensor: Tensor, ctx: FFNContext) -> Tensor:
     assert ctx.cp_size is not None
-    return _all_reduce_sum(tensor, ctx.cp_group, ctx.cp_size)
+    return _all_reduce_sum(
+        tensor,
+        ctx.cp_group,
+        ctx.cp_size,
+        ctx.cp_communication,
+        ctx,
+    )
 
 
 class _CopyToTensorParallelRegion(torch.autograd.Function):

@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 from rl_engine.kernels.ops.pytorch.activation.swiglu import NativeSwiGLUOp
 from rl_engine.kernels.ops.pytorch.ffn.tensor_parallel import (
+    DeterministicContextParallelCommunication,
     DeterministicTensorParallelCommunication,
     FFNContext,
     TensorParallelFFN,
@@ -48,6 +49,20 @@ class _RecordingTPCommunication:
         assert ctx.tp_rank is not None
         self.calls.append((tuple(tensor.shape), ctx.tp_size, ctx.tp_rank))
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=ctx.tp_group)
+        return tensor
+
+
+class _RecordingCPCommunication:
+    """Gloo stand-in that makes the configured CP path observable."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[int, ...], int, int]] = []
+
+    def all_reduce(self, tensor: torch.Tensor, *, ctx: FFNContext) -> torch.Tensor:
+        assert ctx.cp_size is not None
+        assert ctx.cp_rank is not None
+        self.calls.append((tuple(tensor.shape), ctx.cp_size, ctx.cp_rank))
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=ctx.cp_group)
         return tensor
 
 
@@ -286,7 +301,13 @@ def _make_tp_cp_groups(rank: int) -> tuple[Any, Any]:
     return tp_group, cp_group
 
 
-def _tp_cp_ffn_worker(rank: int, world_size: int, init_method: str, result_queue: Any) -> None:
+def _tp_cp_ffn_worker(
+    rank: int,
+    world_size: int,
+    init_method: str,
+    result_queue: Any,
+    use_recording_communication: bool = False,
+) -> None:
     try:
         torch.set_num_threads(1)
         _configure_gloo_loopback()
@@ -297,7 +318,18 @@ def _tp_cp_ffn_worker(rank: int, world_size: int, init_method: str, result_queue
             world_size=world_size,
         )
         tp_group, cp_group = _make_tp_cp_groups(rank)
-        ctx = FFNContext(tp_group=tp_group, cp_group=cp_group)
+        tp_communication = (
+            _RecordingTPCommunication() if use_recording_communication else None
+        )
+        cp_communication = (
+            _RecordingCPCommunication() if use_recording_communication else None
+        )
+        ctx = FFNContext(
+            tp_group=tp_group,
+            cp_group=cp_group,
+            tp_communication=tp_communication,
+            cp_communication=cp_communication,
+        )
         assert (ctx.tp_size, ctx.cp_size) == (2, 2)
         assert ctx.tp_rank == rank % 2
         assert ctx.cp_rank == rank // 2
@@ -404,6 +436,12 @@ def _tp_cp_ffn_worker(rank: int, world_size: int, init_method: str, result_queue
                 "activation_shape": tuple(local_input.shape),
                 "gate_weight_shape": tuple(ffn.gate_weight.shape),
                 "down_weight_shape": tuple(ffn.down_weight.shape),
+                "configured_tp_collectives": (
+                    [] if tp_communication is None else tp_communication.calls
+                ),
+                "configured_cp_collectives": (
+                    [] if cp_communication is None else cp_communication.calls
+                ),
             }
         )
     except Exception:
@@ -489,7 +527,7 @@ def _tp_cp_batch_invariance_worker(
             dist.destroy_process_group()
 
 
-def _run_tp_cp_workers(worker: Any) -> list[dict[str, Any]]:
+def _run_tp_cp_workers(worker: Any, *worker_args: Any) -> list[dict[str, Any]]:
     world_size = 4
     mp_context = mp.get_context("spawn")
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -497,7 +535,10 @@ def _run_tp_cp_workers(worker: Any) -> list[dict[str, Any]]:
         init_method = init_file.as_uri()
         result_queue = mp_context.Queue()
         workers = [
-            mp_context.Process(target=worker, args=(rank, world_size, init_method, result_queue))
+            mp_context.Process(
+                target=worker,
+                args=(rank, world_size, init_method, result_queue, *worker_args),
+            )
             for rank in range(world_size)
         ]
         for process in workers:
@@ -607,6 +648,28 @@ def test_tp_cp_ffn_matches_full_reference_and_cp_weight_gradient_contract() -> N
 
 
 @requires_gloo
+def test_tp_cp_ffn_routes_collectives_through_configured_communication() -> None:
+    """Configured TP and CP communication own their respective SUM boundaries."""
+
+    results = _run_tp_cp_workers(_tp_cp_ffn_worker, True)
+    for result in results:
+        assert result["output_error"] <= 1e-4
+        assert result["reconstructed_output_error"] <= 1e-4
+        assert result["input_grad_error"] <= 1e-4
+        assert result["configured_tp_collectives"] == [
+            (result["activation_shape"], 2, result["rank"] % 2),
+            (result["activation_shape"], 2, result["rank"] % 2),
+        ]
+        assert sorted(result["configured_cp_collectives"]) == sorted(
+            [
+                (result["down_weight_shape"], 2, result["rank"] // 2),
+                (result["gate_weight_shape"], 2, result["rank"] // 2),
+                (result["gate_weight_shape"], 2, result["rank"] // 2),
+            ]
+        )
+
+
+@requires_gloo
 def test_tp_cp_ffn_is_batch_invariant() -> None:
     """TP+CP local rows and their input gradients are batch/padding invariant."""
 
@@ -643,6 +706,12 @@ def test_qwen_weight_shards_follow_column_and_row_parallel_dimensions() -> None:
 
 def test_deterministic_tp_communication_rejects_cpu_tensors() -> None:
     communication = DeterministicTensorParallelCommunication()
+    with pytest.raises(ValueError, match="requires a CUDA tensor"):
+        communication.all_reduce(torch.zeros(2), ctx=FFNContext())
+
+
+def test_deterministic_cp_communication_rejects_cpu_tensors() -> None:
+    communication = DeterministicContextParallelCommunication()
     with pytest.raises(ValueError, match="requires a CUDA tensor"):
         communication.all_reduce(torch.zeros(2), ctx=FFNContext())
 

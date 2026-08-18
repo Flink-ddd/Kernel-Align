@@ -3,6 +3,7 @@
 """Composable Qwen-style feed-forward network reference operators."""
 
 from .tensor_parallel import (
+    DeterministicContextParallelCommunication,
     DeterministicTensorParallelCommunication,
     FFNContext,
     TensorParallelFFN,
@@ -10,6 +11,7 @@ from .tensor_parallel import (
 )
 
 __all__ = [
+    "DeterministicContextParallelCommunication",
     "DeterministicTensorParallelCommunication",
     "FFNContext",
     "TensorParallelFFN",
