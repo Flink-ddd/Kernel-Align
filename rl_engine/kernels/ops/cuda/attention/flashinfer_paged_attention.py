@@ -775,7 +775,8 @@ class FlashInferQwen3PagedAttentionOp:
             communication, "supports_autograd", False
         ):
             raise FlashInferUnavailable(
-                "strict training requires an autograd-capable self-owned GPU AG/RS backend"
+                "strict training requires an autograd-capable self-owned CUDA AG/RS "
+                "or ROCm RCCL AG/RS backend"
             )
         query_start, query_end = plan.query_token_ranges[plan.parallel.cp_rank]
         key_start, key_end = _cp_owner_ranges(plan)[plan.parallel.cp_rank]
