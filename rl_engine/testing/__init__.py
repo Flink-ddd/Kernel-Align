@@ -3,6 +3,14 @@
 
 """Testing helpers for RL-shaped kernel validation."""
 
+from .logprob_comparison import (
+    LogprobBackendUnavailable,
+    LogprobCandidate,
+    LogprobComparisonInputs,
+    LogprobComparisonReport,
+    compare_single_gpu_logprob,
+    make_logprob_candidate,
+)
 from .reference_ops import (
     active_token_count,
     compute_policy_ratio,
@@ -32,6 +40,10 @@ from .ws1_workload import (
 __all__ = [
     "LogicalBatch",
     "PhysicalLayout",
+    "LogprobBackendUnavailable",
+    "LogprobCandidate",
+    "LogprobComparisonInputs",
+    "LogprobComparisonReport",
     "SyntheticRLKernelBatch",
     "WS1Manifest",
     "WorkloadError",
@@ -40,10 +52,12 @@ __all__ = [
     "apply_padding",
     "apply_packing",
     "build_logical_batch",
-    "compute_policy_ratio",
-    "compute_reference_kl",
     "fixture_hash",
     "load_manifest",
+    "compare_single_gpu_logprob",
+    "compute_policy_ratio",
+    "compute_reference_kl",
+    "make_logprob_candidate",
     "make_synthetic_rl_kernel_batch",
     "masked_mean",
     "masked_sum",

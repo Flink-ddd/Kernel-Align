@@ -192,6 +192,101 @@ fp16/bf16 backward: checked against fp32 reference with relaxed tolerance
 CPU-vs-CUDA comparisons use tolerance-based checks; batch-invariance checks
 within the same backend use exact equality where appropriate.
 
+## TP=1 Comparison Harness
+
+The single-GPU comparison harness is the TP=1 registration and regression guard
+for issue #241. It uses the batch-invariant PyTorch implementation as the
+reference and compares exact `pytorch`, `triton`, or `cuda-sm90` backends before
+distributed communication is introduced.
+
+Each backend exposes a diagnostic-only entry point while the production contract
+remains unchanged:
+
+```text
+op(logits, target_ids)                  -> logp
+op.forward_with_lse(logits, target_ids) -> (logp, lse)
+```
+
+The harness reports LSE drift over every logical token row and selected-logprob
+drift over active response/action tokens only. Drift summaries contain max,
+mean, p95, p99, and the number of compared values. Reports also record requested
+and actual backends, implementation, direct-LSE provenance, input shape and
+dtype, `tp_world=1`, and `communication=none`.
+
+Backend selection is exact and does not use registry fallback. In particular,
+an explicit `cuda-sm90` comparison fails unless the compiled SM90 extension,
+Hopper hardware, input dtype, and vocab row stride satisfy the kernel contract.
+
+Run the PyTorch TP=1 guard directly from the kernel-specific testing module:
+
+```bash
+python rl_engine/testing/logprob_comparison.py \
+  --candidate pytorch \
+  --device cpu \
+  --dtype fp32 \
+  --batch 2 \
+  --seq 16 \
+  --vocab 257
+```
+
+On a GPU, repeat `--candidate` to compare multiple exact backends:
+
+```bash
+python rl_engine/testing/logprob_comparison.py \
+  --candidate triton \
+  --candidate cuda-sm90 \
+  --device cuda \
+  --dtype bf16 \
+  --batch 2 \
+  --seq 16 \
+  --vocab 151936
+```
+
+The command writes structured JSON to stdout and routes backend diagnostics to
+stderr. The harness does not implement vocab sharding, collective communication,
+cross-rank LSE merging, or CP reconstruction.
+
+### SM90 validation
+
+SM90 validation requires a Hopper GPU, CUDA-enabled PyTorch, and an `nvcc`
+toolkit matching `torch.version.cuda`. Build the extension with:
+
+```bash
+export FORCE_CUDA=1
+export KERNEL_ALIGN_FORCE_SM90=1
+export TORCH_CUDA_ARCH_LIST="9.0+PTX"
+
+python -m pip install --no-build-isolation --no-deps -e .
+```
+
+Run the focused harness tests, the complete operator suite, and an explicit
+SM90 comparison:
+
+```bash
+python -m pytest \
+  tests/test_logprob_comparison.py \
+  tests/test_operator_inputs.py \
+  tests/test_op_checks.py -q
+
+python -m pytest tests/test_batch_invariant_logp.py -q
+
+python rl_engine/testing/logprob_comparison.py \
+  --candidate cuda-sm90 \
+  --device cuda \
+  --dtype bf16 \
+  --batch 2 \
+  --seq 16 \
+  --vocab 151936 \
+  --prompt-tokens 8 \
+  --seed 241
+```
+
+The PR2 path was validated on an NVIDIA H800 PCIe with PyTorch 2.11.0+cu128,
+CUDA 12.8, and Triton 3.6.0. The focused tests passed 41 cases and the complete
+batch-invariant suite passed 67 cases. For BF16 shape `[2, 16, 151936]`, both
+LSE and active-token dlogp had maximum absolute drift
+`9.5367431640625e-07` against the PyTorch reference, with no backend fallback.
+
 ## Minimal Example
 
 ```python
@@ -219,11 +314,14 @@ out.sum().backward()
 python -m pytest tests/test_batch_invariant_logp.py -q -rs
 ```
 
-All backends (Native, Triton) are tested in a single file. Coverage includes:
+All production backends are tested in a single file. Coverage includes
 correctness, leading-shape preservation, batch-invariance (bitwise), validation,
 ignore-index behavior, backward correctness, CUDA smoke cases, registry
 dispatch, and Triton-specific fp32/fp16/bf16 correctness, large vocab, backward
-gradient batch-invariance, and ignored-row zero gradients.
+gradient batch-invariance, and ignored-row zero gradients. The focused
+`tests/test_logprob_comparison.py` suite covers TP=1 bitwise regression, direct
+LSE identity, active-token drift statistics, structured serialization, exact
+backend diagnostics, and fail-closed provenance.
 
 Triton tests skip when Triton or CUDA is unavailable. On Windows, run via
 WSL/Linux with CUDA.
@@ -236,4 +334,5 @@ WSL/Linux with CUDA.
 - `csrc/cuda/batch_invariant_logp_kernel_sm90.cu`
 - `rl_engine/kernels/registry.py`
 - `tests/test_batch_invariant_logp.py`
+- `tests/test_logprob_comparison.py`
 - `benchmarks/benchmark_batch_invariant_logp.py`
