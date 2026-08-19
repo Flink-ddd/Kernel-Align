@@ -10,10 +10,10 @@ Ascend C kernel (`_C_npu.deterministic_attention_ascend`). Every
 batch-invariant (the same algorithm as the Triton reference and the CUDA
 deterministic op).
 
-Backward: Triton is unavailable on NPU, so the backward mirrors the
-Triton op's portable branch -- it recomputes the reference forward with
-`NativeAttentionOp` under autograd and VJPs the upstream gradient through
-it, reusing the forward-saved q/k/v/mask.
+Backward: Triton is unavailable on NPU, so the backward recomputes the
+fp32 reference forward (`NativeAttentionOp.forward_fp32`, the same golden
+path the forward kernel accumulates in) under autograd and VJPs the
+upstream gradient through it, reusing the forward-saved q/k/v/mask.
 """
 
 from __future__ import annotations
@@ -55,7 +55,9 @@ class _DeterministicAttentionAscendFn(Function):
         v_c = v.contiguous()
         mask_c = key_padding_mask.contiguous() if key_padding_mask is not None else None
 
-        out, lse = _C_npu.deterministic_attention_ascend(q_c, k_c, v_c, causal, float(scale), mask_c)
+        out, lse = _C_npu.deterministic_attention_ascend(
+            q_c, k_c, v_c, causal, float(scale), mask_c
+        )
 
         ctx.save_for_backward(q_c, k_c, v_c, mask_c)
         ctx.causal = causal
@@ -69,11 +71,14 @@ class _DeterministicAttentionAscendFn(Function):
     def backward(ctx, grad_out: torch.Tensor, grad_lse: torch.Tensor):
         del grad_lse  # lse is non-differentiable; always None upstream
         q, k, v, mask = ctx.saved_tensors
+        # VJP of the fp32 reference forward: the Ascend C forward accumulates in
+        # fp32 (like the CUDA deterministic op), so the backward must match the
+        # fp32 golden path, not the low-precision dtype path.
         with torch.enable_grad():
             q_ref = q.detach().requires_grad_(True)
             k_ref = k.detach().requires_grad_(True)
             v_ref = v.detach().requires_grad_(True)
-            out = NativeAttentionOp().forward(
+            out = NativeAttentionOp().forward_fp32(
                 q_ref,
                 k_ref,
                 v_ref,
@@ -90,7 +95,8 @@ class DeterministicAttentionAscendOp:
 
     Public surface matches ``NativeAttentionOp`` / ``DeterministicAttentionOp``
     so the #108 harness can call ``forward(**inputs)`` with ``key_padding_mask``.
-    Inputs the Ascend C kernel cannot take fall back to the native reference.
+    Out-of-domain inputs are rejected up front (the registry-level
+    ``PYTORCH_NATIVE_ATTENTION`` entry covers unavailable-kernel fallback).
     """
 
     def __init__(self) -> None:

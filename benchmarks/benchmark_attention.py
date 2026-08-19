@@ -135,12 +135,12 @@ def _bench_table(configs, native_op, other_ops, closure_factory, device, dtype, 
                 row += ["-"]
                 continue
             o_ms = _time_ms(closure_factory(op, q, k, v), warmup, iters)
-            row += [f"{o_ms:.3f}", f"{n_ms/o_ms:.2f}x"]
+            row += [f"{o_ms:.3f}", f"{n_ms / o_ms:.2f}x"]
         rows.append(row)
 
     headers = ["shape (B x Hq x S)", f"native {label} ms"]
     for name, _ in other_ops:
-        headers += [f"{name} {label} ms", f"vs native"]
+        headers += [f"{name} {label} ms", "vs native"]
     logger.info("\n" + tabulate(rows, headers=headers, tablefmt="github"))
 
 
@@ -169,7 +169,9 @@ def main() -> None:
         ("cuda", _maybe_cuda_op()),
     ]
 
-    _bench_table(configs, native_op, other_ops, _forward_closure, device, dtype, args.warmup, args.iters)
+    _bench_table(
+        configs, native_op, other_ops, _forward_closure, device, dtype, args.warmup, args.iters
+    )
     if args.backward:
         _bench_table(
             configs,

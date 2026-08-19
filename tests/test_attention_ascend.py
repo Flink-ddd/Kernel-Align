@@ -69,10 +69,15 @@ def _gold(q, k, v, causal=True, scale=None, key_padding_mask=None):
 
 
 def _make_qkv(batch, hq, hkv, sq, skv, dtype, seed=0):
-    generator = torch.Generator(device="cpu").manual_seed(seed)
-    q = torch.randn(batch, hq, sq, _D, dtype=dtype, generator=generator).to("npu")
-    k = torch.randn(batch, hkv, skv, _D, dtype=dtype, generator=generator).to("npu")
-    v = torch.randn(batch, hkv, skv, _D, dtype=dtype, generator=generator).to("npu")
+    # Independent generator per tensor: batch size must not shift the k/v
+    # content (a shared generator would make k[0] differ between batch sizes,
+    # breaking the batch-invariance comparisons below).
+    gq = torch.Generator(device="cpu").manual_seed(seed)
+    gk = torch.Generator(device="cpu").manual_seed(seed + 1)
+    gv = torch.Generator(device="cpu").manual_seed(seed + 2)
+    q = torch.randn(batch, hq, sq, _D, dtype=dtype, generator=gq).to("npu")
+    k = torch.randn(batch, hkv, skv, _D, dtype=dtype, generator=gk).to("npu")
+    v = torch.randn(batch, hkv, skv, _D, dtype=dtype, generator=gv).to("npu")
     return q, k, v
 
 
@@ -168,20 +173,23 @@ class TestAscendAttentionCorrectness:
         assert all(g is not None for g in (q.grad, k.grad, v.grad))
         assert all(torch.isfinite(g).all() for g in (q.grad, k.grad, v.grad))
 
-        # The backward is the VJP of the native reference forward; compare.
+        # The backward is the VJP of the fp32 reference forward; compare.
         with torch.enable_grad():
             q_ref = q.detach().requires_grad_(True)
             k_ref = k.detach().requires_grad_(True)
             v_ref = v.detach().requires_grad_(True)
-            ref_out = NativeAttentionOp().forward(q_ref, k_ref, v_ref, causal=True)
-        dq_ref, dk_ref, dv_ref = torch.autograd.grad(
-            ref_out, (q_ref, k_ref, v_ref), grad_out
-        )
+            ref_out = NativeAttentionOp().forward_fp32(q_ref, k_ref, v_ref, causal=True)
+        dq_ref, dk_ref, dv_ref = torch.autograd.grad(ref_out, (q_ref, k_ref, v_ref), grad_out)
         # The backward recomputes the same reference forward, so the VJPs
         # match to numerical noise.
         assert torch.allclose(q.grad.float(), dq_ref.float(), atol=1e-6, rtol=1e-5)
         assert torch.allclose(k.grad.float(), dk_ref.float(), atol=1e-6, rtol=1e-5)
         assert torch.allclose(v.grad.float(), dv_ref.float(), atol=1e-6, rtol=1e-5)
+
+
+@requires_ascend
+class TestAscendAttentionRejects:
+    """Out-of-domain inputs must be rejected up front."""
 
     def test_rejects_fp32(self):
         op = _get_op()
@@ -220,14 +228,18 @@ class TestAscendAttentionBatchInvariance:
             assert torch.equal(alone, in_batch), f"drift at batch_size={batch}"
 
     def test_different_positions_in_batch(self):
+        # Non-causal: every position attends to the same full window. Copy the
+        # same query row content into every position, then require
+        # bitwise-identical output wherever it sits. (Causal windows differ
+        # per position, so a causal sweep would compare different reductions.)
         dtype = torch.bfloat16
-        baseline = None
-        for pos in range(16):
-            row = self._run_row(2, 8, 2, 64, 64, dtype, pos=pos, seed=11)
-            if baseline is None:
-                baseline = row
-            else:
-                assert torch.equal(baseline, row), f"drift at position={pos}"
+        op = _get_op()
+        q, k, v = _make_qkv(2, 8, 2, 64, 64, dtype, seed=11)
+        q[0, :, :, :] = q[0, :, 0:1, :]  # same row content at every position
+        out = op(q, k, v, causal=False)
+        baseline = out[0, 0, 0, :].clone()
+        for pos in range(1, 16):
+            assert torch.equal(baseline, out[0, 0, pos, :]), f"drift at position={pos}"
 
     def test_block_striding(self):
         # 2 * 8 * 128 = 2048 work items > MAX_BLOCKS (512): rows are strided
