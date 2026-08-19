@@ -18,10 +18,10 @@ from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_CORE_ID,
     STRICT_ATTENTION_SCHEDULE_ID,
 )
+from rl_engine.kernels.ops.cuda.attention import deterministic_attn as deterministic_attn_module
 from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
     RLKernelDeterministicAttentionCore,
 )
-from rl_engine.kernels.ops.cuda.attention import deterministic_attn as deterministic_attn_module
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     AttentionPartialState,
     DeterministicCPAttentionReferenceOp,

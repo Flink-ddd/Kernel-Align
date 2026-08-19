@@ -652,8 +652,6 @@ class _RCCLRankOrderedTransport:
         performed locally in source-rank order, so collective reduction order
         is not delegated to RCCL.
         """
-        import torch.distributed as dist
-
         if not full.is_cuda or not full.is_contiguous():
             raise AttentionCPCommunicationUnavailable(
                 "RCCL ReduceScatter requires a contiguous ROCm tensor"
@@ -664,8 +662,9 @@ class _RCCLRankOrderedTransport:
             )
         chunks = tuple(chunk.contiguous() for chunk in full.chunk(self.world_size, dim=0))
         gathered = self.all_gather(full)
-        local = gathered[self.rank * chunks[self.rank].size(0) :
-                         (self.rank + 1) * chunks[self.rank].size(0)].clone()
+        local = gathered[
+            self.rank * chunks[self.rank].size(0) : (self.rank + 1) * chunks[self.rank].size(0)
+        ].clone()
         chunk_rows = chunks[self.rank].size(0)
         # Start with source rank 0, then add the remaining source ranks in
         # ascending order. This avoids counting source 0 twice.

@@ -21,7 +21,9 @@ def main() -> int:
         raise RuntimeError("the formal acceptance matrix requires 8 visible ROCm GPUs")
 
     repo = Path(__file__).resolve().parents[1]
-    output = (repo / args.output_dir).resolve() if not args.output_dir.is_absolute() else args.output_dir
+    output = (
+        (repo / args.output_dir).resolve() if not args.output_dir.is_absolute() else args.output_dir
+    )
     output.mkdir(parents=True, exist_ok=True)
     steps: list[dict[str, object]] = []
 

@@ -25,13 +25,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from rl_engine.kernels.attention_contract import (  # noqa: E402
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
+)
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (  # noqa: E402
     AttentionCPCommunicationPlan,
     AttentionParallelSpec,
 )
-from rl_engine.kernels.attention_contract import (  # noqa: E402
-    STRICT_ATTENTION_CORE_ID,
-    STRICT_ATTENTION_SCHEDULE_ID,
+from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (  # noqa: E402
+    RLKernelDeterministicAttentionCore,
 )
 from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (  # noqa: E402
     FlashInferPagedAttentionConfig,
@@ -42,9 +45,6 @@ from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (  #
     _apply_strict_rope,
     _materialize_strict_logical_kv,
     build_flashinfer_paged_kv_plan,
-)
-from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (  # noqa: E402
-    RLKernelDeterministicAttentionCore,
 )
 from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RoPESM90Op  # noqa: E402
 from rl_engine.testing.attention_comparison import (  # noqa: E402
@@ -400,9 +400,7 @@ def _run_strict_cuda_reference(
 ) -> AttentionPathResult:
     """Call the shared CUDA core directly on the logical KV sequence."""
 
-    core = config.deterministic_core or RLKernelDeterministicAttentionCore(
-        split_kv=config.split_kv
-    )
+    core = config.deterministic_core or RLKernelDeterministicAttentionCore(split_kv=config.split_kv)
     rope = config.strict_rope_op or RoPESM90Op()
     logical_k, logical_v, key_positions = _materialize_strict_logical_kv(
         inputs.k_cache,

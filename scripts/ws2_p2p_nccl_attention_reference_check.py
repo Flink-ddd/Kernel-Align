@@ -486,9 +486,7 @@ def _run_strict_shared_core_check(
 
 def _strict_rope_op():
     if torch.version.hip is not None:
-        from rl_engine.kernels.ops.rocm.rotary_embedding.rope import (
-            RocmDeterministicRoPEOp,
-        )
+        from rl_engine.kernels.ops.rocm.rotary_embedding.rope import RocmDeterministicRoPEOp
 
         return RocmDeterministicRoPEOp()
     from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RoPESM90Op

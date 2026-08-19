@@ -2,8 +2,6 @@
 # Copyright (c) 2026 RL-Kernel Contributors
 """ROCm strict Attention acceptance tests that never use a native fallback."""
 
-import math
-
 import pytest
 import torch
 
@@ -16,9 +14,7 @@ from rl_engine.kernels.attention_contract import SplitKVSpec  # noqa: E402
 from rl_engine.kernels.ops.rocm.attention.deterministic_attn import (  # noqa: E402
     RLKernelDeterministicAttentionCore,
 )
-from rl_engine.kernels.ops.rocm.rotary_embedding.rope import (  # noqa: E402
-    RocmDeterministicRoPEOp,
-)
+from rl_engine.kernels.ops.rocm.rotary_embedding.rope import RocmDeterministicRoPEOp  # noqa: E402
 
 
 def _qkv(*, batch: int = 2, sequence: int = 7):
@@ -110,8 +106,7 @@ def test_rocm_rope_matches_fp32_rotate_half_reference():
     actual = RocmDeterministicRoPEOp()(x, positions)
     half = x.size(-1) // 2
     inv_freq = 1.0 / (
-        1_000_000.0
-        ** (torch.arange(half, dtype=torch.float32, device=x.device) / half)
+        1_000_000.0 ** (torch.arange(half, dtype=torch.float32, device=x.device) / half)
     )
     frequency = positions.float().unsqueeze(-1) * inv_freq
     cos = frequency.cos().unsqueeze(1)

@@ -1458,8 +1458,7 @@ def _validate_strict_core(core: Any) -> None:
         raise ValueError("strict deterministic core ID must be " f"{STRICT_ATTENTION_CORE_ID!r}")
     if getattr(core, "strict_schedule", None) != STRICT_ATTENTION_SCHEDULE_ID:
         raise ValueError(
-            "strict deterministic core schedule must be "
-            f"{STRICT_ATTENTION_SCHEDULE_ID!r}"
+            "strict deterministic core schedule must be " f"{STRICT_ATTENTION_SCHEDULE_ID!r}"
         )
     required = {
         "merge_order": "global_block_index",
@@ -1517,9 +1516,7 @@ def _resolve_strict_rope(cfg: FlashInferPagedAttentionConfig) -> Any:
         return cfg.strict_rope_op
     try:
         if torch.version.hip is not None:
-            from rl_engine.kernels.ops.rocm.rotary_embedding.rope import (
-                RocmDeterministicRoPEOp,
-            )
+            from rl_engine.kernels.ops.rocm.rotary_embedding.rope import RocmDeterministicRoPEOp
 
             return RocmDeterministicRoPEOp()
         from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RoPESM90Op
@@ -1713,8 +1710,7 @@ def _strict_attention_provenance(
                 "rlkernel.cuda.deterministic_attention",
                 "rlkernel.rocm.deterministic_attention",
             }
-            and getattr(cfg.cp_communication, "backend_id", None)
-            in {"cuda_ag_rs", "rccl_ag_rs"}
+            and getattr(cfg.cp_communication, "backend_id", None) in {"cuda_ag_rs", "rccl_ag_rs"}
         ),
     }
 

@@ -16,9 +16,7 @@ def _build_cos_sin(
     theta: float,
     device: torch.device,
 ) -> tuple[Tensor, Tensor]:
-    inv_freq = 1.0 / (
-        theta ** (torch.arange(0, half, dtype=torch.float32, device=device) / half)
-    )
+    inv_freq = 1.0 / (theta ** (torch.arange(0, half, dtype=torch.float32, device=device) / half))
     frequency = positions.to(device=device, dtype=torch.float32).reshape(-1, 1) * inv_freq
     return frequency.cos().contiguous(), frequency.sin().contiguous()
 

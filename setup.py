@@ -217,9 +217,7 @@ def get_extensions():
             nvcc_flags.append("-allow-unsupported-compiler")
             nvcc_flags.append("-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH")
 
-        platform_define = (
-            "-DKERNEL_ALIGN_WITH_ROCM" if is_rocm else "-DKERNEL_ALIGN_WITH_CUDA"
-        )
+        platform_define = "-DKERNEL_ALIGN_WITH_ROCM" if is_rocm else "-DKERNEL_ALIGN_WITH_CUDA"
         cxx_flags = ["-O3", "-std=c++17", platform_define]
         extra_link_args = list(torch_rpath)
 
