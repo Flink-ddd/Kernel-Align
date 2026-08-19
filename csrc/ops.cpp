@@ -74,7 +74,7 @@ torch::Tensor lm_head_sm90_forward_fp32(torch::Tensor hidden,
 torch::Tensor det_gemm_rowwise_fwd_fp32(torch::Tensor a, torch::Tensor b);
 #endif
 
-#if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
+#if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA) || defined(KERNEL_ALIGN_WITH_ROCM)
 torch::Tensor fused_logp_forward_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor output);
 torch::Tensor fused_logp_forward_fp32(torch::Tensor logits, torch::Tensor token_ids);
 torch::Tensor fused_logp_forward_indexed_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices, torch::Tensor output);
@@ -89,7 +89,8 @@ torch::Tensor deterministic_logp_forward_fp32(torch::Tensor logits, torch::Tenso
 torch::Tensor deterministic_logp_forward_indexed_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices, torch::Tensor output);
 torch::Tensor deterministic_logp_forward_indexed_fp32(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices);
 
-// Single-node TP=8 deterministic collectives.
+#if !defined(USE_ROCM)
+// Single-node TP=8 deterministic CUDA collectives.
 std::tuple<std::vector<int64_t>, int64_t> deterministic_collective_ipc_meta(
     torch::Tensor& tensor);
 int64_t deterministic_collective_create(
@@ -102,6 +103,7 @@ void deterministic_collective_stage(int64_t handle, torch::Tensor& input);
 void deterministic_collective_all_reduce(int64_t handle, torch::Tensor& output);
 void deterministic_collective_reduce_scatter(int64_t handle, torch::Tensor& output);
 void deterministic_collective_all_gather(int64_t handle, torch::Tensor& output);
+#endif
 
 // Batch-Invariant Deterministic GEMM Declarations
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
@@ -275,7 +277,8 @@ std::vector<torch::Tensor> deterministic_attention_backward(
     double scale,
     torch::optional<torch::Tensor> key_padding_mask);
 
-// Prefix-Shared Attention Declarations & Wrappers
+#if !defined(USE_ROCM)
+// Prefix-Shared Attention Declarations & Wrappers (NVIDIA PTX only).
 
 void prefix_shared_attention_forward(
   const __nv_bfloat16 *Q,  // [bs, G, len_q, DIM]
@@ -319,6 +322,7 @@ at::Tensor prefix_shared_attention(
 
   return O;
 }
+#endif
 #endif
 
 // PyBind11 Module Registration
@@ -366,7 +370,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "SM90 deterministic rowwise GEMM with FP32 inputs/accumulation/output");
 #endif
 
-#if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
+#if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA) || defined(KERNEL_ALIGN_WITH_ROCM)
     m.def("fused_logp_forward_out", &fused_logp_forward_out, "Fused logp out");
     m.def("fused_logp_forward_fp32", &fused_logp_forward_fp32, "Fused logp fp32");
     m.def("fused_logp_forward_indexed_out", &fused_logp_forward_indexed_out, "Fused logp indexed out");
@@ -381,7 +385,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deterministic_logp_forward_indexed_out", &deterministic_logp_forward_indexed_out, "Batch-invariant deterministic logp indexed out");
     m.def("deterministic_logp_forward_indexed_fp32", &deterministic_logp_forward_indexed_fp32, "Batch-invariant deterministic logp indexed fp32");
 
-    // Single-node TP=8 fixed-tree collectives.
+#if !defined(USE_ROCM)
+    // Single-node TP=8 fixed-tree CUDA collectives.
     m.def(
         "deterministic_collective_ipc_meta",
         &deterministic_collective_ipc_meta,
@@ -413,6 +418,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // registry Prefix-Shared Attention
     m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
+#endif
 
     // registry Batch-Invariant Deterministic GEMM
     m.def("det_gemm_fwd", &det_gemm_fwd, "Batch-invariant deterministic GEMM forward (C=A@B)");
