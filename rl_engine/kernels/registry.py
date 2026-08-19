@@ -85,6 +85,10 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     CUDA_BATCH_INVARIANT_LOGP_SM90 = (
         "rl_engine.kernels.ops.cuda.loss.batch_invariant_logp.BatchInvariantLogpSM90Op"
     )
+    # Deterministic vocab-parallel TP logprob reference (WS2 #241 PR3)
+    PYTORCH_VOCAB_PARALLEL_LOGP = (
+        "rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp.VocabParallelLogprobOp"
+    )
 
     # RMSNorm(pre-norm / QK-Norm) - pure Pytorch reference(ws1 ground-truth)
     PYTORCH_NATIVE_RMS_NORM = "rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp"
@@ -361,6 +365,29 @@ class KernelRegistry:
             }
             for platform, candidates in self._logprob_candidates.items()
         }
+
+        # deterministic vocab-parallel TP logprob reference.
+        ws2_tp_logprob_capability = LogprobBackendCapability(
+            backend_id="pytorch-vocab-parallel-logp-ws2",
+            roles=common_logprob_roles,
+            dtypes=common_logprob_dtypes,
+            tp_world_sizes=None,
+            cp_world_sizes=None,
+            supports_vocab_padding=True,
+            mask_modes=frozenset({MaskMode.EXPLICIT_ACTIVE_MASK, MaskMode.IGNORE_INDEX}),
+            exports_vocab_lse=True,
+            determinism_scopes=frozenset(
+                {DeterminismScope.CROSS_TP_BITWISE, DeterminismScope.FIXED_TOPOLOGY}
+            ),
+            implementation_kind="reference",
+        )
+        for ws2_platform in self._priority_map:
+            self.register_logprob_backend(
+                OpBackend.PYTORCH_VOCAB_PARALLEL_LOGP,
+                ws2_tp_logprob_capability,
+                platform=ws2_platform,
+                prepend=True,
+            )
 
     def _adjust_priority_from_env(self):
         rocm_attn_backend = os.getenv("RL_KERNEL_ROCM_ATTN_BACKEND", "").strip().lower()

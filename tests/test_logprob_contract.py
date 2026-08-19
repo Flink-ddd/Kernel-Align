@@ -247,8 +247,20 @@ def test_ignore_index_must_not_collide_with_the_real_vocabulary():
     assert contract.mask.ignore_index == padding_column
 
 
+def _restrict_to_ws1_candidates(registry: KernelRegistry) -> None:
+    """Drop the #241 PR3 vocab-parallel reference so only WS1 backends remain."""
+
+    platform = registry._platform()
+    registry._logprob_candidates[platform] = [
+        backend
+        for backend in registry._logprob_candidates[platform]
+        if backend is not OpBackend.PYTORCH_VOCAB_PARALLEL_LOGP
+    ]
+
+
 def test_current_ws1_backend_rejects_strict_tp_contract_without_fallback():
     registry = KernelRegistry()
+    _restrict_to_ws1_candidates(registry)
 
     with pytest.raises(RuntimeError) as exc_info:
         registry.get_logprob_op(_contract(), requested_backend="reference")
@@ -262,6 +274,7 @@ def test_current_ws1_backend_rejects_strict_tp_contract_without_fallback():
 
 def test_current_ws1_backend_rejects_padded_vocab_even_at_tp1():
     registry = KernelRegistry()
+    _restrict_to_ws1_candidates(registry)
     contract = _contract(sharding=_sharding(tp_world_size=1, cp_world_size=1))
 
     with pytest.raises(RuntimeError) as exc_info:
@@ -270,6 +283,25 @@ def test_current_ws1_backend_rejects_padded_vocab_even_at_tp1():
     message = str(exc_info.value)
     assert "TP=1 is unsupported" not in message
     assert "padded-vs-real vocab masking is unsupported" in message
+
+
+def test_ws1_rejections_recorded_when_vocab_parallel_reference_resolves():
+    """The WS1 backends still reject strict contracts; they are skipped with
+    recorded reasons while dispatch resolves the #241 PR3 reference."""
+
+    registry = KernelRegistry()
+    platform = registry._platform()
+    # Order the WS1 backends ahead of the reference so their rejections are
+    # exercised on the way to a successful resolution.
+    candidates = registry._logprob_candidates[platform]
+    candidates.remove(OpBackend.PYTORCH_VOCAB_PARALLEL_LOGP)
+    candidates.append(OpBackend.PYTORCH_VOCAB_PARALLEL_LOGP)
+
+    result = registry.get_logprob_op(_contract())
+    assert result.capability.backend_id == "pytorch-vocab-parallel-logp-ws2"
+    assert result.provenance["fallback"] is True
+    rejections = " | ".join(result.provenance["prior_rejections"])
+    assert "vocab-domain LSE export is unsupported" in rejections
 
 
 def test_undeclared_backend_capability_is_never_selected():
