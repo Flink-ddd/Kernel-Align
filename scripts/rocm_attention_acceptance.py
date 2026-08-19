@@ -30,7 +30,7 @@ def main() -> int:
     commands = [
         (
             "single_gpu",
-            [sys.executable, "-m", "pytest", "-q", "tests/test_deterministic_attention_rocm.py"],
+            [sys.executable, "-m", "pytest", "-q", "tests/test_deterministic_attention.py"],
         )
     ]
     for transport, strict in (("p2p_nccl_reference", False), ("rccl_ag_rs", True)):
