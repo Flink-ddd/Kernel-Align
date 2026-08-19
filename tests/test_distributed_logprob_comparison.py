@@ -175,6 +175,11 @@ def test_tp1_cpu_case_writes_116_compatible_artifact(tmp_path, monkeypatch):
     assert payload["ranks"][0]["dp_world_size"] == 1
     assert payload["environment"]["materialization"]["consistent"] is True
     assert payload["aggregate"]["dlogp"]["worst_target_id"] is not None
+    fingerprints = payload["bitwise_fingerprints"]
+    assert len(fingerprints["candidate_logp_sha256"]) == 64
+    assert len(fingerprints["candidate_lse_sha256"]) == 64
+    assert fingerprints["dtype"] == "float32"
+    assert fingerprints["shape"] == [4]
     assert payload["launch_command"].startswith("torchrun --standalone")
 
 

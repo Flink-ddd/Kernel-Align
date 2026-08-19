@@ -175,6 +175,7 @@ class DistributedLogprobReport:
     environment: dict[str, Any]
     ranks: tuple[RankLogprobReport, ...]
     aggregate: dict[str, DriftDetail]
+    bitwise_fingerprints: dict[str, Any]
     passed: bool
 
     def to_dict(self) -> dict[str, Any]:
@@ -590,6 +591,33 @@ def _aggregate_payloads(
     }
 
 
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    """Hash the exact CPU tensor bytes for cross-topology comparisons."""
+
+    data = tensor.detach().cpu().contiguous().numpy().tobytes()
+    return hashlib.sha256(data).hexdigest()
+
+
+def _aggregate_bitwise_fingerprints(
+    case: DistributedLogprobCase,
+    payloads: Sequence[_RankPayload],
+) -> dict[str, Any]:
+    representatives = sorted(
+        (payload for payload in payloads if payload.report.tp_rank == 0),
+        key=lambda payload: payload.report.cp_rank,
+    )
+    if len(representatives) != case.cp_world_size:
+        raise RuntimeError("missing one or more CP representatives in rank reports")
+    candidate_logp = torch.cat([payload.candidate_logp for payload in representatives])
+    candidate_lse = torch.cat([payload.candidate_lse for payload in representatives])
+    return {
+        "candidate_logp_sha256": _tensor_sha256(candidate_logp),
+        "candidate_lse_sha256": _tensor_sha256(candidate_lse),
+        "dtype": str(candidate_logp.dtype).replace("torch.", ""),
+        "shape": list(candidate_logp.shape),
+    }
+
+
 def _create_tp_group(case: DistributedLogprobCase, topology: RankTopology) -> Any:
     if case.world_size == 1:
         return None
@@ -656,6 +684,7 @@ def run_distributed_logprob_case(
         report = None
         if rank == 0:
             aggregate = _aggregate_payloads(case, payloads)
+            bitwise_fingerprints = _aggregate_bitwise_fingerprints(case, payloads)
             rank_reports = tuple(
                 payload.report
                 for payload in sorted(payloads, key=lambda item: item.report.global_rank)
@@ -697,6 +726,7 @@ def run_distributed_logprob_case(
                 },
                 ranks=rank_reports,
                 aggregate=aggregate,
+                bitwise_fingerprints=bitwise_fingerprints,
                 passed=(
                     materialization_consistent
                     and all(rank_report.passed for rank_report in rank_reports)
