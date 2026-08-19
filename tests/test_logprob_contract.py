@@ -297,7 +297,7 @@ def test_ws1_rejections_recorded_when_vocab_parallel_reference_resolves():
     candidates.remove(OpBackend.PYTORCH_VOCAB_PARALLEL_LOGP)
     candidates.append(OpBackend.PYTORCH_VOCAB_PARALLEL_LOGP)
 
-    result = registry.get_logprob_op(_contract())
+    result = registry.get_logprob_op(_contract(), requested_backend="reference")
     assert result.capability.backend_id == "pytorch-vocab-parallel-logp-ws2"
     assert result.provenance["fallback"] is True
     rejections = " | ".join(result.provenance["prior_rejections"])

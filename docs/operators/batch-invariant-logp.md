@@ -58,7 +58,10 @@ or device, dispatch is unchanged (Triton -> PyTorch).
 
 `VocabParallelLogprobOp`
 (`rl_engine/kernels/ops/pytorch/loss/vocab_parallel_logp.py`)
-**TP=1, TP=2, and TP=4 produce bit-identical results.**
+defines a cross-TP bitwise contract for TP=1, TP=2, and TP=4 when
+`num_vocab_tiles` is fixed and every vocabulary-shard boundary is tile-aligned.
+The complete BF16 CUDA/NCCL validation matrix for this contract is tracked by
+issue #241 PR4.
 
 1. Split the padded vocabulary into `num_vocab_tiles` fixed tiles.
 2. Each rank computes fp32 `(max, sumexp)` for the tiles it owns. Every tile
@@ -300,6 +303,65 @@ batch-invariant suite passed 67 cases. For BF16 shape `[2, 16, 151936]`, both
 LSE and active-token dlogp had maximum absolute drift
 `9.5367431640625e-07` against the PyTorch reference, with no backend fallback.
 
+## Distributed WS2 Drift Report
+
+The issue #241 PR4 runner materializes one TP/CP topology per `torchrun`
+invocation. TP partitions the vocabulary and is the only numerical merge axis;
+CP partitions token rows and is recorded in provenance without participating in
+the vocab-domain LSE merge. For global rank `r`:
+
+```text
+tp_rank = r % tp_world_size
+cp_rank = r // tp_world_size
+```
+
+Every case generates the same seeded FP32 logical logits, targets, and active
+mask. The candidate receives a BF16 token/vocab shard through the explicit
+`pytorch-vocab-parallel-logp-ws2` backend, while the independent oracle computes
+`torch.logsumexp` over the complete real-vocab FP32 token slice. Distributed
+dispatch rejects `auto`, capability fallback, topology mismatches, non-tileable
+vocabularies, and incomplete materialization.
+
+Reports follow the issue #116 fields and contain per-rank and aggregate LSE and
+active-token dlogp summaries: max/mean/p95/p99 absolute drift, max relative
+drift, worst global token position, target id, target owner rank, #108 tolerance,
+and pass/fail. Provenance includes TP/CP topology, dtype, shard bounds, backend
+capability, contract fingerprint, reduction spec, merge order, transport, and
+the exact launch command. Replicated TP outputs are checked bitwise before one
+representative per CP shard is included in aggregate statistics.
+
+Print the scoped TP=1/2/4 x CP=1/2 launch matrix without starting workers:
+
+```bash
+python rl_engine/testing/distributed_logprob_comparison.py \
+  --plan \
+  --device cuda \
+  --dtype bf16 \
+  --output artifacts/ws2-logprob/report.json
+```
+
+Run one TP=2, CP=2 Qwen3-vocab case on four local GPUs:
+
+```bash
+torchrun --standalone --nproc-per-node=4 \
+  rl_engine/testing/distributed_logprob_comparison.py \
+  --tp 2 \
+  --cp 2 \
+  --dtype bf16 \
+  --backend pytorch-vocab-parallel-logp-ws2 \
+  --real-vocab 151936 \
+  --padded-vocab 151936 \
+  --num-vocab-tiles 64 \
+  --batch 2 \
+  --seq 16 \
+  --prompt-tokens 8 \
+  --output artifacts/ws2-logprob/tp2-cp2.json
+```
+
+The full matrix requires up to eight ranks for TP=4, CP=2. CPU/Gloo cases are
+available for topology and artifact validation; the scoped numerical gate is
+BF16 on CUDA/NCCL.
+
 ## Minimal Example
 
 ```python
@@ -335,6 +397,9 @@ gradient batch-invariance, and ignored-row zero gradients. The focused
 `tests/test_logprob_comparison.py` suite covers TP=1 bitwise regression, direct
 LSE identity, active-token drift statistics, structured serialization, exact
 backend diagnostics, and fail-closed provenance.
+`tests/test_distributed_logprob_comparison.py` covers topology planning, TP/CP
+rank mapping, token/vocab sharding, explicit backend materialization, #116 JSON
+artifacts, and a real four-process TP=2, CP=2 Gloo smoke case.
 
 Triton tests skip when Triton or CUDA is unavailable. On Windows, run via
 WSL/Linux with CUDA.
@@ -348,6 +413,9 @@ WSL/Linux with CUDA.
 - `rl_engine/kernels/registry.py`
 - `tests/test_batch_invariant_logp.py`
 - `tests/test_logprob_comparison.py`
+- `rl_engine/testing/logprob_drift.py`
+- `rl_engine/testing/distributed_logprob_comparison.py`
+- `tests/test_distributed_logprob_comparison.py`
 - `benchmarks/benchmark_batch_invariant_logp.py`
 - `rl_engine/kernels/ops/pytorch/loss/vocab_parallel_logp.py`
 - `rl_engine/kernels/logprob_contract.py`

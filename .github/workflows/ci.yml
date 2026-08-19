@@ -83,6 +83,10 @@ jobs:
       - name: Run WS2 Vocab-Parallel Logprob Tests (CPU-safe)
         run: python -m pytest tests/test_vocab_parallel_logp.py -v
 
+      - name: Run WS2 Logprob Comparison Tests (CPU-safe)
+        run: |
+          python -m pytest tests/test_logprob_comparison.py -v
+          python -m pytest tests/test_distributed_logprob_comparison.py -v
   docs:
     runs-on: ubuntu-latest
     steps:
