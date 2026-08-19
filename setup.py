@@ -140,6 +140,8 @@ def get_extensions():
             "csrc/cuda/activation.cu",
             "csrc/cuda/attention/deterministic_attention.cu",
         ]
+        if is_rocm:
+            cuda_sources.append("csrc/rocm/deterministic_rope.cu")
         if not is_rocm:
             # This source contains NVIDIA PTX (cp.async, ldmatrix, and mma.sync).
             # The ROCm dispatcher falls back to PyTorch SDPA for this operator.

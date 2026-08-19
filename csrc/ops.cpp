@@ -277,6 +277,14 @@ std::vector<torch::Tensor> deterministic_attention_backward(
     double scale,
     torch::optional<torch::Tensor> key_padding_mask);
 
+#if defined(KERNEL_ALIGN_WITH_ROCM)
+torch::Tensor deterministic_rope_apply_rocm(
+    torch::Tensor x,
+    torch::Tensor cos,
+    torch::Tensor sin,
+    double sin_sign);
+#endif
+
 #if !defined(USE_ROCM)
 // Prefix-Shared Attention Declarations & Wrappers (NVIDIA PTX only).
 
@@ -450,5 +458,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "deterministic_attention_backward",
         &deterministic_attention_backward,
         "Deterministic standard softmax attention backward (dQ, dK, dV)");
+#if defined(KERNEL_ALIGN_WITH_ROCM)
+    m.def(
+        "deterministic_rope_apply_rocm",
+        &deterministic_rope_apply_rocm,
+        "Deterministic GPT-NeoX RoPE apply for ROCm");
+#endif
 #endif
 }

@@ -775,7 +775,7 @@ class FlashInferQwen3PagedAttentionOp:
             communication, "supports_autograd", False
         ):
             raise FlashInferUnavailable(
-                "strict training requires the autograd-capable self-owned CUDA AG/RS backend"
+                "strict training requires an autograd-capable self-owned GPU AG/RS backend"
             )
         query_start, query_end = plan.query_token_ranges[plan.parallel.cp_rank]
         key_start, key_end = _cp_owner_ranges(plan)[plan.parallel.cp_rank]
@@ -1515,12 +1515,18 @@ def _resolve_strict_rope(cfg: FlashInferPagedAttentionConfig) -> Any:
     if cfg.strict_rope_op is not None:
         return cfg.strict_rope_op
     try:
+        if torch.version.hip is not None:
+            from rl_engine.kernels.ops.rocm.rotary_embedding.rope import (
+                RocmDeterministicRoPEOp,
+            )
+
+            return RocmDeterministicRoPEOp()
         from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RoPESM90Op
 
         return RoPESM90Op()
     except (ImportError, RuntimeError) as exc:
         raise FlashInferUnavailable(
-            "strict Attention requires the RL-Kernel WS1 RoPE CUDA operator"
+            "strict Attention requires the RL-Kernel deterministic RoPE operator"
         ) from exc
 
 
@@ -1530,7 +1536,7 @@ def _apply_strict_rope(
     position_ids: torch.Tensor,
     theta: float,
 ) -> torch.Tensor:
-    """RoPESM90Op accepts shared 1-D positions, so execute one batch row at a time."""
+    """Execute one batch row at a time to preserve the strict row schedule."""
 
     if position_ids.shape != (x.size(0), x.size(2)):
         raise ValueError("strict RoPE position IDs must have shape [B,S]")
@@ -1682,12 +1688,12 @@ def _strict_attention_provenance(
         "strict_schedule": core_provenance["strict_schedule"],
         "accum_dtype": core_provenance["accum_dtype"],
         "downcast_at": core_provenance["downcast_at"],
-        "arithmetic_plan_source": "rlkernel_deterministic_cuda_core",
+        "arithmetic_plan_source": "rlkernel_deterministic_gpu_core",
         "arithmetic_semantics_verified": True,
         "native_attention_arithmetic": False,
         "fallback": False,
         "fallback_reason": None,
-        "rope_backend": getattr(rope, "backend_id", "rlkernel.cuda.rope_sm90"),
+        "rope_backend": getattr(rope, "backend_id", "rlkernel.unknown.rope"),
         "rope_theta": float(cfg.rope.rope_theta),
         "rotary_dim": cfg.rope.rotary_dim,
         "rope_fusion": False,
@@ -1697,12 +1703,17 @@ def _strict_attention_provenance(
         "batch_invariant_claim": "strict_runtime_verified",
         "cp_comm_required": cp_required,
         "communication_backend": (
-            "self_owned_cuda_ag_rs" if cp_required else "none"
+            getattr(cfg.cp_communication, "backend_id", "unknown") if cp_required else "none"
         ),
         "production_ready": bool(
             cp_required
             and core_provenance.get("attention_backend")
-            == "rlkernel.cuda.deterministic_attention"
+            in {
+                "rlkernel.cuda.deterministic_attention",
+                "rlkernel.rocm.deterministic_attention",
+            }
+            and getattr(cfg.cp_communication, "backend_id", None)
+            in {"cuda_ag_rs", "rccl_ag_rs"}
         ),
     }
 

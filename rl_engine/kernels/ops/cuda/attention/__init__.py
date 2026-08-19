@@ -13,6 +13,7 @@ from .cp_comm import (
     CPCommunicationStatus,
     CUDAAGRSAttentionCPCommunication,
     P2PNCCLAttentionCPCommunication,
+    RCCLAGRSAttentionCPCommunication,
     sort_attention_cp_partial_states,
 )
 from .deterministic_attn import (
@@ -43,6 +44,7 @@ __all__ = [
     "CPCommunicationStatus",
     "CUDAAGRSAttentionCPCommunication",
     "P2PNCCLAttentionCPCommunication",
+    "RCCLAGRSAttentionCPCommunication",
     "DeterministicAttentionCoreResult",
     "DeterministicAttentionOp",
     "RLKernelDeterministicAttentionCore",
