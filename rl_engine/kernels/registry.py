@@ -77,6 +77,11 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     ASCEND_BATCH_INVARIANT_LOGP = (
         "rl_engine.kernels.ops.ascend.loss.batch_invariant_logp.BatchInvariantLogpAscendOp"
     )
+    # Ascend NPU deterministic (batch-invariant, no split-K) standard-softmax
+    # attention (issue #147); Ascend C forward + reference backward.
+    ASCEND_DETERMINISTIC_ATTENTION = (
+        "rl_engine.kernels.ops.ascend.attention.deterministic_attn.DeterministicAttentionAscendOp"
+    )
 
     # RMSNorm(pre-norm / QK-Norm) - pure Pytorch reference(ws1 ground-truth)
     PYTORCH_NATIVE_RMS_NORM = "rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp"
@@ -297,6 +302,15 @@ class KernelRegistry:
                     OpBackend.ASCEND_BATCH_INVARIANT_LOGP,
                     OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
                 ],
+                "attention": [
+                    OpBackend.ASCEND_DETERMINISTIC_ATTENTION,
+                    OpBackend.PYTORCH_NATIVE_ATTENTION,
+                ],
+                # Production SDPA-layout paths: no Ascend-accelerated candidate
+                # yet, so pin the explicit native fallbacks (the registry-wide
+                # default would resolve to a logp op, which is the wrong kind).
+                "attn": [OpBackend.PYTORCH_ATTN],
+                "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
             },
         }
         logger.info(f"KernelRegistry initialized for {device_ctx.device_type}")
