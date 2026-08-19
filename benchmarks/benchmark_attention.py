@@ -65,9 +65,7 @@ def _maybe_cuda_op():
         and hasattr(_C, "deterministic_attention_forward")
     ):
         return None
-    from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
-        DeterministicAttentionOp,
-    )
+    from rl_engine.kernels.ops.cuda.attention.deterministic_attn import DeterministicAttentionOp
 
     return DeterministicAttentionOp()
 

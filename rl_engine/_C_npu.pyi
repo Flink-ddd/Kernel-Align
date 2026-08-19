@@ -8,7 +8,6 @@ def batch_invariant_logp_ascend(
     target: torch.Tensor,
     ignore_index: int,
 ) -> list[torch.Tensor]: ...
-
 def deterministic_attention_ascend(
     q: torch.Tensor,
     k: torch.Tensor,
