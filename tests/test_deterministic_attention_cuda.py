@@ -36,25 +36,18 @@ ROCM_ONLY = pytest.mark.skipif(not IS_ROCM, reason="ROCm-only acceptance check")
 try:
     from rl_engine.kernels.attention_contract import SplitKVSpec
     from rl_engine.kernels.gtest.op_checks import CandidateSpec, OperatorCase, run_operator_suite
+    from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
+        DeterministicAttentionOp,
+        RLKernelDeterministicAttentionCore,
+    )
     from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
-
-    if IS_ROCM:
-        from rl_engine.kernels.ops.rocm.attention.deterministic_attn import (
-            DeterministicAttentionOp,
-            RLKernelDeterministicAttentionCore,
-        )
-    else:
-        from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
-            DeterministicAttentionOp,
-            RLKernelDeterministicAttentionCore,
-        )
 
     _OP_AVAILABLE = True
 except (ImportError, RuntimeError):
     _OP_AVAILABLE = False
 
 if IS_ROCM:
-    from rl_engine.kernels.ops.rocm.rotary_embedding.rope import RocmDeterministicRoPEOp
+    from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RocmDeterministicRoPEOp
 
 pytestmark = [
     pytestmark,

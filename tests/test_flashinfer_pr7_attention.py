@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import sys
 import types
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
@@ -39,8 +42,21 @@ from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (
     materialize_flashinfer_paged_kv_cache,
 )
 from rl_engine.testing.attention_comparison import DecodeKVCacheMetadata
-from scripts import ws2_p2p_nccl_attention_reference_check as p2p_check_script
-from scripts import ws2_pr7_flashinfer_attention_check as check_script
+
+
+def _load_repo_script(name: str):
+    path = Path(__file__).resolve().parents[1] / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"rl_kernel_{name}", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load repository script {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+p2p_check_script = _load_repo_script("ws2_p2p_nccl_attention_reference_check")
+check_script = _load_repo_script("ws2_pr7_flashinfer_attention_check")
 
 
 class _FakeFlashInferWrapper:

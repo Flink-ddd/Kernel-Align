@@ -1515,12 +1515,13 @@ def _resolve_strict_rope(cfg: FlashInferPagedAttentionConfig) -> Any:
     if cfg.strict_rope_op is not None:
         return cfg.strict_rope_op
     try:
+        from rl_engine.kernels.ops.cuda.rotary_embedding.rope import (
+            RocmDeterministicRoPEOp,
+            RoPESM90Op,
+        )
+
         if torch.version.hip is not None:
-            from rl_engine.kernels.ops.rocm.rotary_embedding.rope import RocmDeterministicRoPEOp
-
             return RocmDeterministicRoPEOp()
-        from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RoPESM90Op
-
         return RoPESM90Op()
     except (ImportError, RuntimeError) as exc:
         raise FlashInferUnavailable(

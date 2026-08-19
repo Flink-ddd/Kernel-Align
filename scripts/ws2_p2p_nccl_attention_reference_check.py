@@ -15,6 +15,7 @@ import argparse
 import json
 import math
 import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,14 +81,94 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="run AG(Q/K/V/positions) -> shared CUDA core -> RS(Out/LSE) with backward",
     )
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--run-rocm-matrix",
+        action="store_true",
+        help="run the complete 1/2/4/8-GPU ROCm acceptance matrix",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("results/rocm-attention"),
+        help="directory for --run-rocm-matrix logs and JSON reports",
+    )
     args = parser.parse_args(argv)
     if args.strict_shared_core and args.transport not in {"cuda_ag_rs", "rccl_ag_rs"}:
         parser.error("--strict-shared-core requires a self-owned AG/RS transport")
+    if args.run_rocm_matrix and (args.strict_shared_core or args.output is not None):
+        parser.error("--run-rocm-matrix cannot be combined with single-run output options")
     return args
+
+
+def _run_rocm_matrix(output_dir: Path) -> int:
+    if torch.version.hip is None or torch.cuda.device_count() < 8:
+        raise RuntimeError("the formal acceptance matrix requires 8 visible ROCm GPUs")
+
+    repo = Path(__file__).resolve().parents[1]
+    output = (repo / output_dir).resolve() if not output_dir.is_absolute() else output_dir
+    output.mkdir(parents=True, exist_ok=True)
+    script = Path(__file__).resolve()
+    commands: list[tuple[str, list[str]]] = [
+        (
+            "single_gpu",
+            [sys.executable, "-m", "pytest", "-q", "tests/test_deterministic_attention_cuda.py"],
+        )
+    ]
+    for transport, strict in (("p2p_nccl_reference", False), ("rccl_ag_rs", True)):
+        for ranks in (2, 4, 8):
+            name = f"{transport}_{ranks}r"
+            command = [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                f"--nproc-per-node={ranks}",
+                str(script),
+                "--transport",
+                transport,
+                "--output",
+                str(output / f"{name}.json"),
+            ]
+            if strict:
+                command.append("--strict-shared-core")
+            commands.append((name, command))
+
+    steps: list[dict[str, object]] = []
+    for name, command in commands:
+        completed = subprocess.run(
+            command,
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        (output / f"{name}.log").write_text(completed.stdout, encoding="utf-8")
+        steps.append({"name": name, "command": command, "returncode": completed.returncode})
+
+    summary = {
+        "schema_version": "ws2_rocm_attention_acceptance/v1",
+        "platform": "rocm",
+        "torch": str(torch.__version__),
+        "hip": str(torch.version.hip),
+        "collective": list(torch.cuda.nccl.version()),
+        "device_count": torch.cuda.device_count(),
+        "device_name": torch.cuda.get_device_name(0),
+        "steps": steps,
+        "passed": all(step["returncode"] == 0 for step in steps),
+    }
+    (output / "summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0 if summary["passed"] else 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.run_rocm_matrix:
+        return _run_rocm_matrix(args.output_dir)
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         raise RuntimeError("this check requires at least two visible CUDA/ROCm devices")
     dist.init_process_group("nccl", init_method="env://")
@@ -485,12 +566,10 @@ def _run_strict_shared_core_check(
 
 
 def _strict_rope_op():
+    from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RocmDeterministicRoPEOp, RoPESM90Op
+
     if torch.version.hip is not None:
-        from rl_engine.kernels.ops.rocm.rotary_embedding.rope import RocmDeterministicRoPEOp
-
         return RocmDeterministicRoPEOp()
-    from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RoPESM90Op
-
     return RoPESM90Op()
 
 

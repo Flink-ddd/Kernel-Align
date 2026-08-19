@@ -153,7 +153,7 @@ GPU-only LARGE Qwen3-8B real-shape smoke test.
 - `csrc/cuda/attention/deterministic_attention.cu` — CUDA kernels
 - `rl_engine/kernels/registry.py`
 - `tests/test_attention.py`
-- `tests/test_deterministic_attention.py`
+- `tests/test_deterministic_attention_cuda.py`
 
 ## Fixed Reduction Order (CUDA Deterministic Backend)
 
