@@ -49,6 +49,7 @@ from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
 )
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     AttentionPartialState,
+    AttentionRingSchedule,
     DeterministicCPAttentionReferenceOp,
     build_reference_split_kv_runtime_plan_set,
     merge_attention_partial_states,
@@ -805,6 +806,11 @@ class FlashInferQwen3PagedAttentionOp:
         if expected_kv_range is None:
             raise FlashInferUnavailable("strict CP Attention requires an expected KV range")
         expected_k_tokens = expected_kv_range[1] - expected_kv_range[0]
+        ring_schedule = AttentionRingSchedule.build(
+            expected_k_tokens,
+            cp_world_size=plan.parallel.cp_world_size,
+            kv_chunk_size=None,
+        )
         if global_q.size(2) != expected_q_tokens:
             raise FlashInferUnavailable("strict AG(Q) returned the wrong global width")
         if global_k.size(2) != expected_k_tokens or global_v.shape != global_k.shape:
@@ -855,6 +861,9 @@ class FlashInferQwen3PagedAttentionOp:
                 "strict_comm_autograd": bool(getattr(communication, "supports_autograd", False)),
                 "strict_local_query_range": [query_start, query_end],
                 "strict_local_kv_range": [key_start, key_end],
+                **ring_schedule.provenance(),
+                "ring_schedule_default": True,
+                "ring_partial_arithmetic": False,
             }
         )
         return FlashInferAttentionResult(

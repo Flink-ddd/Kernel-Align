@@ -57,6 +57,104 @@ class AttentionPartialState:
 
 
 @dataclass(frozen=True)
+class AttentionRingBlock:
+    """One logical KV block in the decoupled Ring Attention schedule."""
+
+    global_block_index: int
+    block_start: int
+    block_end: int
+    owner_cp_rank: int
+
+
+@dataclass(frozen=True)
+class AttentionRingSchedule:
+    """Static compute order separated from the fixed arithmetic merge order."""
+
+    schedule_id: str
+    total_kv_tokens: int
+    cp_world_size: int
+    kv_chunk_size: Optional[int]
+    blocks: tuple[AttentionRingBlock, ...]
+    compute_order: tuple[int, ...]
+    merge_order: tuple[int, ...]
+    compute_communication: str = "decoupled"
+    overlap: str = "disabled"
+
+    @classmethod
+    def build(
+        cls,
+        total_kv_tokens: int,
+        *,
+        cp_world_size: int = 1,
+        kv_chunk_size: Optional[int] = None,
+    ) -> "AttentionRingSchedule":
+        if (
+            isinstance(cp_world_size, bool)
+            or not isinstance(cp_world_size, int)
+            or cp_world_size < 1
+        ):
+            raise ValueError("cp_world_size must be >= 1")
+        if kv_chunk_size is not None and (
+            isinstance(kv_chunk_size, bool)
+            or not isinstance(kv_chunk_size, int)
+            or kv_chunk_size < 1
+        ):
+            raise ValueError("kv_chunk_size must be >= 1 when provided")
+        if (
+            isinstance(total_kv_tokens, bool)
+            or not isinstance(total_kv_tokens, int)
+            or total_kv_tokens < 1
+        ):
+            raise ValueError("total_kv_tokens must be an integer >= 1")
+        if total_kv_tokens < cp_world_size:
+            raise ValueError("Ring Attention requires at least one KV token per CP rank")
+        blocks: list[AttentionRingBlock] = []
+        for owner_cp_rank, (owner_start, owner_end) in enumerate(
+            _split_bounds(total_kv_tokens, cp_world_size)
+        ):
+            cursor = owner_start
+            while cursor < owner_end:
+                block_end = (
+                    owner_end if kv_chunk_size is None else min(cursor + kv_chunk_size, owner_end)
+                )
+                blocks.append(
+                    AttentionRingBlock(
+                        global_block_index=len(blocks),
+                        block_start=cursor,
+                        block_end=block_end,
+                        owner_cp_rank=owner_cp_rank,
+                    )
+                )
+                cursor = block_end
+        compute_order: list[int] = []
+        left, right = 0, len(blocks) - 1
+        while left <= right:
+            compute_order.append(left)
+            if left != right:
+                compute_order.append(right)
+            left += 1
+            right -= 1
+        return cls(
+            schedule_id="rlkernel.attention.strict_ring_state.v1",
+            total_kv_tokens=total_kv_tokens,
+            cp_world_size=cp_world_size,
+            kv_chunk_size=kv_chunk_size,
+            blocks=tuple(blocks),
+            compute_order=tuple(compute_order),
+            merge_order=tuple(range(len(blocks))),
+        )
+
+    def provenance(self) -> dict[str, object]:
+        return {
+            "compute_communication": self.compute_communication,
+            "compute_schedule": self.schedule_id,
+            "compute_order": list(self.compute_order),
+            "merge_order_indices": list(self.merge_order),
+            "communication_overlap": self.overlap,
+        }
+
+
+@dataclass(frozen=True)
 class AttentionBackwardGradients:
     """Training-side gradients emitted by the CP attention backward reference."""
 
@@ -235,6 +333,21 @@ class DeterministicCPAttentionReferenceOp:
             cp_world_size=cp_world_size,
             kv_chunk_size=kv_chunk_size,
             backend="deterministic_cp_reference",
+        )
+
+    @staticmethod
+    def ring_schedule(
+        total_kv_tokens: int,
+        *,
+        cp_world_size: int = 1,
+        kv_chunk_size: Optional[int] = None,
+    ) -> AttentionRingSchedule:
+        """Build the production-default pre-overlap Ring schedule."""
+
+        return AttentionRingSchedule.build(
+            total_kv_tokens,
+            cp_world_size=cp_world_size,
+            kv_chunk_size=kv_chunk_size,
         )
 
     def __call__(
@@ -551,6 +664,11 @@ class DeterministicCPAttentionReferenceOp:
         torch.autograd.backward(out, dout.to(dtype=out.dtype))
         if q_leaf.grad is None or k_leaf.grad is None or v_leaf.grad is None:
             raise RuntimeError("CP attention backward did not produce dq/dk/dv")
+        ring_schedule = self.ring_schedule(
+            k.size(2),
+            cp_world_size=cp_world_size,
+            kv_chunk_size=kv_chunk_size,
+        )
 
         return AttentionBackwardPathResult(
             name=name
@@ -589,6 +707,9 @@ class DeterministicCPAttentionReferenceOp:
                 "merge_order": "global_block_index",
                 "accum_dtype": "fp32",
                 "downcast_at": "final_write",
+                **ring_schedule.provenance(),
+                "ring_schedule_default": True,
+                "ring_partial_arithmetic": False,
                 "output_dtype": str(resolved_output_dtype).replace("torch.", ""),
                 "q_dtype": str(q.dtype).replace("torch.", ""),
                 "k_dtype": str(k.dtype).replace("torch.", ""),
@@ -1182,6 +1303,8 @@ __all__ = [
     "AttentionBackwardPathResult",
     "AttentionBackwardRankDrift",
     "AttentionPartialState",
+    "AttentionRingBlock",
+    "AttentionRingSchedule",
     "build_reference_split_kv_runtime_plan_set",
     "CPAttentionReferenceOp",
     "DeterministicCPAttentionReferenceOp",

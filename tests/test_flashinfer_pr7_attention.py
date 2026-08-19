@@ -670,6 +670,11 @@ def test_strict_cp_path_gathers_qkv_and_real_position_ids_before_shared_core():
     assert result.provenance["materialization"] == ("ag_qkv_positions_shared_core_rs")
     assert result.provenance["strict_full_qkv_all_gather"] is True
     assert result.provenance["strict_position_ids_all_gather"] is True
+    assert result.provenance["compute_communication"] == "decoupled"
+    assert result.provenance["compute_schedule"] == ("rlkernel.attention.strict_ring_state.v1")
+    assert result.provenance["communication_overlap"] == "disabled"
+    assert result.provenance["ring_schedule_default"] is True
+    assert result.provenance["ring_partial_arithmetic"] is False
     assert result.provenance["fallback"] is False
 
 
