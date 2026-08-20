@@ -7,11 +7,12 @@ Triton path — each of which must independently satisfy the invariance contract
 The PyTorch path (torch.matmul) is intentionally NOT tested here: it is the
 non-deterministic reference baseline and would fail batch-invariance by design.
 """
+
 import pytest
 import torch
 
 from rl_engine.kernels.gtest.tolerance import load_contract
-from rl_engine.kernels.ops.cuda.matmul import deterministic_gemm
+from rl_engine.kernels.ops.cuda.matmul import DetGemmOp, deterministic_gemm
 
 try:
     from rl_engine.kernels.ops.triton.matmul import deterministic_gemm_triton
@@ -22,20 +23,91 @@ except ImportError:
 
 torch.backends.cuda.matmul.allow_tf32 = False
 DEV = "cuda"
+IS_ROCM = getattr(torch.version, "hip", None) is not None
+HAS_SUPPORTED_GPU = torch.cuda.is_available() and (
+    IS_ROCM or torch.cuda.get_device_capability()[0] >= 8
+)
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
-    reason="det_gemm requires CUDA SM80+",
+    not HAS_SUPPORTED_GPU,
+    reason="det_gemm requires a ROCm GPU or CUDA SM80+",
 )
 
 # Each deterministic backend is validated independently.
-_BACKENDS = [("cuda", deterministic_gemm)]
+_NATIVE_BACKEND = "rocm" if IS_ROCM else "cuda"
+_BACKENDS = [(_NATIVE_BACKEND, deterministic_gemm)]
 if _HAS_TRITON:
     _BACKENDS.append(("triton", deterministic_gemm_triton))
 
 
 def _rand(*shape):
     return torch.randn(*shape, device=DEV, dtype=torch.bfloat16)
+
+
+_K_TREE_LEAF = 32
+
+
+def _k_tree_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Canonical FP32-leaf/BF16-node midpoint tree used by the native kernel."""
+
+    a = a.detach().contiguous()
+    b = b.detach().contiguous()
+
+    def reduce_range(lo: int, hi: int) -> torch.Tensor:
+        if hi - lo <= _K_TREE_LEAF:
+            return (a[:, lo:hi].float() @ b[lo:hi, :].float()).to(torch.bfloat16)
+        midpoint = lo + (hi - lo) // 2
+        return reduce_range(lo, midpoint) + reduce_range(midpoint, hi)
+
+    return reduce_range(0, a.size(1))
+
+
+def _balanced_tree_sum(parts: list[torch.Tensor]) -> torch.Tensor:
+    level = parts
+    while len(level) > 1:
+        level = [level[index] + level[index + 1] for index in range(0, len(level), 2)]
+    return level[0]
+
+
+@pytest.mark.parametrize("tp_size", (2, 4, 8))
+def test_forward_matches_balanced_contiguous_k_shards_bitwise(tp_size):
+    """The GEMM K-tree and the TP collective rank tree must be the same graph."""
+
+    torch.manual_seed(8)
+    # Qwen3-8B's down projection uses K=12288.  Its 384 32-wide leaves also
+    # exercise the non-power-of-two midpoint tree used by the SM90 kernel.
+    m, k, n = 4, 12288, 64
+    a, b = _rand(m, k), _rand(k, n)
+    width = k // tp_size
+    parts = [
+        deterministic_gemm(
+            a[:, rank * width : (rank + 1) * width].contiguous(),
+            b[rank * width : (rank + 1) * width].contiguous(),
+        )
+        for rank in range(tp_size)
+    ]
+
+    full = deterministic_gemm(a, b)
+    sharded = _balanced_tree_sum(parts)
+    assert torch.equal(full, sharded), (
+        f"full GEMM differed from balanced TP={tp_size} shards at "
+        f"{int((full != sharded).sum().item())} elements"
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+def test_forward_uses_the_input_device_when_it_is_not_current():
+    original_device = torch.cuda.current_device()
+    input_device = (original_device + 1) % torch.cuda.device_count()
+    with torch.cuda.device(input_device):
+        a, b = _rand(4, 64), _rand(64, 32)
+
+    assert torch.cuda.current_device() == original_device
+    output = deterministic_gemm(a, b)
+
+    assert output.device.index == input_device
+    assert torch.isfinite(output).all()
+    assert torch.cuda.current_device() == original_device
 
 
 @pytest.mark.parametrize("name,gemm", _BACKENDS)
@@ -81,10 +153,36 @@ def test_forward_correctness(name, gemm):
     M, K, N = 128, 2048, 2048
     a, b = _rand(M, K), _rand(K, N)
     out = gemm(a, b).float()
-    ref = a.float() @ b.float()
+    ref = _k_tree_gemm(a, b).float() if name == _NATIVE_BACKEND else a.float() @ b.float()
     contract = load_contract()
     thresholds = contract["accuracy"]["default"]["reduction"]["bfloat16"]
     torch.testing.assert_close(out, ref, atol=thresholds["atol"], rtol=thresholds["rtol"])
+
+
+def test_native_forward_retains_reasonable_fp32_accuracy():
+    """BF16 tree nodes may drift near zero but keep scale-normalized error small."""
+
+    torch.manual_seed(45)
+    m, k, n = 64, 4096, 512
+    a, b = _rand(m, k), _rand(k, n)
+    output = deterministic_gemm(a, b).float()
+    reference = a.float() @ b.float()
+    relative_l2_error = (
+        torch.linalg.vector_norm(output - reference) / torch.linalg.vector_norm(reference)
+    ).item()
+
+    # K=4096 has 128 FP32 leaves and seven BF16-add levels.  The 0.7% bound
+    # leaves margin over the measured ~0.5% while remaining scale-independent.
+    assert relative_l2_error < 7e-3
+
+
+def test_forward_fp32_preserves_its_public_dtype_contract():
+    torch.manual_seed(46)
+    a, b = _rand(8, 64), _rand(64, 32)
+    output = DetGemmOp().forward_fp32(a, b)
+
+    assert output.dtype is torch.float32
+    assert output.shape == (8, 32)
 
 
 @pytest.mark.parametrize("name,gemm", _BACKENDS)
@@ -111,6 +209,25 @@ def test_backward_correctness(name, gemm):
     b = _rand(K, N).requires_grad_(True)
     g = _rand(M, N)
     gemm(a, b).backward(g)
+    if name == _NATIVE_BACKEND:
+        expected_da = _k_tree_gemm(g, b.detach().t().contiguous())
+        expected_db = _k_tree_gemm(a.detach().t().contiguous(), g)
+        contract = load_contract()
+        thresholds = contract["accuracy"]["default"]["reduction"]["bfloat16"]
+        torch.testing.assert_close(
+            a.grad.float(),
+            expected_da.float(),
+            atol=thresholds["atol"],
+            rtol=thresholds["rtol"],
+        )
+        torch.testing.assert_close(
+            b.grad.float(),
+            expected_db.float(),
+            atol=thresholds["atol"],
+            rtol=thresholds["rtol"],
+        )
+        return
+
     af = a.detach().float().requires_grad_(True)
     bf = b.detach().float().requires_grad_(True)
     (af @ bf).backward(g.float())
@@ -143,9 +260,9 @@ def test_target_shapes_invariance(name, gemm, shape):
     row = _rand(1, K)
     big = _rand(64, K)
     big[0] = row[0]
-    assert torch.equal(
-        gemm(row, b)[0], gemm(big, b)[0]
-    ), f"{name}: batch-invariance broken at shape {shape}"
+    assert torch.equal(gemm(row, b)[0], gemm(big, b)[0]), (
+        f"{name}: batch-invariance broken at shape {shape}"
+    )
 
 
 @pytest.mark.skipif(not _HAS_TRITON, reason="Triton is unavailable")
