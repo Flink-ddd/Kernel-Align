@@ -26,16 +26,16 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from rl_engine.kernels.attention_contract import (  # noqa: E402
-    STRICT_ATTENTION_CORE_ID,
-    STRICT_ATTENTION_SCHEDULE_ID,
+    STRICT_ATTENTION_FA4_SCHEDULE_ID,
+    STRICT_ATTENTION_PRODUCTION_CORE_ID,
+    STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
+    STRICT_ATTENTION_ROCM_SCHEDULE_ID,
 )
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (  # noqa: E402
     AttentionCPCommunicationPlan,
     AttentionParallelSpec,
 )
-from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (  # noqa: E402
-    RLKernelDeterministicAttentionCore,
-)
+from rl_engine.kernels.ops.cuda.attention.flash_attn import StrictFlashAttention4Core  # noqa: E402
 from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (  # noqa: E402
     FlashInferPagedAttentionConfig,
     FlashInferQwen3PagedAttentionOp,
@@ -46,7 +46,6 @@ from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (  #
     _materialize_strict_logical_kv,
     build_flashinfer_paged_kv_plan,
 )
-from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RoPESM90Op  # noqa: E402
 from rl_engine.testing.attention_comparison import (  # noqa: E402
     AttentionPathResult,
     DecodeAttentionInputs,
@@ -398,10 +397,10 @@ def _run_strict_cuda_reference(
     config: FlashInferPagedAttentionConfig,
     paged_plan: Any,
 ) -> AttentionPathResult:
-    """Call the shared CUDA core directly on the logical KV sequence."""
+    """Call the platform production core directly on the logical KV sequence."""
 
-    core = config.deterministic_core or RLKernelDeterministicAttentionCore(split_kv=config.split_kv)
-    rope = config.strict_rope_op or RoPESM90Op()
+    core = config.deterministic_core or _strict_attention_core(config.split_kv)
+    rope = config.strict_rope_op or _strict_rope_op()
     logical_k, logical_v, key_positions = _materialize_strict_logical_kv(
         inputs.k_cache,
         inputs.v_cache,
@@ -431,12 +430,12 @@ def _run_strict_cuda_reference(
         outputs.append(result.out)
         lses.append(result.lse)
     return AttentionPathResult(
-        name="direct_rlkernel_cuda_deterministic_attention",
+        name="direct_platform_strict_attention",
         out=torch.cat(outputs, dim=0),
         lse=torch.cat(lses, dim=0),
         provenance={
-            "strict_core_id": STRICT_ATTENTION_CORE_ID,
-            "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
+            "strict_core_id": core.core_id,
+            "strict_schedule": core.strict_schedule,
             "split_kv_policy": "disabled",
         },
     )
@@ -647,14 +646,41 @@ def _acceptance_errors(report: dict[str, Any], args: argparse.Namespace) -> list
     if provenance.get("fallback") is not False:
         errors.append("FlashInfer execution used or omitted fallback provenance")
     if args.strict:
+        is_rocm = torch.version.hip is not None
+        expected_core = (
+            STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID
+            if is_rocm
+            else STRICT_ATTENTION_PRODUCTION_CORE_ID
+        )
+        expected_schedule = (
+            STRICT_ATTENTION_ROCM_SCHEDULE_ID if is_rocm else STRICT_ATTENTION_FA4_SCHEDULE_ID
+        )
+        expected_backend = "aiter.rocm.ck_dense_mha" if is_rocm else "flash_attention_4.cute"
         if provenance.get("strict_mode") is not True:
             errors.append("strict runtime did not execute the shared Attention core")
-        if provenance.get("strict_core_id") != STRICT_ATTENTION_CORE_ID:
+        if provenance.get("strict_core_id") != expected_core:
             errors.append("strict runtime core identity is invalid")
-        if provenance.get("strict_schedule") != STRICT_ATTENTION_SCHEDULE_ID:
+        if provenance.get("strict_schedule") != expected_schedule:
             errors.append("strict runtime arithmetic schedule is invalid")
-        if provenance.get("native_attention_arithmetic") is not False:
-            errors.append("strict runtime entered native FlashInfer Attention arithmetic")
+        if provenance.get("actual_backend") != expected_backend:
+            errors.append("strict runtime backend identity is invalid")
+        if provenance.get("native_attention_arithmetic") is not True:
+            errors.append("strict runtime did not execute the native production arithmetic")
+        if provenance.get("num_splits") != 1:
+            errors.append("strict runtime did not prove one reduction partition")
+        if provenance.get("deterministic_backward") is not True:
+            errors.append("strict runtime did not request deterministic backward")
+        if provenance.get("reference_only") is not False:
+            errors.append("strict runtime selected the reference core")
+        if is_rocm:
+            if provenance.get("split_kv_control") != "dense_non_split_api":
+                errors.append("strict ROCm runtime did not use AITER dense non-Split-K MHA")
+            if provenance.get("aiter_api_source") != "aiter.ops.mha":
+                errors.append("strict ROCm runtime did not prove the AITER API source")
+            if not provenance.get("aiter_source_sha256"):
+                errors.append("strict ROCm runtime did not fingerprint AITER MHA")
+        elif provenance.get("fa_api_source") != "flash_attn.cute.interface":
+            errors.append("strict CUDA runtime did not prove the FA4 CuTe API source")
         strict_plans = provenance.get("strict_core_row_plans")
         if not isinstance(strict_plans, list) or not strict_plans:
             errors.append("strict no-Split-K execution plans are missing")
@@ -683,6 +709,20 @@ def _acceptance_errors(report: dict[str, Any], args: argparse.Namespace) -> list
         if report.get(sweep_name, {}).get("passed") is not True:
             errors.append(f"{sweep_name} failed")
     return errors
+
+
+def _strict_attention_core(split_kv):
+    if torch.version.hip is not None:
+        from rl_engine.kernels.ops.rocm.attention.flash_attn import StrictRocmAiterCKAttentionCore
+
+        return StrictRocmAiterCKAttentionCore(split_kv=split_kv)
+    return StrictFlashAttention4Core(split_kv=split_kv)
+
+
+def _strict_rope_op():
+    from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RocmDeterministicRoPEOp, RoPESM90Op
+
+    return RocmDeterministicRoPEOp() if torch.version.hip is not None else RoPESM90Op()
 
 
 def _select_batch_row(inputs: DecodeAttentionInputs, batch_index: int) -> DecodeAttentionInputs:

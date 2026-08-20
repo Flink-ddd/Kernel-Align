@@ -15,7 +15,11 @@ import torch
 
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_FA4_SCHEDULE_ID,
+    STRICT_ATTENTION_PRODUCTION_CORE_ID,
     STRICT_ATTENTION_RING_SCHEDULE_ID,
+    STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
+    STRICT_ATTENTION_ROCM_SCHEDULE_ID,
     STRICT_ATTENTION_SCHEDULE_ID,
     SplitKVSpec,
 )
@@ -1725,7 +1729,7 @@ def test_pr7_check_acceptance_errors_require_all_drift_and_invariance_fields():
     assert check_script._acceptance_errors(report, args) == ["batch_invariant_sweep failed"]
 
 
-def test_pr7_check_accepts_strict_shared_core_without_native_flashinfer_arithmetic():
+def test_pr7_check_accepts_strict_cuda_production_core():
     args = check_script._parse_args(["--strict", "--device", "cuda"])
     report = {
         "device": "cuda:0",
@@ -1734,9 +1738,14 @@ def test_pr7_check_accepts_strict_shared_core_without_native_flashinfer_arithmet
             "attention_mode": "decode",
             "fallback": False,
             "strict_mode": True,
-            "strict_core_id": STRICT_ATTENTION_CORE_ID,
-            "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
-            "native_attention_arithmetic": False,
+            "strict_core_id": STRICT_ATTENTION_PRODUCTION_CORE_ID,
+            "strict_schedule": STRICT_ATTENTION_FA4_SCHEDULE_ID,
+            "actual_backend": "flash_attention_4.cute",
+            "native_attention_arithmetic": True,
+            "num_splits": 1,
+            "deterministic_backward": True,
+            "fa_api_source": "flash_attn.cute.interface",
+            "reference_only": False,
             "strict_core_row_plans": [{"actual_split_kv_policy": "disabled"}],
             "rope_backend": "rlkernel.cuda.rope_sm90",
             "rope_theta": 1_000_000.0,
@@ -1816,17 +1825,21 @@ def test_strict_shared_core_entrypoint_requires_self_owned_ag_rs():
 
 def _strict_acceptance_provenance(**overrides):
     provenance = {
-        "strict_core_id": STRICT_ATTENTION_CORE_ID,
-        "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
-        "attention_backend": "rlkernel.cuda.deterministic_attention",
-        "actual_backend": "rlkernel.cuda.deterministic_attention",
+        "strict_core_id": STRICT_ATTENTION_PRODUCTION_CORE_ID,
+        "strict_schedule": STRICT_ATTENTION_FA4_SCHEDULE_ID,
+        "attention_backend": "flash_attention_4.cute",
+        "actual_backend": "flash_attention_4.cute",
         "rope_backend": "rlkernel.cuda.rope_sm90",
         "strict_mode": True,
-        "native_attention_arithmetic": False,
+        "native_attention_arithmetic": True,
+        "num_splits": 1,
+        "deterministic_backward": True,
+        "reference_only": False,
+        "fa_api_source": "flash_attn.cute.interface",
         "fallback": False,
         "strict_split_kv": "disabled",
         "strict_comm_autograd": True,
-        "communication_backend": "cuda_ag_rs",
+        "communication_backend": "self_owned_cuda_ag_rs",
         "production_ready": True,
         "strict_full_qkv_all_gather": True,
         "strict_position_ids_all_gather": True,
@@ -1867,10 +1880,15 @@ def test_strict_shared_core_acceptance_rejects_provenance_drift(field, invalid):
 
 def test_strict_shared_core_acceptance_requires_rocm_backend_and_rope():
     provenance = _strict_acceptance_provenance(
-        attention_backend="rlkernel.rocm.deterministic_attention",
-        actual_backend="rlkernel.rocm.deterministic_attention",
+        strict_core_id=STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
+        strict_schedule=STRICT_ATTENTION_ROCM_SCHEDULE_ID,
+        attention_backend="aiter.rocm.ck_dense_mha",
+        actual_backend="aiter.rocm.ck_dense_mha",
         rope_backend="rlkernel.rocm.deterministic_rope",
         communication_backend="rccl_ag_rs",
+        split_kv_control="dense_non_split_api",
+        aiter_api_source="aiter.ops.mha",
+        aiter_source_sha256="a" * 64,
     )
 
     assert not p2p_check_script._strict_shared_core_identity_errors(

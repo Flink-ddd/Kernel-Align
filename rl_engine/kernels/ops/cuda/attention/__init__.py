@@ -21,7 +21,7 @@ from .deterministic_attn import (
     DeterministicAttentionOp,
     RLKernelDeterministicAttentionCore,
 )
-from .flash_attn import FlashAttentionOp
+from .flash_attn import FlashAttentionOp, StrictFlashAttention4Core, StrictFlashAttentionUnavailable
 from .flashinfer_paged_attention import (
     FlashInferPagedAttentionConfig,
     FlashInferQwen3PagedAttentionOp,
@@ -49,6 +49,8 @@ __all__ = [
     "DeterministicAttentionOp",
     "RLKernelDeterministicAttentionCore",
     "FlashAttentionOp",
+    "StrictFlashAttention4Core",
+    "StrictFlashAttentionUnavailable",
     "FlashInferPagedAttentionConfig",
     "FlashInferQwen3PagedAttentionOp",
     "FlashInferRoPEFusionConfig",

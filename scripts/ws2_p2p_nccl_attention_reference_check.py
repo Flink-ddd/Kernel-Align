@@ -29,9 +29,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from rl_engine.kernels.attention_contract import (  # noqa: E402
-    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_FA4_SCHEDULE_ID,
+    STRICT_ATTENTION_PRODUCTION_CORE_ID,
     STRICT_ATTENTION_RING_SCHEDULE_ID,
-    STRICT_ATTENTION_SCHEDULE_ID,
+    STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
+    STRICT_ATTENTION_ROCM_SCHEDULE_ID,
 )
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (  # noqa: E402
     AttentionCPBlockMetadata,
@@ -43,9 +45,7 @@ from rl_engine.kernels.ops.cuda.attention.cp_comm import (  # noqa: E402
     P2PNCCLAttentionCPCommunication,
     RCCLAGRSAttentionCPCommunication,
 )
-from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (  # noqa: E402
-    RLKernelDeterministicAttentionCore,
-)
+from rl_engine.kernels.ops.cuda.attention.flash_attn import StrictFlashAttention4Core  # noqa: E402
 from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (  # noqa: E402
     FlashInferPagedAttentionConfig,
     FlashInferQwen3PagedAttentionOp,
@@ -510,7 +510,7 @@ def _run_strict_shared_core_check(
     rope = _strict_rope_op()
     q_ready = _apply_strict_rope(rope, q_ref, positions, config.rope.rope_theta)
     k_ready = _apply_strict_rope(rope, k_ref, positions, config.rope.rope_theta)
-    reference = RLKernelDeterministicAttentionCore().forward_with_lse(
+    reference = _strict_attention_core().forward_with_lse(
         q_ready,
         k_ready,
         v_ref,
@@ -601,24 +601,30 @@ def _strict_shared_core_identity_errors(
 ) -> list[str]:
     """Return every strict-contract provenance mismatch for the rank report."""
 
-    expected_backend = (
-        "rlkernel.rocm.deterministic_attention"
-        if is_rocm
-        else "rlkernel.cuda.deterministic_attention"
+    expected_core = (
+        STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID if is_rocm else STRICT_ATTENTION_PRODUCTION_CORE_ID
     )
+    expected_schedule = (
+        STRICT_ATTENTION_ROCM_SCHEDULE_ID if is_rocm else STRICT_ATTENTION_FA4_SCHEDULE_ID
+    )
+    expected_backend = "aiter.rocm.ck_dense_mha" if is_rocm else "flash_attention_4.cute"
     expected_rope = "rlkernel.rocm.deterministic_rope" if is_rocm else "rlkernel.cuda.rope_sm90"
+    expected_communication = "rccl_ag_rs" if is_rocm else "self_owned_cuda_ag_rs"
     required = {
-        "strict_core_id": STRICT_ATTENTION_CORE_ID,
-        "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
+        "strict_core_id": expected_core,
+        "strict_schedule": expected_schedule,
         "attention_backend": expected_backend,
         "actual_backend": expected_backend,
         "rope_backend": expected_rope,
         "strict_mode": True,
-        "native_attention_arithmetic": False,
+        "native_attention_arithmetic": True,
+        "num_splits": 1,
+        "deterministic_backward": True,
+        "reference_only": False,
         "fallback": False,
         "strict_split_kv": "disabled",
         "strict_comm_autograd": True,
-        "communication_backend": transport,
+        "communication_backend": expected_communication,
         "production_ready": True,
         "strict_full_qkv_all_gather": True,
         "strict_position_ids_all_gather": True,
@@ -631,11 +637,30 @@ def _strict_shared_core_identity_errors(
         "q_rope_state": "post_rope",
         "k_cache_rope_state": "post_rope",
     }
-    return [
+    errors = [
         f"{name}={provenance.get(name)!r}, expected {expected!r}"
         for name, expected in required.items()
         if provenance.get(name) != expected
     ]
+    if is_rocm:
+        if provenance.get("split_kv_control") != "dense_non_split_api":
+            errors.append("split_kv_control must prove the AITER dense non-Split-K API")
+        if provenance.get("aiter_api_source") != "aiter.ops.mha":
+            errors.append("aiter_api_source must identify aiter.ops.mha")
+        if not provenance.get("aiter_source_sha256"):
+            errors.append("aiter_source_sha256 is missing")
+    else:
+        if provenance.get("fa_api_source") != "flash_attn.cute.interface":
+            errors.append("fa_api_source must identify the FA4 CuTe API")
+    return errors
+
+
+def _strict_attention_core():
+    if torch.version.hip is not None:
+        from rl_engine.kernels.ops.rocm.attention.flash_attn import StrictRocmAiterCKAttentionCore
+
+        return StrictRocmAiterCKAttentionCore()
+    return StrictFlashAttention4Core()
 
 
 def _strict_rope_op():
