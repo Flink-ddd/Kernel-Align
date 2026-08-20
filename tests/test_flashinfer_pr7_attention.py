@@ -1764,8 +1764,7 @@ def test_pr7_check_accepts_strict_cuda_production_core():
     assert check_script._acceptance_errors(report, args) == []
 
 
-def test_pr7_check_accepts_strict_rocm_production_core(monkeypatch):
-    monkeypatch.setattr(torch.version, "hip", "6.3.0")
+def test_pr7_check_accepts_strict_rocm_production_core():
     args = check_script._parse_args(["--strict", "--device", "cuda"])
     report = {
         "device": "cuda:0",
@@ -1777,6 +1776,7 @@ def test_pr7_check_accepts_strict_rocm_production_core(monkeypatch):
             "strict_core_id": STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
             "strict_schedule": STRICT_ATTENTION_ROCM_SCHEDULE_ID,
             "actual_backend": "aiter.rocm.ck_dense_mha",
+            "platform": "rocm",
             "native_attention_arithmetic": True,
             "num_splits": 1,
             "deterministic_backward": True,

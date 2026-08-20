@@ -646,7 +646,10 @@ def _acceptance_errors(report: dict[str, Any], args: argparse.Namespace) -> list
     if provenance.get("fallback") is not False:
         errors.append("FlashInfer execution used or omitted fallback provenance")
     if args.strict:
-        is_rocm = torch.version.hip is not None
+        platform = provenance.get("platform", "cuda")
+        if platform not in {"cuda", "rocm"}:
+            errors.append("strict runtime platform provenance is invalid")
+        is_rocm = platform == "rocm"
         expected_core = (
             STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID
             if is_rocm
