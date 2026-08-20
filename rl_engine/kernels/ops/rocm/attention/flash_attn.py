@@ -165,7 +165,9 @@ class StrictRocmAiterCKAttentionCore:
         if _mha_fwd is None:
             mha_fwd, mha_bwd, source_sha256 = _load_aiter_ck_ops()
         else:
-            mha_fwd, mha_bwd = _mha_fwd, _mha_bwd
+            assert _mha_bwd is not None
+            mha_fwd = _mha_fwd
+            mha_bwd = _mha_bwd
             source_sha256 = "test-double" if _source_sha256 is None else _source_sha256
         if not callable(mha_fwd) or not callable(mha_bwd):
             raise StrictRocmAttentionUnavailable("AITER CK MHA entry points are not callable")
