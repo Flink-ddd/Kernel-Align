@@ -1802,6 +1802,40 @@ def test_pr7_check_accepts_strict_rocm_production_core():
     assert check_script._acceptance_errors(report, args) == []
 
 
+@pytest.mark.parametrize(
+    ("backend", "rope_backend"),
+    [
+        ("flash_attention_4.cute", "rlkernel.cuda.rope_sm90"),
+        ("aiter.rocm.ck_dense_mha", "rlkernel.rocm.deterministic_rope"),
+    ],
+)
+def test_strict_report_uses_executed_platform_provenance(backend, rope_backend):
+    fields = check_script._strict_execution_report_fields(
+        {
+            "actual_backend": backend,
+            "rope_backend": rope_backend,
+            "rope_fusion": False,
+            "rope_fusion_boundary": "rlkernel_rope_then_attention",
+            "rope_theta": 1_000_000.0,
+            "rotary_dim": 128,
+            "q_rope_state": "post_rope",
+            "k_cache_rope_state": "post_rope",
+        }
+    )
+
+    assert fields["reference_backend"] == backend
+    assert backend in fields["target"]
+    assert fields["rope"] == {
+        "rope_backend": rope_backend,
+        "rope_fusion": False,
+        "rope_fusion_boundary": "rlkernel_rope_then_attention",
+        "rope_theta": 1_000_000.0,
+        "rotary_dim": 128,
+        "q_rope_state": "post_rope",
+        "k_cache_rope_state": "post_rope",
+    }
+
+
 def test_pr7_check_rejects_nonfinite_drift_and_wrong_tp_local_shape():
     args = check_script._parse_args([])
     report = {
