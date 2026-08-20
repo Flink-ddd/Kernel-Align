@@ -8,7 +8,8 @@ materialized ``[N, V]`` logits tensor with a locked, per-row reduction order
 (batch-invariant). The comparison here is latency and peak device memory across
 a vocab sweep:
 
-- Native materializes ``log_softmax`` over the full ``[N, V]`` tensor.
+- Native materializes FP32 ``[N, V]`` intermediates for an explicit row-wise
+  max, exp, sum, and log calculation.
 - Triton streams the vocab through an online softmax (grid = one program/row).
 - CUDA is the Hopper TMA online-softmax kernel (one CTA/row); only present when
   the extension is built with ``KERNEL_ALIGN_FORCE_SM90=1`` on an SM90 device.
@@ -58,6 +59,8 @@ def _maybe_triton_op():
 
 def _maybe_sm90_op():
     """The Hopper TMA op, or None when unavailable (non-Hopper / not built)."""
+    if device_ctx.device_type != "cuda":
+        return None
     from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 
     if not (
@@ -80,19 +83,22 @@ def _maybe_ascend_op():
         from rl_engine.kernels.ops.ascend.loss.batch_invariant_logp import (
             BatchInvariantLogpAscendOp,
         )
-    except (ImportError, RuntimeError):
+
+        return BatchInvariantLogpAscendOp()
+    except (ImportError, OSError, RuntimeError):
         return None
-    return BatchInvariantLogpAscendOp()
 
 
 def _maybe_accelerated_op():
-    """(label, op) for the fastest hardware kernel on this host, else (None, None)."""
-    sm90_op = _maybe_sm90_op()
-    if sm90_op is not None:
-        return "cuda", sm90_op
-    ascend_op = _maybe_ascend_op()
-    if ascend_op is not None:
-        return "ascend", ascend_op
+    """(label, op) for the active device's hardware kernel, else (None, None)."""
+    if device_ctx.device_type == "cuda":
+        sm90_op = _maybe_sm90_op()
+        if sm90_op is not None:
+            return "cuda", sm90_op
+    elif device_ctx.device_type == "npu":
+        ascend_op = _maybe_ascend_op()
+        if ascend_op is not None:
+            return "ascend", ascend_op
     return None, None
 
 

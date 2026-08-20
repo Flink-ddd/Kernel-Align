@@ -39,6 +39,29 @@ def _fallback_op():
     return NativeBatchInvariantLogpOp()
 
 
+def _batch_invariant_logp_backward(
+    logits_2d: torch.Tensor,
+    target_1d: torch.Tensor,
+    lse: torch.Tensor,
+    grad_flat: torch.Tensor,
+    ignore_index: int,
+) -> torch.Tensor:
+    """Compute onehot - softmax using one full-size FP32 workspace."""
+    valid = target_1d != ignore_index
+    safe_target = torch.where(valid, target_1d, torch.zeros_like(target_1d))
+
+    grad = torch.empty_like(logits_2d, dtype=torch.float32)
+    grad.copy_(logits_2d)
+    grad.sub_(lse.unsqueeze(1)).exp_().neg_()
+    grad.scatter_add_(
+        1,
+        safe_target.unsqueeze(1),
+        valid.to(dtype=grad.dtype).unsqueeze(1),
+    )
+    grad.mul_((grad_flat * valid).unsqueeze(1))
+    return grad.to(logits_2d.dtype)
+
+
 class _BatchInvariantLogpAscendFunction(torch.autograd.Function):
     # Autograd wrapper: Ascend C forward + PyTorch-formula backward.
     # The SM90 op reuses Triton's tile-wise backward; Triton is unavailable on
@@ -69,14 +92,13 @@ class _BatchInvariantLogpAscendFunction(torch.autograd.Function):
 
         grad_flat = grad_output.reshape(-1).contiguous().to(torch.float32)
 
-        valid = target_1d != ignore_index
-        safe_target = torch.where(valid, target_1d, torch.zeros_like(target_1d))
-        probs = torch.exp(logits_2d.float() - lse.unsqueeze(1))
-        onehot = torch.zeros_like(probs)
-        onehot.scatter_(1, safe_target.unsqueeze(1), 1.0)
-        grad = grad_flat.unsqueeze(1) * (onehot - probs)
-        grad = torch.where(valid.unsqueeze(1), grad, torch.zeros_like(grad))
-        grad_logits = grad.to(logits_2d.dtype)
+        grad_logits = _batch_invariant_logp_backward(
+            logits_2d,
+            target_1d,
+            lse,
+            grad_flat,
+            ignore_index,
+        )
 
         grad_logits = grad_logits.reshape(ctx.lead_shape + (vocab_size,))
         return grad_logits, None, None

@@ -14,6 +14,7 @@ import torch
 
 from rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp import NativeBatchInvariantLogpOp
 from rl_engine.kernels.ops.pytorch.loss.logp import NativeLogpOp
+from rl_engine.platforms.device import _npu_available
 
 _V = 300
 
@@ -61,14 +62,6 @@ requires_sm90 = pytest.mark.skipif(
 )
 
 
-def _npu_available() -> bool:
-    try:
-        import torch_npu  # noqa: F401
-    except ImportError:
-        return False
-    return hasattr(torch, "npu") and torch.npu.is_available()
-
-
 def _ascend_kernel_available() -> bool:
     if not _npu_available():
         return False
@@ -77,7 +70,7 @@ def _ascend_kernel_available() -> bool:
             _NPU_EXT_AVAILABLE,
             _C_npu,
         )
-    except ImportError:
+    except Exception:
         return False
     return _NPU_EXT_AVAILABLE and hasattr(_C_npu, "batch_invariant_logp_ascend")
 
@@ -313,7 +306,6 @@ class TestBatchInvariance:
 
 
 class TestValidation:
-
     def test_rejects_1d_logits(self):
         op = NativeBatchInvariantLogpOp()
         with pytest.raises(ValueError, match="at least 2-D"):
@@ -353,6 +345,47 @@ class TestValidation:
         assert out.shape == (2, 3)
         ref = _reference_logp(logits, target)
         assert torch.allclose(out, ref, atol=1e-6)
+
+
+def test_ascend_backward_formula_matches_reference_without_full_onehot():
+    from rl_engine.kernels.ops.ascend.loss.batch_invariant_logp import (
+        _batch_invariant_logp_backward,
+    )
+
+    logits = torch.randn(4, 17)
+    original_logits = logits.clone()
+    target = torch.tensor([0, -100, 8, 16])
+    valid = target != -100
+    safe_target = torch.where(valid, target, torch.zeros_like(target))
+    lse = torch.logsumexp(logits, dim=1)
+    grad_output = torch.randn(4)
+
+    actual = _batch_invariant_logp_backward(logits, target, lse, grad_output, -100)
+
+    reference_logits = logits.clone().requires_grad_(True)
+    selected = reference_logits.gather(1, safe_target.unsqueeze(1)).squeeze(1)
+    reference = selected - torch.logsumexp(reference_logits, dim=1)
+    reference = torch.where(valid, reference, torch.zeros_like(reference))
+    (reference * grad_output).sum().backward()
+
+    assert torch.equal(logits, original_logits)
+    assert torch.allclose(actual, reference_logits.grad, atol=1e-6)
+
+
+def test_ascend_backward_formula_accepts_empty_batch():
+    from rl_engine.kernels.ops.ascend.loss.batch_invariant_logp import (
+        _batch_invariant_logp_backward,
+    )
+
+    grad = _batch_invariant_logp_backward(
+        torch.empty(0, 17),
+        torch.empty(0, dtype=torch.long),
+        torch.empty(0),
+        torch.empty(0),
+        -100,
+    )
+
+    assert grad.shape == (0, 17)
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +440,6 @@ class TestBackward:
 
 
 class TestIgnoreEdgeCases:
-
     def test_all_ignore_index_outputs_zero(self):
         op = NativeBatchInvariantLogpOp()
         logits = torch.randn(4, _V)
@@ -779,7 +811,6 @@ class TestTritonBackward:
 
 @requires_triton_cuda
 class TestTritonIgnoreIndex:
-
     def _get_op(self):
         from rl_engine.kernels.ops.triton.loss.batch_invariant_logp import (
             TritonBatchInvariantLogpOp,
@@ -829,7 +860,6 @@ class TestTritonCPUValidation:
 
 @requires_triton_cuda
 class TestTritonValidation:
-
     def _get_op(self):
         from rl_engine.kernels.ops.triton.loss.batch_invariant_logp import (
             TritonBatchInvariantLogpOp,
@@ -1016,7 +1046,6 @@ class TestCudaSM90Backward:
 
 @requires_sm90
 class TestCudaSM90IgnoreIndex:
-
     def _get_op(self):
         from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import BatchInvariantLogpSM90Op
 
@@ -1116,6 +1145,16 @@ class TestAscendCorrectness:
         target = torch.randint(0, _VC, (16,), device="npu")
         assert torch.allclose(op(logits, target), pytorch_op(logits, target), atol=1e-4)
 
+    def test_empty_batch(self):
+        op = self._get_op()
+        logits = torch.empty(0, _VC, device="npu", requires_grad=True)
+        target = torch.empty(0, device="npu", dtype=torch.long)
+        out = op(logits, target)
+        assert out.shape == (0,)
+        assert out.dtype == torch.float32
+        out.sum().backward()
+        assert logits.grad.shape == logits.shape
+
 
 @requires_ascend
 class TestAscendBatchInvariance:
@@ -1203,7 +1242,6 @@ class TestAscendBackward:
 
 @requires_ascend
 class TestAscendIgnoreIndex:
-
     def _get_op(self):
         from rl_engine.kernels.ops.ascend.loss.batch_invariant_logp import (
             BatchInvariantLogpAscendOp,
@@ -1220,6 +1258,20 @@ class TestAscendIgnoreIndex:
         assert out[3].item() == 0.0
         ref = _reference_logp(logits[[0, 2]], target[[0, 2]])
         assert torch.allclose(out[[0, 2]], ref, atol=1e-4)
+
+
+@requires_ascend
+class TestAscendValidation:
+    def test_rejects_invalid_target_when_requested(self):
+        from rl_engine.kernels.ops.ascend.loss.batch_invariant_logp import (
+            BatchInvariantLogpAscendOp,
+        )
+
+        op = BatchInvariantLogpAscendOp()
+        logits = torch.randn(4, _VC, device="npu")
+        target = torch.tensor([0, -1, 2, 3], device="npu")
+        with pytest.raises(ValueError, match="outside"):
+            op(logits, target, validate=True)
 
 
 @requires_ascend
@@ -1262,3 +1314,18 @@ def test_registry_dispatches_correctly():
     out = op(logits, target)
     ref = _reference_logp(logits, target)
     assert torch.allclose(out, ref, atol=1e-6)
+
+
+def test_benchmark_selects_accelerated_op_for_active_device(monkeypatch):
+    from benchmarks import benchmark_batch_invariant_logp as benchmark
+
+    cuda_op = object()
+    ascend_op = object()
+    monkeypatch.setattr(benchmark, "_maybe_sm90_op", lambda: cuda_op)
+    monkeypatch.setattr(benchmark, "_maybe_ascend_op", lambda: ascend_op)
+
+    monkeypatch.setattr(benchmark.device_ctx, "device_type", "npu")
+    assert benchmark._maybe_accelerated_op() == ("ascend", ascend_op)
+
+    monkeypatch.setattr(benchmark.device_ctx, "device_type", "cuda")
+    assert benchmark._maybe_accelerated_op() == ("cuda", cuda_op)

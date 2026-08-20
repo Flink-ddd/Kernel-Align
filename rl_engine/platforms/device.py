@@ -11,9 +11,10 @@ def _npu_available() -> bool:
     """torch.npu only exists after torch_npu is imported; probe defensively."""
     try:
         import torch_npu  # noqa: F401
-    except ImportError:
+
+        return hasattr(torch, "npu") and torch.npu.is_available()
+    except Exception:
         return False
-    return hasattr(torch, "npu") and torch.npu.is_available()
 
 
 class DeviceContext:

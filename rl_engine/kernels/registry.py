@@ -295,8 +295,9 @@ class KernelRegistry:
                 "silu": [OpBackend.PYTORCH_NATIVE_SILU],
                 "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
             },
-            # Ascend NPU: op types without an entry fall back to PYTORCH_NATIVE
-            # (see get_op's default), so only Ascend-accelerated ops are listed.
+            # Ascend NPU: op types without an entry fall back to their CPU
+            # candidates (see the runtime override below), so only
+            # Ascend-accelerated ops are listed.
             "npu": {
                 "batch_invariant_logp": [
                     OpBackend.ASCEND_BATCH_INVARIANT_LOGP,
@@ -306,13 +307,21 @@ class KernelRegistry:
                     OpBackend.ASCEND_DETERMINISTIC_ATTENTION,
                     OpBackend.PYTORCH_NATIVE_ATTENTION,
                 ],
-                # Production SDPA-layout paths: no Ascend-accelerated candidate
-                # yet, so pin the explicit native fallbacks (the registry-wide
-                # default would resolve to a logp op, which is the wrong kind).
-                "attn": [OpBackend.PYTORCH_ATTN],
-                "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
             },
         }
+        # Preserve the former CPU fallback behavior for every operator on NPU,
+        # then override only the operators with an Ascend-specific backend.
+        self._priority_map["npu"] = {
+            op_type: candidates.copy() for op_type, candidates in self._priority_map["cpu"].items()
+        }
+        self._priority_map["npu"]["batch_invariant_logp"] = [
+            OpBackend.ASCEND_BATCH_INVARIANT_LOGP,
+            OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
+        ]
+        self._priority_map["npu"]["attention"] = [
+            OpBackend.ASCEND_DETERMINISTIC_ATTENTION,
+            OpBackend.PYTORCH_NATIVE_ATTENTION,
+        ]
         logger.info(f"KernelRegistry initialized for {device_ctx.device_type}")
         self._adjust_priority_for_hardware()
         self._adjust_priority_from_env()
