@@ -686,10 +686,15 @@ def _acceptance_errors(report: dict[str, Any], args: argparse.Namespace) -> list
             errors.append("strict no-Split-K execution plans are missing")
         elif any(plan.get("actual_split_kv_policy") != "disabled" for plan in strict_plans):
             errors.append("strict runtime did not keep Split-KV disabled")
-        if provenance.get("rope_backend") not in {
-            "rlkernel.cuda.rope_sm90",
-            "rlkernel.cuda.rope_sm90_op",
-        }:
+        expected_rope_backends = (
+            {"rlkernel.rocm.deterministic_rope"}
+            if is_rocm
+            else {
+                "rlkernel.cuda.rope_sm90",
+                "rlkernel.cuda.rope_sm90_op",
+            }
+        )
+        if provenance.get("rope_backend") not in expected_rope_backends:
             errors.append("strict runtime did not use the RL-Kernel WS1 RoPE operator")
     elif provenance.get("pos_encoding_mode") != "ROPE_LLAMA":
         errors.append("FlashInfer runtime did not use ROPE_LLAMA")

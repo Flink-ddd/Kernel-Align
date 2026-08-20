@@ -1764,6 +1764,44 @@ def test_pr7_check_accepts_strict_cuda_production_core():
     assert check_script._acceptance_errors(report, args) == []
 
 
+def test_pr7_check_accepts_strict_rocm_production_core(monkeypatch):
+    monkeypatch.setattr(torch.version, "hip", "6.3.0")
+    args = check_script._parse_args(["--strict", "--device", "cuda"])
+    report = {
+        "device": "cuda:0",
+        "shape": {"q_heads": 16, "kv_heads": 4, "head_dim": 128},
+        "candidate_provenance": {
+            "attention_mode": "decode",
+            "fallback": False,
+            "strict_mode": True,
+            "strict_core_id": STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
+            "strict_schedule": STRICT_ATTENTION_ROCM_SCHEDULE_ID,
+            "actual_backend": "aiter.rocm.ck_dense_mha",
+            "native_attention_arithmetic": True,
+            "num_splits": 1,
+            "deterministic_backward": True,
+            "reference_only": False,
+            "split_kv_control": "dense_non_split_api",
+            "aiter_api_source": "aiter.ops.mha",
+            "aiter_source_sha256": "a" * 64,
+            "strict_core_row_plans": [{"actual_split_kv_policy": "disabled"}],
+            "rope_backend": "rlkernel.rocm.deterministic_rope",
+            "rope_theta": 1_000_000.0,
+            "rotary_dim": 128,
+            "arithmetic_semantics_verified": True,
+        },
+        "drift": {
+            "out": {"max_abs": 0.0},
+            "lse": {"max_abs": 0.0},
+            "dlogp": {"max_abs": 0.0},
+        },
+        "batch_invariant_sweep": {"passed": True},
+        "page_layout_invariant_sweep": {"passed": True},
+    }
+
+    assert check_script._acceptance_errors(report, args) == []
+
+
 def test_pr7_check_rejects_nonfinite_drift_and_wrong_tp_local_shape():
     args = check_script._parse_args([])
     report = {
