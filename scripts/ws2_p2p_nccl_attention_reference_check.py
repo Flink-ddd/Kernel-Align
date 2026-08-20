@@ -510,13 +510,11 @@ def _run_strict_shared_core_check(
     rope = _strict_rope_op()
     q_ready = _apply_strict_rope(rope, q_ref, positions, config.rope.rope_theta)
     k_ready = _apply_strict_rope(rope, k_ref, positions, config.rope.rope_theta)
-    reference = _strict_attention_core().forward_with_lse(
+    reference = _strict_attention_reference_rows(
         q_ready,
         k_ready,
         v_ref,
-        causal=True,
-        query_position_ids=positions,
-        key_position_ids=positions,
+        positions=positions,
         output_dtype=q.dtype,
     )
     out_ref = reference.out[:, :, start:end, :]
@@ -661,6 +659,35 @@ def _strict_attention_core():
 
         return StrictRocmAiterCKAttentionCore()
     return StrictFlashAttention4Core()
+
+
+def _strict_attention_reference_rows(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    positions: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> SimpleNamespace:
+    """Run the production core with its one-logical-row execution contract."""
+
+    core = _strict_attention_core()
+    rows = [
+        core.forward_with_lse(
+            q[index : index + 1],
+            k[index : index + 1],
+            v[index : index + 1],
+            causal=True,
+            query_position_ids=positions[index : index + 1],
+            key_position_ids=positions[index : index + 1],
+            output_dtype=output_dtype,
+        )
+        for index in range(q.size(0))
+    ]
+    return SimpleNamespace(
+        out=torch.cat([row.out for row in rows], dim=0),
+        lse=torch.cat([row.lse for row in rows], dim=0),
+    )
 
 
 def _strict_rope_op():

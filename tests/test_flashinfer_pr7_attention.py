@@ -1861,6 +1861,41 @@ def test_strict_shared_core_entrypoint_requires_self_owned_ag_rs():
     assert args.strict_shared_core is True
 
 
+def test_strict_shared_core_reference_executes_one_logical_row(monkeypatch):
+    calls = []
+
+    class _RowCore:
+        def forward_with_lse(self, q, k, v, **kwargs):
+            calls.append((q.shape[0], kwargs["query_position_ids"].clone()))
+            return types.SimpleNamespace(
+                out=q + k + v,
+                lse=(q + k).sum(dim=-1),
+            )
+
+    monkeypatch.setattr(p2p_check_script, "_strict_attention_core", _RowCore)
+    q = torch.randn(2, 1, 3, 4, requires_grad=True)
+    k = torch.randn(2, 1, 3, 4, requires_grad=True)
+    v = torch.randn(2, 1, 3, 4, requires_grad=True)
+    positions = torch.arange(3).expand(2, -1)
+
+    result = p2p_check_script._strict_attention_reference_rows(
+        q,
+        k,
+        v,
+        positions=positions,
+        output_dtype=q.dtype,
+    )
+
+    assert [batch for batch, _positions in calls] == [1, 1]
+    assert [item.tolist() for _batch, item in calls] == [[[0, 1, 2]], [[0, 1, 2]]]
+    assert torch.equal(result.out, q + k + v)
+    assert torch.equal(result.lse, (q + k).sum(dim=-1))
+    (result.out.sum() + result.lse.sum()).backward()
+    assert q.grad is not None
+    assert k.grad is not None
+    assert v.grad is not None
+
+
 def _strict_acceptance_provenance(**overrides):
     provenance = {
         "strict_core_id": STRICT_ATTENTION_PRODUCTION_CORE_ID,
