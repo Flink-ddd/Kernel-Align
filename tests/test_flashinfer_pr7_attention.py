@@ -15,6 +15,7 @@ import torch
 
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_RING_SCHEDULE_ID,
     STRICT_ATTENTION_SCHEDULE_ID,
     SplitKVSpec,
 )
@@ -1811,6 +1812,72 @@ def test_strict_shared_core_entrypoint_requires_self_owned_ag_rs():
 
     args = p2p_check_script.parse_args(["--transport", "cuda_ag_rs", "--strict-shared-core"])
     assert args.strict_shared_core is True
+
+
+def _strict_acceptance_provenance(**overrides):
+    provenance = {
+        "strict_core_id": STRICT_ATTENTION_CORE_ID,
+        "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
+        "attention_backend": "rlkernel.cuda.deterministic_attention",
+        "actual_backend": "rlkernel.cuda.deterministic_attention",
+        "rope_backend": "rlkernel.cuda.rope_sm90",
+        "strict_mode": True,
+        "native_attention_arithmetic": False,
+        "fallback": False,
+        "strict_split_kv": "disabled",
+        "strict_comm_autograd": True,
+        "communication_backend": "cuda_ag_rs",
+        "production_ready": True,
+        "strict_full_qkv_all_gather": True,
+        "strict_position_ids_all_gather": True,
+        "compute_communication": "decoupled",
+        "compute_schedule": STRICT_ATTENTION_RING_SCHEDULE_ID,
+        "communication_overlap": "disabled",
+        "ring_schedule_default": True,
+        "ring_partial_arithmetic": False,
+        "rope_fusion": False,
+        "q_rope_state": "post_rope",
+        "k_cache_rope_state": "post_rope",
+    }
+    provenance.update(overrides)
+    return provenance
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("compute_schedule", "dynamic_ring"),
+        ("communication_overlap", "enabled"),
+        ("ring_schedule_default", False),
+        ("ring_partial_arithmetic", True),
+        ("actual_backend", "flashinfer"),
+        ("rope_backend", "native_rope"),
+        ("strict_comm_autograd", False),
+    ],
+)
+def test_strict_shared_core_acceptance_rejects_provenance_drift(field, invalid):
+    errors = p2p_check_script._strict_shared_core_identity_errors(
+        _strict_acceptance_provenance(**{field: invalid}),
+        transport="cuda_ag_rs",
+        is_rocm=False,
+    )
+
+    assert any(error.startswith(f"{field}=") for error in errors)
+
+
+def test_strict_shared_core_acceptance_requires_rocm_backend_and_rope():
+    provenance = _strict_acceptance_provenance(
+        attention_backend="rlkernel.rocm.deterministic_attention",
+        actual_backend="rlkernel.rocm.deterministic_attention",
+        rope_backend="rlkernel.rocm.deterministic_rope",
+        communication_backend="rccl_ag_rs",
+    )
+
+    assert not p2p_check_script._strict_shared_core_identity_errors(
+        provenance,
+        transport="rccl_ag_rs",
+        is_rocm=True,
+    )
 
 
 @pytest.mark.parametrize(

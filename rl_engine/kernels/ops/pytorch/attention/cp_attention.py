@@ -17,6 +17,7 @@ from typing import Optional, Sequence
 import torch
 
 from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_RING_SCHEDULE_ID,
     SplitKVExecutionPlan,
     SplitKVMode,
     SplitKVRuntimeCoordinate,
@@ -135,7 +136,7 @@ class AttentionRingSchedule:
             left += 1
             right -= 1
         return cls(
-            schedule_id="rlkernel.attention.strict_ring_state.v1",
+            schedule_id=STRICT_ATTENTION_RING_SCHEDULE_ID,
             total_kv_tokens=total_kv_tokens,
             cp_world_size=cp_world_size,
             kv_chunk_size=kv_chunk_size,

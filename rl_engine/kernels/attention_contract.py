@@ -22,6 +22,9 @@ _EnumT = TypeVar("_EnumT", bound=Enum)
 # rollout. Backend adapters may differ, but strict runtime evidence must not.
 STRICT_ATTENTION_CORE_ID = "rlkernel.attention.deterministic_core.v1"
 STRICT_ATTENTION_SCHEDULE_ID = "single_batch_single_query_global_kv_blocks"
+# The distributed strict path executes the full-KV core above. This identifies
+# the fixed, pre-overlap communication schedule around that core.
+STRICT_ATTENTION_RING_SCHEDULE_ID = "rlkernel.attention.strict_ring_state.v1"
 
 
 class AttentionContractError(ValueError):
@@ -1454,6 +1457,7 @@ __all__ = [
     "SplitKVRuntimePlanSet",
     "SplitKVSpec",
     "STRICT_ATTENTION_CORE_ID",
+    "STRICT_ATTENTION_RING_SCHEDULE_ID",
     "STRICT_ATTENTION_SCHEDULE_ID",
     "validate_split_kv_alignment",
     "validate_split_kv_plan_set_alignment",

@@ -30,6 +30,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from rl_engine.kernels.attention_contract import (  # noqa: E402
     STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_RING_SCHEDULE_ID,
     STRICT_ATTENTION_SCHEDULE_ID,
 )
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (  # noqa: E402
@@ -112,7 +113,19 @@ def _run_rocm_matrix(output_dir: Path) -> int:
         (
             "single_gpu",
             [sys.executable, "-m", "pytest", "-q", "tests/test_deterministic_attention_cuda.py"],
-        )
+        ),
+        (
+            "adapter_cp_contracts",
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "tests/test_flashinfer_pr7_attention.py",
+                "tests/test_cp_attention.py",
+                "tests/test_attention_comparison.py",
+            ],
+        ),
     ]
     for transport, strict in (("p2p_nccl_reference", False), ("rccl_ag_rs", True)):
         for ranks in (2, 4, 8):
@@ -148,6 +161,7 @@ def _run_rocm_matrix(output_dir: Path) -> int:
 
     summary = {
         "schema_version": "ws2_rocm_attention_acceptance/v1",
+        "git_commit": _current_git_commit(repo),
         "platform": "rocm",
         "torch": str(torch.__version__),
         "hip": str(torch.version.hip),
@@ -163,6 +177,19 @@ def _run_rocm_matrix(output_dir: Path) -> int:
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0 if summary["passed"] else 1
+
+
+def _current_git_commit(repo: Path) -> str:
+    """Bind an acceptance artifact to the checkout that generated it."""
+
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("ROCm Attention acceptance requires a Git checkout") from exc
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -213,6 +240,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if global_rank == 0:
             report = {
                 "schema_version": f"ws2_{args.transport}_attention/v2",
+                "git_commit": _current_git_commit(REPO_ROOT),
                 "backend": str(dist.get_backend()),
                 "platform": "rocm" if torch.version.hip is not None else "cuda",
                 "torch_version": str(torch.__version__),
@@ -533,20 +561,18 @@ def _run_strict_shared_core_check(
         repeat_lse_bitwise = repeat_lse_bitwise and torch.equal(repeated.lse, distributed.lse)
 
     provenance = distributed.provenance
-    identity_valid = (
-        provenance.get("strict_core_id") == STRICT_ATTENTION_CORE_ID
-        and provenance.get("strict_schedule") == STRICT_ATTENTION_SCHEDULE_ID
-        and provenance.get("strict_mode") is True
-        and provenance.get("native_attention_arithmetic") is False
-        and provenance.get("fallback") is False
-        and provenance.get("strict_split_kv") == "disabled"
-        and provenance.get("strict_comm_autograd") is True
-        and provenance.get("communication_backend") == args.transport
+    identity_errors = _strict_shared_core_identity_errors(
+        provenance,
+        transport=args.transport,
+        is_rocm=torch.version.hip is not None,
     )
     return {
         "executed": True,
         "passed": (
-            all(bitwise.values()) and repeat_out_bitwise and repeat_lse_bitwise and identity_valid
+            all(bitwise.values())
+            and repeat_out_bitwise
+            and repeat_lse_bitwise
+            and not identity_errors
         ),
         "strict_core_id": provenance.get("strict_core_id"),
         "strict_schedule": provenance.get("strict_schedule"),
@@ -558,11 +584,58 @@ def _run_strict_shared_core_check(
         "fallback": provenance.get("fallback"),
         "split_kv_policy": provenance.get("strict_split_kv"),
         "communication_autograd": provenance.get("strict_comm_autograd"),
+        "strict_provenance": provenance,
+        "identity_errors": identity_errors,
         "bitwise": bitwise,
         "max_abs": max_abs,
         "repeat_out_bitwise": repeat_out_bitwise,
         "repeat_lse_bitwise": repeat_lse_bitwise,
     }
+
+
+def _strict_shared_core_identity_errors(
+    provenance: dict[str, object],
+    *,
+    transport: str,
+    is_rocm: bool,
+) -> list[str]:
+    """Return every strict-contract provenance mismatch for the rank report."""
+
+    expected_backend = (
+        "rlkernel.rocm.deterministic_attention"
+        if is_rocm
+        else "rlkernel.cuda.deterministic_attention"
+    )
+    expected_rope = "rlkernel.rocm.deterministic_rope" if is_rocm else "rlkernel.cuda.rope_sm90"
+    required = {
+        "strict_core_id": STRICT_ATTENTION_CORE_ID,
+        "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
+        "attention_backend": expected_backend,
+        "actual_backend": expected_backend,
+        "rope_backend": expected_rope,
+        "strict_mode": True,
+        "native_attention_arithmetic": False,
+        "fallback": False,
+        "strict_split_kv": "disabled",
+        "strict_comm_autograd": True,
+        "communication_backend": transport,
+        "production_ready": True,
+        "strict_full_qkv_all_gather": True,
+        "strict_position_ids_all_gather": True,
+        "compute_communication": "decoupled",
+        "compute_schedule": STRICT_ATTENTION_RING_SCHEDULE_ID,
+        "communication_overlap": "disabled",
+        "ring_schedule_default": True,
+        "ring_partial_arithmetic": False,
+        "rope_fusion": False,
+        "q_rope_state": "post_rope",
+        "k_cache_rope_state": "post_rope",
+    }
+    return [
+        f"{name}={provenance.get(name)!r}, expected {expected!r}"
+        for name, expected in required.items()
+        if provenance.get(name) != expected
+    ]
 
 
 def _strict_rope_op():
