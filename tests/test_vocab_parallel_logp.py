@@ -257,6 +257,29 @@ class TestBackward:
         logp.sum().backward()
         assert bool((z.grad[-1] == 0).all())
 
+    def test_entropy_matches_full_vocab_oracle_and_backpropagates(self):
+        contract = _contract()
+        logits, targets = _inputs()
+        x = logits.clone().requires_grad_(True)
+        logp, _lse, entropy = VocabParallelLogprobOp().apply_with_entropy(
+            x,
+            targets,
+            contract=contract,
+            num_vocab_tiles=NUM_TILES,
+        )
+
+        y = logits.clone().requires_grad_(True)
+        ref_log_probs = torch.log_softmax(y[:, :REAL_VOCAB].float(), dim=-1)
+        safe = targets.clamp(0, REAL_VOCAB - 1)
+        ref_logp = ref_log_probs[torch.arange(NUM_TOKENS), safe]
+        ref_logp = torch.where(torch.tensor(ACTIVE), ref_logp, torch.zeros_like(ref_logp))
+        ref_entropy = -(ref_log_probs.exp() * ref_log_probs).sum(dim=-1)
+
+        torch.testing.assert_close(entropy, ref_entropy)
+        (logp.sum() + entropy.sum()).backward()
+        (ref_logp.sum() + ref_entropy.sum()).backward()
+        torch.testing.assert_close(x.grad, y.grad, atol=2e-5, rtol=2e-5)
+
 
 def test_dispatch_resolves_reference_and_leaves_legacy_untouched():
     registry = KernelRegistry()

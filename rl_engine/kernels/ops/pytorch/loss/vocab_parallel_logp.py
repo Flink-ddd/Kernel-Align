@@ -267,6 +267,28 @@ def _gather_target_logit(
     return stacked[owner, rows]
 
 
+def _gather_entropy_partials(
+    local_entropy: torch.Tensor,
+    contract: LogprobContract,
+    tp_group: Any,
+) -> torch.Tensor:
+    """Merge per-shard entropy contributions in TP-rank order.
+
+    Entropy is not part of the WS2 selected-logprob contract, but the Vime
+    adapter needs it for the existing training loss surface.  The collective
+    transports independent per-shard contributions; every TP rank performs
+    the same explicit rank-ordered sum afterwards.
+    """
+
+    if contract.sharding.tp_world_size == 1:
+        return local_entropy
+
+    dist = _require_distributed_initialized()
+    gathered = [torch.empty_like(local_entropy) for _ in range(contract.sharding.tp_world_size)]
+    dist.all_gather(gathered, local_entropy.contiguous(), group=tp_group)
+    return torch.stack(gathered, dim=0).sum(dim=0)
+
+
 def _merge_tile_partials(m_all: torch.Tensor, s_all: torch.Tensor) -> torch.Tensor:
     """Fixed-order (max, sumexp) merge over [n, num_vocab_tiles]."""
 
@@ -280,7 +302,17 @@ def _merge_tile_partials(m_all: torch.Tensor, s_all: torch.Tensor) -> torch.Tens
 
 class _VocabParallelLogprobFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, local_logits, target_1d, active_mask, contract, tp_group, tile):
+    def forward(
+        ctx,
+        local_logits,
+        target_1d,
+        active_mask,
+        contract,
+        tp_group,
+        tile,
+        with_entropy,
+        with_entropy_grad,
+    ):
         z_masked = local_logits.float()
         sharding = contract.sharding
         global_ids = torch.arange(
@@ -299,19 +331,40 @@ class _VocabParallelLogprobFunction(torch.autograd.Function):
 
         selected_logp = torch.where(active_mask, target_logit - lse, torch.zeros_like(lse))
 
-        ctx.save_for_backward(z_masked, lse, safe_target, active_mask, padding_cols)
+        if with_entropy:
+            finite_row = torch.isfinite(lse)
+            lse_safe = torch.where(finite_row, lse, torch.zeros_like(lse))
+            probabilities = (z_masked - lse_safe.unsqueeze(1)).exp()
+            probabilities = torch.where(finite_row.unsqueeze(1), probabilities, torch.zeros_like(probabilities))
+            finite_logits = torch.isfinite(z_masked)
+            log_gap = torch.where(
+                finite_logits,
+                lse_safe.unsqueeze(1) - z_masked,
+                torch.zeros_like(z_masked),
+            )
+            local_entropy = (probabilities * log_gap).sum(dim=1)
+            entropy = _gather_entropy_partials(local_entropy, contract, tp_group)
+        else:
+            entropy = local_logits.new_empty((0,), dtype=torch.float32)
+
+        ctx.save_for_backward(z_masked, lse, safe_target, active_mask, padding_cols, entropy)
         ctx.local_vocab_start = sharding.local_vocab_start
         ctx.local_vocab_size = sharding.local_vocab_size
         ctx.input_dtype = local_logits.dtype
+        ctx.with_entropy_grad = bool(with_entropy and with_entropy_grad)
         ctx.set_materialize_grads(False)
-        return selected_logp, lse
+        if with_entropy and not ctx.with_entropy_grad:
+            ctx.mark_non_differentiable(entropy)
+        return selected_logp, lse, entropy
 
     @staticmethod
-    def backward(ctx, grad_logp, grad_lse):
-        if not ctx.needs_input_grad[0] or (grad_logp is None and grad_lse is None):
-            return None, None, None, None, None, None
+    def backward(ctx, grad_logp, grad_lse, grad_entropy):
+        if not ctx.needs_input_grad[0] or (
+            grad_logp is None and grad_lse is None and grad_entropy is None
+        ):
+            return None, None, None, None, None, None, None, None
 
-        z_masked, lse, safe_target, active_mask, padding_cols = ctx.saved_tensors
+        z_masked, lse, safe_target, active_mask, padding_cols, entropy = ctx.saved_tensors
         n, local_vocab = z_masked.shape
         finite_row = torch.isfinite(lse)
         lse_safe = torch.where(finite_row, lse, torch.zeros_like(lse))
@@ -332,9 +385,13 @@ class _VocabParallelLogprobFunction(torch.autograd.Function):
             grad = grad + g_logp.unsqueeze(1) * (onehot - p)
         if grad_lse is not None:
             grad = grad + grad_lse.unsqueeze(1) * p
+        if ctx.with_entropy_grad and grad_entropy is not None:
+            entropy_input = lse_safe.unsqueeze(1) - z_masked - entropy.unsqueeze(1)
+            entropy_input = torch.where(torch.isfinite(z_masked), entropy_input, torch.zeros_like(entropy_input))
+            grad = grad + grad_entropy.unsqueeze(1) * p * entropy_input
         if bool(padding_cols.any()):
             grad = grad.masked_fill(padding_cols.unsqueeze(0), 0.0)
-        return grad.to(ctx.input_dtype), None, None, None, None, None
+        return grad.to(ctx.input_dtype), None, None, None, None, None, None, None
 
 
 class VocabParallelLogprobOp:
@@ -375,6 +432,58 @@ class VocabParallelLogprobOp:
         num_vocab_tiles: int = DEFAULT_NUM_VOCAB_TILES,
         validate: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        selected_logp, lse, _ = self._apply(
+            local_logits,
+            target_ids,
+            contract=contract,
+            tp_group=tp_group,
+            num_vocab_tiles=num_vocab_tiles,
+            validate=validate,
+            with_entropy=False,
+            with_entropy_grad=False,
+        )
+        return selected_logp, lse
+
+    def apply_with_entropy(
+        self,
+        local_logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        *,
+        contract: LogprobContract,
+        tp_group: Any = None,
+        num_vocab_tiles: int = DEFAULT_NUM_VOCAB_TILES,
+        validate: bool = True,
+        with_entropy_grad: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return selected logprob, vocabulary LSE, and full-vocabulary entropy.
+
+        The method is intentionally separate from :meth:`apply` so the WS2
+        selected-logprob surface remains unchanged for existing callers.
+        """
+
+        return self._apply(
+            local_logits,
+            target_ids,
+            contract=contract,
+            tp_group=tp_group,
+            num_vocab_tiles=num_vocab_tiles,
+            validate=validate,
+            with_entropy=True,
+            with_entropy_grad=with_entropy_grad,
+        )
+
+    def _apply(
+        self,
+        local_logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        *,
+        contract: LogprobContract,
+        tp_group: Any,
+        num_vocab_tiles: int,
+        validate: bool,
+        with_entropy: bool,
+        with_entropy_grad: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not isinstance(contract, LogprobContract):
             raise LogprobContractError("contract must be a LogprobContract")
         tile = _tile_size(contract, num_vocab_tiles)
@@ -389,8 +498,15 @@ class VocabParallelLogprobOp:
             if contract.sharding.tp_world_size > 1:
                 _preflight_cross_rank_agreement(contract, tp_group, num_vocab_tiles)
 
-        selected_logp, lse = _VocabParallelLogprobFunction.apply(
-            local_logits, target_1d, active_mask, contract, tp_group, tile
+        selected_logp, lse, entropy = _VocabParallelLogprobFunction.apply(
+            local_logits,
+            target_1d,
+            active_mask,
+            contract,
+            tp_group,
+            tile,
+            with_entropy,
+            with_entropy_grad,
         )
 
         if validate and bool((~torch.isfinite(lse) & active_mask).any().item()):
@@ -398,7 +514,7 @@ class VocabParallelLogprobOp:
                 "non-finite logsumexp on an active row: logits over the real "
                 "vocabulary must be finite for every active token"
             )
-        return selected_logp, lse
+        return selected_logp, lse, entropy
 
 
 __all__ = [
