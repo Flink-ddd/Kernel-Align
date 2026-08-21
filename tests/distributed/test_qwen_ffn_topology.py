@@ -459,10 +459,15 @@ def _spawn_workers(
             pytest.fail(f"timed out waiting for {world_size} FFN topology workers")
         finally:
             for process in processes:
-                process.join(timeout=10)
+                # RCCL teardown can take longer than ten seconds after every
+                # worker has already reported a successful result, especially
+                # for the eight-rank topology on ROCm hosts with unusable RDMA
+                # interfaces.  Allow cleanup to finish instead of turning a
+                # successful numerical check into a SIGTERM false failure.
+                process.join(timeout=30)
                 if process.is_alive():
                     process.terminate()
-                    process.join(timeout=10)
+                    process.join(timeout=30)
             result_queue.close()
             result_queue.join_thread()
 
