@@ -277,6 +277,7 @@ std::vector<torch::Tensor> deterministic_attention_backward(
 
 // Prefix-Shared Attention Declarations & Wrappers
 
+#if !defined(USE_ROCM)
 void prefix_shared_attention_forward(
   const __nv_bfloat16 *Q,  // [bs, G, len_q, DIM]
   const __nv_bfloat16 *K,  // [bs, len_kv, DIM]
@@ -319,6 +320,7 @@ at::Tensor prefix_shared_attention(
 
   return O;
 }
+#endif
 #endif
 
 // PyBind11 Module Registration
@@ -411,8 +413,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &deterministic_collective_all_gather,
         "Run the TP=8 deterministic rank-ordered all-gather kernel");
 
-    // registry Prefix-Shared Attention
+    // Prefix-shared attention uses NVIDIA PTX and falls back to PyTorch SDPA on ROCm.
+#if !defined(USE_ROCM)
     m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
+#endif
 
     // registry Batch-Invariant Deterministic GEMM
     m.def("det_gemm_fwd", &det_gemm_fwd, "Batch-invariant deterministic GEMM forward (C=A@B)");
