@@ -13,8 +13,8 @@ change more often than RL-Kernel's public API.
 | --- | --- | --- | --- |
 | Read docs or edit docs | `pip install -r requirements-docs.txt` | No | Use `mkdocs build --strict -f mkdocs.yaml` before opening a PR. |
 | Run CPU/mock tests | `pip install -e ".[dev]"` | No | Matches the default CI style: fallback and mocked integration coverage. |
-| Run CUDA operators | `pip install -e ".[cuda]"` | Yes, NVIDIA | Requires a CUDA-enabled PyTorch wheel and a working CUDA toolchain for source builds. |
-| Run ROCm operators | `pip install -e ".[rocm]"` | Yes, AMD | Requires a ROCm-enabled PyTorch wheel and ROCm compiler/runtime environment. |
+| Run CUDA operators | `RL_KERNEL_REQUIRE_EXT=1 pip install --no-build-isolation -e ".[cuda]"` | Yes, NVIDIA | Requires a CUDA-enabled PyTorch wheel and a working CUDA toolchain. |
+| Run ROCm operators | `RL_KERNEL_REQUIRE_EXT=1 pip install --no-build-isolation -e ".[rocm]"` | Yes, AMD | Requires a ROCm-enabled PyTorch wheel and ROCm compiler/runtime environment. |
 | Run real vLLM rollout | `pip install -e ".[vllm]"` | Runtime-dependent | Core tests do not need vLLM; install this only where real vLLM is used. |
 
 Do not install every optional extra by default. Install the smallest environment
@@ -84,7 +84,13 @@ The important rule is that PyTorch must match your runtime:
 ```bash
 git clone https://github.com/RL-Align/RL-Kernel.git
 cd RL-Kernel
+
+# CPU-only / pure-Python fallback
 pip install -e .
+
+# Native CUDA or ROCm extension (after installing a matching PyTorch build)
+RL_KERNEL_REQUIRE_EXT=1 pip install --no-build-isolation -e .
+python -c "import rl_engine._C as _C; assert hasattr(_C, 'fused_logp'); print(_C.__file__)"
 ```
 
 The examples on this page use `python3` for system-level commands. Inside an
@@ -93,9 +99,9 @@ activated virtual environment, `python` is also fine.
 ### Which optional extras exist?
 
 ```bash
-pip install -e ".[cuda]"
-pip install -e ".[rocm]"
-pip install -e ".[vllm]"
+RL_KERNEL_REQUIRE_EXT=1 pip install --no-build-isolation -e ".[cuda]"
+RL_KERNEL_REQUIRE_EXT=1 pip install --no-build-isolation -e ".[rocm]"
+pip install --no-build-isolation -e ".[vllm]"
 pip install -e ".[dev]"
 ```
 
