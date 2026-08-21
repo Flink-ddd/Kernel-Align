@@ -83,6 +83,29 @@ op = result.op                                      # rl_engine.kernels.logprob_
 logp, lse = op(local_logits, target_ids, contract=contract, tp_group=tp_group)
 ```
 
+### Vime CP=2 runtime provider
+
+The optional Vime adapter is owned by RL-Kernel and can be selected without
+patching Megatron or vLLM:
+
+```text
+--selected-logprob-provider rl_engine.integrations.vime.logp.provider
+--selected-logprob-provider-mode strict
+```
+
+Vime passes the local `[T, V_local]` logits, shifted targets, TP subgroup,
+and CP row-ownership metadata. The provider builds the same `LogprobContract`
+used by the distributed report, dispatches the explicit
+`pytorch-vocab-parallel-logp-ws2` backend, and returns selected logp as `[T, 1]`.
+When entropy is requested, it uses the same fixed TP-rank order and returns
+full-vocabulary entropy for the existing loss surface. CP rank/layout are
+recorded in provenance and never participate in the vocabulary LSE merge.
+
+The provider fails closed for undeclared real/padded vocabulary sizes, TP/CP
+metadata mismatches, unsupported top-p replay masks, and backend fallback.
+`auto` mode may then use Vime's native path; `strict` mode reports the
+configuration error. This adapter does not import Vime.
+
 ## Benchmarks
 
 `benchmarks/benchmark_batch_invariant_logp.py` compares Native, Triton, and the

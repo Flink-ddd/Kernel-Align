@@ -286,7 +286,10 @@ def _gather_entropy_partials(
     dist = _require_distributed_initialized()
     gathered = [torch.empty_like(local_entropy) for _ in range(contract.sharding.tp_world_size)]
     dist.all_gather(gathered, local_entropy.contiguous(), group=tp_group)
-    return torch.stack(gathered, dim=0).sum(dim=0)
+    merged = gathered[0].clone()
+    for partial in gathered[1:]:
+        merged = merged + partial
+    return merged
 
 
 def _merge_tile_partials(m_all: torch.Tensor, s_all: torch.Tensor) -> torch.Tensor:
