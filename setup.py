@@ -3,8 +3,8 @@
 
 import importlib.util
 import os
-import warnings
 import sysconfig
+import warnings
 from distutils.errors import CompileError
 from distutils.spawn import find_executable
 from pathlib import Path
