@@ -209,6 +209,23 @@ def provider(request: Any) -> ProviderResult:
         )
         entropy = None
     provenance = dict(dispatch.provenance)
+    provenance["request"] = {
+        "logits_shape": list(request.logits.shape),
+        "logits_dtype": str(request.logits.dtype).replace("torch.", ""),
+        "target_shape": list(request.target_ids.shape),
+        "target_dtype": str(request.target_ids.dtype).replace("torch.", ""),
+        "real_vocab_size": contract.sharding.real_vocab_size,
+        "padded_vocab_size": contract.sharding.padded_vocab_size,
+        "tp_rank": contract.sharding.tp_rank,
+        "tp_world_size": contract.sharding.tp_world_size,
+        "cp_rank": contract.sharding.cp_rank,
+        "cp_world_size": contract.sharding.cp_world_size,
+    }
+    provenance["execution"] = {
+        "role": "vime_training_selected_logprob",
+        "strict_backend": True,
+        "top_p_replay": False,
+    }
     provenance["cp_row_ownership"] = {
         "cp_rank": contract.sharding.cp_rank,
         "cp_world_size": contract.sharding.cp_world_size,
