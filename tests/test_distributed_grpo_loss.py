@@ -822,18 +822,18 @@ class TestMeshBitwise:
         assert actual["advantage_bits"] == baseline["advantage_bits"]
         # The sensitive comparison: per-sequence totals, before the scalar
         # average rounds a reordering away.
-        assert actual["per_sequence_policy_bits"] == baseline["per_sequence_policy_bits"], (
-            f"{label} per-sequence policy totals differ from the single-rank baseline"
-        )
-        assert actual["per_sequence_kl_bits"] == baseline["per_sequence_kl_bits"], (
-            f"{label} per-sequence KL totals differ from the single-rank baseline"
-        )
+        assert (
+            actual["per_sequence_policy_bits"] == baseline["per_sequence_policy_bits"]
+        ), f"{label} per-sequence policy totals differ from the single-rank baseline"
+        assert (
+            actual["per_sequence_kl_bits"] == baseline["per_sequence_kl_bits"]
+        ), f"{label} per-sequence KL totals differ from the single-rank baseline"
         assert actual["loss_bits"] == baseline["loss_bits"], f"{label} loss differs"
         assert actual["policy_bits"] == baseline["policy_bits"]
         assert actual["kl_bits"] == baseline["kl_bits"]
-        assert actual["grad_row"] == baseline["grad_row"], (
-            f"{label} gradient differs from the single-rank baseline"
-        )
+        assert (
+            actual["grad_row"] == baseline["grad_row"]
+        ), f"{label} gradient differs from the single-rank baseline"
 
     @_requires_gpus(4)
     def test_pure_axes_agree_with_each_other(self):
@@ -851,9 +851,9 @@ class TestMeshBitwise:
 class TestMeshGuards:
     def test_preflight_rejects_a_dp_rank_that_disagrees(self):
         payloads = _run_mesh(1, 2, scenario="preflight_dp_mismatch")
-        assert all(not item.get("ok") for item in payloads), (
-            "every rank must abort when one of them declares a different objective"
-        )
+        assert all(
+            not item.get("ok") for item in payloads
+        ), "every rank must abort when one of them declares a different objective"
         assert any("preflight" in item.get("error", "") for item in payloads)
 
     def test_preflight_rejects_a_tp_rank_that_disagrees(self):

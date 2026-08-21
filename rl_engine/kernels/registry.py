@@ -98,6 +98,9 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_VOCAB_PARALLEL_LOGP = (
         "rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp.VocabParallelLogprobOp"
     )
+    ROCM_VOCAB_PARALLEL_LOGP = (
+        "rl_engine.kernels.ops.rocm.loss.vocab_parallel_logp.RocmVocabParallelLogprobOp"
+    )
     # Deterministic GRPO loss on the TP-aware logprob path (WS2 #241 PR5)
     PYTORCH_DISTRIBUTED_GRPO_LOSS = (
         "rl_engine.kernels.ops.pytorch.loss.distributed_grpo_loss.DistributedGRPOLossOp"
@@ -137,6 +140,18 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_NATIVE_EMBEDDING = "rl_engine.kernels.ops.pytorch.linear.embedding.NativeEmbeddingOp"
     CUDA_SM90_LM_HEAD = "rl_engine.kernels.ops.cuda.linear.lm_head.SM90LMHeadOp"
     CUDA_SM90_EMBEDDING = "rl_engine.kernels.ops.cuda.linear.embedding.SM90EmbeddingOp"
+
+
+def _rocm_vocab_logprob_native_available() -> bool:
+    """Return whether the strict ROCm tile kernel is actually loadable."""
+
+    if torch.version.hip is None:
+        return False
+    try:
+        from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
+    except ImportError:
+        return False
+    return bool(_EXT_AVAILABLE and hasattr(_C, "deterministic_logp_tile_stats"))
 
 
 def resolve_logp_op_type(
@@ -399,6 +414,28 @@ class KernelRegistry:
                 OpBackend.PYTORCH_VOCAB_PARALLEL_LOGP,
                 ws2_tp_logprob_capability,
                 platform=ws2_platform,
+                prepend=True,
+            )
+
+        rocm_vocab_logprob_capability = LogprobBackendCapability(
+            backend_id="rocm-vocab-parallel-logp-ws2",
+            roles=common_logprob_roles,
+            dtypes=common_logprob_dtypes,
+            tp_world_sizes=None,
+            cp_world_sizes=None,
+            supports_vocab_padding=True,
+            mask_modes=frozenset({MaskMode.EXPLICIT_ACTIVE_MASK, MaskMode.IGNORE_INDEX}),
+            exports_vocab_lse=True,
+            determinism_scopes=frozenset(
+                {DeterminismScope.CROSS_TP_BITWISE, DeterminismScope.FIXED_TOPOLOGY}
+            ),
+            implementation_kind="production",
+        )
+        if _rocm_vocab_logprob_native_available():
+            self.register_logprob_backend(
+                OpBackend.ROCM_VOCAB_PARALLEL_LOGP,
+                rocm_vocab_logprob_capability,
+                platform="rocm",
                 prepend=True,
             )
 

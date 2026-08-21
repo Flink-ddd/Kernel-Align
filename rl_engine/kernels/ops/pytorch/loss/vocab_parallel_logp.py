@@ -202,6 +202,46 @@ def _local_tile_stats(z_masked: torch.Tensor, tile: int) -> tuple[torch.Tensor, 
     return torch.stack(m_parts, dim=1), torch.stack(s_parts, dim=1)
 
 
+def _native_rocm_tile_stats(
+    z_masked: torch.Tensor,
+    tile: int,
+    *,
+    vocab_start: int,
+    real_vocab_size: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Use the HIP-compatible local partial kernel when the extension has it.
+
+    TP transport and the global merge deliberately stay in Python.  That keeps
+    the issue #241 reduction contract identical across CUDA, ROCm, and the
+    reference implementation while making the large local vocab scan native.
+    """
+
+    if torch.version.hip is None or not z_masked.is_cuda:
+        raise RuntimeError("ROCm native tile stats require a HIP CUDA tensor")
+    try:
+        from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
+
+        if not _EXT_AVAILABLE or not hasattr(_C, "deterministic_logp_tile_stats"):
+            raise RuntimeError(
+                "ROCm vocab-parallel logprob native extension is unavailable; "
+                "build rl_engine._C with a ROCm toolchain"
+            )
+        local_tiles = z_masked.shape[1] // tile
+        if local_tiles <= 0:
+            raise RuntimeError("ROCm native tile stats require at least one local vocab tile")
+        return tuple(
+            tensor.contiguous()
+            for tensor in _C.deterministic_logp_tile_stats(
+                z_masked,
+                int(vocab_start),
+                int(real_vocab_size),
+                int(local_tiles),
+            )
+        )
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError("ROCm vocab-parallel logprob native extension is unavailable") from exc
+
+
 def _gather_tile_stats(
     local_m: torch.Tensor,
     local_s: torch.Tensor,
@@ -315,6 +355,7 @@ class _VocabParallelLogprobFunction(torch.autograd.Function):
         tile,
         with_entropy,
         with_entropy_grad,
+        use_native_tile_stats,
     ):
         z_masked = local_logits.float()
         sharding = contract.sharding
@@ -327,7 +368,15 @@ class _VocabParallelLogprobFunction(torch.autograd.Function):
 
         safe_target = torch.where(active_mask, target_1d, torch.zeros_like(target_1d))
 
-        local_m, local_s = _local_tile_stats(z_masked, tile)
+        if use_native_tile_stats:
+            local_m, local_s = _native_rocm_tile_stats(
+                z_masked,
+                tile,
+                vocab_start=sharding.local_vocab_start,
+                real_vocab_size=sharding.real_vocab_size,
+            )
+        else:
+            local_m, local_s = _local_tile_stats(z_masked, tile)
         m_all, s_all = _gather_tile_stats(local_m, local_s, contract, tp_group, tile)
         target_logit = _gather_target_logit(z_masked, safe_target, contract, tp_group)
         lse = _merge_tile_partials(m_all, s_all)
@@ -338,7 +387,9 @@ class _VocabParallelLogprobFunction(torch.autograd.Function):
             finite_row = torch.isfinite(lse)
             lse_safe = torch.where(finite_row, lse, torch.zeros_like(lse))
             probabilities = (z_masked - lse_safe.unsqueeze(1)).exp()
-            probabilities = torch.where(finite_row.unsqueeze(1), probabilities, torch.zeros_like(probabilities))
+            probabilities = torch.where(
+                finite_row.unsqueeze(1), probabilities, torch.zeros_like(probabilities)
+            )
             finite_logits = torch.isfinite(z_masked)
             log_gap = torch.where(
                 finite_logits,
@@ -365,7 +416,7 @@ class _VocabParallelLogprobFunction(torch.autograd.Function):
         if not ctx.needs_input_grad[0] or (
             grad_logp is None and grad_lse is None and grad_entropy is None
         ):
-            return None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None
 
         z_masked, lse, safe_target, active_mask, padding_cols, entropy = ctx.saved_tensors
         n, local_vocab = z_masked.shape
@@ -390,11 +441,13 @@ class _VocabParallelLogprobFunction(torch.autograd.Function):
             grad = grad + grad_lse.unsqueeze(1) * p
         if ctx.with_entropy_grad and grad_entropy is not None:
             entropy_input = lse_safe.unsqueeze(1) - z_masked - entropy.unsqueeze(1)
-            entropy_input = torch.where(torch.isfinite(z_masked), entropy_input, torch.zeros_like(entropy_input))
+            entropy_input = torch.where(
+                torch.isfinite(z_masked), entropy_input, torch.zeros_like(entropy_input)
+            )
             grad = grad + grad_entropy.unsqueeze(1) * p * entropy_input
         if bool(padding_cols.any()):
             grad = grad.masked_fill(padding_cols.unsqueeze(0), 0.0)
-        return grad.to(ctx.input_dtype), None, None, None, None, None, None, None
+        return grad.to(ctx.input_dtype), None, None, None, None, None, None, None, None
 
 
 class VocabParallelLogprobOp:
@@ -402,6 +455,7 @@ class VocabParallelLogprobOp:
 
     op_class = "logprob"
     is_batch_invariant = True
+    use_native_tile_stats = False
 
     def __init__(self) -> None:
         pass
@@ -444,6 +498,7 @@ class VocabParallelLogprobOp:
             validate=validate,
             with_entropy=False,
             with_entropy_grad=False,
+            use_native_tile_stats=self.use_native_tile_stats,
         )
         return selected_logp, lse
 
@@ -473,6 +528,7 @@ class VocabParallelLogprobOp:
             validate=validate,
             with_entropy=True,
             with_entropy_grad=with_entropy_grad,
+            use_native_tile_stats=self.use_native_tile_stats,
         )
 
     def _apply(
@@ -486,6 +542,7 @@ class VocabParallelLogprobOp:
         validate: bool,
         with_entropy: bool,
         with_entropy_grad: bool,
+        use_native_tile_stats: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not isinstance(contract, LogprobContract):
             raise LogprobContractError("contract must be a LogprobContract")
@@ -510,6 +567,7 @@ class VocabParallelLogprobOp:
             tile,
             with_entropy,
             with_entropy_grad,
+            use_native_tile_stats,
         )
 
         if validate and bool((~torch.isfinite(lse) & active_mask).any().item()):

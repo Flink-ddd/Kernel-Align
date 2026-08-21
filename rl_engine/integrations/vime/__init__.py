@@ -6,4 +6,3 @@
 from .logp import ProviderResult, SelectedLogprobProviderUnavailable, provider
 
 __all__ = ["ProviderResult", "SelectedLogprobProviderUnavailable", "provider"]
-

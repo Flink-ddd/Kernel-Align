@@ -358,3 +358,91 @@ torch::Tensor deterministic_logp_forward_indexed_fp32(
     auto output = torch::zeros({logits.size(0)}, logits.options().dtype(at::ScalarType::Float));
     return deterministic_logp_forward_indexed_out(logits, token_ids, row_indices, output);
 }
+
+namespace {
+
+constexpr int kDeterministicLogpTileBlockSize = 256;
+
+template <typename scalar_t, int BlockSize>
+__global__ void deterministic_logp_tile_stats_kernel(
+    const scalar_t* __restrict__ logits,
+    float* __restrict__ tile_max,
+    float* __restrict__ tile_sum,
+    int64_t rows,
+    int64_t local_vocab,
+    int64_t vocab_start,
+    int64_t real_vocab,
+    int64_t tile_size,
+    int64_t local_tiles) {
+    const int64_t tile_index = static_cast<int64_t>(blockIdx.y);
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    if (row >= rows || tile_index >= local_tiles) {
+        return;
+    }
+    const int64_t col_begin = tile_index * tile_size;
+    const int64_t col_end = min(col_begin + tile_size, local_vocab);
+    float local_max = -std::numeric_limits<float>::infinity();
+    for (int64_t col = col_begin + threadIdx.x; col < col_end; col += BlockSize) {
+        const int64_t global_col = vocab_start + col;
+        if (global_col < real_vocab) {
+            local_max = fmaxf(local_max, static_cast<float>(logits[row * local_vocab + col]));
+        }
+    }
+    const float max_value = deterministicBlockReduceMax<BlockSize>(local_max);
+    __shared__ float row_max;
+    if (threadIdx.x == 0) row_max = max_value;
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int64_t col = col_begin + threadIdx.x; col < col_end; col += BlockSize) {
+        const int64_t global_col = vocab_start + col;
+        if (global_col < real_vocab) {
+            local_sum += expf(static_cast<float>(logits[row * local_vocab + col]) - row_max);
+        }
+    }
+    const float sum_value = deterministicBlockReduceSum<BlockSize>(local_sum);
+    if (threadIdx.x == 0) {
+        const int64_t output_index = row * local_tiles + tile_index;
+        tile_max[output_index] = row_max;
+        tile_sum[output_index] = isfinite(row_max) ? sum_value : 0.0f;
+    }
+}
+
+} // namespace
+
+std::vector<torch::Tensor> deterministic_logp_tile_stats(
+    torch::Tensor logits,
+    int64_t vocab_start,
+    int64_t real_vocab,
+    int64_t num_tiles) {
+    TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA/ROCm tensor");
+    TORCH_CHECK(logits.dim() == 2, "logits must be 2D [tokens, local_vocab]");
+    TORCH_CHECK(logits.scalar_type() == at::ScalarType::Half ||
+                    logits.scalar_type() == at::ScalarType::BFloat16 ||
+                    logits.scalar_type() == at::ScalarType::Float,
+                "logits must be float16, bfloat16, or float32");
+    TORCH_CHECK(vocab_start >= 0 && real_vocab > 0 && num_tiles > 0,
+                "invalid vocabulary metadata");
+    auto input = logits.contiguous();
+    const int64_t rows = input.size(0);
+    const int64_t local_vocab = input.size(1);
+    TORCH_CHECK(local_vocab > 0 && local_vocab % num_tiles == 0,
+                "local_vocab must be divisible by num_tiles");
+    const int64_t tile_size = local_vocab / num_tiles;
+    auto options = input.options().dtype(at::ScalarType::Float);
+    auto tile_max = torch::empty({rows, num_tiles}, options);
+    auto tile_sum = torch::empty({rows, num_tiles}, options);
+    const dim3 grid(static_cast<unsigned int>(rows), static_cast<unsigned int>(num_tiles), 1);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(),
+        "deterministic_logp_tile_stats", ([&] {
+            deterministic_logp_tile_stats_kernel<scalar_t, kDeterministicLogpTileBlockSize>
+                <<<grid, kDeterministicLogpTileBlockSize, 0, stream>>>(
+                    input.data_ptr<scalar_t>(), tile_max.data_ptr<float>(),
+                    tile_sum.data_ptr<float>(), rows, local_vocab, vocab_start,
+                    real_vocab, tile_size, num_tiles);
+        }));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {tile_max, tile_sum};
+}

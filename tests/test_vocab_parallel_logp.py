@@ -28,6 +28,7 @@ from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import (
     BACKEND_ID,
     VocabParallelLogprobOp,
 )
+from rl_engine.kernels.ops.rocm.loss.vocab_parallel_logp import RocmVocabParallelLogprobOp
 from rl_engine.kernels.registry import KernelRegistry, OpBackend
 
 REAL_VOCAB = 27
@@ -372,7 +373,16 @@ def _tp_inputs(device, dtype, seed: int = 2026):
     return logits.to(device=device, dtype=dtype), targets.to(device)
 
 
-def _nccl_worker(rank, world_size, init_method, result_queue, scenario, uneven, dtype_name):
+def _nccl_worker(
+    rank,
+    world_size,
+    init_method,
+    result_queue,
+    scenario,
+    uneven,
+    dtype_name,
+    backend_kind="pytorch",
+):
     import torch.distributed as dist
 
     try:
@@ -382,7 +392,7 @@ def _nccl_worker(rank, world_size, init_method, result_queue, scenario, uneven, 
             backend="nccl", init_method=init_method, rank=rank, world_size=world_size
         )
         dtype = TP_DTYPES[dtype_name]
-        op = VocabParallelLogprobOp()
+        op = RocmVocabParallelLogprobOp() if backend_kind == "rocm" else VocabParallelLogprobOp()
         bounds = _tp_bounds(world_size, uneven)
         logits, targets = _tp_inputs(device, dtype)
         tiles = TP_NUM_TILES
@@ -467,7 +477,9 @@ def _nccl_worker(rank, world_size, init_method, result_queue, scenario, uneven, 
             dist.destroy_process_group()
 
 
-def _run_nccl_scenario(world_size, scenario="correctness", uneven=False, dtype_name="fp32"):
+def _run_nccl_scenario(
+    world_size, scenario="correctness", uneven=False, dtype_name="fp32", backend_kind="pytorch"
+):
     ctx = mp.get_context("spawn")
     with tempfile.TemporaryDirectory() as tmpdir:
         init_method = (Path(tmpdir) / "nccl_init").as_uri()
@@ -475,7 +487,16 @@ def _run_nccl_scenario(world_size, scenario="correctness", uneven=False, dtype_n
         processes = [
             ctx.Process(
                 target=_nccl_worker,
-                args=(rank, world_size, init_method, result_queue, scenario, uneven, dtype_name),
+                args=(
+                    rank,
+                    world_size,
+                    init_method,
+                    result_queue,
+                    scenario,
+                    uneven,
+                    dtype_name,
+                    backend_kind,
+                ),
             )
             for rank in range(world_size)
         ]
@@ -558,3 +579,29 @@ class TestCrossTPGuards:
         results = _run_nccl_scenario(2, scenario="misaligned")
         for result in results:
             assert "not aligned to the vocab tile size" in result["message"]
+
+
+@pytest.mark.skipif(torch.version.hip is None, reason="requires a ROCm PyTorch build")
+class TestRocmNativeCrossTP:
+    """The ROCm production path must preserve the same TP contract as reference."""
+
+    @staticmethod
+    def _require_native() -> None:
+        from rl_engine.kernels.registry import _rocm_vocab_logprob_native_available
+
+        if not _rocm_vocab_logprob_native_available():
+            pytest.skip("requires the compiled ROCm logprob extension")
+
+    @_requires_gpus(2)
+    @pytest.mark.parametrize("dtype_name", ["fp32", "bf16"])
+    def test_tp2_native_matches_tp1_and_repeat(self, dtype_name):
+        self._require_native()
+        results = _run_nccl_scenario(2, dtype_name=dtype_name, backend_kind="rocm")
+        TestCrossTPBitwise._assert_matches_tp1(results)
+
+    @_requires_gpus(4)
+    @pytest.mark.parametrize("dtype_name", ["fp32", "bf16"])
+    def test_tp4_native_matches_tp1_and_repeat(self, dtype_name):
+        self._require_native()
+        results = _run_nccl_scenario(4, dtype_name=dtype_name, backend_kind="rocm")
+        TestCrossTPBitwise._assert_matches_tp1(results)

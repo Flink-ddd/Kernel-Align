@@ -16,11 +16,9 @@ import argparse
 import json
 import os
 import subprocess
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
-
 
 DEFAULT_CONFIG = Path(__file__).with_name("qwen3_8b_tp2_cp2.json")
 PROVIDER_MARKER = "Selected-logprob provider active"
@@ -44,7 +42,11 @@ def validate_config(config: Mapping[str, Any]) -> None:
     training = config.get("training")
     rollout = config.get("rollout")
     provider = config.get("selected_logprob_provider")
-    if not isinstance(training, Mapping) or not isinstance(rollout, Mapping) or not isinstance(provider, Mapping):
+    if (
+        not isinstance(training, Mapping)
+        or not isinstance(rollout, Mapping)
+        or not isinstance(provider, Mapping)
+    ):
         raise ValueError("training, rollout, and selected_logprob_provider sections are required")
     expected = {
         "tensor_model_parallel_size": 2,
@@ -163,7 +165,9 @@ def build_report(
     provider_active = PROVIDER_MARKER in log_text
     fallback_observed = any(marker in log_text for marker in FALLBACK_MARKERS)
     strict_provider_passed = status == "passed" and provider_active and not fallback_observed
-    effective_status = "passed" if strict_provider_passed else ("failed" if status == "passed" else status)
+    effective_status = (
+        "passed" if strict_provider_passed else ("failed" if status == "passed" else status)
+    )
     attention_status = _operator_evidence_status(runtime_evidence, "attention")
     ffn_status = _operator_evidence_status(runtime_evidence, "ffn")
     return {
@@ -192,7 +196,9 @@ def build_report(
         "returncode": returncode,
         "artifacts": {
             "log": None if log_path is None else str(log_path),
-            "runtime_evidence": None if runtime_evidence_path is None else str(runtime_evidence_path),
+            "runtime_evidence": (
+                None if runtime_evidence_path is None else str(runtime_evidence_path)
+            ),
         },
         "runtime_evidence": None if runtime_evidence is None else dict(runtime_evidence),
         "revisions": {
@@ -206,7 +212,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--vime-root", type=Path, default=Path(os.environ.get("VIME_ROOT", ".")))
-    parser.add_argument("--rl-kernel-root", type=Path, default=Path(os.environ.get("RL_KERNEL_ROOT", ".")))
+    parser.add_argument(
+        "--rl-kernel-root", type=Path, default=Path(os.environ.get("RL_KERNEL_ROOT", "."))
+    )
     parser.add_argument("--output", type=Path, default=Path("qwen3_8b_tp2_cp2.validation.json"))
     parser.add_argument(
         "--runtime-evidence",
@@ -234,7 +242,9 @@ def main(argv: list[str] | None = None) -> int:
         log_path = args.output.with_suffix(".log")
         env = build_environment(vime_root, rl_kernel_root)
         with log_path.open("w", encoding="utf-8") as log_handle:
-            process = subprocess.run(command, cwd=vime_root, env=env, stdout=log_handle, stderr=subprocess.STDOUT)
+            process = subprocess.run(
+                command, cwd=vime_root, env=env, stdout=log_handle, stderr=subprocess.STDOUT
+            )
         returncode = process.returncode
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
         status = "passed" if returncode == 0 else "failed"

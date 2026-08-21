@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -13,7 +12,6 @@ from examples.vime_qwen3_8b_tp2_cp2.run import (
     validate_config,
     validate_runtime_evidence,
 )
-
 
 ROOT = Path(__file__).parents[1]
 CONFIG = ROOT / "examples" / "vime_qwen3_8b_tp2_cp2" / "qwen3_8b_tp2_cp2.json"
@@ -67,8 +65,16 @@ def _runtime_evidence():
         "schema_version": "rlkernel.operator_runtime_evidence.v1",
         "operators": {
             "attention": {
-                "training": {"implementation_id": "rlk.attn", "backend_id": "rlk", "contract_id": "a"},
-                "rollout": {"implementation_id": "rlk.attn", "backend_id": "rlk", "contract_id": "a"},
+                "training": {
+                    "implementation_id": "rlk.attn",
+                    "backend_id": "rlk",
+                    "contract_id": "a",
+                },
+                "rollout": {
+                    "implementation_id": "rlk.attn",
+                    "backend_id": "rlk",
+                    "contract_id": "a",
+                },
                 "comparison": {
                     "passed": True,
                     "out_max_abs": 0.0,
@@ -79,8 +85,16 @@ def _runtime_evidence():
                 },
             },
             "ffn": {
-                "training": {"implementation_id": "rlk.ffn", "backend_id": "rlk", "contract_id": "f"},
-                "rollout": {"implementation_id": "rlk.ffn", "backend_id": "rlk", "contract_id": "f"},
+                "training": {
+                    "implementation_id": "rlk.ffn",
+                    "backend_id": "rlk",
+                    "contract_id": "f",
+                },
+                "rollout": {
+                    "implementation_id": "rlk.ffn",
+                    "backend_id": "rlk",
+                    "contract_id": "f",
+                },
                 "comparison": {
                     "passed": True,
                     "out_max_abs": 0.0,

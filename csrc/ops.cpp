@@ -88,8 +88,14 @@ torch::Tensor deterministic_logp_forward_out(torch::Tensor logits, torch::Tensor
 torch::Tensor deterministic_logp_forward_fp32(torch::Tensor logits, torch::Tensor token_ids);
 torch::Tensor deterministic_logp_forward_indexed_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices, torch::Tensor output);
 torch::Tensor deterministic_logp_forward_indexed_fp32(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices);
+std::vector<torch::Tensor> deterministic_logp_tile_stats(
+    torch::Tensor logits,
+    int64_t vocab_start,
+    int64_t real_vocab,
+    int64_t num_tiles);
 
 // Single-node TP=8 deterministic collectives.
+#if !defined(__HIPCC__) && !defined(__HIP_PLATFORM_AMD__)
 std::tuple<std::vector<int64_t>, int64_t> deterministic_collective_ipc_meta(
     torch::Tensor& tensor);
 int64_t deterministic_collective_create(
@@ -102,6 +108,7 @@ void deterministic_collective_stage(int64_t handle, torch::Tensor& input);
 void deterministic_collective_all_reduce(int64_t handle, torch::Tensor& output);
 void deterministic_collective_reduce_scatter(int64_t handle, torch::Tensor& output);
 void deterministic_collective_all_gather(int64_t handle, torch::Tensor& output);
+#endif
 
 // Batch-Invariant Deterministic GEMM Declarations
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
@@ -382,8 +389,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deterministic_logp_forward_fp32", &deterministic_logp_forward_fp32, "Batch-invariant deterministic logp fp32");
     m.def("deterministic_logp_forward_indexed_out", &deterministic_logp_forward_indexed_out, "Batch-invariant deterministic logp indexed out");
     m.def("deterministic_logp_forward_indexed_fp32", &deterministic_logp_forward_indexed_fp32, "Batch-invariant deterministic logp indexed fp32");
+    m.def("deterministic_logp_tile_stats", &deterministic_logp_tile_stats,
+          "Deterministic local vocab-tile FP32 max and sumexp partials");
 
     // Single-node TP=8 fixed-tree collectives.
+#if !defined(__HIPCC__) && !defined(__HIP_PLATFORM_AMD__)
     m.def(
         "deterministic_collective_ipc_meta",
         &deterministic_collective_ipc_meta,
@@ -412,9 +422,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "deterministic_collective_all_gather",
         &deterministic_collective_all_gather,
         "Run the TP=8 deterministic rank-ordered all-gather kernel");
+#endif
 
     // Prefix-shared attention uses NVIDIA PTX and falls back to PyTorch SDPA on ROCm.
-#if !defined(USE_ROCM)
+#if !defined(__HIPCC__) && !defined(__HIP_PLATFORM_AMD__)
     m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
 #endif
 

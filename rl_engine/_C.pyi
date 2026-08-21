@@ -161,6 +161,12 @@ def deterministic_logp_forward_indexed_fp32(
     token_ids: torch.Tensor,
     row_indices: torch.Tensor,
 ) -> torch.Tensor: ...
+def deterministic_logp_tile_stats(
+    logits: torch.Tensor,
+    vocab_start: int,
+    real_vocab: int,
+    num_tiles: int,
+) -> list[torch.Tensor]: ...
 def deterministic_attention_forward(
     q: torch.Tensor,
     k: torch.Tensor,

@@ -282,7 +282,9 @@ def _normalized(
     reduction = contract.reduction
     normalizer = reduction.token_normalizer
     if normalizer is TokenNormalizer.FIXED_CONSTANT:
-        return per_sequence_totals.sum() / float(reduction.fixed_normalizer_constant)
+        fixed_normalizer_constant = reduction.fixed_normalizer_constant
+        assert fixed_normalizer_constant is not None
+        return per_sequence_totals.sum() / float(fixed_normalizer_constant)
     if normalizer is TokenNormalizer.GLOBAL_ACTIVE_TOKENS:
         return per_sequence_totals.sum() / per_sequence_counts.sum().to(per_sequence_totals.dtype)
 

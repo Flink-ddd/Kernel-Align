@@ -316,3 +316,69 @@ def test_tp2_cp2_gloo_cli_emits_per_rank_report(tmp_path):
     assert {rank["cp_rank"] for rank in payload["ranks"]} == {0, 1}
     assert payload["aggregate"]["dlogp"]["stats"]["active_count"] == 3
     assert json.loads(result.stdout)["case"]["tp_world_size"] == 2
+
+
+@pytest.mark.skipif(torch.version.hip is None, reason="requires a ROCm PyTorch build")
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires four ROCm GPUs")
+def test_tp2_cp2_rocm_native_cli_emits_strict_report(tmp_path):
+    """Run the production ROCm backend across TP2 x CP2 and require provenance."""
+
+    from rl_engine.kernels.registry import _rocm_vocab_logprob_native_available
+
+    if not _rocm_vocab_logprob_native_available():
+        pytest.skip("requires the compiled ROCm logprob extension")
+
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "rl_engine"
+        / "testing"
+        / "distributed_logprob_comparison.py"
+    )
+    output = tmp_path / "tp2-cp2-rocm-native.json"
+    environment = os.environ.copy()
+    environment.setdefault("OMP_NUM_THREADS", "1")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=4",
+            str(script),
+            "--tp",
+            "2",
+            "--cp",
+            "2",
+            "--device",
+            "cuda",
+            "--dist-backend",
+            "nccl",
+            "--backend",
+            "rocm-vocab-parallel-logp-ws2",
+            "--real-vocab",
+            "13",
+            "--padded-vocab",
+            "16",
+            "--num-vocab-tiles",
+            "8",
+            "--batch",
+            "1",
+            "--seq",
+            "4",
+            "--prompt-tokens",
+            "1",
+            "--output",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=environment,
+    )
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["passed"]
+    assert {rank["actual_backend"] for rank in payload["ranks"]} == {"rocm-vocab-parallel-logp-ws2"}
+    assert {rank["fallback"] for rank in payload["ranks"]} == {False}
+    assert {rank["contract"]["sharding"]["cp_world_size"] for rank in payload["ranks"]} == {2}
+    assert json.loads(result.stdout)["case"]["cp_world_size"] == 2

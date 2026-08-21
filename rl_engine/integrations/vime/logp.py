@@ -57,14 +57,18 @@ class ProviderResult:
 
 def _as_positive_int(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise SelectedLogprobProviderUnavailable(f"{name} must be a positive integer; got {value!r}")
+        raise SelectedLogprobProviderUnavailable(
+            f"{name} must be a positive integer; got {value!r}"
+        )
     return value
 
 
 def _metadata(request: Any) -> Mapping[str, Any]:
     value = getattr(request, "metadata", None)
     if not isinstance(value, Mapping):
-        raise SelectedLogprobProviderUnavailable("request.metadata must provide vocab-parallel metadata")
+        raise SelectedLogprobProviderUnavailable(
+            "request.metadata must provide vocab-parallel metadata"
+        )
     return value
 
 
@@ -108,7 +112,9 @@ def _contract_for_request(request: Any) -> tuple[LogprobContract, int]:
     targets = _request_tensor(request, "target_ids")
     metadata = _metadata(request)
     if logits.ndim != 2 or targets.shape != (logits.shape[0],):
-        raise SelectedLogprobProviderUnavailable("request must contain local [T, V] logits and aligned [T] targets")
+        raise SelectedLogprobProviderUnavailable(
+            "request must contain local [T, V] logits and aligned [T] targets"
+        )
     if logits.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise SelectedLogprobProviderUnavailable(f"unsupported logit dtype {logits.dtype}")
     if targets.device != logits.device:
@@ -117,12 +123,20 @@ def _contract_for_request(request: Any) -> tuple[LogprobContract, int]:
     cp = getattr(request, "context_parallel", None)
     cp_world_size = _as_positive_int(getattr(cp, "world_size", None), "context_parallel.world_size")
     cp_rank = getattr(cp, "rank", None)
-    if isinstance(cp_rank, bool) or not isinstance(cp_rank, int) or not 0 <= cp_rank < cp_world_size:
+    if (
+        isinstance(cp_rank, bool)
+        or not isinstance(cp_rank, int)
+        or not 0 <= cp_rank < cp_world_size
+    ):
         raise SelectedLogprobProviderUnavailable(
             f"context_parallel.rank={cp_rank!r} is invalid for CP={cp_world_size}"
         )
-    if getattr(cp, "layout", None) not in ({"single"} if cp_world_size == 1 else {"zigzag", "allgather"}):
-        raise SelectedLogprobProviderUnavailable("context_parallel layout does not describe local CP token ownership")
+    if getattr(cp, "layout", None) not in (
+        {"single"} if cp_world_size == 1 else {"zigzag", "allgather"}
+    ):
+        raise SelectedLogprobProviderUnavailable(
+            "context_parallel layout does not describe local CP token ownership"
+        )
 
     tp_rank, tp_world_size = _tp_coordinates(getattr(request, "tensor_parallel_group", None))
     declared_tp_rank = metadata.get("tp_rank")
@@ -133,7 +147,8 @@ def _contract_for_request(request: Any) -> tuple[LogprobContract, int]:
         )
     if declared_tp_world_size is not None and declared_tp_world_size != tp_world_size:
         raise SelectedLogprobProviderUnavailable(
-            f"metadata tp_world_size={declared_tp_world_size} disagrees with TP group size={tp_world_size}"
+            f"metadata tp_world_size={declared_tp_world_size} disagrees with "
+            f"TP group size={tp_world_size}"
         )
 
     real_vocab_size = _as_positive_int(metadata.get("real_vocab_size"), "real_vocab_size")
@@ -141,10 +156,13 @@ def _contract_for_request(request: Any) -> tuple[LogprobContract, int]:
     if logits.shape[1] * tp_world_size != padded_vocab_size:
         raise SelectedLogprobProviderUnavailable(
             "local vocab width and TP group do not cover padded_vocab_size exactly: "
-            f"{logits.shape[1]} * {tp_world_size} != {padded_vocab_size}"
+            f"{logits.shape[1]} * {tp_world_size} != "
+            f"{padded_vocab_size}"
         )
     if real_vocab_size > padded_vocab_size:
-        raise SelectedLogprobProviderUnavailable("real_vocab_size must not exceed padded_vocab_size")
+        raise SelectedLogprobProviderUnavailable(
+            "real_vocab_size must not exceed padded_vocab_size"
+        )
 
     bounds = tuple(
         (rank * logits.shape[1], (rank + 1) * logits.shape[1]) for rank in range(tp_world_size)
