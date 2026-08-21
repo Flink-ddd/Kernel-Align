@@ -105,6 +105,9 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_DISTRIBUTED_GRPO_LOSS = (
         "rl_engine.kernels.ops.pytorch.loss.distributed_grpo_loss.DistributedGRPOLossOp"
     )
+    ASCEND_BATCH_INVARIANT_LOGP = (
+        "rl_engine.kernels.ops.ascend.loss.batch_invariant_logp.BatchInvariantLogpAscendOp"
+    )
 
     # RMSNorm(pre-norm / QK-Norm) - pure Pytorch reference(ws1 ground-truth)
     PYTORCH_NATIVE_RMS_NORM = "rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp"
@@ -372,6 +375,15 @@ class KernelRegistry:
                 "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
             },
         }
+        # Preserve the former CPU fallback behavior for every operator on NPU,
+        # then override only the operator with an Ascend-specific backend.
+        self._priority_map["npu"] = {
+            op_type: candidates.copy() for op_type, candidates in self._priority_map["cpu"].items()
+        }
+        self._priority_map["npu"]["batch_invariant_logp"] = [
+            OpBackend.ASCEND_BATCH_INVARIANT_LOGP,
+            OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
+        ]
         logger.info(f"KernelRegistry initialized for {device_ctx.device_type}")
         self._adjust_priority_for_hardware()
         self._adjust_priority_from_env()
@@ -877,6 +889,8 @@ class KernelRegistry:
                 return "rocm"
             if device_ctx.device_type == "cuda":
                 return "cuda"
+            if device_ctx.device_type == "npu":
+                return "npu"
             return "cpu"
 
         resolved = torch.device(device)
