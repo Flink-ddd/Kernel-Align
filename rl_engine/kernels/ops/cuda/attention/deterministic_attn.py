@@ -33,13 +33,18 @@ class _DeterministicAttentionFn(Function):
         causal: bool,
         scale: float,
         key_padding_mask: Optional[torch.Tensor],
+        output_fp32: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         q_c = q.contiguous()
         k_c = k.contiguous()
         v_c = v.contiguous()
         mask_c = key_padding_mask.contiguous() if key_padding_mask is not None else None
 
-        results = _C.deterministic_attention_forward(q_c, k_c, v_c, causal, float(scale), mask_c)
+        results = (
+            _C.deterministic_attention_forward_fp32(q_c, k_c, v_c, causal, float(scale), mask_c)
+            if output_fp32
+            else _C.deterministic_attention_forward(q_c, k_c, v_c, causal, float(scale), mask_c)
+        )
         out, lse, P = results[0], results[1], results[2]
 
         ctx.save_for_backward(q_c, k_c, v_c, P, mask_c)
@@ -54,6 +59,8 @@ class _DeterministicAttentionFn(Function):
     def backward(ctx, grad_out: torch.Tensor, grad_lse: torch.Tensor):
         q_c, k_c, v_c, P, mask_c = ctx.saved_tensors
 
+        if grad_out.dtype != q_c.dtype:
+            grad_out = grad_out.to(q_c.dtype)
         dQ, dK, dV = _C.deterministic_attention_backward(
             grad_out.contiguous(),
             q_c,
@@ -65,7 +72,7 @@ class _DeterministicAttentionFn(Function):
             mask_c,
         )
 
-        return dQ, dK, dV, None, None, None
+        return dQ, dK, dV, None, None, None, None
 
 
 class DeterministicAttentionOp:
@@ -130,9 +137,26 @@ class DeterministicAttentionOp:
         self._validate_inputs(q, k, v, key_padding_mask)
         resolved_scale = scale if scale is not None else (1.0 / math.sqrt(q.shape[-1]))
         out, lse = _DeterministicAttentionFn.apply(
-            q, k, v, causal, resolved_scale, key_padding_mask
+            q, k, v, causal, resolved_scale, key_padding_mask, False
         )
         return out, lse
+
+    def forward_fp32(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        causal: bool = True,
+        scale: Optional[float] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        self._validate_inputs(q, k, v, key_padding_mask)
+        resolved_scale = scale if scale is not None else (1.0 / math.sqrt(q.shape[-1]))
+        out, _lse = _DeterministicAttentionFn.apply(
+            q, k, v, causal, resolved_scale, key_padding_mask, True
+        )
+        return out
 
     @staticmethod
     def _validate_inputs(

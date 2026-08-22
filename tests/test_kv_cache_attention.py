@@ -30,6 +30,7 @@ import contextlib
 import pytest
 import torch
 
+from rl_engine.kernels.gtest.tolerance import load_contract, resolve_tolerance
 from rl_engine.kernels.ops.pytorch.attention.kv_cache import NativeKVCacheAttnOp
 from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
 from rl_engine.kernels.registry import kernel_registry
@@ -43,14 +44,15 @@ _HEAD_DIM = 128  # 32 * 128 == 4096 == hidden
 # the standard-attention test, since this op shares its reduction).
 _DTYPE_REL_PEAK = {torch.bfloat16: 3.0e-2, torch.float16: 5.0e-3}
 
-# Prefill<->decode reduction width differs -> not bitwise; bounded near-equality.
-_DECODE_ATOL = 1.0e-6
+_CONTRACT = load_contract()
 
-# key_padding_mask compares a softmax over (S_past+S_new) keys against one over the
-# valid-only subset, so the reduction widths differ (same situation as the standard
-# attention padding test).  The drift is ~1.3e-6 and platform-sensitive, so this
-# cross-width comparison carries extra headroom over the closed-form decode checks.
-_PADDING_ATOL = 2.0e-6
+
+def _decode_tol(dtype: torch.dtype) -> tuple[float, float]:
+    """C1 attention forward_accuracy only — no private KV thresholds."""
+    spec = resolve_tolerance(
+        _CONTRACT, judgment="forward_accuracy", op_class="attention", dtype=dtype
+    )
+    return spec.atol, spec.rtol
 
 
 def _cpu_fp16_matmul_supported() -> bool:
@@ -200,9 +202,10 @@ def test_stepwise_decode_matches_full_prefill():
             k_new, v_new = k_all[:, :, t : t + 1], v_all[:, :, t : t + 1]
             decode_t = op.forward_fp32(q_t, k_cache, v_cache, k_new, v_new, causal=True)
             max_err = (decode_t - prefill[:, :, t : t + 1]).abs().max().item()
+            atol, rtol = _decode_tol(torch.float32)
             assert torch.allclose(
-                decode_t, prefill[:, :, t : t + 1], atol=_DECODE_ATOL, rtol=0.0
-            ), f"decode step {t} diverges from prefill by {max_err:.3g} > {_DECODE_ATOL}"
+                decode_t, prefill[:, :, t : t + 1], atol=atol, rtol=rtol
+            ), f"decode step {t} diverges from prefill by {max_err:.3g} > C1 {atol}"
 
 
 def test_batch_invariance_slice():
@@ -300,7 +303,8 @@ def test_key_padding_mask_excludes_padded_keys():
         valid_only_row0 = ref.forward_fp32(
             q[:1], k_full[:1][:, :, keep], v_full[:1][:, :, keep], causal=False
         )
-    assert torch.allclose(masked[:1], valid_only_row0, atol=_PADDING_ATOL, rtol=0.0)
+    atol, rtol = _decode_tol(torch.float32)
+    assert torch.allclose(masked[:1], valid_only_row0, atol=atol, rtol=rtol)
 
 
 # --------------------------------------------------------------------------- #

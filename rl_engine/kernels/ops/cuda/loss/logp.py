@@ -9,6 +9,35 @@ from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 from rl_engine.utils.logger import logger
 
 
+class _FusedLogpAutograd(torch.autograd.Function):
+    """Autograd bridge for the generic CUDA selected-logprob forward.
+
+    The VJP is row-local: ``dlogits = grad * (one_hot(target) - softmax)``.
+    It runs in FP32 on CUDA and casts only the final input VJP to the BF16
+    execution dtype.  There is no cross-token reduction or borrowed Triton
+    candidate, so Batch/Chunk layout cannot change the result.
+    """
+
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor, token_ids: torch.Tensor, backend):
+        logits_2d = logits.reshape(-1, logits.size(-1)).contiguous()
+        labels = token_ids.reshape(-1).to(device=logits.device, dtype=torch.long).contiguous()
+        output = backend.fused_logp(logits_2d, labels)
+        ctx.save_for_backward(logits_2d, labels)
+        ctx.input_shape = tuple(logits.shape)
+        ctx.input_dtype = logits.dtype
+        return output.reshape(logits.shape[:-1])
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        logits, labels = ctx.saved_tensors
+        probs = torch.softmax(logits.float(), dim=-1)
+        rows = torch.arange(logits.size(0), device=logits.device)
+        probs[rows, labels] -= 1.0
+        grad = -grad_output.reshape(-1, 1).float() * probs
+        return grad.to(ctx.input_dtype).reshape(ctx.input_shape), None, None
+
+
 class FusedLogpSM90Op:
     """TMA-accelerated Fused LogP for SM90+ cards."""
 
@@ -128,9 +157,7 @@ class FusedLogpGenericOp:
         return row_indices.reshape(-1).to(device=logits.device, dtype=torch.long).contiguous()
 
     def apply(self, logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
-        logits_2d, token_ids_1d, orig_shape = self._prepare_inputs(logits, token_ids)
-        results = self.op(logits_2d, token_ids_1d)
-        return results.view(orig_shape)
+        return _FusedLogpAutograd.apply(logits, token_ids, self._backend)
 
     def apply_fp32(self, logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
         logits_2d, token_ids_1d, orig_shape = self._prepare_inputs(logits, token_ids)

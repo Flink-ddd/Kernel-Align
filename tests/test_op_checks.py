@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 
+import pytest
 import torch
 
 from rl_engine.kernels.gtest.op_checks import CandidateSpec, OperatorCase, run_operator_suite
@@ -13,6 +14,7 @@ from rl_engine.kernels.gtest.operator_specs import (
     make_operator_case,
     operator_names,
 )
+from rl_engine.kernels.gtest.tolerance import BackendProvenance, ContractResolveError
 from rl_engine.kernels.ops.pytorch.linear.embedding import NativeEmbeddingOp
 from rl_engine.kernels.ops.pytorch.linear.lm_head import NativeLMHeadOp
 from rl_engine.kernels.ops.pytorch.loss.logp import NativeLogpOp
@@ -86,6 +88,8 @@ def _spec_args(op: str) -> argparse.Namespace:
         normalized_dim=8,
         k_dim=8,
         n_dim=8,
+        n_heads=2,
+        head_dim=8,
         theta=1.0e6,
         eps=1.0e-6,
     )
@@ -119,7 +123,11 @@ def test_embedding_native_candidate_suite_passes_issue_108_helper():
     )
 
     assert report.passed
-    assert report.candidates[0].cases[0].outputs[1].message == "gradient:weight"
+    gradient = report.candidates[0].cases[0].outputs[1]
+    assert gradient.message == "gradient:weight"
+    assert gradient.judgment == "gradient_accuracy"
+    assert gradient.comparison_lhs_role == "bf16_candidate"
+    assert gradient.comparison_rhs_role == "fp32_reference"
 
 
 def test_lm_head_native_candidate_suite_passes_issue_108_helper():
@@ -137,9 +145,9 @@ def test_lm_head_native_candidate_suite_passes_issue_108_helper():
 
 
 def test_issue151_ops_pass_shared_issue_108_spec_path():
-    assert {"embedding", "lm_head"}.issubset(operator_names())
+    assert {"embedding", "lm_head", "qk_norm", "pack"}.issubset(operator_names())
 
-    for op_name in ("embedding", "lm_head"):
+    for op_name in ("embedding", "lm_head", "qk_norm", "pack"):
         args = _spec_args(op_name)
         report = run_operator_suite(
             op_name,
@@ -182,6 +190,153 @@ def test_suite_report_to_dict_contains_error_metrics():
     assert "passed" in output
 
 
+def test_ws1_report_persists_roles_and_backend_provenance():
+    provenance = BackendProvenance(
+        backend_profile="cuda_bf16",
+        requested_backend="cuda",
+        actual_backend="cuda",
+        execution_dtype="bfloat16",
+        accumulation_dtype="float32",
+        output_dtype="bfloat16",
+        reference_dtype="float32",
+        candidate_tf32_enabled=False,
+        reference_tf32_enabled=False,
+    )
+    report = run_operator_suite(
+        "logp",
+        candidates=[
+            CandidateSpec(
+                name="cuda-logp",
+                backend="cuda",
+                fn=NativeLogpOp(),
+                provenance=provenance,
+            )
+        ],
+        cases=[_logp_case("bf16", torch.bfloat16, seed=12)],
+    )
+    output = report.candidates[0].cases[0].outputs[0]
+    assert output.judgment == "forward_accuracy"
+    assert output.comparison_lhs_role == "bf16_candidate"
+    assert output.comparison_rhs_role == "fp32_reference"
+    data = report.to_dict()["candidates"][0]
+    assert data["backend_provenance"]["actual_backend"] == "cuda"
+    assert "baseline" not in data["cases"][0]["outputs"][0]
+
+
+def test_ws1_report_accepts_triton_backend_provenance():
+    provenance = BackendProvenance(
+        backend_profile="triton_cuda_bf16",
+        requested_backend="triton",
+        actual_backend="triton",
+        execution_dtype="bfloat16",
+        accumulation_dtype="float32",
+        output_dtype="bfloat16",
+        reference_dtype="float32",
+        candidate_tf32_enabled=False,
+        reference_tf32_enabled=False,
+    )
+    report = run_operator_suite(
+        "logp",
+        candidates=[
+            CandidateSpec(
+                name="triton-logp",
+                backend="triton",
+                fn=NativeLogpOp(),
+                provenance=provenance,
+            )
+        ],
+        cases=[_logp_case("bf16", torch.bfloat16, seed=15)],
+    )
+    output = report.candidates[0].cases[0].outputs[0]
+    assert output.judgment == "forward_accuracy"
+    assert output.comparison_lhs_role == "bf16_candidate"
+    assert output.comparison_rhs_role == "fp32_reference"
+    data = report.to_dict()["candidates"][0]
+    assert data["backend_provenance"]["actual_backend"] == "triton"
+    assert "baseline" not in data["cases"][0]["outputs"][0]
+
+
+def test_ws1_report_rejects_backend_provenance_mismatch():
+    provenance = BackendProvenance(
+        backend_profile="cuda_bf16",
+        requested_backend="cuda",
+        actual_backend="cuda",
+        execution_dtype="bfloat16",
+        accumulation_dtype="float32",
+        output_dtype="bfloat16",
+        reference_dtype="float32",
+        candidate_tf32_enabled=False,
+        reference_tf32_enabled=False,
+    )
+    with pytest.raises(ContractResolveError, match="actual_backend"):
+        run_operator_suite(
+            "logp",
+            candidates=[
+                CandidateSpec(
+                    name="bad",
+                    backend="triton",
+                    fn=NativeLogpOp(),
+                    provenance=provenance,
+                )
+            ],
+            cases=[_logp_case("bf16", torch.bfloat16, seed=13)],
+        )
+
+
+def test_ws1_report_checks_observed_output_dtype_against_provenance():
+    provenance = BackendProvenance(
+        backend_profile="cuda_bf16",
+        requested_backend="cuda",
+        actual_backend="cuda",
+        execution_dtype="bfloat16",
+        accumulation_dtype="float32",
+        output_dtype="bfloat16",
+        reference_dtype="float32",
+        candidate_tf32_enabled=False,
+        reference_tf32_enabled=False,
+    )
+
+    def wrong_output_dtype(logits, token_ids):
+        return NativeLogpOp().forward(logits, token_ids).float()
+
+    with pytest.raises(ContractResolveError, match="candidate output dtype"):
+        run_operator_suite(
+            "logp",
+            candidates=[
+                CandidateSpec(
+                    name="wrong-output",
+                    backend="cuda",
+                    fn=wrong_output_dtype,
+                    provenance=provenance,
+                )
+            ],
+            cases=[_logp_case("bf16", torch.bfloat16, seed=14)],
+        )
+
+    wrong_gold_case = _logp_case("bf16", torch.bfloat16, seed=14)
+    wrong_gold_case = OperatorCase(
+        name=wrong_gold_case.name,
+        op_class=wrong_gold_case.op_class,
+        dtype=wrong_gold_case.dtype,
+        inputs=wrong_gold_case.inputs,
+        gold_fn=lambda **inputs: NativeLogpOp().forward(**inputs),
+        grad_input_names=wrong_gold_case.grad_input_names,
+    )
+    with pytest.raises(ContractResolveError, match="gold output dtype"):
+        run_operator_suite(
+            "logp",
+            candidates=[
+                CandidateSpec(
+                    name="wrong-gold-output",
+                    backend="cuda",
+                    fn=NativeLogpOp(),
+                    provenance=provenance,
+                )
+            ],
+            cases=[wrong_gold_case],
+        )
+
+
 def test_candidate_arch_key_uses_tolerance_override():
     def slightly_shifted_logp(logits, token_ids):
         return NativeLogpOp().forward_fp32(logits, token_ids) + 0.02
@@ -219,6 +374,28 @@ def test_candidate_arch_key_uses_tolerance_override():
     output = report.candidates[0].cases[0].outputs[0]
     assert report.passed
     assert output.atol == 5.0e-2
+
+
+def test_legacy_contract_rejects_non_forward_judgment():
+    """Legacy accuracy mirrors must not be reused as gradient thresholds."""
+    from rl_engine.kernels.gtest.op_checks import _resolve_tolerance
+
+    contract = {
+        "accuracy": {
+            "default": {
+                "logprob": {
+                    "float32": {"atol": 1.0e-5, "rtol": 0.0},
+                }
+            }
+        }
+    }
+    with pytest.raises(ContractResolveError, match="legacy accuracy contracts"):
+        _resolve_tolerance(
+            contract,
+            op_class="logprob",
+            dtype=torch.float32,
+            judgment="gradient_accuracy",
+        )
 
 
 def test_logp_native_candidate_backward_suite_passes():

@@ -84,6 +84,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--constant-value", type=float, default=0.25)
     parser.add_argument("--token-value", type=int, default=0)
     parser.add_argument("--normalized-dim", type=int, default=4096)
+    parser.add_argument("--n-heads", type=int, default=32)
+    parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--k-dim", type=int, default=4096)
     parser.add_argument("--n-dim", type=int, default=4096)
     parser.add_argument("--theta", type=float, default=1.0e6)

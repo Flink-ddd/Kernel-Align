@@ -5,7 +5,6 @@ import argparse
 import time
 
 import torch
-from tabulate import tabulate
 
 from rl_engine.kernels.sampling import SamplerBackend as RL_Sampler
 from rl_engine.platforms.device import device_ctx
@@ -90,6 +89,8 @@ def run_benchmark(args, return_data: bool = False):
 
     if return_data:
         return raw_metrics
+
+    from tabulate import tabulate
 
     headers = ["Batch Size (G)", "Native Latency", "RL-Kernel", "Speedup"]
     print("\n" + "=" * 80)

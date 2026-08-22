@@ -7,8 +7,8 @@ from typing import Optional
 
 import torch
 
+from rl_engine.kernels.ops.backward_runtime import record_backward
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
-from rl_engine.kernels.ops.pytorch.linear.lm_head import NativeLMHeadOp
 from rl_engine.utils.logger import logger
 
 _SUPPORTED_DTYPES = {torch.float32, torch.float16, torch.bfloat16}
@@ -19,16 +19,6 @@ def _is_hopper(device: torch.device) -> bool:
         return torch.cuda.get_device_capability(device)[0] == 9
     except Exception:
         return False
-
-
-def _can_use_det_gemm_backward(hidden: torch.Tensor, weight: torch.Tensor) -> bool:
-    return (
-        hidden.dtype == torch.bfloat16
-        and weight.dtype == torch.bfloat16
-        and _EXT_AVAILABLE
-        and hasattr(_C, "det_gemm_da")
-        and hasattr(_C, "det_gemm_db")
-    )
 
 
 class _SM90LMHeadFunction(torch.autograd.Function):
@@ -54,51 +44,37 @@ class _SM90LMHeadFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         hidden, weight, bias = ctx.saved_tensors
-        grad_hidden = grad_weight = grad_bias = None
-
-        hidden_2d = hidden.reshape(-1, hidden.size(-1))
-        grad_2d = grad_output.reshape(-1, weight.size(0)).float()
-        hidden_f = hidden_2d.float()
-        weight_f = weight.float()
-        needs_projection_grad = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
-        use_det_gemm = (
-            hidden_2d.size(0) > 0
-            and needs_projection_grad
-            and _can_use_det_gemm_backward(hidden, weight)
-        )
-        if (
-            hidden_2d.size(0) > 0
-            and needs_projection_grad
-            and hidden.dtype == torch.bfloat16
-            and weight.dtype == torch.bfloat16
-            and not use_det_gemm
-        ):
+        if not _EXT_AVAILABLE or not hasattr(_C, "det_gemm_fwd"):
             raise RuntimeError(
-                "SM90LMHeadOp.backward requires _C.det_gemm_da/db for bf16 "
-                "batch-invariant gradients."
+                "SM90 LM-head backward requires _C.det_gemm_fwd; "
+                "torch.matmul / cuBLAS fallback is forbidden"
             )
-
+        grad_2d = grad_output.reshape(-1, weight.size(0)).contiguous()
+        hidden_2d = hidden.reshape(-1, hidden.size(-1)).contiguous()
+        weight_c = weight.contiguous()
+        if grad_2d.dtype != torch.bfloat16:
+            grad_2d = grad_2d.to(torch.bfloat16)
+        if hidden_2d.dtype != torch.bfloat16:
+            hidden_2d = hidden_2d.to(torch.bfloat16)
+        if weight_c.dtype != torch.bfloat16:
+            weight_c = weight_c.to(torch.bfloat16)
+        grad_hidden = grad_weight = grad_bias = None
         if ctx.needs_input_grad[0]:
-            if use_det_gemm:
-                grad_hidden = _C.det_gemm_da(
-                    grad_2d.to(torch.bfloat16).contiguous(),
-                    weight.t().contiguous(),
-                )
-            else:
-                grad_hidden = grad_2d.matmul(weight_f)
-            grad_hidden = grad_hidden.reshape_as(hidden).to(hidden.dtype)
+            grad_hidden = _C.det_gemm_fwd(grad_2d, weight_c).reshape_as(hidden).to(hidden.dtype)
         if ctx.needs_input_grad[1]:
-            if use_det_gemm:
-                grad_weight = _C.det_gemm_db(
-                    hidden_2d.contiguous(),
-                    grad_2d.to(torch.bfloat16).contiguous(),
-                ).t()
-            else:
-                grad_weight = grad_2d.transpose(0, 1).matmul(hidden_f)
-            grad_weight = grad_weight.contiguous().to(weight.dtype)
+            grad_weight = _C.det_gemm_fwd(grad_2d.t().contiguous(), hidden_2d).to(weight.dtype)
         if ctx.has_bias and ctx.needs_input_grad[2]:
-            grad_bias = grad_2d.sum(0).to(bias.dtype)
-
+            rows = grad_output.reshape(-1, weight.size(0)).float()
+            acc = torch.zeros((rows.shape[1],), device=rows.device, dtype=torch.float32)
+            for index in range(rows.shape[0]):
+                acc = acc + rows[index]
+            grad_bias = acc.to(bias.dtype)
+        record_backward(
+            "lm_head",
+            kernel_id="rl_engine._C.det_gemm_fwd",
+            impl="cuda_det_gemm",
+            family="cuda",
+        )
         return grad_hidden, grad_weight, grad_bias, None
 
 
@@ -108,10 +84,12 @@ class SM90LMHeadOp:
     The CUDA forward launches one CTA per output logit and performs the full K
     reduction in that CTA. There is no Split-K and no cuBLAS algorithm selection
     in the forward path, so a row's logits do not depend on batch layout.
+    Backward uses the declared CUDA deterministic GEMM (no torch.matmul).
     """
 
     op_class = "reduction"
     is_batch_invariant = True
+    backward_impl = "cuda_det_gemm"
 
     def __init__(self) -> None:
         if not _EXT_AVAILABLE or not hasattr(_C, "lm_head_sm90_forward"):
@@ -119,7 +97,6 @@ class SM90LMHeadOp:
                 "lm_head_sm90_forward is not compiled into the extension. "
                 "Rebuild on Hopper with KERNEL_ALIGN_FORCE_SM90=1."
             )
-        self._fallback = NativeLMHeadOp()
         logger.info("Successfully linked to precompiled _C.lm_head_sm90_forward kernel.")
 
     def __call__(
@@ -139,7 +116,10 @@ class SM90LMHeadOp:
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not self._can_use_sm90(hidden, weight, bias):
-            return self._fallback.forward(hidden, weight, bias=bias)
+            raise RuntimeError(
+                "SM90LMHeadOp requires Hopper CUDA bf16/fp16/fp32 inputs; "
+                "Native/Triton fallback is forbidden"
+            )
         return _SM90LMHeadFunction.apply(hidden, weight, bias, False)
 
     def forward_fp32(
@@ -150,8 +130,17 @@ class SM90LMHeadOp:
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not self._can_use_sm90(hidden, weight, bias):
-            return self._fallback.forward_fp32(hidden, weight, bias=bias)
+            raise RuntimeError(
+                "SM90LMHeadOp requires Hopper CUDA bf16/fp16/fp32 inputs; "
+                "Native/Triton fallback is forbidden"
+            )
         return _SM90LMHeadFunction.apply(hidden, weight, bias, True)
+
+    def parameter_vjp_contributions_fp32(self, *, hidden, weight, grad_output, bias=None):
+        del weight, bias
+        rows_h = hidden.reshape(-1, hidden.size(-1)).float()
+        rows_g = grad_output.reshape(-1, grad_output.size(-1)).float()
+        return {"weight": rows_g[:, :, None] * rows_h[:, None, :]}
 
     @staticmethod
     def _can_use_sm90(

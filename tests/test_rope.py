@@ -259,3 +259,72 @@ class TestNativeRoPEOpQwen3Shapes:
         x_k, pos = _make_inputs(2, 8, 16, 128, seed=13)
         out = op.forward_fp32(x_k, pos, theta=1_000_000.0)
         assert out.shape == (2, 8, 16, 128)
+
+
+class TestRoPEPackedPositionReset:
+    """C5: packed tokens must keep logical positions, not packed 0..T-1."""
+
+    def test_packed_logical_positions_match_per_sample_rope(self):
+        op = NativeRoPEOp()
+        heads, dim = 4, QWEN3_HEAD_DIM
+        seqs = [torch.randn(heads, length, dim) for length in (3, 5)]
+        logical_pos = [torch.tensor([2, 5, 9]), torch.tensor([1, 4, 6, 8, 11])]
+        per_sample = [
+            op.forward_fp32(seq.unsqueeze(0), pos, theta=QWEN3_THETA).squeeze(0)
+            for seq, pos in zip(seqs, logical_pos)
+        ]
+
+        packed = torch.cat(seqs, dim=1).unsqueeze(0)
+        packed_pos = torch.cat(logical_pos)
+        packed_out = op.forward_fp32(packed, packed_pos, theta=QWEN3_THETA).squeeze(0)
+        assert torch.equal(packed_out[:, :3], per_sample[0])
+        assert torch.equal(packed_out[:, 3:], per_sample[1])
+
+        naive_idx = torch.arange(packed_pos.numel())
+        naive_out = op.forward_fp32(packed, naive_idx, theta=QWEN3_THETA).squeeze(0)
+        assert not torch.equal(packed_out, naive_out)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="candidate RoPE requires CUDA")
+class TestCandidateRoPELayouts:
+    def _candidates(self):
+        from rl_engine.kernels.ops.triton.rotary_embedding.rope import TritonRoPEOp
+
+        ops = [("triton", TritonRoPEOp())]
+        try:
+            from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RoPESM90Op
+
+            # SM90 kernel may be present in a prebuilt extension on SM86 hosts;
+            # only add the candidate when the active device can actually launch it.
+            if torch.cuda.get_device_capability(0)[0] == 9:
+                ops.append(("cuda-sm90", RoPESM90Op()))
+        except RuntimeError:
+            pass
+        return ops
+
+    def test_positions_1d_and_2d_match_native(self):
+        native = NativeRoPEOp()
+        x, pos_1d = _make_inputs(3, 8, 16, QWEN3_HEAD_DIM, seed=7)
+        pos_2d = torch.stack([pos_1d + i * 17 for i in range(3)])
+        x_bf16 = x.bfloat16().cuda()
+        pos_1d = pos_1d.cuda()
+        pos_2d = pos_2d.cuda()
+        gold_1d = native.forward_fp32(x_bf16, pos_1d, theta=QWEN3_THETA)
+        gold_2d = native.forward_fp32(x_bf16, pos_2d, theta=QWEN3_THETA)
+        for name, op in self._candidates():
+            got_1d = op.forward(x_bf16, pos_1d, theta=QWEN3_THETA).float()
+            got_2d = op.forward(x_bf16, pos_2d, theta=QWEN3_THETA).float()
+            assert torch.allclose(got_1d, gold_1d, atol=2e-2, rtol=1.6e-2), name
+            assert torch.allclose(got_2d, gold_2d, atol=2e-2, rtol=1.6e-2), name
+
+    def test_packed_logical_positions_on_candidates(self):
+        native = NativeRoPEOp()
+        heads, dim = 4, QWEN3_HEAD_DIM
+        seqs = [torch.randn(heads, length, dim) for length in (3, 5)]
+        logical_pos = [torch.tensor([2, 5, 9]), torch.tensor([1, 4, 6, 8, 11])]
+        packed = torch.cat(seqs, dim=1).unsqueeze(0).bfloat16().cuda()
+        packed_pos = torch.cat(logical_pos).cuda()
+        gold = native.forward_fp32(packed, packed_pos, theta=QWEN3_THETA)
+        for name, op in self._candidates():
+            got = op.forward(packed, packed_pos, theta=QWEN3_THETA).float()
+            assert torch.allclose(got, gold, atol=2e-2, rtol=1.6e-2), name

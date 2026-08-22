@@ -9,6 +9,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+build_jit/
 develop-eggs/
 dist/
 downloads/
@@ -209,3 +210,6 @@ __marimo__/
 
 # Local dev notes (not for upstream)
 _dev_notes/
+
+# Local C8 execute dumps; default output is under TMPDIR.
+ws1-c8-ci.json

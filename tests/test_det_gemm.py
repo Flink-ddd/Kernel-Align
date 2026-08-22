@@ -146,3 +146,21 @@ def test_target_shapes_invariance(name, gemm, shape):
     assert torch.equal(
         gemm(row, b)[0], gemm(big, b)[0]
     ), f"{name}: batch-invariance broken at shape {shape}"
+
+
+@pytest.mark.skipif(not _HAS_TRITON, reason="Triton is unavailable")
+def test_triton_ragged_tiles_mask_all_axes():
+    """Non-multiple M/N/K tiles must not read or write past tensor bounds."""
+    torch.manual_seed(7)
+    a = _rand(80, 130).requires_grad_(True)
+    b = _rand(130, 129).requires_grad_(True)
+    out = deterministic_gemm_triton(a, b)
+    torch.cuda.synchronize()
+    assert tuple(out.shape) == (80, 129)
+    torch.testing.assert_close(
+        out.float(), a.detach().float() @ b.detach().float(), atol=5e-2, rtol=2e-2
+    )
+    out.backward(_rand(80, 129))
+    torch.cuda.synchronize()
+    assert torch.isfinite(a.grad).all()
+    assert torch.isfinite(b.grad).all()

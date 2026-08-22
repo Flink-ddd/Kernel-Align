@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import torch
 
+from rl_engine.kernels.ops.backward_runtime import record_backward
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
-from rl_engine.kernels.ops.pytorch.linear.embedding import NativeEmbeddingOp
 from rl_engine.utils.logger import logger
 
 _SUPPORTED_DTYPES = {torch.float32, torch.float16, torch.bfloat16}
@@ -92,6 +92,15 @@ class _SM90EmbeddingFunction(torch.autograd.Function):
                 weight_shape=ctx.weight_shape,
                 weight_dtype=ctx.weight_dtype,
             )
+        record_backward(
+            "embedding",
+            kernel_id=(
+                "rl_engine.kernels.ops.cuda.linear.embedding."
+                "_deterministic_embedding_grad_weight"
+            ),
+            impl="cuda_sorted_segment_dweight",
+            family="cuda",
+        )
         return None, grad_weight, None
 
 
@@ -108,17 +117,22 @@ class SM90EmbeddingOp(torch.nn.Module):
                 "embedding_sm90_forward is not compiled into the extension. "
                 "Rebuild on Hopper with KERNEL_ALIGN_FORCE_SM90=1."
             )
-        self._fallback = NativeEmbeddingOp()
         logger.info("Successfully linked to precompiled _C.embedding_sm90_forward kernel.")
 
     def forward(self, token_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         if not self._can_use_sm90(token_ids, weight):
-            return self._fallback.forward(token_ids, weight)
+            raise RuntimeError(
+                "SM90EmbeddingOp requires Hopper CUDA bf16/fp16/fp32 inputs; "
+                "Native/Triton fallback is forbidden"
+            )
         return _SM90EmbeddingFunction.apply(token_ids, weight, False)
 
     def forward_fp32(self, token_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         if not self._can_use_sm90(token_ids, weight):
-            return self._fallback.forward_fp32(token_ids, weight)
+            raise RuntimeError(
+                "SM90EmbeddingOp requires Hopper CUDA bf16/fp16/fp32 inputs; "
+                "Native/Triton fallback is forbidden"
+            )
         return _SM90EmbeddingFunction.apply(token_ids, weight, True)
 
     @staticmethod

@@ -11,34 +11,18 @@ from rl_engine.utils.logger import logger
 
 def _sm90_supported(logits: torch.Tensor) -> bool:
     """Whether the TMA forward can run these logits directly.
+
     Hopper (SM90) only, bf16/fp32 only, and the TMA descriptor needs the vocab
     row stride (``V * element_size``) to be a multiple of 16 bytes.
 
-    The device capability is checked per input (not just at registry init) so a
-    cached op instance handed a tensor on a non-Hopper GPU falls back instead of
-    launching the SM90 kernel on hardware that cannot run it.
+    The device capability is checked per input (not just at registry init). The
+    caller raises when this returns false; silent fallback is forbidden.
     """
     if not logits.is_cuda or logits.dtype not in (torch.bfloat16, torch.float32):
         return False
     if torch.cuda.get_device_capability(logits.device)[0] != 9:
         return False
     return (logits.size(-1) * logits.element_size()) % 16 == 0
-
-
-def _fallback_op():
-    """Portable op for inputs the SM90 forward cannot take. Triton, else native."""
-    try:
-        from rl_engine.kernels.ops.triton.loss.batch_invariant_logp import (
-            TritonBatchInvariantLogpOp,
-        )
-
-        return TritonBatchInvariantLogpOp()
-    except Exception:  # pragma: no cover - Triton missing
-        from rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp import (
-            NativeBatchInvariantLogpOp,
-        )
-
-        return NativeBatchInvariantLogpOp()
 
 
 class _BatchInvariantLogpSM90Function(torch.autograd.Function):
@@ -146,7 +130,10 @@ class BatchInvariantLogpSM90Op:
             )
 
         if not _sm90_supported(logits):
-            return _fallback_op()(logits, target_ids, ignore_index=ignore_index, validate=validate)
+            raise RuntimeError(
+                "BatchInvariantLogpSM90Op requires Hopper CUDA with a 16-byte-aligned "
+                "vocab stride; Triton/Native fallback is forbidden"
+            )
 
         if validate:
             vocab_size = logits.size(-1)

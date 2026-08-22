@@ -26,6 +26,8 @@ def make_operator_inputs(
 ) -> dict[str, Any]:
     builders = {
         "rms_norm": _make_rms_norm_inputs,
+        "qk_norm": _make_qk_norm_inputs,
+        "pack": _make_pack_inputs,
         "matmul": _make_matmul_inputs,
         "det_gemm": _make_det_gemm_inputs,
         "attention": _make_attention_inputs,
@@ -50,6 +52,9 @@ def operator_shape_name(op_name: str, args: argparse.Namespace) -> str:
     vocab = _arg_int(args, "vocab", DEFAULT_VOCAB)
     names = {
         "rms_norm": f"{batch}x{seq}x{_normalized_dim(args)}",
+        "qk_norm": f"{batch}x{seq}x{_arg_int(args, 'n_heads', DEFAULT_N_HEADS)}x"
+        f"{_arg_int(args, 'head_dim', DEFAULT_HEAD_DIM)}",
+        "pack": f"{batch}x{seq}x{_normalized_dim(args)}",
         "matmul": f"{batch}x{seq}x{_matmul_k(args)}x{_matmul_n(args)}",
         "det_gemm": f"{batch}x{seq}x{_matmul_k(args)}x{_matmul_n(args)}",
         "attention": f"{batch}x{DEFAULT_N_HEADS}x{seq}x{DEFAULT_HEAD_DIM}",
@@ -79,6 +84,37 @@ def _make_rms_norm_inputs(
         "weight": _floating_tensor((normalized_dim,), args, dtype, device, offset=1),
         "eps": _arg_float(args, "eps", DEFAULT_RMS_EPS),
     }
+
+
+def _make_qk_norm_inputs(
+    args: argparse.Namespace, dtype: torch.dtype, device: torch.device
+) -> dict[str, Any]:
+    """Per-head RMSNorm: last dim is head_dim, not the full hidden width."""
+    batch, seq = _batch_seq(args)
+    n_heads = _arg_int(args, "n_heads", DEFAULT_N_HEADS)
+    head_dim = _arg_int(args, "head_dim", DEFAULT_HEAD_DIM)
+    return {
+        "x": _floating_tensor((batch, seq * n_heads, head_dim), args, dtype, device, offset=0),
+        "weight": _floating_tensor((head_dim,), args, dtype, device, offset=1),
+        "eps": _arg_float(args, "eps", DEFAULT_RMS_EPS),
+    }
+
+
+def _make_pack_inputs(
+    args: argparse.Namespace, dtype: torch.dtype, device: torch.device
+) -> dict[str, Any]:
+    batch, seq = _batch_seq(args)
+    hidden = _normalized_dim(args)
+    x = _floating_tensor((batch, seq, hidden), args, dtype, device, offset=0)
+    mode = _arg_str(args, "input_mode", "random")
+    if mode == "constant":
+        mask = torch.zeros(batch, seq, device=device, dtype=torch.bool)
+        mask[:, : max(1, seq // 2)] = True
+    else:
+        generator = _generator(args, device, offset=17)
+        mask = torch.randint(0, 2, (batch, seq), generator=generator, device=device) > 0
+        mask[:, 0] = True
+    return {"x": x, "mask": mask}
 
 
 def _make_matmul_inputs(

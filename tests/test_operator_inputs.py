@@ -21,6 +21,8 @@ def _args(**overrides):
         "constant_value": 0.5,
         "token_value": 3,
         "normalized_dim": 128,
+        "n_heads": 32,
+        "head_dim": 128,
         "k_dim": 16,
         "n_dim": 32,
         "theta": 1.0e6,
@@ -34,6 +36,8 @@ def _args(**overrides):
     "op_name",
     [
         "rms_norm",
+        "qk_norm",
+        "pack",
         "matmul",
         "det_gemm",
         "attention",

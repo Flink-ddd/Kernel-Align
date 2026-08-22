@@ -313,3 +313,15 @@ torch::Tensor lm_head_sm90_forward_fp32(torch::Tensor hidden, torch::Tensor weig
                                         torch::optional<torch::Tensor> bias) {
     return lm_head_sm90_forward_impl(hidden, weight, bias, true);
 }
+
+torch::Tensor det_gemm_rowwise_fwd_fp32(torch::Tensor a, torch::Tensor b) {
+    TORCH_CHECK(a.dim() == 2 && b.dim() == 2,
+                "det_gemm_rowwise_fwd_fp32 expects [M,K] @ [K,N]");
+    TORCH_CHECK(a.size(1) == b.size(0),
+                "det_gemm_rowwise_fwd_fp32: K mismatch");
+    // lm_head_sm90_forward_impl computes one output element per CTA using a
+    // fixed 256-thread block reduction. Passing B^T as [N,K] exposes that
+    // deterministic rowwise reduction as a general GEMM configuration.
+    return lm_head_sm90_forward_impl(
+        a, b.transpose(0, 1).contiguous(), torch::optional<torch::Tensor>{}, true);
+}

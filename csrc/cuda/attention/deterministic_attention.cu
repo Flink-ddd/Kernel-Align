@@ -147,9 +147,8 @@ __global__ void masked_softmax_lse_kernel(
     }
   } else {
     lse_val = row_max + logf(row_sum);
-    float inv_sum = 1.0f / row_sum;
     for (int k = threadIdx.x; k < Skv; k += kSoftmaxThreads) {
-      row[k] *= inv_sum;
+      row[k] /= row_sum;
     }
   }
 
@@ -166,11 +165,11 @@ __global__ void masked_softmax_lse_kernel(
 constexpr int kPVTileQ = 16;
 constexpr int kPVTileD = 16;
 
-template <typename scalar_t>
+template <typename input_t, typename output_t>
 __global__ void pv_kernel(
     const float* __restrict__ P,      // [B, Hq, Sq, Skv]
-    const scalar_t* __restrict__ V,   // [B, Hkv, Skv, D]
-    scalar_t* __restrict__ out,       // [B, Hq, Sq, D]
+    const input_t* __restrict__ V,   // [B, Hkv, Skv, D]
+    output_t* __restrict__ out,       // [B, Hq, Sq, D]
     int64_t B, int64_t Hq, int64_t Hkv,
     int64_t Sq, int64_t Skv, int64_t D) {
 
@@ -185,7 +184,7 @@ __global__ void pv_kernel(
   const int kv_head = hq / (Hq / Hkv);
 
   const float* p_row = P + ((int64_t)b * Hq * Sq * Skv + (int64_t)hq * Sq * Skv + (int64_t)q_idx * Skv);
-  const scalar_t* v_base = V + ((int64_t)b * Hkv * Skv * D + (int64_t)kv_head * Skv * D);
+  const input_t* v_base = V + ((int64_t)b * Hkv * Skv * D + (int64_t)kv_head * Skv * D);
 
   float acc = 0.0f;
   for (int64_t k = 0; k < Skv; ++k) {
@@ -193,7 +192,7 @@ __global__ void pv_kernel(
   }
 
   const int64_t out_idx = (int64_t)b * Hq * Sq * D + (int64_t)hq * Sq * D + (int64_t)q_idx * D + d_idx;
-  out[out_idx] = (scalar_t)acc;
+  out[out_idx] = (output_t)acc;
 }
 
 void check_deterministic_attention_inputs(
@@ -257,13 +256,14 @@ void check_deterministic_attention_inputs(
 //   out: [B, Hq, Sq, D] same dtype as q
 //   lse: [B, Hq, Sq] FP32
 //   P:   [B, Hq, Sq, Skv] FP32  (softmax probabilities, saved for backward)
-std::vector<torch::Tensor> deterministic_attention_forward(
+std::vector<torch::Tensor> deterministic_attention_forward_impl(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
     bool causal,
     double scale,
-    torch::optional<torch::Tensor> key_padding_mask) {
+    torch::optional<torch::Tensor> key_padding_mask,
+    bool output_fp32) {
   check_deterministic_attention_inputs(q, k, v, key_padding_mask);
 
   const at::cuda::OptionalCUDAGuard device_guard(at::device_of(q));
@@ -327,7 +327,9 @@ std::vector<torch::Tensor> deterministic_attention_forward(
   }
 
   // --- Launch PV kernel ---
-  auto out = torch::empty_like(q_contig);
+  auto out = output_fp32
+      ? torch::empty(q_contig.sizes(), q_contig.options().dtype(at::kFloat))
+      : torch::empty_like(q_contig);
   {
     dim3 block(kPVTileD, kPVTileQ);
     dim3 grid(
@@ -337,16 +339,38 @@ std::vector<torch::Tensor> deterministic_attention_forward(
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         q_contig.scalar_type(), "pv_kernel", [&] {
-          pv_kernel<scalar_t><<<grid, block, 0, stream>>>(
-              scores.data_ptr<float>(),
-              v_contig.data_ptr<scalar_t>(),
-              out.data_ptr<scalar_t>(),
-              B, Hq, Hkv, Sq, Skv, D);
+          if (output_fp32) {
+            pv_kernel<scalar_t, float><<<grid, block, 0, stream>>>(
+                scores.data_ptr<float>(),
+                v_contig.data_ptr<scalar_t>(),
+                out.data_ptr<float>(),
+                B, Hq, Hkv, Sq, Skv, D);
+          } else {
+            pv_kernel<scalar_t, scalar_t><<<grid, block, 0, stream>>>(
+                scores.data_ptr<float>(),
+                v_contig.data_ptr<scalar_t>(),
+                out.data_ptr<scalar_t>(),
+                B, Hq, Hkv, Sq, Skv, D);
+          }
           C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
   }
 
   return {out, lse, scores};
+}
+
+std::vector<torch::Tensor> deterministic_attention_forward(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, bool causal, double scale,
+    torch::optional<torch::Tensor> key_padding_mask) {
+  return deterministic_attention_forward_impl(
+      q, k, v, causal, scale, key_padding_mask, false);
+}
+
+std::vector<torch::Tensor> deterministic_attention_forward_fp32(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, bool causal, double scale,
+    torch::optional<torch::Tensor> key_padding_mask) {
+  return deterministic_attention_forward_impl(
+      q, k, v, causal, scale, key_padding_mask, true);
 }
 
 // ===========================================================================

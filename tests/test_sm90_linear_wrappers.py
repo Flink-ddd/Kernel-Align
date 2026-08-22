@@ -30,6 +30,26 @@ requires_sm90_linear = pytest.mark.skipif(
 )
 
 
+def test_sm90_embedding_rejects_non_hopper_fallback(monkeypatch):
+    from rl_engine.kernels.ops.cuda.linear import embedding as embedding_module
+
+    class FakeExtension:
+        @staticmethod
+        def embedding_sm90_forward(token_ids, weight):
+            return weight[token_ids.long()]
+
+    monkeypatch.setattr(embedding_module, "_EXT_AVAILABLE", True)
+    monkeypatch.setattr(embedding_module, "_C", FakeExtension)
+    monkeypatch.setattr(
+        embedding_module.SM90EmbeddingOp,
+        "_can_use_sm90",
+        staticmethod(lambda token_ids, weight: False),
+    )
+    op = embedding_module.SM90EmbeddingOp()
+    with pytest.raises(RuntimeError, match="fallback is forbidden"):
+        op.forward(torch.tensor([[1]]), torch.randn(4, 3))
+
+
 def test_sm90_embedding_wrapper_calls_extension_symbol(monkeypatch):
     from rl_engine.kernels.ops.cuda.linear import embedding as embedding_module
 
@@ -144,10 +164,8 @@ def test_sm90_lm_head_wrapper_calls_extension_symbol(monkeypatch):
     assert [name for name, *_ in calls] == ["forward", "forward_fp32"]
 
 
-def test_sm90_lm_head_bf16_backward_routes_projection_grads_through_det_gemm(monkeypatch):
+def test_sm90_lm_head_bf16_backward_uses_fp32_reference_vjp(monkeypatch):
     from rl_engine.kernels.ops.cuda.linear import lm_head as lm_head_module
-
-    calls = []
 
     class FakeExtension:
         @staticmethod
@@ -165,14 +183,8 @@ def test_sm90_lm_head_bf16_backward_routes_projection_grads_through_det_gemm(mon
             return out.float()
 
         @staticmethod
-        def det_gemm_da(dc, b):
-            calls.append(("da", tuple(dc.shape), tuple(b.shape)))
-            return dc.float().matmul(b.float().t()).to(torch.bfloat16)
-
-        @staticmethod
-        def det_gemm_db(a, dc):
-            calls.append(("db", tuple(a.shape), tuple(dc.shape)))
-            return a.float().t().matmul(dc.float()).to(torch.bfloat16)
+        def det_gemm_fwd(a, b):
+            return a.float().matmul(b.float()).to(a.dtype)
 
     monkeypatch.setattr(lm_head_module, "_EXT_AVAILABLE", True)
     monkeypatch.setattr(lm_head_module, "_C", FakeExtension)
@@ -180,11 +192,6 @@ def test_sm90_lm_head_bf16_backward_routes_projection_grads_through_det_gemm(mon
         lm_head_module.SM90LMHeadOp,
         "_can_use_sm90",
         staticmethod(lambda hidden, weight, bias: True),
-    )
-    monkeypatch.setattr(
-        lm_head_module,
-        "_can_use_det_gemm_backward",
-        lambda hidden, weight: True,
     )
 
     hidden = torch.randn(2, 3, 5, dtype=torch.bfloat16, requires_grad=True)
@@ -197,13 +204,15 @@ def test_sm90_lm_head_bf16_backward_routes_projection_grads_through_det_gemm(mon
 
     flat_hidden = hidden.detach().reshape(-1, hidden.size(-1))
     flat_dy = dy.reshape(-1, weight.size(0))
-    expected_hidden = flat_dy.float().matmul(weight.detach().float()).to(torch.bfloat16)
-    expected_weight = flat_hidden.float().t().matmul(flat_dy.float()).to(torch.bfloat16).t()
+    expected_hidden = (
+        flat_dy.float().matmul(weight.detach().float()).to(torch.bfloat16).reshape_as(hidden)
+    )
+    expected_weight = flat_dy.float().t().matmul(flat_hidden.float()).to(torch.bfloat16)
+    expected_bias = flat_dy.float().sum(0).to(torch.bfloat16)
 
-    assert calls == [("da", (6, 7), (5, 7)), ("db", (6, 5), (6, 7))]
     assert torch.equal(hidden.grad, expected_hidden.reshape_as(hidden))
     assert torch.equal(weight.grad, expected_weight)
-    assert torch.equal(bias.grad, flat_dy.float().sum(0).to(torch.bfloat16))
+    assert torch.equal(bias.grad, expected_bias)
 
 
 @requires_sm90_linear

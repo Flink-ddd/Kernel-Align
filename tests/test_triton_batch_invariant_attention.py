@@ -155,6 +155,58 @@ def test_triton_attention_padding_layout_invariant():
     torch.testing.assert_close(out_a.float(), out_b.float(), atol=5e-2, rtol=2e-2)
 
 
+def _c3_style_rows(
+    n_rows: int,
+    heads: int,
+    head_dim: int,
+    *,
+    offset: int,
+    dtype: torch.dtype,
+    sample_id: str = "s2",
+):
+    """Match C3 ``_logical_fill`` so the 1-ULP left-pad case is reproducible."""
+
+    n = heads * head_dim
+    sample_ord = sum(ord(ch) for ch in sample_id)
+    rows = []
+    for position in range(n_rows):
+        axis = torch.arange(n, device="cuda", dtype=torch.int64)
+        values = ((axis + sample_ord * 17 + position * 13 + offset * 11) % 257) - 128
+        rows.append((values.to(torch.float32) / 1024.0).to(dtype).reshape(heads, head_dim))
+    stacked = torch.stack(rows)
+    return stacked.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
+
+
+@requires_cuda
+def test_triton_attention_causal_left_pad_matches_right_pad_bitwise():
+    """C3 BN/padded_left vs packed/right-pad must be bitwise at Qwen3 head_dim=128.
+
+    The kernel rebases a contiguous valid KV interval to logical column zero so
+    left padding cannot move values to different reduction lanes.
+    """
+
+    dtype = torch.bfloat16
+    valid, right_len, left_len, heads, head_dim = 13, 19, 20, 4, 128
+    q_real = _c3_style_rows(valid, heads, head_dim, offset=0, dtype=dtype)
+    k_real = _c3_style_rows(valid, 1, head_dim, offset=1, dtype=dtype)
+    v_real = _c3_style_rows(valid, 1, head_dim, offset=2, dtype=dtype)
+    op = TritonBatchInvariantAttentionOp()
+
+    def _place(padded: int, side: str) -> torch.Tensor:
+        q = torch.zeros((1, heads, padded, head_dim), device="cuda", dtype=dtype)
+        k = torch.zeros((1, 1, padded, head_dim), device="cuda", dtype=dtype)
+        v = torch.zeros((1, 1, padded, head_dim), device="cuda", dtype=dtype)
+        mask = torch.zeros((1, padded), device="cuda", dtype=torch.bool)
+        sl = slice(padded - valid, padded) if side == "left" else slice(0, valid)
+        q[:, :, sl] = q_real
+        k[:, :, sl] = k_real
+        v[:, :, sl] = v_real
+        mask[:, sl] = True
+        return op(q, k, v, causal=True, key_padding_mask=mask)[:, :, sl]
+
+    assert torch.equal(_place(left_len, "left"), _place(right_len, "right"))
+
+
 @requires_cuda
 def test_triton_attention_lse_padding_layout_invariant():
     dtype = torch.bfloat16
@@ -308,7 +360,7 @@ def test_triton_attention_all_false_key_padding_mask_row_matches_native():
 
 
 @requires_cuda
-def test_triton_attention_backward_uses_reference_fallback():
+def test_triton_attention_backward_matches_native_vjp():
     dtype = torch.bfloat16
     q, k, v = _qkv(1, 8, 8, dtype=dtype, seed=7)
     dy = torch.randn_like(q)
@@ -322,6 +374,39 @@ def test_triton_attention_backward_uses_reference_fallback():
     torch.testing.assert_close(dq.float(), ref_dq.float(), atol=5e-2, rtol=2e-2)
     torch.testing.assert_close(dk.float(), ref_dk.float(), atol=5e-2, rtol=2e-2)
     torch.testing.assert_close(dv.float(), ref_dv.float(), atol=5e-2, rtol=2e-2)
+    import rl_engine.kernels.ops.triton.attention.standard_attn as attn_mod
+
+    assert not hasattr(attn_mod, "NativeAttentionOp")
+
+
+@requires_cuda
+def test_triton_attention_partial_pad_backward_matches_native_vjp():
+    """GQA + partial key padding: compare dq/dk/dv against NativeAttentionOp."""
+    dtype = torch.bfloat16
+    q, k, v = _qkv(2, 8, 8, q_heads=4, kv_heads=2, dtype=dtype, seed=24)
+    mask = torch.ones((2, 8), device="cuda", dtype=torch.bool)
+    mask[0, 6:] = False
+    mask[1, 5:] = False
+    dy = torch.randn_like(q)
+    op = TritonBatchInvariantAttentionOp()
+    native = NativeAttentionOp()
+
+    out, dq, dk, dv = _run_backward(op, q, k, v, dy, causal=True, key_padding_mask=mask)
+    ref_out, ref_dq, ref_dk, ref_dv = _run_backward(
+        native, q, k, v, dy, causal=True, key_padding_mask=mask
+    )
+
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(dq).all() and torch.isfinite(dk).all() and torch.isfinite(dv).all()
+    torch.testing.assert_close(out.float(), ref_out.float(), atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(dq.float(), ref_dq.float(), atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(dk.float(), ref_dk.float(), atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(dv.float(), ref_dv.float(), atol=5e-2, rtol=2e-2)
+    # Padded key positions must not accumulate gradient.
+    assert torch.equal(dk[0, :, 6:], torch.zeros_like(dk[0, :, 6:]))
+    assert torch.equal(dv[0, :, 6:], torch.zeros_like(dv[0, :, 6:]))
+    assert torch.equal(dk[1, :, 5:], torch.zeros_like(dk[1, :, 5:]))
+    assert torch.equal(dv[1, :, 5:], torch.zeros_like(dv[1, :, 5:]))
 
 
 @requires_cuda
