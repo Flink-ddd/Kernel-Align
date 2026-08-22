@@ -64,6 +64,20 @@ not compiled, instantiation fails and dispatch falls through to PyTorch native.
 bf16/fp32 NPU tensors run the Ascend C kernel; anything else (e.g. fp16)
 silently falls back to the native op.
 
+### WS2 TP-aware dispatch
+
+WS2 distributed callers use a separate contract-aware entry point,
+`kernel_registry.get_logprob_op(contract)`. It validates explicit vocab-shard ownership,
+padded-vs-real vocab metadata, active-token masking, and fixed `(max, sumexp)` merge
+semantics before selecting a backend. Legacy `get_op("batch_invariant_logp")` behavior
+remains unchanged.
+
+The backends above are single-shard (TP=1) references and do not yet export vocab-domain
+LSE or carry vocab-shard metadata, so they are declared incompatible with strict WS2
+requests instead of being selected as a silent fallback. The Ascend backend is likewise
+undeclared for WS2, so it is rejected with an explicit reason rather than silently
+selected. The contract objects are documented in `rl_engine.kernels.logprob_contract`.
+
 ## Benchmarks
 
 `benchmarks/benchmark_batch_invariant_logp.py` compares Native, Triton when
