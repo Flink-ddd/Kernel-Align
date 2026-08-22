@@ -256,9 +256,7 @@ def _restrict_to_ws1_candidates(registry: KernelRegistry) -> None:
         OpBackend.ROCM_VOCAB_PARALLEL_LOGP,
     }
     registry._logprob_candidates[platform] = [
-        backend
-        for backend in registry._logprob_candidates[platform]
-        if backend not in ws2_backends
+        backend for backend in registry._logprob_candidates[platform] if backend not in ws2_backends
     ]
 
 
