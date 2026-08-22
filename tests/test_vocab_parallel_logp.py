@@ -286,7 +286,7 @@ def test_dispatch_resolves_reference_and_leaves_legacy_untouched():
     registry = KernelRegistry()
     contract = _contract()
 
-    result = registry.get_logprob_op(contract)
+    result = registry.get_logprob_op(contract, requested_backend="reference")
     assert result.capability.backend_id == BACKEND_ID
     assert result.provenance["fallback"] is False
     assert isinstance(result.op, VocabParallelLogprobOp)
