@@ -31,7 +31,10 @@ def test_rocm_backend_is_gated_by_native_extension(monkeypatch):
         assert capability.backend_id == "rocm-vocab-parallel-logp-ws2"
         assert capability.implementation_kind == "production"
     else:
-        assert candidates[0] is OpBackend.PYTORCH_VOCAB_PARALLEL_LOGP
+        assert candidates[0] in {
+            OpBackend.TRITON_VOCAB_PARALLEL_LOGP,
+            OpBackend.PYTORCH_VOCAB_PARALLEL_LOGP,
+        }
 
 
 def test_rocm_native_tile_kernel_is_hip_guarded_and_registered():
@@ -100,9 +103,37 @@ def _native_rocm_available() -> bool:
     return _rocm_vocab_logprob_native_available()
 
 
-@pytest.mark.skipif(not _native_rocm_available(), reason="requires the ROCm logprob extension")
-class TestRocmFusedPath:
-    """The HIP fast path must agree with the reference op on the same contract."""
+def _triton_available() -> bool:
+    import torch
+
+    if not torch.cuda.is_available():
+        return False
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _kernel_backends() -> list:
+    """(id, op factory) for every fused kernel backend usable on this machine."""
+
+    backends = []
+    if _native_rocm_available():
+        backends.append(pytest.param(RocmVocabParallelLogprobOp, id="rocm-hip"))
+    if _triton_available():
+        from rl_engine.kernels.ops.triton.loss.vocab_parallel_logp import (
+            TritonVocabParallelLogprobOp,
+        )
+
+        backends.append(pytest.param(TritonVocabParallelLogprobOp, id="triton"))
+    return backends
+
+
+@pytest.mark.skipif(not _kernel_backends(), reason="requires a fused WS2 kernel backend")
+@pytest.mark.parametrize("op_class", _kernel_backends())
+class TestFusedKernelPath:
+    """Every fused kernel backend must agree with the reference op on the same contract."""
 
     @staticmethod
     def _case(real_vocab, padded_vocab, num_tokens, dtype, *, seed=3):
@@ -134,12 +165,14 @@ class TestRocmFusedPath:
         [(1000, 1024, 32), (13, 16, 8), (151936, 151936, 64)],
         ids=["partial-pad", "full-pad-tile", "qwen3"],
     )
-    def test_forward_backward_match_reference(self, dtype_name, real_vocab, padded_vocab, tiles):
+    def test_forward_backward_match_reference(
+        self, op_class, dtype_name, real_vocab, padded_vocab, tiles
+    ):
         import torch
 
         dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[dtype_name]
         logits, targets, active, contract = self._case(real_vocab, padded_vocab, 24, dtype)
-        ref_op, rocm_op = VocabParallelLogprobOp(), RocmVocabParallelLogprobOp()
+        ref_op, rocm_op = VocabParallelLogprobOp(), op_class()
         outputs = {}
         for name, op in (("ref", ref_op), ("rocm", rocm_op)):
             leaf = logits.clone().requires_grad_(True)
@@ -166,11 +199,11 @@ class TestRocmFusedPath:
             again[1], outputs["rocm"][1]
         )
 
-    def test_logp_only_and_lse_only_gradients(self):
+    def test_logp_only_and_lse_only_gradients(self, op_class):
         import torch
 
         logits, targets, active, contract = self._case(1000, 1024, 12, torch.bfloat16)
-        ref_op, rocm_op = VocabParallelLogprobOp(), RocmVocabParallelLogprobOp()
+        ref_op, rocm_op = VocabParallelLogprobOp(), op_class()
         for which in ("logp", "lse"):
             grads = []
             for op in (ref_op, rocm_op):
@@ -180,30 +213,64 @@ class TestRocmFusedPath:
                 grads.append(leaf.grad.float())
             torch.testing.assert_close(grads[1], grads[0], rtol=2e-5, atol=2e-5)
 
-    def test_tile_stats_read_input_dtype_exactly(self):
+    def test_tile_stats_read_input_dtype_exactly(self, op_class):
         """BF16 input straight into the kernel equals the FP32 upcast path bitwise."""
         import torch
 
-        from rl_engine.kernels.ops.base import _C
+        from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import _local_tile_stats
 
+        if op_class is RocmVocabParallelLogprobOp:
+            from rl_engine.kernels.ops.base import _C
+
+            tile_stats = _C.hip_deterministic_logp_tile_stats
+        else:
+            from rl_engine.kernels.ops.triton.loss.vocab_parallel_logp import (
+                triton_vocab_tile_stats,
+            )
+
+            tile_stats = triton_vocab_tile_stats
         logits, _, _, _ = self._case(1000, 1024, 16, torch.bfloat16)
-        direct = _C.hip_deterministic_logp_tile_stats(logits, 0, 1000, 32)
-        upcast = _C.hip_deterministic_logp_tile_stats(logits.float(), 0, 1000, 32)
+        direct = tile_stats(logits, 0, 1000, 32)
+        upcast = tile_stats(logits.float(), 0, 1000, 32)
         assert all(torch.equal(a, b) for a, b in zip(direct, upcast))
-        # Same tile maxima as the shared CUDA/HIP kernel; sums differ only by order.
-        shared = _C.deterministic_logp_tile_stats(logits.float(), 0, 1000, 32)
-        assert torch.equal(direct[0], shared[0])
-        torch.testing.assert_close(direct[1], shared[1], rtol=1e-6, atol=0.0)
+        # Same tile maxima as the PyTorch tile loop; sums differ only by order.
+        ids = torch.arange(1024, device=logits.device)
+        masked = logits.float().masked_fill((ids >= 1000).unsqueeze(0), float("-inf"))
+        ref_max, ref_sum = _local_tile_stats(masked, 32)
+        assert torch.equal(direct[0], ref_max)
+        torch.testing.assert_close(direct[1], ref_sum, rtol=1e-6, atol=0.0)
         # A tile that is entirely padding is the (-inf, 0) identity partial.
-        tail = _C.hip_deterministic_logp_tile_stats(logits, 1024, 1000, 32)
+        tail = tile_stats(logits, 1024, 1000, 32)
         assert torch.isneginf(tail[0]).all() and torch.equal(tail[1], torch.zeros_like(tail[1]))
 
-    def test_entropy_path_still_available(self):
+    def test_entropy_path_still_available(self, op_class):
         import torch
 
         logits, targets, active, contract = self._case(1000, 1024, 8, torch.float32)
-        ref_op, rocm_op = VocabParallelLogprobOp(), RocmVocabParallelLogprobOp()
+        ref_op, rocm_op = VocabParallelLogprobOp(), op_class()
         ref = ref_op.apply_with_entropy(logits, targets, contract=contract, num_vocab_tiles=32)
         rocm = rocm_op.apply_with_entropy(logits, targets, contract=contract, num_vocab_tiles=32)
         for a, b in zip(ref, rocm):
             torch.testing.assert_close(b, a, rtol=1e-5, atol=1e-5)
+
+
+def test_triton_backend_registered_where_triton_runs():
+    registry = KernelRegistry()
+    import rl_engine.kernels.registry as registry_module
+
+    for platform in ("cuda", "rocm"):
+        candidates = registry._logprob_candidates[platform]
+        if registry_module._triton_vocab_logprob_available():
+            assert OpBackend.TRITON_VOCAB_PARALLEL_LOGP in candidates
+            capability = registry._logprob_capabilities[platform][
+                OpBackend.TRITON_VOCAB_PARALLEL_LOGP
+            ]
+            assert capability.backend_id == "triton-vocab-parallel-logp-ws2"
+            assert capability.implementation_kind == "production"
+            # The reference never outranks a production kernel backend.
+            assert candidates.index(OpBackend.PYTORCH_VOCAB_PARALLEL_LOGP) > candidates.index(
+                OpBackend.TRITON_VOCAB_PARALLEL_LOGP
+            )
+        else:
+            assert OpBackend.TRITON_VOCAB_PARALLEL_LOGP not in candidates
+    assert OpBackend.TRITON_VOCAB_PARALLEL_LOGP not in registry._logprob_candidates["cpu"]

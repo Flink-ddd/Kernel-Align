@@ -63,6 +63,7 @@ from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import (
     _local_tile_stats,
 )
 from rl_engine.kernels.ops.rocm.loss.vocab_parallel_logp import RocmVocabParallelLogprobOp
+from rl_engine.kernels.ops.triton.loss.vocab_parallel_logp import TritonVocabParallelLogprobOp
 
 REAL_VOCAB = 151936  # Qwen3 tokenizer/lm_head width; 151936 = 64 * 2374, so no padding.
 NUM_TILES = 64
@@ -79,7 +80,8 @@ TOPOLOGIES = (
     ("tp4_cp2", 4, 2),
     ("tp2_cp4", 2, 4),
 )
-DISTRIBUTED_PATHS = ("native", "ws2-reference", "ws2-rocm")
+DISTRIBUTED_PATHS = ("native", "ws2-reference", "ws2-triton", "ws2-rocm")
+WS2_KERNEL_PATHS = ("ws2-triton", "ws2-rocm")
 _DTYPES = {"bf16": torch.bfloat16, "fp32": torch.float32}
 _SPAWN_TIMEOUT_S = 1800
 
@@ -294,6 +296,14 @@ def _single_gpu_paths(
         ws2_reference_fn,
         lambda *a: ws2_reference_fn(*a)[0],
     )
+    ws2_triton = TritonVocabParallelLogprobOp()
+
+    def ws2_triton_fn(logits, targets, active, contract):
+        return ws2_triton.apply(
+            logits, targets, contract=contract, num_vocab_tiles=NUM_TILES, validate=False
+        )
+
+    paths["ws2-triton"] = (ws2_triton_fn, lambda *a: ws2_triton_fn(*a)[0])
     paths["ws2-rocm"] = (ws2_rocm_fn, lambda *a: ws2_rocm_fn(*a)[0])
     return paths
 
@@ -398,17 +408,23 @@ def _single_gpu_benchmarks(
                     f"peak={cases[-1]['train_peak_mib']:.1f}MiB",
                     flush=True,
                 )
-            if "ws2-reference" in outputs and "ws2-rocm" in outputs:
+            if "ws2-reference" in outputs:
                 ref_logp, ref_lse = outputs["ws2-reference"]
-                rocm_logp, rocm_lse = outputs["ws2-rocm"]
-                for case in cases:
-                    if case["dtype"] == dtype_name and case["tokens"] == num_tokens:
-                        if case["path"] == "ws2-rocm":
+                for kernel_path in WS2_KERNEL_PATHS:
+                    if kernel_path not in outputs:
+                        continue
+                    k_logp, k_lse = outputs[kernel_path]
+                    for case in cases:
+                        if (
+                            case["dtype"] == dtype_name
+                            and case["tokens"] == num_tokens
+                            and case["path"] == kernel_path
+                        ):
                             case["mismatch_vs_reference"] = _mismatch_count(
-                                rocm_logp, ref_logp
-                            ) + _mismatch_count(rocm_lse, ref_lse)
+                                k_logp, ref_logp
+                            ) + _mismatch_count(k_lse, ref_lse)
                             case["rel_l2_vs_reference"] = max(
-                                _relative_l2(rocm_logp, ref_logp), _relative_l2(rocm_lse, ref_lse)
+                                _relative_l2(k_logp, ref_logp), _relative_l2(k_lse, ref_lse)
                             )
             # validate=True production entry point overhead (host-side checks + .item() sync)
             if dtype_name == "bf16":
@@ -660,6 +676,7 @@ def _distributed_worker(
         vocab_start, vocab_end = bounds[tp_rank]
         ops = {
             "ws2-reference": VocabParallelLogprobOp(),
+            "ws2-triton": TritonVocabParallelLogprobOp(),
             "ws2-rocm": RocmVocabParallelLogprobOp(),
         }
         results: list[dict[str, Any]] = []
@@ -771,21 +788,17 @@ def _distributed_worker(
                         flush=True,
                     )
             ref_logp, ref_lse = outputs["ws2-reference"]
-            rocm_logp, rocm_lse = outputs["ws2-rocm"]
-            nat_logp, nat_lse = outputs["native"]
-            mismatch = _mismatch_count(rocm_logp, ref_logp) + _mismatch_count(rocm_lse, ref_lse)
-            rel = max(_relative_l2(rocm_logp, ref_logp), _relative_l2(rocm_lse, ref_lse))
-            native_rel = max(_relative_l2(nat_logp, ref_logp), _relative_l2(nat_lse, ref_lse))
-            # Count once per TP group (outputs are replicated inside the group).
-            mismatch_total = _all_sum(mismatch if tp_rank == 0 else 0)
-            rel_max = _all_max(rel)
-            native_rel_max = _all_max(native_rel)
-            for entry in results:
-                if entry["tokens"] == num_tokens and entry["path"] == "ws2-rocm":
-                    entry["mismatch_vs_reference"] = mismatch_total
-                    entry["rel_l2_vs_reference"] = rel_max
-                if entry["tokens"] == num_tokens and entry["path"] == "native":
-                    entry["rel_l2_vs_reference"] = native_rel_max
+            for other_path in ("native",) + WS2_KERNEL_PATHS:
+                o_logp, o_lse = outputs[other_path]
+                mismatch = _mismatch_count(o_logp, ref_logp) + _mismatch_count(o_lse, ref_lse)
+                rel = max(_relative_l2(o_logp, ref_logp), _relative_l2(o_lse, ref_lse))
+                # Count once per TP group (outputs are replicated inside the group).
+                mismatch_total = _all_sum(mismatch if tp_rank == 0 else 0)
+                rel_max = _all_max(rel)
+                for entry in results:
+                    if entry["tokens"] == num_tokens and entry["path"] == other_path:
+                        entry["mismatch_vs_reference"] = mismatch_total
+                        entry["rel_l2_vs_reference"] = rel_max
             shard = oracle_logp = oracle_lse = outputs = None
             torch.cuda.empty_cache()
         dist.barrier()
@@ -849,6 +862,11 @@ PATH_DESCRIPTIONS = {
         "tile loop for the per-tile FP32 `(max, sumexp)` partials, all-gather of the partials, "
         "fixed global tile-order merge, and a PyTorch autograd backward"
     ),
+    "ws2-triton": (
+        "`triton-vocab-parallel-logp-ws2`, the same contract, transport, and merge with two "
+        "Triton kernels (tile statistics read from the stored shard, fused backward); one "
+        "source for CUDA and ROCm"
+    ),
     "ws2-rocm": (
         "`rocm-vocab-parallel-logp-ws2`, the same contract, transport, and merge with two HIP "
         "kernels: `hip_deterministic_logp_tile_stats` reads the stored BF16/FP16/FP32 shard "
@@ -865,6 +883,7 @@ DISTRIBUTED_DESCRIPTIONS = {
         "the WS2 operators all-gather per-tile `(max, sumexp)` partials over RCCL and merge them "
         "in fixed global tile order; CP ranks shard tokens and never enter the merge"
     ),
+    "ws2-triton": "",
     "ws2-rocm": "",
 }
 
@@ -1060,11 +1079,13 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
                 f"topologies, at {_range_text(d_mem, '{:.2f}')}x the per-rank peak memory "
                 f"(absolute forward {_range_text(d_abs, '{:.3f}')} ms)."
             )
-    if "ws2-rocm" in style.paths and "ws1-triton" in style.paths:
+    for kernel_path in WS2_KERNEL_PATHS:
+        if kernel_path not in style.paths or "ws1-triton" not in style.paths:
+            continue
         ratios_fwd, ratios_train = [], []
         for dtype_name in SINGLE_DTYPES:
             for case in single:
-                if case["path"] != "ws2-rocm" or case["dtype"] != dtype_name:
+                if case["path"] != kernel_path or case["dtype"] != dtype_name:
                     continue
                 if not style.keep_tokens(case["tokens"]):
                     continue
@@ -1077,13 +1098,13 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
                 )
         if ratios_fwd:
             add(
-                f"- `{style.name('ws2-rocm')}` runs at {_range_text(ratios_fwd, '{:.2f}')}x the "
+                f"- `{style.name(kernel_path)}` runs at {_range_text(ratios_fwd, '{:.2f}')}x the "
                 f"latency of `{style.name('ws1-triton')}` in forward and "
                 f"{_range_text(ratios_train, '{:.2f}')}x in forward+backward with the same peak "
                 "memory, while carrying the vocab-parallel contract (tile partials, all-gather, "
                 "fixed tile-order merge, vocab-domain LSE export) that the single-shard Triton op "
                 "does not provide; the gap is the operator's fixed Python/launch floor, not the "
-                "HIP kernels."
+                "kernels."
             )
     if component and "ws2-rocm" in style.paths:
         comp_speed = [
@@ -1102,15 +1123,17 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
             f"allocates {_range_text(comp_mem, '{:.0f}')}x less transient memory (it writes only "
             f"the `[tokens, {NUM_TILES}]` FP32 partials)."
         )
-    if "ws2-rocm" in style.paths and "ws2-reference" in style.paths:
+    for kernel_path in WS2_KERNEL_PATHS:
+        if kernel_path not in style.paths or "ws2-reference" not in style.paths:
+            continue
         mism = [
             c.get("mismatch_vs_reference")
             for c in single
-            if c["path"] == "ws2-rocm" and c.get("mismatch_vs_reference") is not None
+            if c["path"] == kernel_path and c.get("mismatch_vs_reference") is not None
         ]
-        relr = [c.get("rel_l2_vs_reference", 0.0) for c in single if c["path"] == "ws2-rocm"]
+        relr = [c.get("rel_l2_vs_reference", 0.0) for c in single if c["path"] == kernel_path]
         add(
-            f"- `{style.name('ws2-rocm')}` vs `{style.name('ws2-reference')}`: tile maxima are "
+            f"- `{style.name(kernel_path)}` vs `{style.name('ws2-reference')}`: tile maxima are "
             "bitwise equal; sumexp partials differ only by FP32 summation order, so final outputs "
             f"differ in {_range_text([float(m) for m in mism], '{:.0f}')} elements per case with "
             f"relative-L2 {_range_text(relr, '{:.1e}')}. Both paths are equally close to FP64."
@@ -1178,19 +1201,22 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
                     f"{_field_ratio(case, ref, 'train_peak_mib')} | {_yes(case['grad_finite'])} |"
                 )
         add("")
-        if "ws2-rocm" in style.paths and "ws2-reference" in style.paths:
-            add(f"### `{style.name('ws2-rocm')}` versus `{style.name('ws2-reference')}` numerics")
+        kernel_paths = [p for p in WS2_KERNEL_PATHS if p in style.paths]
+        if kernel_paths and "ws2-reference" in style.paths:
+            add(f"### Numerics versus `{style.name('ws2-reference')}`")
             add("")
-            add("| Tokens | Mismatched elements (logp+LSE) | Relative L2 |")
-            add("|---:|---:|---:|")
+            add("| Tokens | Path | Mismatched elements (logp+LSE) | Relative L2 |")
+            add("|---:|---|---:|---:|")
             for tokens in sorted({c["tokens"] for c in rows}):
-                rocm = _lookup(rows, tokens=tokens, path="ws2-rocm")
-                if rocm is None:
-                    continue
-                add(
-                    f"| {tokens} | {rocm.get('mismatch_vs_reference', 'n/a')} | "
-                    f"{rocm.get('rel_l2_vs_reference', float('nan')):.3e} |"
-                )
+                for kernel_path in kernel_paths:
+                    case = _lookup(rows, tokens=tokens, path=kernel_path)
+                    if case is None:
+                        continue
+                    add(
+                        f"| {tokens} | {style.name(kernel_path)} | "
+                        f"{case.get('mismatch_vs_reference', 'n/a')} | "
+                        f"{case.get('rel_l2_vs_reference', float('nan')):.3e} |"
+                    )
             add("")
 
     overhead = [
@@ -1256,6 +1282,20 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
     if dist_rows:
         add("## Distributed vocab-parallel logprob (BF16, RCCL)")
         add("")
+        absent = [
+            style.name(path)
+            for path in style.paths
+            if path not in {d["path"] for d in payload["distributed"]}
+        ]
+        if absent:
+            add(
+                "Only the vocab-parallel operators take part here. "
+                + ", ".join(f"`{name}`" for name in absent)
+                + " is a single-shard op that consumes the full `[tokens, V]` logits on one GPU; "
+                "it has no TP implementation (no vocab shard input, TP group, or partial merge), "
+                "so there is no comparable distributed row for it."
+            )
+            add("")
         add("### Forward")
         add("")
         add(
@@ -1289,19 +1329,17 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
                 f"{_field_ratio(d, ref, 'train_peak_mib')} | {_yes(d['grad_finite'])} |"
             )
         add("")
-        if "ws2-rocm" in style.paths and "ws2-reference" in style.paths:
-            add(
-                f"### `{style.name('ws2-rocm')}` versus `{style.name('ws2-reference')}` "
-                "numerics (distributed)"
-            )
+        kernel_paths = [p for p in WS2_KERNEL_PATHS if p in style.paths]
+        if kernel_paths and "ws2-reference" in style.paths:
+            add(f"### Numerics versus `{style.name('ws2-reference')}` (distributed)")
             add("")
-            add("| Topology | Tokens | Mismatched elements (logp+LSE) | Relative L2 |")
-            add("|---|---:|---:|---:|")
+            add("| Topology | Tokens | Path | Mismatched elements (logp+LSE) | Relative L2 |")
+            add("|---|---:|---|---:|---:|")
             for d in dist_rows:
-                if d["path"] != "ws2-rocm":
+                if d["path"] not in kernel_paths:
                     continue
                 add(
-                    f"| {d['topology']} | {d['tokens']} | "
+                    f"| {d['topology']} | {d['tokens']} | {style.name(d['path'])} | "
                     f"{d.get('mismatch_vs_reference', 'n/a')} | "
                     f"{d.get('rel_l2_vs_reference', float('nan')):.3e} |"
                 )
@@ -1356,6 +1394,15 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
     (output_directory / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+_LINE_STYLES = (
+    {"marker": "o", "linestyle": "-", "linewidth": 2.2, "markersize": 7},
+    {"marker": "s", "linestyle": "--", "linewidth": 1.8, "markersize": 6},
+    {"marker": "^", "linestyle": ":", "linewidth": 2.4, "markersize": 6},
+    {"marker": "D", "linestyle": "-.", "linewidth": 1.6, "markersize": 5},
+    {"marker": "x", "linestyle": "-", "linewidth": 1.2, "markersize": 7},
+)
+
+
 def _write_figures(payload: dict[str, Any], output_directory: Path, style: ReportStyle) -> None:
     import matplotlib
 
@@ -1390,12 +1437,21 @@ def _write_figures(payload: dict[str, Any], output_directory: Path, style: Repor
                         ys.append(case[key]["median_ms"])
                     else:
                         ys.append(case[key])
-                axis.plot(tokens, ys, marker="o", label=style.name(path))
+                # Distinct styles and z-order keep coincident series visible (for example
+                # triton and strict-hip share the same forward+backward peak memory).
+                line_style = _LINE_STYLES[style.paths.index(path) % len(_LINE_STYLES)]
+                axis.plot(
+                    tokens,
+                    ys,
+                    label=style.name(path),
+                    zorder=3 + style.paths.index(path),
+                    **line_style,
+                )
             axis.set_xscale("log", base=2)
             axis.set_yscale("log")
             axis.set_xlabel("tokens")
             axis.set_ylabel(ylabel)
-            axis.set_title(f"Single MI300X, BF16, V={REAL_VOCAB}: {direction} {title}")
+            axis.set_title(f"Single MI300X, BF16: {direction} {title}", fontsize=11)
             axis.grid(True, which="both", alpha=0.3)
             if style.paths:
                 axis.legend(fontsize=8)
@@ -1406,15 +1462,17 @@ def _write_figures(payload: dict[str, Any], output_directory: Path, style: Repor
     distributed = [d for d in payload["distributed"] if d["path"] in style.paths]
     if not distributed:
         return
+    # Only paths with distributed measurements get a bar (single-shard ops have none).
+    dist_paths = tuple(p for p in style.paths if any(d["path"] == p for d in distributed))
     labels = []
     series: dict[tuple[str, str], list[float]] = {
-        (path, key): [] for path in style.paths for key in ("forward", "train_fwd_bwd")
+        (path, key): [] for path in dist_paths for key in ("forward", "train_fwd_bwd")
     }
     for d in distributed:
         if d["path"] != style.baseline:
             continue
         labels.append(f"{d['topology']}\nM={d['tokens']}")
-        for path in style.paths:
+        for path in dist_paths:
             other = _lookup(distributed, path=path, topology=d["topology"], tokens=d["tokens"])
             for key in ("forward", "train_fwd_bwd"):
                 series[(path, key)].append(
@@ -1422,12 +1480,12 @@ def _write_figures(payload: dict[str, Any], output_directory: Path, style: Repor
                 )
     figure, axes = plt.subplots(1, 2, figsize=(max(12, 1.1 * len(labels)), 4.8))
     xs = list(range(len(labels)))
-    width = 0.8 / max(len(style.paths), 1)
+    width = 0.8 / max(len(dist_paths), 1)
     for axis, key, direction in zip(
         axes, ("forward", "train_fwd_bwd"), ("Forward", "Forward+backward")
     ):
-        for index, path in enumerate(style.paths):
-            offset = (index - (len(style.paths) - 1) / 2) * width
+        for index, path in enumerate(dist_paths):
+            offset = (index - (len(dist_paths) - 1) / 2) * width
             axis.bar([x + offset for x in xs], series[(path, key)], width, label=style.name(path))
         axis.set_xticks(xs)
         axis.set_xticklabels(labels, fontsize=8)
@@ -1469,7 +1527,7 @@ def _validate_environment(require_distributed: bool) -> None:
         raise RuntimeError("PyTorch RCCL/ProcessGroupNCCL support is unavailable")
 
 
-ALL_PATHS = ("native", "ws1-pytorch", "ws1-triton", "ws2-reference", "ws2-rocm")
+ALL_PATHS = ("native", "ws1-pytorch", "ws1-triton", "ws2-reference", "ws2-triton", "ws2-rocm")
 
 
 def parse_args() -> argparse.Namespace:

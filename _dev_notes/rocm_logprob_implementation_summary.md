@@ -158,3 +158,17 @@ TP contract、tile 顺序 merge、selected-target 传输和 active-mask 语义�
 构建期可调参数：`DETERMINISTIC_LOGP_TILE_BLOCK_SIZE`（默认 128）、
 `DETERMINISTIC_LOGP_TILE_VECTOR_ELEMENTS`（默认 8）、`DETERMINISTIC_LOGP_BACKWARD_BLOCK_SIZE`
 （默认 256），通过 `setup.py` 的环境变量注入。
+
+## 2026-08-23 补充：Triton vocab-parallel backend
+
+`apply` 所用的 fused autograd 路径被提成共享实现
+（`rl_engine/kernels/ops/pytorch/loss/vocab_parallel_logp.py` 里的
+`apply_with_kernels` / `VocabParallelLogprobKernels`）：backend 只需提供
+`tile_stats` 和 `backward` 两个 kernel，TP 传输、固定 tile 顺序 merge、
+target ownership、mask 语义全部复用。基于这个接口新增了
+`rl_engine/kernels/ops/triton/loss/vocab_parallel_logp.py`
+（`triton-vocab-parallel-logp-ws2`）：两个 Triton kernel，按 `BLOCK_V=1024`
+从 tile 起点分块归约，masked lane 贡献 identity，所以归约顺序只由 `BLOCK_V`
+决定，TP=n 与 TP=1 仍 bitwise 一致；同一份源码可在 CUDA 和 ROCm 上运行。
+registry 在 `cuda`/`rocm` 平台都注册它，排在 PyTorch reference 之前；ROCm 上
+HIP backend 仍然排第一。

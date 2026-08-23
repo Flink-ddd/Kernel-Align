@@ -392,7 +392,16 @@ def _nccl_worker(
             backend="nccl", init_method=init_method, rank=rank, world_size=world_size
         )
         dtype = TP_DTYPES[dtype_name]
-        op = RocmVocabParallelLogprobOp() if backend_kind == "rocm" else VocabParallelLogprobOp()
+        if backend_kind == "rocm":
+            op = RocmVocabParallelLogprobOp()
+        elif backend_kind == "triton":
+            from rl_engine.kernels.ops.triton.loss.vocab_parallel_logp import (
+                TritonVocabParallelLogprobOp,
+            )
+
+            op = TritonVocabParallelLogprobOp()
+        else:
+            op = VocabParallelLogprobOp()
         bounds = _tp_bounds(world_size, uneven)
         logits, targets = _tp_inputs(device, dtype)
         tiles = TP_NUM_TILES
@@ -604,4 +613,31 @@ class TestRocmNativeCrossTP:
     def test_tp4_native_matches_tp1_and_repeat(self, dtype_name):
         self._require_native()
         results = _run_nccl_scenario(4, dtype_name=dtype_name, backend_kind="rocm")
+        TestCrossTPBitwise._assert_matches_tp1(results)
+
+
+def _triton_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(not _triton_available(), reason="requires Triton on a CUDA/ROCm GPU")
+class TestTritonNativeCrossTP:
+    """The Triton production path must preserve the same TP contract as reference."""
+
+    @_requires_gpus(2)
+    @pytest.mark.parametrize("dtype_name", ["fp32", "bf16"])
+    def test_tp2_native_matches_tp1_and_repeat(self, dtype_name):
+        results = _run_nccl_scenario(2, dtype_name=dtype_name, backend_kind="triton")
+        TestCrossTPBitwise._assert_matches_tp1(results)
+
+    @_requires_gpus(4)
+    @pytest.mark.parametrize("dtype_name", ["fp32", "bf16"])
+    def test_tp4_native_matches_tp1_and_repeat(self, dtype_name):
+        results = _run_nccl_scenario(4, dtype_name=dtype_name, backend_kind="triton")
         TestCrossTPBitwise._assert_matches_tp1(results)

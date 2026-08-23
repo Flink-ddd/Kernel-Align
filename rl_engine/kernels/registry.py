@@ -101,6 +101,9 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     ROCM_VOCAB_PARALLEL_LOGP = (
         "rl_engine.kernels.ops.rocm.loss.vocab_parallel_logp.RocmVocabParallelLogprobOp"
     )
+    TRITON_VOCAB_PARALLEL_LOGP = (
+        "rl_engine.kernels.ops.triton.loss.vocab_parallel_logp.TritonVocabParallelLogprobOp"
+    )
     # Deterministic GRPO loss on the TP-aware logprob path (WS2 #241 PR5)
     PYTORCH_DISTRIBUTED_GRPO_LOSS = (
         "rl_engine.kernels.ops.pytorch.loss.distributed_grpo_loss.DistributedGRPOLossOp"
@@ -143,6 +146,18 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_NATIVE_EMBEDDING = "rl_engine.kernels.ops.pytorch.linear.embedding.NativeEmbeddingOp"
     CUDA_SM90_LM_HEAD = "rl_engine.kernels.ops.cuda.linear.lm_head.SM90LMHeadOp"
     CUDA_SM90_EMBEDDING = "rl_engine.kernels.ops.cuda.linear.embedding.SM90EmbeddingOp"
+
+
+def _triton_vocab_logprob_available() -> bool:
+    """Return whether the Triton WS2 vocab-parallel kernels can run here."""
+
+    if not torch.cuda.is_available():
+        return False
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def _rocm_vocab_logprob_native_available() -> bool:
@@ -428,6 +443,32 @@ class KernelRegistry:
                 platform=ws2_platform,
                 prepend=True,
             )
+
+        # Triton WS2 vocab-parallel production backend: one source for CUDA and
+        # ROCm, registered ahead of the reference wherever Triton can run.
+        triton_vocab_logprob_capability = LogprobBackendCapability(
+            backend_id="triton-vocab-parallel-logp-ws2",
+            roles=common_logprob_roles,
+            dtypes=common_logprob_dtypes,
+            tp_world_sizes=None,
+            cp_world_sizes=None,
+            supports_vocab_padding=True,
+            mask_modes=frozenset({MaskMode.EXPLICIT_ACTIVE_MASK, MaskMode.IGNORE_INDEX}),
+            exports_vocab_lse=True,
+            determinism_scopes=frozenset(
+                {DeterminismScope.CROSS_TP_BITWISE, DeterminismScope.FIXED_TOPOLOGY}
+            ),
+            implementation_kind="production",
+        )
+        if _triton_vocab_logprob_available():
+            for triton_platform in ("cuda", "rocm"):
+                if triton_platform in self._priority_map:
+                    self.register_logprob_backend(
+                        OpBackend.TRITON_VOCAB_PARALLEL_LOGP,
+                        triton_vocab_logprob_capability,
+                        platform=triton_platform,
+                        prepend=True,
+                    )
 
         rocm_vocab_logprob_capability = LogprobBackendCapability(
             backend_id="rocm-vocab-parallel-logp-ws2",
