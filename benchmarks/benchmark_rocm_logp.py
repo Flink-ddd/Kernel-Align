@@ -840,7 +840,10 @@ PATH_DESCRIPTIONS = {
     "ws1-pytorch": (
         "`pytorch-batch-invariant-logp-ws1`, the single-shard batch-invariant PyTorch op"
     ),
-    "ws1-triton": "`triton-batch-invariant-logp-ws1`, the single-shard Triton online-softmax op",
+    "ws1-triton": (
+        "`triton-batch-invariant-logp-ws1`, the single-shard Triton online-softmax op; it has "
+        "no vocab-parallel (TP) path, so it appears only in the single-GPU results"
+    ),
     "ws2-reference": (
         "`pytorch-vocab-parallel-logp-ws2`, the WS2 vocab-parallel reference operator: a PyTorch "
         "tile loop for the per-tile FP32 `(max, sumexp)` partials, all-gather of the partials, "
@@ -922,10 +925,10 @@ def _field_ratio(
 def _range_text(values: list[float], fmt: str = "{:.1f}") -> str:
     if not values:
         return "n/a"
-    low, high = min(values), max(values)
-    if math.isclose(low, high, rel_tol=1e-3):
-        return fmt.format(low)
-    return f"{fmt.format(low)}-{fmt.format(high)}"
+    low, high = fmt.format(min(values)), fmt.format(max(values))
+    if low == high:
+        return low
+    return f"{low}-{high}"
 
 
 def _lookup(cases: list[dict[str, Any]], **match: Any) -> dict[str, Any] | None:
@@ -972,7 +975,9 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
     add("- Measured paths:")
     for path in style.paths:
         add(f"  - `{style.name(path)}`: {PATH_DESCRIPTIONS[path]}.")
-    dist_notes = [DISTRIBUTED_DESCRIPTIONS[p] for p in style.paths if DISTRIBUTED_DESCRIPTIONS[p]]
+    dist_notes = [
+        DISTRIBUTED_DESCRIPTIONS.get(p, "") for p in style.paths if DISTRIBUTED_DESCRIPTIONS.get(p)
+    ]
     if dist_notes:
         add("- Distributed: one process per GPU; " + "; ".join(dist_notes) + ".")
     add(
@@ -1054,6 +1059,31 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
                 f"forward+backward across {len({d['topology'] for d in distributed})} TP/CP "
                 f"topologies, at {_range_text(d_mem, '{:.2f}')}x the per-rank peak memory "
                 f"(absolute forward {_range_text(d_abs, '{:.3f}')} ms)."
+            )
+    if "ws2-rocm" in style.paths and "ws1-triton" in style.paths:
+        ratios_fwd, ratios_train = [], []
+        for dtype_name in SINGLE_DTYPES:
+            for case in single:
+                if case["path"] != "ws2-rocm" or case["dtype"] != dtype_name:
+                    continue
+                if not style.keep_tokens(case["tokens"]):
+                    continue
+                tri = _lookup(single, dtype=dtype_name, tokens=case["tokens"], path="ws1-triton")
+                if tri is None:
+                    continue
+                ratios_fwd.append(case["forward"]["median_ms"] / tri["forward"]["median_ms"])
+                ratios_train.append(
+                    case["train_fwd_bwd"]["median_ms"] / tri["train_fwd_bwd"]["median_ms"]
+                )
+        if ratios_fwd:
+            add(
+                f"- `{style.name('ws2-rocm')}` runs at {_range_text(ratios_fwd, '{:.2f}')}x the "
+                f"latency of `{style.name('ws1-triton')}` in forward and "
+                f"{_range_text(ratios_train, '{:.2f}')}x in forward+backward with the same peak "
+                "memory, while carrying the vocab-parallel contract (tile partials, all-gather, "
+                "fixed tile-order merge, vocab-domain LSE export) that the single-shard Triton op "
+                "does not provide; the gap is the operator's fixed Python/launch floor, not the "
+                "HIP kernels."
             )
     if component and "ws2-rocm" in style.paths:
         comp_speed = [

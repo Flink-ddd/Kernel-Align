@@ -22,6 +22,7 @@
 - Qwen3 vocabulary `V=151936` split into 64 tiles of 2374 columns; seeded logits (`randn * 2.0`), random targets, every seventh token inactive.
 - Measured paths:
   - `native`: `pytorch-vocab-parallel-logp-ws2`, the WS2 vocab-parallel reference operator: a PyTorch tile loop for the per-tile FP32 `(max, sumexp)` partials, all-gather of the partials, fixed global tile-order merge, and a PyTorch autograd backward.
+  - `triton`: `triton-batch-invariant-logp-ws1`, the single-shard Triton online-softmax op; it has no vocab-parallel (TP) path, so it appears only in the single-GPU results.
   - `strict-hip`: `rocm-vocab-parallel-logp-ws2`, the same contract, transport, and merge with two HIP kernels: `hip_deterministic_logp_tile_stats` reads the stored BF16/FP16/FP32 shard directly (8-element vector loads, no FP32 copy) and `hip_deterministic_logp_backward` produces the gradient in one fused pass.
 - Distributed: one process per GPU; the WS2 operators all-gather per-tile `(max, sumexp)` partials over RCCL and merge them in fixed global tile order; CP ranks shard tokens and never enter the merge.
 - Forward returns the selected-token logprob and the vocabulary LSE; forward+backward computes `grad_logits` for `sum(active * logp)`. The WS2 operators run with `validate=False`; the `validate=True` production entry point is measured separately.
@@ -37,8 +38,8 @@ python benchmarks/benchmark_rocm_logp.py \
   --warmup 5 \
   --samples 20 \
   --training-samples 10 \
-  --report-paths ws2-reference,ws2-rocm \
-  --rename ws2-reference=native,ws2-rocm=strict-hip \
+  --report-paths ws2-reference,ws1-triton,ws2-rocm \
+  --rename ws2-reference=native,ws1-triton=triton,ws2-rocm=strict-hip \
   --report-baseline ws2-reference \
   --table-tokens 2048 \
   --output-dir benchmarks/results/pr328_rocm_mi300x
@@ -46,8 +47,10 @@ python benchmarks/benchmark_rocm_logp.py \
 
 ## Key findings
 
+- Single GPU: `triton` is 8.90-10.79x faster than `native` in forward and 6.73-11.28x in forward+backward, with 0.15-0.33x its peak memory.
 - Single GPU: `strict-hip` is 5.97-7.23x faster than `native` in forward and 4.94-6.83x in forward+backward, with 0.15-0.33x its peak memory.
 - Distributed: `strict-hip` is 1.69-4.60x faster than `native` in forward and 1.97-4.64x in forward+backward across 6 TP/CP topologies, at 0.15x the per-rank peak memory (absolute forward 0.773-1.041 ms).
+- `strict-hip` runs at 1.49x the latency of `triton` in forward and 1.36-1.65x in forward+backward with the same peak memory, while carrying the vocab-parallel contract (tile partials, all-gather, fixed tile-order merge, vocab-domain LSE export) that the single-shard Triton op does not provide; the gap is the operator's fixed Python/launch floor, not the HIP kernels.
 - The `hip_deterministic_logp_tile_stats` kernel alone is 10.2-10.6x faster than the PyTorch tile loop and allocates 57x less transient memory (it writes only the `[tokens, 64]` FP32 partials).
 - `strict-hip` vs `native`: tile maxima are bitwise equal; sumexp partials differ only by FP32 summation order, so final outputs differ in 0-65 elements per case with relative-L2 0.0e+00-1.3e-08. Both paths are equally close to FP64.
 - Repeat bitwise: yes; batch-invariant: yes; all gradients finite: yes.
@@ -60,6 +63,7 @@ python benchmarks/benchmark_rocm_logp.py \
 | Tokens | Path | Median (ms) | p95 (ms) | Speedup vs native | Peak MiB | logp max-abs vs FP64 | LSE max-abs vs FP64 | Repeat | Batch-inv |
 |---:|---|---:|---:|---:|---:|---:|---:|:---:|:---:|
 | 2048 | native | 6.4801 | 6.7318 | 1.00× | 1245.0 | 1.557e-06 | 1.382e-06 | yes | yes |
+| 2048 | triton | 0.6005 | 0.6081 | 10.79× | 0.0 | 1.589e-06 | 1.516e-06 | yes | yes |
 | 2048 | strict-hip | 0.8964 | 0.9366 | 7.23× | 2.0 | 1.621e-06 | 1.318e-06 | yes | yes |
 
 ### Forward+backward
@@ -67,6 +71,7 @@ python benchmarks/benchmark_rocm_logp.py \
 | Tokens | Path | Median (ms) | p95 (ms) | Speedup vs native | Peak MiB | Memory vs native | Grad finite |
 |---:|---|---:|---:|---:|---:|---:|:---:|
 | 2048 | native | 12.8275 | 12.9236 | 1.00× | 7715.7 | 1.00× | yes |
+| 2048 | triton | 1.1376 | 1.1707 | 11.28× | 1187.0 | 0.15× | yes |
 | 2048 | strict-hip | 1.8781 | 1.9318 | 6.83× | 1187.1 | 0.15× | yes |
 
 ### `strict-hip` versus `native` numerics
@@ -82,6 +87,7 @@ python benchmarks/benchmark_rocm_logp.py \
 | Tokens | Path | Median (ms) | p95 (ms) | Speedup vs native | Peak MiB | logp max-abs vs FP64 | LSE max-abs vs FP64 | Repeat | Batch-inv |
 |---:|---|---:|---:|---:|---:|---:|---:|:---:|:---:|
 | 2048 | native | 6.0009 | 6.2081 | 1.00× | 58.0 | 1.747e-06 | 1.271e-06 | yes | yes |
+| 2048 | triton | 0.6741 | 0.6921 | 8.90× | 0.0 | 1.909e-06 | 1.550e-06 | yes | yes |
 | 2048 | strict-hip | 1.0045 | 1.0516 | 5.97× | 2.0 | 1.747e-06 | 1.271e-06 | yes | yes |
 
 ### Forward+backward
@@ -89,6 +95,7 @@ python benchmarks/benchmark_rocm_logp.py \
 | Tokens | Path | Median (ms) | p95 (ms) | Speedup vs native | Peak MiB | Memory vs native | Grad finite |
 |---:|---|---:|---:|---:|---:|---:|:---:|
 | 2048 | native | 12.5812 | 12.7740 | 1.00× | 7122.2 | 1.00× | yes |
+| 2048 | triton | 1.8702 | 1.9688 | 6.73× | 2374.0 | 0.33× | yes |
 | 2048 | strict-hip | 2.5475 | 2.6220 | 4.94× | 2374.1 | 0.33× | yes |
 
 ### `strict-hip` versus `native` numerics
@@ -96,6 +103,23 @@ python benchmarks/benchmark_rocm_logp.py \
 | Tokens | Mismatched elements (logp+LSE) | Relative L2 |
 |---:|---:|---:|
 | 2048 | 37 | 8.004e-09 |
+
+### `validate=True` production entry point (strict-hip, BF16)
+
+| Tokens | validate=False (ms) | validate=True (ms) | Overhead |
+|---:|---:|---:|---:|
+| 2048 | 0.8911 | 1.0743 | 1.21× |
+
+`validate=True` adds host-side target-range checks and a non-finite LSE check that synchronizes the stream; the cost is a fixed per-call overhead.
+
+## Tile-stats kernel
+
+`hip_deterministic_logp_tile_stats` computes the per-row, per-tile FP32 `(max, sumexp)` partials that the operator all-gathers and merges; the PyTorch tile loop is what `native` uses for the same step. Tile maxima are bitwise equal; sums differ only by FP32 summation order.
+
+| Logits dtype | Tokens | PyTorch tile loop (ms) | HIP kernel on FP32 (ms) | HIP kernel on stored dtype (ms) | Speedup | Loop peak MiB | HIP peak MiB | Max bitwise | sumexp max rel | Repeat |
+|---|---:|---:|---:|---:|---:|---:|---:|:---:|---:|:---:|
+| bf16 | 2048 | 5.5575 | 0.5239 | 0.4659 | 10.61× | 56.6 | 1.0 | yes | 3.64e-07 | yes |
+| fp32 | 2048 | 5.5582 | 0.5459 | 0.5364 | 10.18× | 56.6 | 1.0 | yes | 4.48e-07 | yes |
 
 ## Distributed vocab-parallel logprob (BF16, RCCL)
 
