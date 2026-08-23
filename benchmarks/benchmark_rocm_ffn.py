@@ -1526,6 +1526,13 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
     distributed_output_errors = [
         row["output_relative_l2"] * 100.0 for row in distributed_rows
     ]
+    one_mib_collective_ms = [
+        row["deterministic"]["median_ms"]
+        for row in collective_rows
+        if row["message_bytes_per_rank"] == _MIB
+    ]
+    triton_forward_ms = [row["triton"]["median_ms"] for row in forward_rows]
+    triton_training_ms = [row["triton"]["median_ms"] for row in training_rows]
     consistency_rows = all(
         row["train_infer_bitwise"] and row["repeat_bitwise"]
         for row in distributed_rows
@@ -1741,6 +1748,38 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
             f"{'yes' if row['triton_train_infer_bitwise'] else 'no'} | "
             f"{'yes' if row['triton_repeat_bitwise'] else 'no'} |"
         )
+
+    lines.extend(
+        (
+            "",
+            "## Communication overlap feasibility",
+            "",
+            "The reported implementations deliberately serialize compute and "
+            "communication; the tables above do not claim overlap. A representative "
+            f"1 MiB strict collective costs {min(one_mib_collective_ms):.4f}-"
+            f"{max(one_mib_collective_ms):.4f} ms, while Triton distributed FFN "
+            f"forward costs {min(triton_forward_ms):.4f}-"
+            f"{max(triton_forward_ms):.4f} ms and forward+backward costs "
+            f"{min(triton_training_ms):.4f}-{max(triton_training_ms):.4f} ms. "
+            "Communication is therefore material after the GEMM speedup, but only "
+            "some calls are structurally hideable.",
+            "",
+            "- Forward SP all-gather feeds both gate/up GEMMs, and the final TP "
+            "all-reduce or reduce-scatter consumes the down projection. These are "
+            "dependency boundaries and cannot be hidden by simply moving them to "
+            "another stream.",
+            "- Backward has one safe pipeline candidate: launch the fixed-order TP "
+            "reduction for the gate contribution to `dHidden`, compute the independent "
+            "up contribution, then wait and add in the existing gate-then-up order. "
+            "The rank tree and BF16 addition order must remain unchanged.",
+            "- CP activation/gradient gathers are prerequisites for weight-gradient "
+            "GEMMs. They can be coalesced into a fixed packed layout to amortize "
+            "launch/signature validation, but are not naturally hidden by those GEMMs.",
+            "- Because the plausible overlap window is bounded by roughly one strict "
+            "collective, coalescing and removing per-call host signature validation "
+            "should be benchmarked before adding multi-stream scheduling complexity.",
+        )
+    )
 
     lines.extend(
         (
