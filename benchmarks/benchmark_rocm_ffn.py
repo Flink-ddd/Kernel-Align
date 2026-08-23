@@ -173,11 +173,11 @@ def _single_gpu_benchmarks(
     for tokens in (1, 8, 32, 128):
         gemm_shapes.extend(
             (
-                (f"gate_up_m{tokens}", tokens, 4096, 12288),
-                (f"down_m{tokens}", tokens, 12288, 4096),
+                (tokens, 4096, 12288),
+                (tokens, 12288, 4096),
             )
         )
-    for index, (name, m_size, k_size, n_size) in enumerate(gemm_shapes):
+    for index, (m_size, k_size, n_size) in enumerate(gemm_shapes):
         left = _randn((m_size, k_size), seed=1000 + index * 2, device=device)
         right = _randn((k_size, n_size), seed=1001 + index * 2, device=device)
         native_output = torch.matmul(left, right)
@@ -198,7 +198,7 @@ def _single_gpu_benchmarks(
         )
         results["gemm"].append(
             {
-                "name": name,
+                "name": f"(M,K,N)=({m_size},{k_size},{n_size})",
                 "m": m_size,
                 "k": k_size,
                 "n": n_size,
@@ -266,7 +266,7 @@ def _single_gpu_benchmarks(
             )
             results["swiglu"].append(
                 {
-                    "name": f"swiglu_{direction}_m{tokens}",
+                    "name": f"(M,I)=({tokens},12288), {direction}",
                     "direction": direction,
                     "tokens": tokens,
                     "intermediate": 12288,
@@ -318,7 +318,7 @@ def _single_gpu_benchmarks(
         )
         results["ffn"].append(
             {
-                "name": f"ffn_forward_m{tokens}",
+                "name": f"(M,H,I)=({tokens},4096,12288), forward",
                 "direction": "forward",
                 "tokens": tokens,
                 "hidden": 4096,
@@ -362,7 +362,7 @@ def _single_gpu_benchmarks(
         )
         results["ffn"].append(
             {
-                "name": f"ffn_train_fwd_bwd_m{tokens}",
+                "name": f"(M,H,I)=({tokens},4096,12288), forward+backward",
                 "direction": "train_fwd_bwd",
                 "tokens": tokens,
                 "hidden": 4096,
@@ -1172,7 +1172,7 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
             "## Key findings",
             "",
             f"- Deterministic Triton GEMM costs {_ratio_range(gemm_rows)} native "
-            "ROCm latency over Qwen3 gate/up and down projection shapes.",
+            "ROCm latency over the tested `(M,K,N)` shapes.",
             f"- Triton SwiGLU costs {_ratio_range(swiglu_rows, 2)} native PyTorch "
             f"latency; the complete single-GPU FFN costs {_ratio_range(ffn_rows)}.",
             f"- Deterministic collectives cost {_ratio_range(collective_rows)} native "
@@ -1186,9 +1186,19 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
             "- TP2/TP4/TP8, TP+CP, and sequence-parallel topology tests produced "
             "0 output/gradient mismatches versus TP=1; a production-dimension "
             "Qwen3-8B TP2 smoke test also produced 0 mismatches.",
-            "- Native-vs-Triton error quantifies the accuracy price of fixing every "
-            "BF16 arithmetic/reduction tree; it is not used as the determinism "
-            "acceptance criterion.",
+            "- Numerical drift means Triton versus native ROCm/RCCL on identical "
+            "BF16 inputs. GEMM-to-FP32 error is separately labelled and uses "
+            "`A.float() @ B.float()` as its reference.",
+            "",
+            "## Accuracy references",
+            "",
+            "- `Repeat mismatch`: Triton run 1 versus Triton run 2.",
+            "- `Train/infer mismatch`: Triton training forward versus Triton "
+            "inference forward.",
+            "- `Topology mismatch`: distributed Triton TP/CP/SP versus Triton TP=1.",
+            "- `vs FP32`: BF16 GEMM output versus `A.float() @ B.float()`.",
+            "- `Triton/native rel-L2`: Triton output or gradient versus the native "
+            "ROCm/RCCL path with identical BF16 tensors and parallel layout.",
         )
     )
 
@@ -1217,7 +1227,7 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
             "## Single-GPU SwiGLU",
             "",
             "| Case | Native PyTorch (ms) | Triton (ms) | Triton/native | Repeat "
-            "mismatch | Triton/native rel-L2 |",
+            "mismatch | Triton/native ROCm rel-L2 |",
             "|---|---:|---:|---:|---:|---:|",
         )
     )
@@ -1234,7 +1244,8 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
             "## Single-GPU FFN",
             "",
             "| Case | Native ROCm (ms) | Triton (ms) | Triton/native | Repeat "
-            "mismatch | Train/infer mismatch | Output rel-L2 | Max grad rel-L2 |",
+            "mismatch | Train/infer mismatch | Triton/native output rel-L2 | "
+            "Triton/native max grad rel-L2 |",
             "|---|---:|---:|---:|---:|---:|---:|---:|",
         )
     )
@@ -1273,7 +1284,7 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
             "",
             "| Topology | Direction | Native ROCm/RCCL (ms) | Triton/deterministic "
             "RCCL (ms) | Overhead | Repeat mismatch | Train/infer mismatch | "
-            "Output rel-L2 | Max grad rel-L2 |",
+            "Triton/native output rel-L2 | Triton/native max grad rel-L2 |",
             "|---|---|---:|---:|---:|---:|---:|---:|---:|",
         )
     )
@@ -1337,32 +1348,62 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
     import matplotlib.pyplot as plt
 
     plt.style.use("seaborn-v0_8-whitegrid")
-    single_rows = (
-        payload["single_gpu"]["gemm"]
-        + payload["single_gpu"]["swiglu"]
-        + payload["single_gpu"]["ffn"]
+    plt.rcParams.update(
+        {
+            "font.size": 16,
+            "axes.titlesize": 24,
+            "axes.labelsize": 20,
+            "xtick.labelsize": 13,
+            "ytick.labelsize": 16,
+            "legend.fontsize": 16,
+        }
     )
-    figure, axis = plt.subplots(figsize=(18, 7))
+
+    gemm_rows = payload["single_gpu"]["gemm"]
+    swiglu_rows = payload["single_gpu"]["swiglu"]
+    ffn_rows = payload["single_gpu"]["ffn"]
+    single_rows = gemm_rows + swiglu_rows + ffn_rows
+    single_labels = (
+        [f"GEMM\n({row['m']},{row['k']},{row['n']})" for row in gemm_rows]
+        + [
+            f"SwiGLU {row['direction']}\n(M,I)=({row['tokens']},12288)"
+            for row in swiglu_rows
+        ]
+        + [
+            f"FFN {'FWD' if row['direction'] == 'forward' else 'FWD+BWD'}"
+            f"\n(M,H,I)=({row['tokens']},4096,12288)"
+            for row in ffn_rows
+        ]
+    )
+    single_ratios = [row["overhead_ratio"] for row in single_rows]
+    figure, axis = plt.subplots(figsize=(26, 10))
     positions = list(range(len(single_rows)))
-    axis.bar(
+    bars = axis.bar(
         positions,
-        [row["overhead_ratio"] for row in single_rows],
+        single_ratios,
         color="#8b5cf6",
         label="Deterministic Triton",
     )
-    axis.axhline(1.0, color="black", linewidth=1, label="Native ROCm")
-    axis.set_yscale("log")
-    axis.set_ylabel("Triton / native latency (x, log scale)")
-    axis.set_title("MI300X single-GPU deterministic Triton overhead")
-    axis.set_xticks(
-        positions, [row["name"] for row in single_rows], rotation=55, ha="right"
+    axis.bar_label(
+        bars,
+        labels=[f"{value:.1f}×" for value in single_ratios],
+        padding=4,
+        fontsize=13,
+        rotation=90,
     )
-    axis.legend()
+    axis.axhline(1.0, color="black", linewidth=2, label="Native ROCm = 1.0×")
+    axis.set_yscale("log")
+    axis.set_ylim(0.5, max(single_ratios) * 1.8)
+    axis.set_xlabel("Operator and tensor shape")
+    axis.set_ylabel("Median latency ratio: Triton / native ROCm (×, log scale)")
+    axis.set_title("MI300X single-GPU operator latency by shape")
+    axis.set_xticks(positions, single_labels, rotation=55, ha="right")
+    axis.legend(loc="upper left")
     figure.tight_layout()
     figure.savefig(output_directory / "single_gpu_overhead.png", dpi=180)
     plt.close(figure)
 
-    figure, axes = plt.subplots(1, 3, figsize=(16, 5), sharey=True)
+    figure, axes = plt.subplots(1, 3, figsize=(24, 8), sharey=True)
     for axis, operation in zip(
         axes, ("all_reduce", "all_gather", "reduce_scatter"), strict=True
     ):
@@ -1372,73 +1413,126 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
                 for row in payload["collectives"]
                 if row["operation"] == operation and row["world_size"] == world_size
             ]
+            x_values = [row["message_bytes_per_rank"] / _MIB for row in rows]
+            y_values = [row["overhead_ratio"] for row in rows]
             axis.plot(
-                [row["message_bytes_per_rank"] / _MIB for row in rows],
-                [row["overhead_ratio"] for row in rows],
+                x_values,
+                y_values,
                 marker="o",
+                linewidth=3,
+                markersize=9,
                 label=f"{world_size} ranks",
             )
-        axis.axhline(1.0, color="black", linewidth=1)
+            for x_value, y_value in zip(x_values, y_values, strict=True):
+                axis.annotate(
+                    f"{y_value:.1f}×",
+                    (x_value, y_value),
+                    xytext=(0, 9),
+                    textcoords="offset points",
+                    ha="center",
+                    fontsize=12,
+                )
+        axis.axhline(1.0, color="black", linewidth=2)
         axis.set_xscale("log", base=2)
         axis.set_yscale("log")
-        axis.set_title(operation)
-        axis.set_xlabel("Input per rank (MiB)")
-    axes[0].set_ylabel("Deterministic / native RCCL latency (x, log scale)")
-    axes[-1].legend()
-    figure.suptitle("MI300X deterministic collective overhead vs native RCCL")
-    figure.tight_layout()
+        axis.set_xticks((0.0625, 1, 16), labels=("0.0625", "1", "16"))
+        axis.set_title(operation.replace("_", " ").title())
+        axis.set_xlabel("BF16 input per rank (MiB)")
+    axes[0].set_ylabel(
+        "Median latency ratio: deterministic / native RCCL (×, log scale)"
+    )
+    axes[-1].legend(title="World size", loc="lower left")
+    figure.suptitle("MI300X collective latency by message size and rank count", y=0.98)
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
     figure.savefig(output_directory / "collective_overhead.png", dpi=180)
     plt.close(figure)
 
     rows = payload["distributed_ffn"]
-    figure, axis = plt.subplots(figsize=(16, 6))
+    labels = [
+        f"TP={row['tp_size']}, CP={row['cp_size']}, "
+        f"SP={'on' if row['sequence_parallel'] else 'off'}\n"
+        f"{'FWD' if row['direction'] == 'forward' else 'FWD+BWD'}"
+        for row in rows
+    ]
+    ratios = [row["overhead_ratio"] for row in rows]
+    figure, axis = plt.subplots(figsize=(24, 9))
     positions = list(range(len(rows)))
-    axis.bar(
+    bars = axis.bar(
         positions,
-        [row["overhead_ratio"] for row in rows],
+        ratios,
         color="#8b5cf6",
         label="Triton + deterministic RCCL",
     )
-    axis.axhline(1.0, color="black", linewidth=1, label="Native ROCm/RCCL")
-    axis.set_yscale("log")
-    axis.set_ylabel("Triton / native latency (x, log scale)")
-    axis.set_title("Qwen3-shaped distributed FFN overhead on MI300X")
-    axis.set_xticks(
-        positions,
-        [f"{row['name']}\n{row['direction']}" for row in rows],
-        rotation=55,
-        ha="right",
+    axis.bar_label(
+        bars,
+        labels=[f"{value:.1f}×" for value in ratios],
+        padding=5,
+        fontsize=13,
     )
-    axis.legend()
+    axis.axhline(
+        1.0,
+        color="black",
+        linewidth=2,
+        label="Native ROCm/RCCL = 1.0×",
+    )
+    axis.set_yscale("log")
+    axis.set_ylim(0.8, max(ratios) * 1.4)
+    axis.set_xlabel("Parallel configuration and measured direction")
+    axis.set_ylabel(
+        "Median latency ratio: Triton/deterministic RCCL / native (×, log scale)"
+    )
+    axis.set_title("MI300X distributed FFN latency by TP / CP / SP configuration")
+    axis.set_xticks(positions, labels, rotation=50, ha="right")
+    axis.legend(loc="upper right")
     figure.tight_layout()
     figure.savefig(output_directory / "distributed_ffn_overhead.png", dpi=180)
     plt.close(figure)
 
-    gemm_rows = payload["single_gpu"]["gemm"]
-    figure, axis = plt.subplots(figsize=(12, 6))
+    figure, axis = plt.subplots(figsize=(19, 9))
     positions = list(range(len(gemm_rows)))
-    width = 0.38
-    axis.bar(
+    width = 0.4
+    native_errors = [
+        row["native_vs_fp32"]["relative_l2"] * 100.0 for row in gemm_rows
+    ]
+    triton_errors = [
+        row["triton_vs_fp32"]["relative_l2"] * 100.0 for row in gemm_rows
+    ]
+    native_bars = axis.bar(
         [position - width / 2 for position in positions],
-        [row["native_vs_fp32"]["relative_l2"] for row in gemm_rows],
+        native_errors,
         width,
-        label="Native ROCm vs FP32",
+        label="Native ROCm BF16 vs FP32",
         color="#3b82f6",
     )
-    axis.bar(
+    triton_bars = axis.bar(
         [position + width / 2 for position in positions],
-        [row["triton_vs_fp32"]["relative_l2"] for row in gemm_rows],
+        triton_errors,
         width,
-        label="Deterministic Triton vs FP32",
+        label="Deterministic Triton BF16 vs FP32",
         color="#8b5cf6",
     )
-    axis.set_yscale("log")
-    axis.set_ylabel("Relative L2 error (log scale)")
-    axis.set_title("BF16 GEMM accuracy cost of a fixed Triton reduction tree")
+    for bars, values in (
+        (native_bars, native_errors),
+        (triton_bars, triton_errors),
+    ):
+        axis.bar_label(
+            bars,
+            labels=[f"{value:.3f}%" for value in values],
+            padding=4,
+            fontsize=12,
+            rotation=90,
+        )
+    axis.set_ylim(0.0, max(triton_errors) * 1.3)
+    axis.set_xlabel("GEMM shape (M, K, N)")
+    axis.set_ylabel("Relative L2 error vs FP32 A.float() @ B.float() (%)")
+    axis.set_title("MI300X BF16 GEMM numerical error by shape and implementation")
     axis.set_xticks(
-        positions, [row["name"] for row in gemm_rows], rotation=45, ha="right"
+        positions,
+        [f"({row['m']}, {row['k']}, {row['n']})" for row in gemm_rows],
+        rotation=45,
+        ha="right",
     )
-    axis.legend()
+    axis.legend(loc="upper left")
     figure.tight_layout()
     figure.savefig(output_directory / "accuracy_tradeoff.png", dpi=180)
     plt.close(figure)
