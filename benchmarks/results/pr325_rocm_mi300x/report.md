@@ -12,18 +12,18 @@ This is an operator-only MI300X report. It does not load or benchmark a model ch
 
 | Field | Value |
 |---|---|
-| gpu | AMD Instinct MI300X |
-| gpu_count | 8 |
+| NCCL_IB_DISABLE | 1 |
 | architecture | gfx942:sramecc+:xnack- |
-| torch | 2.12.0+rocm7.14.0a20260608 |
-| transformers | 5.10.4 |
-| hip | 7.14.60850 |
-| python | 3.12.3 |
-| git_commit | 08f47d97d0443c5998b8da6b41a22fdf3848da8f |
-| speed_baseline | Hugging Face Transformers Qwen3MLP, TP=1 |
 | deterministic_compute | ROCm-native Triton |
 | deterministic_transport | fixed-order RCCL on ROCm |
-| NCCL_IB_DISABLE | 1 |
+| git_commit | 08f47d97d0443c5998b8da6b41a22fdf3848da8f |
+| gpu | AMD Instinct MI300X |
+| gpu_count | 8 |
+| hip | 7.14.60850 |
+| python | 3.12.3 |
+| speed_baseline | Hugging Face Transformers Qwen3MLP, TP=1 |
+| torch | 2.12.0+rocm7.14.0a20260608 |
+| transformers | 5.10.4 |
 
 ## Methodology
 
@@ -125,5 +125,3 @@ In backward, the gate and up contributions to dHidden are independent until thei
 ![Topology mismatch versus Triton TP=1](collective_overhead.png)
 
 ![Distributed official TP=1 versus Triton speed](distributed_ffn_overhead.png)
-
-![Official Qwen3MLP FP16 versus FP32](accuracy_tradeoff.png)

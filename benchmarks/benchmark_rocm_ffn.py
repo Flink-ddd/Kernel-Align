@@ -983,8 +983,6 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
             "",
             "![Distributed official TP=1 versus Triton speed](distributed_ffn_overhead.png)",
             "",
-            "![Official Qwen3MLP FP16 versus FP32](accuracy_tradeoff.png)",
-            "",
         )
     )
     (output_directory / "report.md").write_text(
@@ -1071,8 +1069,14 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
         [[row[key] for key in mismatch_keys] for row in exactness_rows],
         dtype=float,
     )
-    figure, axis = plt.subplots(figsize=(16, 11))
-    image = axis.imshow(matrix, cmap="RdYlGn_r", vmin=0, vmax=max(1.0, matrix.max()))
+    figure, axis = plt.subplots(figsize=(12, 10))
+    image = axis.imshow(
+        matrix,
+        aspect="auto",
+        cmap="RdYlGn_r",
+        vmin=0,
+        vmax=max(1.0, matrix.max()),
+    )
     for y_position in range(matrix.shape[0]):
         for x_position in range(matrix.shape[1]):
             axis.text(
@@ -1152,33 +1156,6 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
     )
     figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     figure.savefig(output_directory / "distributed_ffn_overhead.png", dpi=180)
-    plt.close(figure)
-
-    dtype_row = payload["single_gpu"]["dtype_accuracy"][0]
-    relative_l2_percent = dtype_row["relative_l2"] * 100.0
-    figure, axis = plt.subplots(figsize=(11, 9))
-    bars = axis.bar(
-        [0],
-        [relative_l2_percent],
-        width=0.48,
-        color="#0f766e",
-        label="Official Qwen3MLP TP=1",
-    )
-    axis.bar_label(
-        bars,
-        labels=[f"{relative_l2_percent:.4f}%"],
-        padding=7,
-        fontsize=19,
-        fontweight="bold",
-    )
-    axis.set_ylim(0.0, max(0.01, relative_l2_percent * 1.3))
-    axis.set_xticks([0], ["FP16 output"])
-    axis.set_xlabel("Candidate dtype\n(M,H,I)=(8,4096,12288)")
-    axis.set_ylabel("Relative L2 error (%)\nReference: official Qwen3MLP FP32")
-    axis.set_title("MI300X simple FP16 vs FP32 accuracy observation")
-    axis.legend(loc="upper right")
-    figure.tight_layout()
-    figure.savefig(output_directory / "accuracy_tradeoff.png", dpi=180)
     plt.close(figure)
 
 
