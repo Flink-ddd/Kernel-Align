@@ -229,9 +229,14 @@ def _native_rocm_tile_stats(
         local_tiles = z_masked.shape[1] // tile
         if local_tiles <= 0:
             raise RuntimeError("ROCm native tile stats require at least one local vocab tile")
+        # The ROCm build also ships a gfx942-tuned kernel with the same contract;
+        # one kernel serves every ROCm entry point so their partials stay bitwise equal.
+        tile_stats = getattr(
+            _C, "hip_deterministic_logp_tile_stats", _C.deterministic_logp_tile_stats
+        )
         return tuple(
             tensor.contiguous()
-            for tensor in _C.deterministic_logp_tile_stats(
+            for tensor in tile_stats(
                 z_masked,
                 int(vocab_start),
                 int(real_vocab_size),

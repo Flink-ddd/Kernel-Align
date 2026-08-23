@@ -143,6 +143,10 @@ def get_extensions():
             "csrc/cuda/activation.cu",
             "csrc/cuda/attention/deterministic_attention.cu",
         ]
+        if is_rocm:
+            # ROCm-tuned WS2 vocab-parallel logprob kernels; the shared
+            # deterministic_logp_kernel.cu keeps the SM90-tuned CUDA path.
+            cuda_sources.append("csrc/hip/hip_deterministic_logp_kernel.hip")
         if not is_rocm:
             # CUDA IPC and the fixed-tree collective implementation are not
             # part of the ROCm extension yet.
@@ -206,6 +210,13 @@ def get_extensions():
                 "FUSED_LOGP_ONLINE_MIN_BLOCKS_PER_SM",
             )
         )
+        if is_rocm:
+            for tile_knob in (
+                "DETERMINISTIC_LOGP_TILE_BLOCK_SIZE",
+                "DETERMINISTIC_LOGP_TILE_VECTOR_ELEMENTS",
+                "DETERMINISTIC_LOGP_BACKWARD_BLOCK_SIZE",
+            ):
+                nvcc_flags.extend(_cuda_define_from_env(tile_knob, tile_knob))
         if not is_rocm and envs.env_flag(envs.KERNEL_ALIGN_NCU_LINEINFO):
             nvcc_flags.append("-lineinfo")
         if (

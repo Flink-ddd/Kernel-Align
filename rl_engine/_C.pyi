@@ -167,6 +167,22 @@ def deterministic_logp_tile_stats(
     real_vocab: int,
     num_tiles: int,
 ) -> list[torch.Tensor]: ...
+def hip_deterministic_logp_tile_stats(
+    logits: torch.Tensor,
+    vocab_start: int,
+    real_vocab: int,
+    num_tiles: int,
+) -> list[torch.Tensor]: ...
+def hip_deterministic_logp_backward(
+    logits: torch.Tensor,
+    lse: torch.Tensor,
+    coef_logp: torch.Tensor,
+    coef_lse: torch.Tensor,
+    target_local: torch.Tensor,
+    vocab_start: int,
+    real_vocab: int,
+    has_lse_grad: bool,
+) -> torch.Tensor: ...
 def deterministic_attention_forward(
     q: torch.Tensor,
     k: torch.Tensor,

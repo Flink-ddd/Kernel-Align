@@ -135,3 +135,26 @@ PYTHONHASHSEED=0 pytest -q -ra \
 ## 当前提交
 
 实现尚未推送远程；代码位于当前工作分支 `work/ws2-logprob-rocm`。合并基线提交是 `b811abc`，本次实现文件仍在工作区，待 ROCm 环境验证后再拆分成正式 PR commits。
+
+## 2026-08-23 补充：ROCm 性能调优
+
+在 MI300X 上做完基准测试（`benchmarks/benchmark_rocm_logp.py`，结果见
+`benchmarks/results/pr328_rocm_mi300x/report.md`）后，对 ROCm backend 做了两处调整，
+TP contract、tile 顺序 merge、selected-target 传输和 active-mask 语义都没有变：
+
+1. 新增 ROCm 专用文件 `csrc/hip/hip_deterministic_logp_kernel.hip`（只在 ROCm 构建时编译，
+   共享的 `csrc/deterministic_logp_kernel.cu` 保持 SM90 调优版本不动）。其中
+   `hip_deterministic_logp_tile_stats` 直接读取 BF16/FP16/FP32 shard（kernel 内部逐元素精确
+   转成 FP32，并自行过滤 padding 列），不再先做一份 FP32 拷贝；每个线程固定处理 8 个连续
+   元素（向量化 load），累加顺序只由 `(BlockSize, Vec)` 决定，与 rank、shard 偏移和存储
+   dtype 无关，所以 TP=n 与 TP=1 仍然 bitwise 一致，BF16 直读与 FP32 上转的 partial 也
+   bitwise 一致。全 padding 的 tile 现在返回 `(-inf, 0)` identity partial（原来是 `-FLT_MAX`）。
+2. 新增 `hip_deterministic_logp_backward`：从保存的输入 shard 一次 fused pass 生成
+   `grad_logits`（`g_logp * (onehot - p) + g_lse * p`，padding 列为 0，非有限行 `p = 0`），
+   替代共享 Python autograd 里约 9 次 `[tokens, vocab]` FP32 elementwise pass。
+   `RocmVocabParallelLogprobOp.apply` 走这条 HIP autograd 路径；`apply_with_entropy`
+   仍沿用共享路径（带 HIP tile kernel），因为 entropy 梯度本来就需要完整的概率张量。
+
+构建期可调参数：`DETERMINISTIC_LOGP_TILE_BLOCK_SIZE`（默认 128）、
+`DETERMINISTIC_LOGP_TILE_VECTOR_ELEMENTS`（默认 8）、`DETERMINISTIC_LOGP_BACKWARD_BLOCK_SIZE`
+（默认 256），通过 `setup.py` 的环境变量注入。
