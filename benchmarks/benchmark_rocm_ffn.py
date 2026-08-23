@@ -1395,7 +1395,7 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
     axis.set_yscale("log")
     axis.set_ylim(0.5, max(single_ratios) * 1.8)
     axis.set_xlabel("Operator and tensor shape")
-    axis.set_ylabel("Median latency ratio: Triton / native ROCm (×, log scale)")
+    axis.set_ylabel("Median latency ratio (×, log scale)\nTriton / native ROCm")
     axis.set_title("MI300X single-GPU operator latency by shape")
     axis.set_xticks(positions, single_labels, rotation=55, ha="right")
     axis.legend(loc="upper left")
@@ -1424,12 +1424,14 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
                 label=f"{world_size} ranks",
             )
             for x_value, y_value in zip(x_values, y_values, strict=True):
+                y_offset = -17 if world_size == 2 else 9
                 axis.annotate(
                     f"{y_value:.1f}×",
                     (x_value, y_value),
-                    xytext=(0, 9),
+                    xytext=(0, y_offset),
                     textcoords="offset points",
                     ha="center",
+                    va="top" if y_offset < 0 else "bottom",
                     fontsize=12,
                 )
         axis.axhline(1.0, color="black", linewidth=2)
@@ -1439,7 +1441,7 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
         axis.set_title(operation.replace("_", " ").title())
         axis.set_xlabel("BF16 input per rank (MiB)")
     axes[0].set_ylabel(
-        "Median latency ratio: deterministic / native RCCL (×, log scale)"
+        "Median latency ratio (×, log scale)\nDeterministic / native RCCL"
     )
     axes[-1].legend(title="World size", loc="lower left")
     figure.suptitle("MI300X collective latency by message size and rank count", y=0.98)
@@ -1479,7 +1481,8 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
     axis.set_ylim(0.8, max(ratios) * 1.4)
     axis.set_xlabel("Parallel configuration and measured direction")
     axis.set_ylabel(
-        "Median latency ratio: Triton/deterministic RCCL / native (×, log scale)"
+        "Median latency ratio (×, log scale)\n"
+        "Triton + deterministic RCCL / native"
     )
     axis.set_title("MI300X distributed FFN latency by TP / CP / SP configuration")
     axis.set_xticks(positions, labels, rotation=50, ha="right")
@@ -1524,7 +1527,9 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
         )
     axis.set_ylim(0.0, max(triton_errors) * 1.3)
     axis.set_xlabel("GEMM shape (M, K, N)")
-    axis.set_ylabel("Relative L2 error vs FP32 A.float() @ B.float() (%)")
+    axis.set_ylabel(
+        "Relative L2 error (%)\nReference: FP32 A.float() @ B.float()"
+    )
     axis.set_title("MI300X BF16 GEMM numerical error by shape and implementation")
     axis.set_xticks(
         positions,
