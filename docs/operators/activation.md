@@ -2,11 +2,12 @@
 
 The activation operators are the element-wise core of the Qwen3/Llama gated MLP. They
 implement the WS1 dual-path contract (issue #108): pure-PyTorch fp32 ground truth, plus
-CUDA and Triton candidates that validate against it.
+CUDA, Triton, and Ascend C candidates that validate against it.
 
 - **SiLU** (`NativeSiLUOp` / `SiLUCudaOp` / `TritonSiLUOp`): `silu(x) = x * sigmoid(x)` —
   the `hidden_act="silu"` gate.
-- **SwiGLU** (`NativeSwiGLUOp` / `SwiGLUCudaOp` / `TritonSwiGLUOp`):
+- **SwiGLU** (`NativeSwiGLUOp` / `SwiGLUCudaOp` / `TritonSwiGLUOp` /
+  `SwiGLUAscendOp`):
   `swiglu(gate, up) = silu(gate) * up` — the gated MLP middle stage. `gate` / `up` are the
   `gate_proj` / `up_proj` outputs (already at the intermediate width); the following
   `down_proj` is a plain Matmul and is **not** part of this operator.
@@ -44,6 +45,7 @@ All backends expose the WS1 dual-path contract:
 | PyTorch fallback | `NativeSiLUOp` / `NativeSwiGLUOp` | None | fp32 ground-truth reference; CPU and any GPU. |
 | CUDA | `SiLUCudaOp` / `SwiGLUCudaOp` | `_C.silu_*` / `_C.swiglu_*` | General CUDA (fp16/bf16/fp32); math in fp32. |
 | Triton | `TritonSiLUOp` / `TritonSwiGLUOp` | Triton JIT | Portable GPU baseline; same fp32 math contract. |
+| Ascend C | `SwiGLUAscendOp` | `_C_npu.swiglu_ascend_*` | NPU SwiGLU forward/backward (fp16/bf16/fp32); math in fp32. |
 
 ## Tensor Contract
 
@@ -67,9 +69,10 @@ mutation, device/dtype follow the inputs.
 | `cuda` | CUDA → Triton → PyTorch native |
 | `rocm` | Triton → PyTorch native |
 | `cpu` | PyTorch native |
+| `npu` | Ascend C SwiGLU → PyTorch native (SwiGLU); PyTorch native (SiLU) |
 
-If the CUDA extension is not built (or symbols are missing), the registry falls back to
-Triton, then to the native gold.
+If an accelerated extension is not built (or its symbols are missing), the registry moves
+to the next available candidate and ultimately falls back to the native gold.
 
 ## Accuracy
 
@@ -106,29 +109,34 @@ Gold path: `NativeSiLUOp.forward_fp32` / `NativeSwiGLUOp.forward_fp32`.
 
 ## Performance Notes
 
-Element-wise kernels with a fixed 1-D grid (CUDA) / `BLOCK=1024` (Triton). Suitable as the
-standalone WS1 activation path; fused bias+SiLU MLP kernels remain a separate future work
-item and should continue to validate against this reference.
+Element-wise kernels with a fixed 1-D grid (CUDA), `BLOCK=1024` (Triton), or aligned
+multi-core 1-D tiles of at most 5120 elements (Ascend C). Suitable as the standalone WS1
+activation path; fused bias+SiLU MLP kernels remain a separate future work item and should
+continue to validate against this reference.
 
 ## Tests
 
 ```bash
-python -m pytest tests/test_swiglu.py -v
+python -m pytest tests/test_swiglu.py tests/test_swiglu_ascend.py -v
 ```
 
 Covers: correctness vs an independent fp32 formula, dtype paths, Axis-A batch invariance
 (slice + padding), input purity, gradient flow, the SwiGLU shape guard, CUDA/Triton vs
-native forward+backward, registry dispatch, and the issue-#108 `OP_SPECS` harness.
+native forward+backward, Ascend C forward/backward and tail tiles when NPU hardware is
+available, registry dispatch, and the issue-#108 `OP_SPECS` harness.
 
 ## Implementation Files
 
 - `rl_engine/kernels/ops/pytorch/activation/swiglu.py` — gold
 - `rl_engine/kernels/ops/cuda/activation/swiglu.py` — CUDA wrappers
 - `rl_engine/kernels/ops/triton/activation/swiglu.py` — Triton kernels
+- `rl_engine/kernels/ops/ascend/activation/swiglu.py` — Ascend wrapper/autograd
 - `csrc/cuda/activation.cu` — CUDA kernels
+- `csrc/ascend/swiglu_ascend.asc` — Ascend C forward/backward kernels
 - `rl_engine/kernels/registry.py`
 - `rl_engine/kernels/gtest/operator_specs.py`
 - `tests/test_swiglu.py`
+- `tests/test_swiglu_ascend.py`
 
 ## Known Limitations
 

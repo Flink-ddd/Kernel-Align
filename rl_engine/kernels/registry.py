@@ -77,6 +77,7 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     ASCEND_BATCH_INVARIANT_LOGP = (
         "rl_engine.kernels.ops.ascend.loss.batch_invariant_logp.BatchInvariantLogpAscendOp"
     )
+    ASCEND_SWIGLU = "rl_engine.kernels.ops.ascend.activation.swiglu.SwiGLUAscendOp"
 
     # RMSNorm(pre-norm / QK-Norm) - pure Pytorch reference(ws1 ground-truth)
     PYTORCH_NATIVE_RMS_NORM = "rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp"
@@ -299,6 +300,10 @@ class KernelRegistry:
         self._priority_map["npu"]["batch_invariant_logp"] = [
             OpBackend.ASCEND_BATCH_INVARIANT_LOGP,
             OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
+        ]
+        self._priority_map["npu"]["swiglu"] = [
+            OpBackend.ASCEND_SWIGLU,
+            OpBackend.PYTORCH_NATIVE_SWIGLU,
         ]
         logger.info(f"KernelRegistry initialized for {device_ctx.device_type}")
         self._adjust_priority_for_hardware()

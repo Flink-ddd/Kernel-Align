@@ -8,3 +8,14 @@ def batch_invariant_logp_ascend(
     target: torch.Tensor,
     ignore_index: int,
 ) -> list[torch.Tensor]: ...
+
+def swiglu_ascend_forward(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+) -> torch.Tensor: ...
+
+def swiglu_ascend_backward(
+    dy: torch.Tensor,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+) -> list[torch.Tensor]: ...
