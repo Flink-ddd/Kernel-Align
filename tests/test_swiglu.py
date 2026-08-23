@@ -372,6 +372,34 @@ def test_cuda_triton_swiglu_matches_native_forward_and_backward(impl, dtype, sha
     )
 
 
+@requires_cuda_activation
+@requires_triton_activation
+def test_triton_swiglu_matches_hip_bitwise_at_qwen3_width():
+    shape = (32, _INTERMEDIATE)
+    values = tuple(
+        (_rand(shape, seed=seed, dtype=torch.float32) * 0.02).to(
+            device="cuda", dtype=torch.bfloat16
+        )
+        for seed in (35, 36)
+    )
+    grad_output = (_rand(shape, seed=37, dtype=torch.float32) * 0.02).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    hip_inputs = [value.detach().clone().requires_grad_(True) for value in values]
+    triton_inputs = [value.detach().clone().requires_grad_(True) for value in values]
+
+    hip_output = SwiGLUCudaOp().forward(*hip_inputs)
+    triton_output = TritonSwiGLUOp().forward(*triton_inputs)
+    hip_output.backward(grad_output)
+    triton_output.backward(grad_output)
+
+    assert torch.equal(hip_output, triton_output)
+    assert all(
+        torch.equal(hip_input.grad, triton_input.grad)
+        for hip_input, triton_input in zip(hip_inputs, triton_inputs, strict=True)
+    )
+
+
 @requires_cuda
 @pytest.mark.parametrize("impl", _silu_impls())
 def test_cuda_triton_silu_batch_invariance_bitwise(impl):

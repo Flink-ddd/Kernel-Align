@@ -25,6 +25,7 @@ from rl_engine.kernels.ops.pytorch.ffn.ffn import (
     QWEN3_8B_INTERMEDIATE_SIZE,
     qwen3_ffn,
 )
+from rl_engine.kernels.ops.triton.ffn import qwen3_ffn_triton
 from rl_engine.platforms.device import device_ctx
 
 _REQUIRED_SYMBOLS = (
@@ -362,3 +363,67 @@ def test_qwen3_ffn_gpu_output_and_hidden_gradient_are_token_slice_invariant():
 
     assert torch.equal(slice_output, full_output[2:4])
     assert torch.equal(slice_hidden.grad, full_hidden.grad[2:4])
+
+
+@requires_gpu_ffn
+@pytest.mark.parametrize("shape", ((7, 64, 128), (32, 64, 512)))
+def test_qwen3_ffn_triton_matches_native_forward_and_backward_bitwise(shape):
+    device = device_ctx.device
+    tokens, hidden_size, intermediate_size = shape
+    values = (
+        _randn((tokens, hidden_size), seed=50, dtype=torch.bfloat16, device=device),
+        _randn(
+            (intermediate_size, hidden_size),
+            seed=51,
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        _randn(
+            (intermediate_size, hidden_size),
+            seed=52,
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        _randn(
+            (hidden_size, intermediate_size),
+            seed=53,
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+    )
+    grad_output = _randn(
+        (tokens, hidden_size),
+        seed=54,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    native_inputs = [value.detach().clone().requires_grad_(True) for value in values]
+    triton_inputs = [value.detach().clone().requires_grad_(True) for value in values]
+
+    native_output = qwen3_ffn(*native_inputs)
+    triton_output = qwen3_ffn_triton(*triton_inputs)
+    native_output.backward(grad_output)
+    triton_output.backward(grad_output)
+
+    assert torch.equal(native_output, triton_output)
+    for native, triton_input in zip(native_inputs, triton_inputs, strict=True):
+        assert torch.equal(native.grad, triton_input.grad)
+
+
+@requires_gpu_ffn
+def test_qwen3_ffn_triton_repeat_and_train_infer_are_bitwise():
+    device = device_ctx.device
+    values = (
+        _randn((8, 64), seed=60, dtype=torch.bfloat16, device=device),
+        _randn((128, 64), seed=61, dtype=torch.bfloat16, device=device),
+        _randn((128, 64), seed=62, dtype=torch.bfloat16, device=device),
+        _randn((64, 128), seed=63, dtype=torch.bfloat16, device=device),
+    )
+    with torch.no_grad():
+        first = qwen3_ffn_triton(*values)
+        second = qwen3_ffn_triton(*values)
+    training_values = [value.detach().clone().requires_grad_(True) for value in values]
+    training = qwen3_ffn_triton(*training_values)
+
+    assert torch.equal(first, second)
+    assert torch.equal(first, training.detach())

@@ -28,6 +28,7 @@ from rl_engine.kernels.ops.pytorch.ffn.ffn import (
     QWEN3_8B_INTERMEDIATE_SIZE,
     qwen3_ffn,
 )
+from rl_engine.kernels.ops.triton.ffn import qwen3_ffn_triton
 
 _REQUIRED_FFN_SYMBOLS = (
     "det_gemm_fwd",
@@ -182,6 +183,14 @@ def _canonical(
     return inference, training, inputs
 
 
+def _ffn_implementation(name: str):
+    if name == "native":
+        return qwen3_ffn
+    if name == "triton":
+        return qwen3_ffn_triton
+    raise ValueError(f"unknown FFN implementation: {name}")
+
+
 def _mesh_groups(
     dist: Any,
     tp_size: int,
@@ -226,6 +235,7 @@ def _run_topology(
     inference_reference: torch.Tensor,
     training_reference: torch.Tensor,
     reference_inputs: list[torch.Tensor],
+    implementation: str = "native",
 ) -> None:
     mesh_key = (tp_size, cp_size)
     if mesh_key not in meshes:
@@ -251,15 +261,16 @@ def _run_topology(
         down[:, feature_start:feature_end].contiguous(),
     )
 
+    target_ffn = _ffn_implementation(implementation)
     with torch.no_grad():
-        inference = qwen3_ffn(
+        inference = target_ffn(
             *shard,
             tp_group=tp_group,
             cp_group=cp_group,
             sequence_parallel=sequence_parallel,
         )
     inputs = [value.detach().clone().requires_grad_(True) for value in shard]
-    training = qwen3_ffn(
+    training = target_ffn(
         *inputs,
         tp_group=tp_group,
         cp_group=cp_group,
@@ -296,6 +307,7 @@ def _topology_worker(
     init_method: str,
     result_queue: Any,
     configs: tuple[tuple[str, int, int, bool], ...],
+    implementation: str = "native",
 ) -> None:
     try:
         import torch.distributed as dist
@@ -341,6 +353,7 @@ def _topology_worker(
                 inference_reference=inference_reference,
                 training_reference=training_reference,
                 reference_inputs=reference_inputs,
+                implementation=implementation,
             )
         result_queue.put({"ok": True, "rank": rank})
     except Exception:  # pragma: no cover - forwarded to the parent process.
@@ -501,6 +514,33 @@ def test_qwen3_ffn_tp8_matches_tp1_bitwise() -> None:
         8,
         (_WORLD8_CONFIGS,),
         timeout_seconds=360,
+    )
+
+
+def test_qwen3_ffn_triton_tp2_and_tp_sp_match_native_tp1_bitwise() -> None:
+    _spawn_workers(
+        _topology_worker,
+        2,
+        (_WORLD2_CONFIGS, "triton"),
+        timeout_seconds=240,
+    )
+
+
+def test_qwen3_ffn_triton_tp4_tp_cp_and_tp_cp_sp_match_native_tp1_bitwise() -> None:
+    _spawn_workers(
+        _topology_worker,
+        4,
+        (_WORLD4_CONFIGS, "triton"),
+        timeout_seconds=300,
+    )
+
+
+def test_qwen3_ffn_triton_tp8_matches_native_tp1_bitwise() -> None:
+    _spawn_workers(
+        _topology_worker,
+        8,
+        (_WORLD8_CONFIGS, "triton"),
+        timeout_seconds=420,
     )
 
 

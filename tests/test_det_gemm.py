@@ -153,7 +153,7 @@ def test_forward_correctness(name, gemm):
     M, K, N = 128, 2048, 2048
     a, b = _rand(M, K), _rand(K, N)
     out = gemm(a, b).float()
-    ref = _k_tree_gemm(a, b).float() if name == _NATIVE_BACKEND else a.float() @ b.float()
+    ref = _k_tree_gemm(a, b).float()
     contract = load_contract()
     thresholds = contract["accuracy"]["default"]["reduction"]["bfloat16"]
     torch.testing.assert_close(out, ref, atol=thresholds["atol"], rtol=thresholds["rtol"])
@@ -209,35 +209,21 @@ def test_backward_correctness(name, gemm):
     b = _rand(K, N).requires_grad_(True)
     g = _rand(M, N)
     gemm(a, b).backward(g)
-    if name == _NATIVE_BACKEND:
-        expected_da = _k_tree_gemm(g, b.detach().t().contiguous())
-        expected_db = _k_tree_gemm(a.detach().t().contiguous(), g)
-        contract = load_contract()
-        thresholds = contract["accuracy"]["default"]["reduction"]["bfloat16"]
-        torch.testing.assert_close(
-            a.grad.float(),
-            expected_da.float(),
-            atol=thresholds["atol"],
-            rtol=thresholds["rtol"],
-        )
-        torch.testing.assert_close(
-            b.grad.float(),
-            expected_db.float(),
-            atol=thresholds["atol"],
-            rtol=thresholds["rtol"],
-        )
-        return
-
-    af = a.detach().float().requires_grad_(True)
-    bf = b.detach().float().requires_grad_(True)
-    (af @ bf).backward(g.float())
+    expected_da = _k_tree_gemm(g, b.detach().t().contiguous())
+    expected_db = _k_tree_gemm(a.detach().t().contiguous(), g)
     contract = load_contract()
     thresholds = contract["accuracy"]["default"]["reduction"]["bfloat16"]
     torch.testing.assert_close(
-        a.grad.float(), af.grad, atol=thresholds["atol"], rtol=thresholds["rtol"]
+        a.grad.float(),
+        expected_da.float(),
+        atol=thresholds["atol"],
+        rtol=thresholds["rtol"],
     )
     torch.testing.assert_close(
-        b.grad.float(), bf.grad, atol=thresholds["atol"], rtol=thresholds["rtol"]
+        b.grad.float(),
+        expected_db.float(),
+        atol=thresholds["atol"],
+        rtol=thresholds["rtol"],
     )
 
 
@@ -274,10 +260,43 @@ def test_triton_ragged_tiles_mask_all_axes():
     out = deterministic_gemm_triton(a, b)
     torch.cuda.synchronize()
     assert tuple(out.shape) == (80, 129)
-    torch.testing.assert_close(
-        out.float(), a.detach().float() @ b.detach().float(), atol=5e-2, rtol=2e-2
-    )
+    assert torch.equal(out, deterministic_gemm(a.detach(), b.detach()))
     out.backward(_rand(80, 129))
     torch.cuda.synchronize()
     assert torch.isfinite(a.grad).all()
     assert torch.isfinite(b.grad).all()
+
+
+@pytest.mark.skipif(not _HAS_TRITON, reason="Triton is unavailable")
+@pytest.mark.parametrize("shape", ((4, 65, 129), (8, 4096, 128), (4, 12288, 64)))
+def test_triton_tree_matches_native_forward_bitwise(shape):
+    """Triton evaluates the native FP32-leaf/BF16-node tree exactly."""
+
+    torch.manual_seed(47)
+    m_size, k_size, n_size = shape
+    a = _rand(m_size, k_size)
+    b = _rand(k_size, n_size)
+
+    native = deterministic_gemm(a, b)
+    triton_output = deterministic_gemm_triton(a, b)
+
+    assert torch.equal(native, triton_output), (
+        f"Triton/native mismatch at {shape}: "
+        f"{int((native != triton_output).sum().item())} elements"
+    )
+
+
+@pytest.mark.skipif(not _HAS_TRITON, reason="Triton is unavailable")
+def test_triton_tree_matches_native_backward_bitwise():
+    torch.manual_seed(48)
+    a = _rand(32, 512)
+    b = _rand(512, 128)
+    grad_output = _rand(32, 128)
+    native_inputs = [value.detach().clone().requires_grad_(True) for value in (a, b)]
+    triton_inputs = [value.detach().clone().requires_grad_(True) for value in (a, b)]
+
+    deterministic_gemm(*native_inputs).backward(grad_output)
+    deterministic_gemm_triton(*triton_inputs).backward(grad_output)
+
+    for native, triton_input in zip(native_inputs, triton_inputs, strict=True):
+        assert torch.equal(native.grad, triton_input.grad)
