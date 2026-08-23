@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Operator-only ROCm analysis for the deterministic distributed Triton FFN.
+"""ROCm analysis for the deterministic distributed Triton Qwen3 FFN.
 
-The two compute paths are native ROCm (PyTorch/rocBLAS) and the PR's Triton
-implementation. Communication compares native RCCL with the fixed-rank
-deterministic RCCL transport. No model checkpoint or serving engine is used.
+Performance compares the PR's FFN with the official Hugging Face Qwen3MLP at
+TP=1. Determinism compares every Triton TP/CP/SP layout bitwise with Triton
+TP=1. A separate, simple FP16-versus-FP32 observation uses official Qwen3MLP.
+No model checkpoint or serving engine is used.
 """
 
 from __future__ import annotations
@@ -25,18 +26,12 @@ from typing import Any, Callable
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import torch.nn.functional as F
+from transformers import __version__ as transformers_version
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
 
 import rl_engine.kernels.ops.triton.ffn.ffn as ffn_module
-from rl_engine.distributed import RCCLDeterministicCollective
-from rl_engine.kernels.ops.triton.activation.swiglu import (
-    _launch_swiglu_bwd,
-    _launch_swiglu_fwd,
-)
 from rl_engine.kernels.ops.triton.ffn import qwen3_ffn
-from rl_engine.kernels.ops.triton.matmul import deterministic_gemm_triton
-
-_MIB = 1024 * 1024
 _DISTRIBUTED_CONFIGS: dict[int, tuple[tuple[str, int, int, bool], ...]] = {
     2: (("tp2", 2, 1, False), ("tp2_sp", 2, 1, True)),
     4: (
@@ -104,10 +99,11 @@ def _randn(
     seed: int,
     device: torch.device,
     scale: float = 0.02,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     generator = torch.Generator(device="cpu").manual_seed(seed)
     value = torch.randn(shape, generator=generator, dtype=torch.float32) * scale
-    return value.to(device=device, dtype=torch.bfloat16)
+    return value.to(device=device, dtype=dtype)
 
 
 def _gpu_event_samples(
@@ -131,15 +127,31 @@ def _gpu_event_samples(
     return [float(start.elapsed_time(end)) for start, end in events]
 
 
-def _native_ffn(
-    hidden: torch.Tensor,
+def _official_qwen3_mlp(
     gate_weight: torch.Tensor,
     up_weight: torch.Tensor,
     down_weight: torch.Tensor,
-) -> torch.Tensor:
-    gate = hidden @ gate_weight.t()
-    up = hidden @ up_weight.t()
-    return (F.silu(gate) * up) @ down_weight.t()
+) -> Qwen3MLP:
+    """Build the upstream Transformers Qwen3 FFN with the benchmark weights."""
+    config = Qwen3Config(
+        hidden_size=gate_weight.size(1),
+        intermediate_size=gate_weight.size(0),
+        hidden_act="silu",
+    )
+    module = Qwen3MLP(config).to(
+        device=gate_weight.device,
+        dtype=gate_weight.dtype,
+    )
+    with torch.no_grad():
+        module.gate_proj.weight.copy_(gate_weight)
+        module.up_proj.weight.copy_(up_weight)
+        module.down_proj.weight.copy_(down_weight)
+    return module
+
+
+def _official_inference(module: Qwen3MLP, hidden: torch.Tensor) -> torch.Tensor:
+    with torch.no_grad():
+        return module(hidden)
 
 
 def _training_step(
@@ -163,160 +175,32 @@ def _single_gpu_benchmarks(
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
     torch.backends.cuda.matmul.allow_tf32 = False
-    results: dict[str, list[dict[str, Any]]] = {
-        "gemm": [],
-        "swiglu": [],
-        "ffn": [],
-    }
-
-    gemm_shapes = []
-    for tokens in (1, 8, 32, 128):
-        gemm_shapes.extend(
-            (
-                (tokens, 4096, 12288),
-                (tokens, 12288, 4096),
-            )
-        )
-    for index, (m_size, k_size, n_size) in enumerate(gemm_shapes):
-        left = _randn((m_size, k_size), seed=1000 + index * 2, device=device)
-        right = _randn((k_size, n_size), seed=1001 + index * 2, device=device)
-        native_output = torch.matmul(left, right)
-        triton_output = deterministic_gemm_triton(left, right)
-        triton_repeat = deterministic_gemm_triton(left, right)
-        fp32_reference = left.float() @ right.float()
-        native_timing = _summary_ms(
-            _gpu_event_samples(
-                lambda: torch.matmul(left, right), warmup=warmup, samples=samples
-            )
-        )
-        triton_timing = _summary_ms(
-            _gpu_event_samples(
-                lambda: deterministic_gemm_triton(left, right),
-                warmup=warmup,
-                samples=samples,
-            )
-        )
-        results["gemm"].append(
-            {
-                "name": f"(M,K,N)=({m_size},{k_size},{n_size})",
-                "m": m_size,
-                "k": k_size,
-                "n": n_size,
-                "dtype": "bfloat16",
-                "native": native_timing,
-                "triton": triton_timing,
-                "overhead_ratio": (
-                    triton_timing["median_ms"] / native_timing["median_ms"]
-                ),
-                "mismatch_count": _mismatches(triton_output, triton_repeat),
-                "triton_vs_native": _accuracy(triton_output, native_output),
-                "native_vs_fp32": _accuracy(native_output, fp32_reference),
-                "triton_vs_fp32": _accuracy(triton_output, fp32_reference),
-            }
-        )
-        del left, right, native_output, triton_output, triton_repeat, fp32_reference
-        torch.cuda.empty_cache()
-
-    for index, tokens in enumerate((1, 8, 32, 128)):
-        gate = _randn((tokens, 12288), seed=2000 + index * 3, device=device)
-        up = _randn((tokens, 12288), seed=2001 + index * 3, device=device)
-        grad_output = _randn(
-            (tokens, 12288), seed=2002 + index * 3, device=device
-        )
-
-        def native_backward() -> tuple[torch.Tensor, torch.Tensor]:
-            sigmoid = torch.sigmoid(gate)
-            grad_gate = grad_output * up * sigmoid * (1.0 + gate * (1.0 - sigmoid))
-            grad_up = grad_output * F.silu(gate)
-            return grad_gate, grad_up
-
-        for direction, native_function, triton_function in (
-            (
-                "forward",
-                lambda: F.silu(gate) * up,
-                lambda: _launch_swiglu_fwd(gate, up),
-            ),
-            (
-                "backward",
-                native_backward,
-                lambda: _launch_swiglu_bwd(grad_output, gate, up),
-            ),
-        ):
-            native_output = native_function()
-            triton_output = triton_function()
-            triton_repeat = triton_function()
-            native_timing = _summary_ms(
-                _gpu_event_samples(
-                    native_function, warmup=warmup, samples=samples
-                )
-            )
-            triton_timing = _summary_ms(
-                _gpu_event_samples(
-                    triton_function, warmup=warmup, samples=samples
-                )
-            )
-            native_values = (
-                native_output if isinstance(native_output, tuple) else (native_output,)
-            )
-            triton_values = (
-                triton_output if isinstance(triton_output, tuple) else (triton_output,)
-            )
-            repeat_values = (
-                triton_repeat if isinstance(triton_repeat, tuple) else (triton_repeat,)
-            )
-            results["swiglu"].append(
-                {
-                    "name": f"(M,I)=({tokens},12288), {direction}",
-                    "direction": direction,
-                    "tokens": tokens,
-                    "intermediate": 12288,
-                    "dtype": "bfloat16",
-                    "native": native_timing,
-                    "triton": triton_timing,
-                    "overhead_ratio": (
-                        triton_timing["median_ms"] / native_timing["median_ms"]
-                    ),
-                    "mismatch_count": sum(
-                        _mismatches(actual, repeat)
-                        for actual, repeat in zip(
-                            triton_values, repeat_values, strict=True
-                        )
-                    ),
-                    "triton_vs_native_relative_l2": max(
-                        _relative_l2(actual, expected)
-                        for actual, expected in zip(
-                            triton_values, native_values, strict=True
-                        )
-                    ),
-                }
-            )
-        del gate, up, grad_output
-        torch.cuda.empty_cache()
-
+    results: dict[str, list[dict[str, Any]]] = {"speed": [], "dtype_accuracy": []}
     gate_weight = _randn((12288, 4096), seed=3000, device=device)
     up_weight = _randn((12288, 4096), seed=3001, device=device)
     down_weight = _randn((4096, 12288), seed=3002, device=device)
+    official = _official_qwen3_mlp(gate_weight, up_weight, down_weight)
     for index, tokens in enumerate((1, 8, 32)):
         hidden = _randn((tokens, 4096), seed=3010 + index * 2, device=device)
         grad_output = _randn(
             (tokens, 4096), seed=3011 + index * 2, device=device
         )
-        values = (hidden, gate_weight, up_weight, down_weight)
-        with torch.no_grad():
-            native_output = _native_ffn(*values)
-            triton_output = qwen3_ffn(*values)
-            triton_repeat = qwen3_ffn(*values)
-        native_timing = _summary_ms(
+        weights = (gate_weight, up_weight, down_weight)
+        official_timing = _summary_ms(
             _gpu_event_samples(
-                lambda: _native_ffn(*values), warmup=warmup, samples=samples
+                lambda: _official_inference(official, hidden),
+                warmup=warmup,
+                samples=samples,
             )
         )
         triton_timing = _summary_ms(
             _gpu_event_samples(
-                lambda: qwen3_ffn(*values), warmup=warmup, samples=samples
+                lambda: qwen3_ffn(hidden, *weights),
+                warmup=warmup,
+                samples=samples,
             )
         )
-        results["ffn"].append(
+        results["speed"].append(
             {
                 "name": f"(M,H,I)=({tokens},4096,12288), forward",
                 "direction": "forward",
@@ -324,43 +208,42 @@ def _single_gpu_benchmarks(
                 "hidden": 4096,
                 "intermediate": 12288,
                 "dtype": "bfloat16",
-                "native": native_timing,
+                "official_tp1": official_timing,
                 "triton": triton_timing,
-                "overhead_ratio": (
-                    triton_timing["median_ms"] / native_timing["median_ms"]
+                "latency_ratio_vs_official_tp1": (
+                    triton_timing["median_ms"] / official_timing["median_ms"]
                 ),
-                "mismatch_count": _mismatches(triton_output, triton_repeat),
-                "train_infer_mismatch_count": 0,
-                "triton_vs_native": _accuracy(triton_output, native_output),
             }
         )
 
-        native_inputs = [value.detach().clone().requires_grad_(True) for value in values]
-        triton_inputs = [value.detach().clone().requires_grad_(True) for value in values]
-        repeat_inputs = [value.detach().clone().requires_grad_(True) for value in values]
-        native_function = lambda *args: _native_ffn(*args)
-        triton_function = lambda *args: qwen3_ffn(*args)
-        native_train = _training_step(native_function, native_inputs, grad_output)
-        triton_train = _training_step(triton_function, triton_inputs, grad_output)
-        repeat_train = _training_step(triton_function, repeat_inputs, grad_output)
-        native_grads = [value.grad.detach().clone() for value in native_inputs]
-        triton_grads = [value.grad.detach().clone() for value in triton_inputs]
-        repeat_grads = [value.grad.detach().clone() for value in repeat_inputs]
-        native_train_timing = _summary_ms(
+        official_hidden = hidden.detach().clone().requires_grad_(True)
+        triton_inputs = [
+            value.detach().clone().requires_grad_(True)
+            for value in (hidden, *weights)
+        ]
+
+        def official_training_step() -> torch.Tensor:
+            official.zero_grad(set_to_none=True)
+            official_hidden.grad = None
+            output = official(official_hidden)
+            output.backward(grad_output)
+            return output
+
+        official_train_timing = _summary_ms(
             _gpu_event_samples(
-                lambda: _training_step(native_function, native_inputs, grad_output),
+                official_training_step,
                 warmup=max(1, warmup // 2),
                 samples=training_samples,
             )
         )
         triton_train_timing = _summary_ms(
             _gpu_event_samples(
-                lambda: _training_step(triton_function, triton_inputs, grad_output),
+                lambda: _training_step(qwen3_ffn, triton_inputs, grad_output),
                 warmup=max(1, warmup // 2),
                 samples=training_samples,
             )
         )
-        results["ffn"].append(
+        results["speed"].append(
             {
                 "name": f"(M,H,I)=({tokens},4096,12288), forward+backward",
                 "direction": "train_fwd_bwd",
@@ -368,187 +251,57 @@ def _single_gpu_benchmarks(
                 "hidden": 4096,
                 "intermediate": 12288,
                 "dtype": "bfloat16",
-                "native": native_train_timing,
+                "official_tp1": official_train_timing,
                 "triton": triton_train_timing,
-                "overhead_ratio": (
+                "latency_ratio_vs_official_tp1": (
                     triton_train_timing["median_ms"]
-                    / native_train_timing["median_ms"]
-                ),
-                "mismatch_count": _mismatches(triton_train, repeat_train)
-                + sum(
-                    _mismatches(actual, repeat)
-                    for actual, repeat in zip(
-                        triton_grads, repeat_grads, strict=True
-                    )
-                ),
-                "train_infer_mismatch_count": _mismatches(
-                    triton_output, triton_train
-                ),
-                "triton_vs_native": _accuracy(triton_train, native_train),
-                "max_gradient_relative_l2": max(
-                    _relative_l2(actual, expected)
-                    for actual, expected in zip(
-                        triton_grads, native_grads, strict=True
-                    )
+                    / official_train_timing["median_ms"]
                 ),
             }
         )
-        del hidden, grad_output, native_inputs, triton_inputs, repeat_inputs
+        del hidden, grad_output, official_hidden, triton_inputs
         torch.cuda.empty_cache()
+
+    # This is intentionally separate from the determinism and speed results.
+    del official, gate_weight, up_weight, down_weight
+    torch.cuda.empty_cache()
+    tokens = 8
+    fp32_hidden = _randn(
+        (tokens, 4096), seed=3100, device=device, dtype=torch.float32
+    )
+    fp32_gate = _randn(
+        (12288, 4096), seed=3101, device=device, dtype=torch.float32
+    )
+    fp32_up = _randn(
+        (12288, 4096), seed=3102, device=device, dtype=torch.float32
+    )
+    fp32_down = _randn(
+        (4096, 12288), seed=3103, device=device, dtype=torch.float32
+    )
+    official_fp32 = _official_qwen3_mlp(fp32_gate, fp32_up, fp32_down)
+    with torch.no_grad():
+        fp32_output = official_fp32(fp32_hidden)
+    del official_fp32
+    torch.cuda.empty_cache()
+    official_fp16 = _official_qwen3_mlp(
+        fp32_gate.half(), fp32_up.half(), fp32_down.half()
+    )
+    with torch.no_grad():
+        fp16_output = official_fp16(fp32_hidden.half())
+    results["dtype_accuracy"].append(
+        {
+            "name": "Official Qwen3MLP TP=1 FP16 vs FP32",
+            "tokens": tokens,
+            "hidden": 4096,
+            "intermediate": 12288,
+            "candidate_dtype": "float16",
+            "reference_dtype": "float32",
+            **_accuracy(fp16_output, fp32_output),
+        }
+    )
     return results
 
 
-def _native_all_gather(input_tensor: torch.Tensor, group: Any) -> torch.Tensor:
-    world_size = dist.get_world_size(group=group)
-    flat_input = input_tensor.contiguous().view(-1)
-    flat_output = torch.empty(
-        world_size * flat_input.numel(),
-        dtype=input_tensor.dtype,
-        device=input_tensor.device,
-    )
-    dist.all_gather_into_tensor(flat_output, flat_input, group=group)
-    return flat_output.reshape(
-        input_tensor.size(0) * world_size, *input_tensor.shape[1:]
-    )
-
-
-def _native_all_reduce(input_tensor: torch.Tensor, group: Any) -> torch.Tensor:
-    output = input_tensor.clone()
-    dist.all_reduce(output, group=group)
-    return output
-
-
-def _native_reduce_scatter(input_tensor: torch.Tensor, group: Any) -> torch.Tensor:
-    world_size = dist.get_world_size(group=group)
-    output = torch.empty(
-        (input_tensor.size(0) // world_size, *input_tensor.shape[1:]),
-        dtype=input_tensor.dtype,
-        device=input_tensor.device,
-    )
-    dist.reduce_scatter_tensor(output, input_tensor.contiguous(), group=group)
-    return output
-
-
-class _NativeDistributedFFNFunction(torch.autograd.Function):
-    """Native ROCm/RCCL baseline with the Triton path's collective schedule."""
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        hidden: torch.Tensor,
-        gate_weight: torch.Tensor,
-        up_weight: torch.Tensor,
-        down_weight: torch.Tensor,
-        tp_group: Any,
-        cp_group: Any,
-        sequence_parallel: bool,
-    ) -> torch.Tensor:
-        input_shape = hidden.shape
-        hidden_2d = hidden.reshape(-1, hidden.size(-1)).contiguous()
-        if sequence_parallel:
-            hidden_2d = _native_all_gather(hidden_2d, tp_group)
-        gate = hidden_2d @ gate_weight.t()
-        up = hidden_2d @ up_weight.t()
-        activated = F.silu(gate) * up
-        output = activated @ down_weight.t()
-        if sequence_parallel:
-            output = _native_reduce_scatter(output, tp_group)
-        elif tp_group is not None:
-            output = _native_all_reduce(output, tp_group)
-        ctx.save_for_backward(
-            hidden_2d,
-            gate,
-            up,
-            activated,
-            gate_weight,
-            up_weight,
-            down_weight,
-        )
-        ctx.input_shape = input_shape
-        ctx.tp_group = tp_group
-        ctx.cp_group = cp_group
-        ctx.sequence_parallel = sequence_parallel
-        return output.reshape(*input_shape[:-1], output.size(-1))
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[Any, ...]:
-        (
-            hidden,
-            gate,
-            up,
-            activated,
-            gate_weight,
-            up_weight,
-            down_weight,
-        ) = ctx.saved_tensors
-        grad_output = grad_output.reshape(-1, grad_output.size(-1)).contiguous()
-        if ctx.sequence_parallel:
-            grad_output = _native_all_gather(grad_output, ctx.tp_group)
-
-        if ctx.cp_group is not None:
-            activated_full = _native_all_gather(activated, ctx.cp_group)
-            grad_output_full = _native_all_gather(grad_output, ctx.cp_group)
-            grad_down_weight = grad_output_full.t() @ activated_full
-        else:
-            grad_down_weight = grad_output.t() @ activated
-
-        grad_activated = grad_output @ down_weight
-        sigmoid = torch.sigmoid(gate)
-        grad_gate = grad_activated * up * sigmoid * (1.0 + gate * (1.0 - sigmoid))
-        grad_up = grad_activated * F.silu(gate)
-        if ctx.cp_group is not None:
-            hidden_full = _native_all_gather(hidden, ctx.cp_group)
-            grad_gate_full = _native_all_gather(grad_gate, ctx.cp_group)
-            grad_up_full = _native_all_gather(grad_up, ctx.cp_group)
-            grad_gate_weight = grad_gate_full.t() @ hidden_full
-            grad_up_weight = grad_up_full.t() @ hidden_full
-        else:
-            grad_gate_weight = grad_gate.t() @ hidden
-            grad_up_weight = grad_up.t() @ hidden
-
-        grad_hidden_gate = grad_gate @ gate_weight
-        if ctx.sequence_parallel:
-            grad_hidden_gate = _native_reduce_scatter(
-                grad_hidden_gate, ctx.tp_group
-            )
-        elif ctx.tp_group is not None:
-            grad_hidden_gate = _native_all_reduce(grad_hidden_gate, ctx.tp_group)
-        grad_hidden_up = grad_up @ up_weight
-        if ctx.sequence_parallel:
-            grad_hidden_up = _native_reduce_scatter(grad_hidden_up, ctx.tp_group)
-        elif ctx.tp_group is not None:
-            grad_hidden_up = _native_all_reduce(grad_hidden_up, ctx.tp_group)
-        grad_hidden = grad_hidden_gate.add_(grad_hidden_up)
-        return (
-            grad_hidden.reshape(ctx.input_shape),
-            grad_gate_weight,
-            grad_up_weight,
-            grad_down_weight,
-            None,
-            None,
-            None,
-        )
-
-
-def _native_distributed_ffn(
-    hidden: torch.Tensor,
-    gate_weight: torch.Tensor,
-    up_weight: torch.Tensor,
-    down_weight: torch.Tensor,
-    *,
-    tp_group: Any,
-    cp_group: Any,
-    sequence_parallel: bool,
-) -> torch.Tensor:
-    return _NativeDistributedFFNFunction.apply(
-        hidden,
-        gate_weight,
-        up_weight,
-        down_weight,
-        tp_group,
-        cp_group,
-        sequence_parallel,
-    )
 
 
 def _mesh_groups(
@@ -631,112 +384,6 @@ def _slowest_rank_summary(
     return _summary_ms(slowest)
 
 
-def _collective_benchmarks(
-    rank: int,
-    world_size: int,
-    *,
-    warmup: int,
-    samples: int,
-) -> list[dict[str, Any]]:
-    device = torch.device("cuda", rank)
-    results = []
-    element_size = torch.tensor([], dtype=torch.bfloat16).element_size()
-    for message_bytes in (64 * 1024, _MIB, 16 * _MIB):
-        elements = message_bytes // element_size
-        input_tensor = torch.zeros(elements, dtype=torch.bfloat16, device=device)
-        deterministic = RCCLDeterministicCollective(
-            group=dist.group.WORLD,
-            device=device,
-            max_size_bytes=message_bytes,
-        )
-        det_outputs = {
-            "all_reduce": torch.empty_like(input_tensor),
-            "all_gather": torch.empty(
-                elements * world_size, dtype=input_tensor.dtype, device=device
-            ),
-            "reduce_scatter": torch.empty(
-                elements // world_size, dtype=input_tensor.dtype, device=device
-            ),
-        }
-        native_outputs = {
-            "all_gather": torch.empty_like(det_outputs["all_gather"]),
-            "reduce_scatter": torch.empty_like(det_outputs["reduce_scatter"]),
-        }
-
-        def det_all_reduce():
-            return deterministic.all_reduce(input_tensor, out=det_outputs["all_reduce"])
-
-        def native_all_reduce():
-            output = input_tensor.clone()
-            dist.all_reduce(output)
-            return output
-
-        def det_all_gather():
-            return deterministic.all_gather(input_tensor, out=det_outputs["all_gather"])
-
-        def native_all_gather():
-            dist.all_gather_into_tensor(native_outputs["all_gather"], input_tensor)
-            return native_outputs["all_gather"]
-
-        def det_reduce_scatter():
-            return deterministic.reduce_scatter(
-                input_tensor, out=det_outputs["reduce_scatter"]
-            )
-
-        def native_reduce_scatter():
-            dist.reduce_scatter_tensor(native_outputs["reduce_scatter"], input_tensor)
-            return native_outputs["reduce_scatter"]
-
-        operations = (
-            ("all_reduce", native_all_reduce, det_all_reduce),
-            ("all_gather", native_all_gather, det_all_gather),
-            ("reduce_scatter", native_reduce_scatter, det_reduce_scatter),
-        )
-        for operation, native_function, det_function in operations:
-            native_summary = _slowest_rank_summary(
-                _distributed_wall_samples(
-                    native_function,
-                    group=dist.group.WORLD,
-                    warmup=warmup,
-                    samples=samples,
-                ),
-                dist.group.WORLD,
-            )
-            det_summary = _slowest_rank_summary(
-                _distributed_wall_samples(
-                    det_function,
-                    group=dist.group.WORLD,
-                    warmup=warmup,
-                    samples=samples,
-                ),
-                dist.group.WORLD,
-            )
-            first = det_function().detach().clone()
-            second = det_function().detach().clone()
-            local_mismatch = _mismatches(first, second)
-            mismatch_counts: list[int | None] = [None] * world_size
-            dist.all_gather_object(mismatch_counts, local_mismatch)
-            if rank == 0:
-                results.append(
-                    {
-                        "operation": operation,
-                        "world_size": world_size,
-                        "message_bytes_per_rank": message_bytes,
-                        "dtype": "bfloat16",
-                        "native": native_summary,
-                        "deterministic": det_summary,
-                        "overhead_ratio": (
-                            det_summary["median_ms"] / native_summary["median_ms"]
-                        ),
-                        "mismatch_count": sum(
-                            value for value in mismatch_counts if value is not None
-                        ),
-                    }
-                )
-        deterministic.close()
-        del input_tensor, det_outputs, native_outputs
-        torch.cuda.empty_cache()
-    return results
 
 
 def _distributed_ffn_benchmark(
@@ -763,6 +410,53 @@ def _distributed_ffn_benchmark(
     grad_output_full = _randn(
         (token_count, hidden_size), seed=5004, device=device
     )
+
+    # Performance reference: upstream Qwen3MLP, unsharded TP=1, full M=32 input.
+    official = _official_qwen3_mlp(gate_full, up_full, down_full)
+
+    def official_forward() -> torch.Tensor:
+        return _official_inference(official, hidden_full)
+
+    official_forward_summary = _slowest_rank_summary(
+        _distributed_wall_samples(
+            official_forward,
+            group=dist.group.WORLD,
+            warmup=warmup,
+            samples=samples,
+        ),
+        dist.group.WORLD,
+    )
+    official_hidden = hidden_full.detach().clone().requires_grad_(True)
+
+    def official_training_step() -> torch.Tensor:
+        official.zero_grad(set_to_none=True)
+        official_hidden.grad = None
+        output = official(official_hidden)
+        output.backward(grad_output_full)
+        return output
+
+    official_train_summary = _slowest_rank_summary(
+        _distributed_wall_samples(
+            official_training_step,
+            group=dist.group.WORLD,
+            warmup=max(1, warmup // 2),
+            samples=training_samples,
+        ),
+        dist.group.WORLD,
+    )
+    del official, official_hidden
+    torch.cuda.empty_cache()
+
+    # Exactness reference: the same deterministic Triton implementation at TP=1.
+    full_values = (hidden_full, gate_full, up_full, down_full)
+    with torch.no_grad():
+        tp1_forward = qwen3_ffn(*full_values).detach().clone()
+    tp1_inputs = [value.detach().clone().requires_grad_(True) for value in full_values]
+    tp1_train = _training_step(qwen3_ffn, tp1_inputs, grad_output_full).detach().clone()
+    tp1_grads = [value.grad.detach().clone() for value in tp1_inputs]
+    del tp1_inputs
+    torch.cuda.empty_cache()
+
     meshes: dict[tuple[int, int], tuple[list[Any], list[Any]]] = {}
     results = []
 
@@ -791,14 +485,6 @@ def _distributed_ffn_benchmark(
         )
         local_grad_output = grad_output_full[token_start:token_end].contiguous()
 
-        def native_forward():
-            return _native_distributed_ffn(
-                *shard,
-                tp_group=tp_group,
-                cp_group=cp_group,
-                sequence_parallel=sequence_parallel,
-            )
-
         def triton_forward():
             return qwen3_ffn(
                 *shard,
@@ -808,18 +494,8 @@ def _distributed_ffn_benchmark(
             )
 
         with torch.no_grad():
-            native_output = native_forward()
             triton_output = triton_forward()
             triton_repeat = triton_forward()
-        native_forward_summary = _slowest_rank_summary(
-            _distributed_wall_samples(
-                native_forward,
-                group=dist.group.WORLD,
-                warmup=warmup,
-                samples=samples,
-            ),
-            dist.group.WORLD,
-        )
         triton_forward_summary = _slowest_rank_summary(
             _distributed_wall_samples(
                 triton_forward,
@@ -830,21 +506,8 @@ def _distributed_ffn_benchmark(
             dist.group.WORLD,
         )
 
-        native_inputs = [value.detach().clone().requires_grad_(True) for value in shard]
         triton_inputs = [value.detach().clone().requires_grad_(True) for value in shard]
         repeat_inputs = [value.detach().clone().requires_grad_(True) for value in shard]
-
-        def native_training_step():
-            for value in native_inputs:
-                value.grad = None
-            output = _native_distributed_ffn(
-                *native_inputs,
-                tp_group=tp_group,
-                cp_group=cp_group,
-                sequence_parallel=sequence_parallel,
-            )
-            output.backward(local_grad_output)
-            return output
 
         def triton_training_step(inputs):
             for value in inputs:
@@ -858,21 +521,10 @@ def _distributed_ffn_benchmark(
             output.backward(local_grad_output)
             return output
 
-        native_train = native_training_step().detach().clone()
-        native_grads = [value.grad.detach().clone() for value in native_inputs]
         triton_train = triton_training_step(triton_inputs).detach().clone()
         triton_grads = [value.grad.detach().clone() for value in triton_inputs]
         repeat_train = triton_training_step(repeat_inputs).detach().clone()
         repeat_grads = [value.grad.detach().clone() for value in repeat_inputs]
-        native_train_summary = _slowest_rank_summary(
-            _distributed_wall_samples(
-                native_training_step,
-                group=dist.group.WORLD,
-                warmup=max(1, warmup // 2),
-                samples=training_samples,
-            ),
-            dist.group.WORLD,
-        )
         triton_train_summary = _slowest_rank_summary(
             _distributed_wall_samples(
                 lambda: triton_training_step(triton_inputs),
@@ -883,25 +535,36 @@ def _distributed_ffn_benchmark(
             dist.group.WORLD,
         )
 
-        local_accuracy = {
-            "forward_mismatch_count": _mismatches(triton_output, triton_repeat),
+        expected_forward = tp1_forward[token_start:token_end]
+        expected_train = tp1_train[token_start:token_end]
+        expected_grads = (
+            tp1_grads[0][token_start:token_end],
+            tp1_grads[1][feature_start:feature_end],
+            tp1_grads[2][feature_start:feature_end],
+            tp1_grads[3][:, feature_start:feature_end],
+        )
+        local_exactness = {
+            "tp1_forward_output": _mismatches(triton_output, expected_forward),
+            "tp1_training_output": _mismatches(triton_train, expected_train),
+            "tp1_hidden_gradient": _mismatches(
+                triton_grads[0], expected_grads[0]
+            ),
+            "tp1_weight_gradient": sum(
+                _mismatches(actual, expected)
+                for actual, expected in zip(
+                    triton_grads[1:], expected_grads[1:], strict=True
+                )
+            ),
+            "repeat_forward": _mismatches(triton_output, triton_repeat),
             "train_infer_mismatch_count": _mismatches(triton_output, triton_train),
-            "training_mismatch_count": _mismatches(triton_train, repeat_train)
+            "repeat_training": _mismatches(triton_train, repeat_train)
             + sum(
                 _mismatches(actual, repeat)
                 for actual, repeat in zip(triton_grads, repeat_grads, strict=True)
             ),
-            "output_relative_l2": _relative_l2(triton_output, native_output),
-            "train_output_relative_l2": _relative_l2(triton_train, native_train),
-            "max_gradient_relative_l2": max(
-                _relative_l2(actual, expected)
-                for actual, expected in zip(
-                    triton_grads, native_grads, strict=True
-                )
-            ),
         }
         gathered: list[dict[str, Any] | None] = [None] * world_size
-        dist.all_gather_object(gathered, local_accuracy)
+        dist.all_gather_object(gathered, local_exactness)
         if rank == 0:
             valid = [value for value in gathered if value is not None]
             common = {
@@ -919,47 +582,54 @@ def _distributed_ffn_benchmark(
                     {
                         **common,
                         "direction": "forward",
-                        "native": native_forward_summary,
+                        "official_tp1": official_forward_summary,
                         "triton": triton_forward_summary,
-                        "overhead_ratio": (
+                        "latency_ratio_vs_official_tp1": (
                             triton_forward_summary["median_ms"]
-                            / native_forward_summary["median_ms"]
+                            / official_forward_summary["median_ms"]
                         ),
-                        "mismatch_count": sum(
-                            value["forward_mismatch_count"] for value in valid
+                        "tp1_mismatch": {
+                            "forward_output": sum(
+                                value["tp1_forward_output"] for value in valid
+                            ),
+                        },
+                        "repeat_mismatch_count": sum(
+                            value["repeat_forward"] for value in valid
                         ),
                         "train_infer_mismatch_count": sum(
                             value["train_infer_mismatch_count"] for value in valid
-                        ),
-                        "output_relative_l2": max(
-                            value["output_relative_l2"] for value in valid
                         ),
                     },
                     {
                         **common,
                         "direction": "train_fwd_bwd",
-                        "native": native_train_summary,
+                        "official_tp1": official_train_summary,
                         "triton": triton_train_summary,
-                        "overhead_ratio": (
+                        "latency_ratio_vs_official_tp1": (
                             triton_train_summary["median_ms"]
-                            / native_train_summary["median_ms"]
+                            / official_train_summary["median_ms"]
                         ),
-                        "mismatch_count": sum(
-                            value["training_mismatch_count"] for value in valid
+                        "tp1_mismatch": {
+                            "training_output": sum(
+                                value["tp1_training_output"] for value in valid
+                            ),
+                            "hidden_gradient": sum(
+                                value["tp1_hidden_gradient"] for value in valid
+                            ),
+                            "weight_gradient": sum(
+                                value["tp1_weight_gradient"] for value in valid
+                            ),
+                        },
+                        "repeat_mismatch_count": sum(
+                            value["repeat_training"] for value in valid
                         ),
                         "train_infer_mismatch_count": sum(
                             value["train_infer_mismatch_count"] for value in valid
                         ),
-                        "output_relative_l2": max(
-                            value["train_output_relative_l2"] for value in valid
-                        ),
-                        "max_gradient_relative_l2": max(
-                            value["max_gradient_relative_l2"] for value in valid
-                        ),
                     },
                 )
             )
-        del shard, native_inputs, triton_inputs, repeat_inputs
+        del shard, triton_inputs, repeat_inputs
         torch.cuda.empty_cache()
         dist.barrier()
 
@@ -985,10 +655,8 @@ def _distributed_worker(
             init_method=init_method,
             rank=rank,
             world_size=world_size,
+            device_id=torch.device("cuda", rank),
             timeout=timedelta(minutes=15),
-        )
-        collectives = _collective_benchmarks(
-            rank, world_size, warmup=warmup, samples=samples
         )
         distributed_ffn = _distributed_ffn_benchmark(
             rank,
@@ -1003,7 +671,6 @@ def _distributed_worker(
                 {
                     "ok": True,
                     "world_size": world_size,
-                    "collectives": collectives,
                     "distributed_ffn": distributed_ffn,
                 }
             )
@@ -1087,70 +754,109 @@ def _run_distributed_world(
     return result
 
 
-def _ratio_range(rows: list[dict[str, Any]], digits: int = 1) -> str:
-    values = [row["overhead_ratio"] for row in rows]
-    return f"{min(values):.{digits}f}-{max(values):.{digits}f}x"
+
+
+def _topology_exactness_rows(
+    distributed_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for row in distributed_rows:
+        entry = merged.setdefault(
+            row["name"],
+            {
+                "name": row["name"],
+                "world_size": row["world_size"],
+                "tp_size": row["tp_size"],
+                "cp_size": row["cp_size"],
+                "sequence_parallel": row["sequence_parallel"],
+                "forward_output": 0,
+                "training_output": 0,
+                "hidden_gradient": 0,
+                "weight_gradient": 0,
+                "repeat": 0,
+                "train_infer": 0,
+            },
+        )
+        for key, value in row["tp1_mismatch"].items():
+            entry[key] += value
+        entry["repeat"] += row["repeat_mismatch_count"]
+        entry["train_infer"] += row["train_infer_mismatch_count"]
+    return list(merged.values())
 
 
 def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
-    gemm_rows = payload["single_gpu"]["gemm"]
-    swiglu_rows = payload["single_gpu"]["swiglu"]
-    ffn_rows = payload["single_gpu"]["ffn"]
-    collective_rows = payload["collectives"]
-    distributed_rows = payload["distributed_ffn"]
-    forward_rows = [row for row in distributed_rows if row["direction"] == "forward"]
-    training_rows = [
-        row for row in distributed_rows if row["direction"] == "train_fwd_bwd"
-    ]
-    all_rows = gemm_rows + swiglu_rows + ffn_rows + collective_rows + distributed_rows
-    total_mismatches = sum(row.get("mismatch_count", 0) for row in all_rows)
-    total_train_infer_mismatches = sum(
-        row.get("train_infer_mismatch_count", 0) for row in all_rows
-    )
-    one_mib_collective_ms = [
-        row["deterministic"]["median_ms"]
-        for row in collective_rows
-        if row["message_bytes_per_rank"] == _MIB
-    ]
-    triton_forward_ms = [row["triton"]["median_ms"] for row in forward_rows]
-    triton_training_ms = [row["triton"]["median_ms"] for row in training_rows]
+    environment = payload["environment"]
     methodology = payload["methodology"]
+    single_speed = payload["single_gpu"]["speed"]
+    dtype_rows = payload["single_gpu"]["dtype_accuracy"]
+    distributed_speed = payload["distributed_ffn"]
+    exactness_rows = _topology_exactness_rows(distributed_speed)
+    single_ratios = [
+        row["latency_ratio_vs_official_tp1"] for row in single_speed
+    ]
+    distributed_ratios = [
+        row["latency_ratio_vs_official_tp1"] for row in distributed_speed
+    ]
+    total_tp1_mismatch = sum(
+        row[key]
+        for row in exactness_rows
+        for key in (
+            "forward_output",
+            "training_output",
+            "hidden_gradient",
+            "weight_gradient",
+        )
+    )
+    total_repeat_mismatch = sum(row["repeat"] for row in exactness_rows)
+    total_train_infer_mismatch = sum(row["train_infer"] for row in exactness_rows)
+    dtype_row = dtype_rows[0]
 
     lines = [
-        "# PR #325 ROCm-native Triton distributed FFN correctness and performance",
+        "# PR #325 ROCm deterministic Triton FFN report",
         "",
-        "> Operator-only benchmark. No model checkpoint or serving engine was used.",
+        "This is an operator-only MI300X report. It does not load or benchmark a "
+        "model checkpoint.",
+        "",
+        "## Comparison contract",
+        "",
+        "1. **Determinism:** every Triton TP/CP/SP result is compared bitwise with "
+        "the same deterministic Triton FFN at **TP=1**. The reported metric is "
+        "element mismatch count; acceptance requires 0.",
+        "2. **FP16/FP32:** one separate, simple output comparison runs official "
+        "Hugging Face `Qwen3MLP` at TP=1 in FP16 and FP32. FP32 is the reference.",
+        "3. **Speed:** official Hugging Face `Qwen3MLP` at TP=1 is the only speed "
+        "baseline. Speed tables and figures intentionally contain no numerical "
+        "accuracy comparison between official FFN and Triton.",
         "",
         "## Environment",
         "",
-        "| Item | Value |",
+        "| Field | Value |",
         "|---|---|",
     ]
-    for key, value in payload["environment"].items():
+    for key, value in environment.items():
         lines.append(f"| {key} | {value} |")
     lines.extend(
         (
             "",
             "## Methodology",
             "",
-            "- BF16 inputs; production FFN dimensions H=4096 and I=12288.",
-            "- Native compute is PyTorch `torch.matmul`/elementwise ROCm dispatch; "
-            "the deterministic compute path is written directly in Triton.",
-            "- Native communication is ProcessGroupNCCL (RCCL on ROCm); the "
-            "deterministic transport is a fixed rank-order RCCL all-gather followed "
-            "by a balanced BF16 reduction tree.",
-            "- Native and Triton distributed FFNs use identical weights, TP/CP/SP "
-            "sharding, and collective placement.",
-            "- Exactness is accepted separately from native numerical proximity: "
-            "the topology suite compares Triton TP/CP/SP outputs and all gradients "
-            "bitwise against Triton TP=1.",
+            "- Operator shape: H=4096, I=12288; BF16 is used for all speed and "
+            "determinism measurements.",
+            "- Single-GPU shapes use M=1/8/32. Distributed cases use the same full "
+            "logical M=32 input for TP2/4/8, TP+CP, and sequence parallelism.",
+            "- The official performance baseline is upstream Transformers "
+            "`Qwen3MLP` with unsharded weights and input (TP=1). Each distributed "
+            "rank runs that TP=1 reference and the slowest rank/sample is reported.",
+            "- The distributed exactness baseline is the PR's deterministic Triton "
+            "FFN at TP=1. Local outputs, dHidden, and sharded dWeights are compared "
+            "against their exact TP=1 slices.",
             f"- Single-GPU timing: {methodology['single_gpu_timing']}; distributed "
             f"timing: {methodology['distributed_timing']}.",
             f"- {methodology['warmup']} warmups, {methodology['samples']} measured "
-            f"forward/collective samples, and {methodology['training_samples']} "
+            f"forward samples, and {methodology['training_samples']} measured "
             "forward+backward samples.",
-            "- `NCCL_IB_DISABLE=1` forces the same intra-node XGMI transport. Raw "
-            "median, p95, min, and max values are in `results.json`.",
+            "- `NCCL_IB_DISABLE=1` keeps the distributed run on intra-node XGMI. "
+            "Median, p95, min, and max values are available in `results.json`.",
             "",
             "Reproduce from the repository root:",
             "",
@@ -1162,177 +868,122 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
             "  --output-dir benchmarks/results/pr325_rocm_mi300x",
             "```",
             "",
-            "Reproduce topology exactness (including Qwen3-8B H=4096/I=12288 TP2):",
+            "## Results summary",
             "",
-            "```bash",
-            "NCCL_IB_DISABLE=1 pytest -q \\",
-            "  tests/distributed/test_qwen_ffn_topology.py",
-            "```",
+            f"- TP=1 exactness baseline: **{total_tp1_mismatch} mismatched "
+            "elements** across topology forward outputs, training outputs, "
+            "dHidden, and dWeights.",
+            f"- Repeat mismatch: **{total_repeat_mismatch}**; training/inference "
+            f"forward mismatch: **{total_train_infer_mismatch}**.",
+            f"- Single-GPU deterministic Triton latency is "
+            f"**{min(single_ratios):.2f}-{max(single_ratios):.2f}x** the official "
+            "Qwen3MLP TP=1 latency across M=1/8/32 and forward/training.",
+            f"- Distributed deterministic Triton latency is "
+            f"**{min(distributed_ratios):.2f}-{max(distributed_ratios):.2f}x** the "
+            "official Qwen3MLP TP=1 latency across tested parallel layouts.",
+            f"- The separate official-Qwen3MLP FP16 versus FP32 observation has "
+            f"relative-L2 error **{dtype_row['relative_l2']:.3e}** for "
+            "(M,H,I)=(8,4096,12288).",
             "",
-            "## Key findings",
+            "## Single-GPU FFN speed",
             "",
-            f"- Deterministic Triton GEMM costs {_ratio_range(gemm_rows)} native "
-            "ROCm latency over the tested `(M,K,N)` shapes.",
-            f"- Triton SwiGLU costs {_ratio_range(swiglu_rows, 2)} native PyTorch "
-            f"latency; the complete single-GPU FFN costs {_ratio_range(ffn_rows)}.",
-            f"- Deterministic collectives cost {_ratio_range(collective_rows)} native "
-            "RCCL latency across 2/4/8 ranks and 64 KiB/1 MiB/16 MiB per rank.",
-            f"- Distributed Triton FFN costs {_ratio_range(forward_rows)} native for "
-            f"forward and {_ratio_range(training_rows)} for forward+backward across "
-            "TP2/4/8, CP2, and sequence-parallel configurations.",
-            f"- Deterministic repeats produced {total_mismatches} mismatched elements; "
-            f"training and inference produced {total_train_infer_mismatches} "
-            "mismatched elements.",
-            "- TP2/TP4/TP8, TP+CP, and sequence-parallel topology tests produced "
-            "0 output/gradient mismatches versus TP=1; a production-dimension "
-            "Qwen3-8B TP2 smoke test also produced 0 mismatches.",
-            "- Numerical drift means Triton versus native ROCm/RCCL on identical "
-            "BF16 inputs. GEMM-to-FP32 error is separately labelled and uses "
-            "`A.float() @ B.float()` as its reference.",
+            "Performance only; no official-versus-Triton accuracy metric is "
+            "reported here.",
             "",
-            "## Accuracy references",
-            "",
-            "- `Repeat mismatch`: Triton run 1 versus Triton run 2.",
-            "- `Train/infer mismatch`: Triton training forward versus Triton "
-            "inference forward.",
-            "- `Topology mismatch`: distributed Triton TP/CP/SP versus Triton TP=1.",
-            "- `vs FP32`: BF16 GEMM output versus `A.float() @ B.float()`.",
-            "- `Triton/native rel-L2`: Triton output or gradient versus the native "
-            "ROCm/RCCL path with identical BF16 tensors and parallel layout.",
+            "| Shape / direction | Official Qwen3MLP TP=1 (ms) | Deterministic "
+            "Triton (ms) | Triton / official TP=1 |",
+            "|---|---:|---:|---:|",
         )
     )
-
-    lines.extend(
-        (
-            "",
-            "## Single-GPU GEMM",
-            "",
-            "| Shape | Native ROCm (ms) | Triton (ms) | Triton/native | Repeat "
-            "mismatch | Triton rel-L2 vs FP32 | Native rel-L2 vs FP32 |",
-            "|---|---:|---:|---:|---:|---:|---:|",
-        )
-    )
-    for row in gemm_rows:
+    for row in single_speed:
         lines.append(
-            f"| {row['name']} | {row['native']['median_ms']:.4f} | "
-            f"{row['triton']['median_ms']:.4f} | {row['overhead_ratio']:.1f}x | "
-            f"{row['mismatch_count']} | "
-            f"{row['triton_vs_fp32']['relative_l2']:.3e} | "
-            f"{row['native_vs_fp32']['relative_l2']:.3e} |"
+            f"| {row['name']} | {row['official_tp1']['median_ms']:.4f} | "
+            f"{row['triton']['median_ms']:.4f} | "
+            f"{row['latency_ratio_vs_official_tp1']:.2f}x |"
         )
 
     lines.extend(
         (
             "",
-            "## Single-GPU SwiGLU",
+            "## Distributed FFN speed",
             "",
-            "| Case | Native PyTorch (ms) | Triton (ms) | Triton/native | Repeat "
-            "mismatch | Triton/native ROCm rel-L2 |",
-            "|---|---:|---:|---:|---:|---:|",
+            "The baseline remains the full logical M=32 official FFN at TP=1 for "
+            "every row. Performance only; no numerical accuracy is mixed into "
+            "this comparison.",
+            "",
+            "| Parallel layout | Direction | Official Qwen3MLP TP=1 (ms) | "
+            "Deterministic distributed Triton (ms) | Triton / official TP=1 |",
+            "|---|---|---:|---:|---:|",
         )
     )
-    for row in swiglu_rows:
-        lines.append(
-            f"| {row['name']} | {row['native']['median_ms']:.4f} | "
-            f"{row['triton']['median_ms']:.4f} | {row['overhead_ratio']:.2f}x | "
-            f"{row['mismatch_count']} | {row['triton_vs_native_relative_l2']:.3e} |"
-        )
-
-    lines.extend(
-        (
-            "",
-            "## Single-GPU FFN",
-            "",
-            "| Case | Native ROCm (ms) | Triton (ms) | Triton/native | Repeat "
-            "mismatch | Train/infer mismatch | Triton/native output rel-L2 | "
-            "Triton/native max grad rel-L2 |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|",
-        )
-    )
-    for row in ffn_rows:
-        lines.append(
-            f"| {row['name']} | {row['native']['median_ms']:.4f} | "
-            f"{row['triton']['median_ms']:.4f} | {row['overhead_ratio']:.1f}x | "
-            f"{row['mismatch_count']} | {row['train_infer_mismatch_count']} | "
-            f"{row['triton_vs_native']['relative_l2']:.3e} | "
-            f"{row.get('max_gradient_relative_l2', float('nan')):.3e} |"
-        )
-
-    lines.extend(
-        (
-            "",
-            "## RCCL collectives",
-            "",
-            "| Operation | Ranks | Input/rank | Native RCCL (ms) | Deterministic "
-            "(ms) | Overhead | Repeat mismatch |",
-            "|---|---:|---:|---:|---:|---:|---:|",
-        )
-    )
-    for row in collective_rows:
-        lines.append(
-            f"| {row['operation']} | {row['world_size']} | "
-            f"{row['message_bytes_per_rank'] / _MIB:.4g} MiB | "
-            f"{row['native']['median_ms']:.4f} | "
-            f"{row['deterministic']['median_ms']:.4f} | "
-            f"{row['overhead_ratio']:.1f}x | {row['mismatch_count']} |"
-        )
-
-    lines.extend(
-        (
-            "",
-            "## Distributed FFN",
-            "",
-            "| Topology | Direction | Native ROCm/RCCL (ms) | Triton/deterministic "
-            "RCCL (ms) | Overhead | Repeat mismatch | Train/infer mismatch | "
-            "Triton/native output rel-L2 | Triton/native max grad rel-L2 |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|",
-        )
-    )
-    for row in distributed_rows:
+    for row in distributed_speed:
         lines.append(
             f"| {row['name']} | {row['direction']} | "
-            f"{row['native']['median_ms']:.4f} | "
-            f"{row['triton']['median_ms']:.4f} | {row['overhead_ratio']:.1f}x | "
-            f"{row['mismatch_count']} | {row['train_infer_mismatch_count']} | "
-            f"{row['output_relative_l2']:.3e} | "
-            f"{row.get('max_gradient_relative_l2', float('nan')):.3e} |"
+            f"{row['official_tp1']['median_ms']:.4f} | "
+            f"{row['triton']['median_ms']:.4f} | "
+            f"{row['latency_ratio_vs_official_tp1']:.2f}x |"
         )
 
     lines.extend(
         (
             "",
-            "## Communication overlap feasibility",
+            "## Topology exactness versus Triton TP=1",
             "",
-            "The measured implementation deliberately serializes dependencies; the "
-            "numbers above do not claim overlap. A representative 1 MiB "
-            f"deterministic collective costs {min(one_mib_collective_ms):.4f}-"
-            f"{max(one_mib_collective_ms):.4f} ms, while distributed Triton FFN "
-            f"forward costs {min(triton_forward_ms):.4f}-"
-            f"{max(triton_forward_ms):.4f} ms and forward+backward costs "
-            f"{min(triton_training_ms):.4f}-{max(triton_training_ms):.4f} ms.",
+            "All columns are element mismatch counts. This table does not compare "
+            "against the official FFN.",
             "",
-            "- Forward SP all-gather feeds both gate/up GEMMs, and the final TP "
-            "all-reduce or reduce-scatter consumes the down projection. These are "
-            "hard data dependencies.",
-            "- Backward can overlap the fixed-order TP reduction of the gate "
-            "contribution to dHidden with computation of the independent up "
-            "contribution. The final wait and gate-then-up add order must remain "
-            "unchanged to preserve 0 mismatch.",
-            "- CP gathers are prerequisites for weight-gradient GEMMs. Packing them "
-            "in a fixed layout can amortize launch/signature overhead, but they "
-            "cannot be hidden behind the GEMMs that consume them.",
-            "- Coalescing and host-side validation caching should be measured before "
-            "introducing multi-stream scheduling complexity.",
+            "| Parallel layout | Forward output | Training output | dHidden | "
+            "dWeights | Repeat | Train/infer |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        )
+    )
+    for row in exactness_rows:
+        lines.append(
+            f"| {row['name']} | {row['forward_output']} | "
+            f"{row['training_output']} | {row['hidden_gradient']} | "
+            f"{row['weight_gradient']} | {row['repeat']} | "
+            f"{row['train_infer']} |"
+        )
+
+    lines.extend(
+        (
+            "",
+            "## Simple FP16 versus FP32 observation",
+            "",
+            "This is an official `Qwen3MLP` TP=1 output comparison only; it is not "
+            "used to judge deterministic Triton and is not included in speed "
+            "ratios.",
+            "",
+            "| Shape | Candidate | Reference | Max abs | Mean abs | Relative L2 |",
+            "|---|---|---|---:|---:|---:|",
+            f"| (M,H,I)=({dtype_row['tokens']},{dtype_row['hidden']},"
+            f"{dtype_row['intermediate']}) | FP16 | FP32 | "
+            f"{dtype_row['max_abs']:.3e} | {dtype_row['mean_abs']:.3e} | "
+            f"{dtype_row['relative_l2']:.3e} |",
+            "",
+            "## Deterministic communication overlap",
+            "",
+            "The current timing includes the fixed-order communication schedule "
+            "and makes no overlap claim. Forward SP all-gather must finish before "
+            "gate/up projection, and TP reduction consumes the down-projection "
+            "output, so those edges are hard dependencies.",
+            "",
+            "In backward, the gate and up contributions to dHidden are independent "
+            "until their final ordered addition. A future implementation can place "
+            "the fixed-rank reduction of one contribution on a second stream while "
+            "computing the other, but it must preserve rank order, reduction tree, "
+            "wait points, and gate-then-up addition order. Any optimization is "
+            "accepted only if every TP=1 mismatch column remains zero.",
             "",
             "## Figures",
             "",
-            "![Single-GPU overhead](single_gpu_overhead.png)",
+            "![Single-GPU official TP=1 versus Triton speed](single_gpu_overhead.png)",
             "",
-            "![RCCL collective overhead](collective_overhead.png)",
+            "![Topology mismatch versus Triton TP=1](collective_overhead.png)",
             "",
-            "![Distributed FFN overhead](distributed_ffn_overhead.png)",
+            "![Distributed official TP=1 versus Triton speed](distributed_ffn_overhead.png)",
             "",
-            "![Accuracy trade-off](accuracy_tradeoff.png)",
+            "![Official Qwen3MLP FP16 versus FP32](accuracy_tradeoff.png)",
             "",
         )
     )
@@ -1346,198 +997,186 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import numpy as np
 
     plt.style.use("seaborn-v0_8-whitegrid")
     plt.rcParams.update(
         {
-            "font.size": 16,
-            "axes.titlesize": 24,
-            "axes.labelsize": 20,
-            "xtick.labelsize": 13,
+            "font.size": 18,
+            "axes.titlesize": 25,
+            "axes.labelsize": 21,
+            "xtick.labelsize": 15,
             "ytick.labelsize": 16,
-            "legend.fontsize": 16,
+            "legend.fontsize": 17,
         }
     )
 
-    gemm_rows = payload["single_gpu"]["gemm"]
-    swiglu_rows = payload["single_gpu"]["swiglu"]
-    ffn_rows = payload["single_gpu"]["ffn"]
-    single_rows = gemm_rows + swiglu_rows + ffn_rows
-    single_labels = (
-        [f"GEMM\n({row['m']},{row['k']},{row['n']})" for row in gemm_rows]
-        + [
-            f"SwiGLU {row['direction']}\n(M,I)=({row['tokens']},12288)"
-            for row in swiglu_rows
-        ]
-        + [
-            f"FFN {'FWD' if row['direction'] == 'forward' else 'FWD+BWD'}"
-            f"\n(M,H,I)=({row['tokens']},4096,12288)"
-            for row in ffn_rows
-        ]
+    single_rows = payload["single_gpu"]["speed"]
+    single_labels = [
+        f"M={row['tokens']}\n"
+        f"{'FWD' if row['direction'] == 'forward' else 'FWD+BWD'}"
+        for row in single_rows
+    ]
+    positions = np.arange(len(single_rows))
+    width = 0.37
+    figure, axis = plt.subplots(figsize=(17, 10))
+    official_values = [row["official_tp1"]["median_ms"] for row in single_rows]
+    triton_values = [row["triton"]["median_ms"] for row in single_rows]
+    official_bars = axis.bar(
+        positions - width / 2,
+        official_values,
+        width,
+        label="Official Qwen3MLP TP=1",
+        color="#2563eb",
     )
-    single_ratios = [row["overhead_ratio"] for row in single_rows]
-    figure, axis = plt.subplots(figsize=(26, 10))
-    positions = list(range(len(single_rows)))
-    bars = axis.bar(
-        positions,
-        single_ratios,
-        color="#8b5cf6",
-        label="Deterministic Triton",
+    triton_bars = axis.bar(
+        positions + width / 2,
+        triton_values,
+        width,
+        label="Deterministic Triton FFN",
+        color="#7c3aed",
     )
-    axis.bar_label(
-        bars,
-        labels=[f"{value:.1f}×" for value in single_ratios],
-        padding=4,
-        fontsize=13,
-        rotation=90,
-    )
-    axis.axhline(1.0, color="black", linewidth=2, label="Native ROCm = 1.0×")
+    for bars, values in ((official_bars, official_values), (triton_bars, triton_values)):
+        axis.bar_label(
+            bars,
+            labels=[f"{value:.2f}" for value in values],
+            padding=4,
+            fontsize=13,
+            rotation=90,
+        )
     axis.set_yscale("log")
-    axis.set_ylim(0.5, max(single_ratios) * 1.8)
-    axis.set_xlabel("Operator and tensor shape")
-    axis.set_ylabel("Median latency ratio (×, log scale)\nTriton / native ROCm")
-    axis.set_title("MI300X single-GPU operator latency by shape")
-    axis.set_xticks(positions, single_labels, rotation=55, ha="right")
+    axis.set_xlabel("Token count M and measured direction\nH=4096, I=12288, BF16")
+    axis.set_ylabel("Median latency (ms, log scale)")
+    axis.set_title("MI300X single-GPU FFN speed: official TP=1 vs Triton")
+    axis.set_xticks(positions, single_labels)
     axis.legend(loc="upper left")
     figure.tight_layout()
     figure.savefig(output_directory / "single_gpu_overhead.png", dpi=180)
     plt.close(figure)
 
-    figure, axes = plt.subplots(1, 3, figsize=(24, 8), sharey=True)
-    for axis, operation in zip(
-        axes, ("all_reduce", "all_gather", "reduce_scatter"), strict=True
-    ):
-        for world_size in (2, 4, 8):
-            rows = [
-                row
-                for row in payload["collectives"]
-                if row["operation"] == operation and row["world_size"] == world_size
-            ]
-            x_values = [row["message_bytes_per_rank"] / _MIB for row in rows]
-            y_values = [row["overhead_ratio"] for row in rows]
-            axis.plot(
-                x_values,
-                y_values,
-                marker="o",
-                linewidth=3,
-                markersize=9,
-                label=f"{world_size} ranks",
-            )
-            for x_value, y_value in zip(x_values, y_values, strict=True):
-                y_offset = -17 if world_size == 2 else 9
-                axis.annotate(
-                    f"{y_value:.1f}×",
-                    (x_value, y_value),
-                    xytext=(0, y_offset),
-                    textcoords="offset points",
-                    ha="center",
-                    va="top" if y_offset < 0 else "bottom",
-                    fontsize=12,
-                )
-        axis.axhline(1.0, color="black", linewidth=2)
-        axis.set_xscale("log", base=2)
-        axis.set_yscale("log")
-        axis.set_xticks((0.0625, 1, 16), labels=("0.0625", "1", "16"))
-        axis.set_title(operation.replace("_", " ").title())
-        axis.set_xlabel("BF16 input per rank (MiB)")
-    axes[0].set_ylabel(
-        "Median latency ratio (×, log scale)\nDeterministic / native RCCL"
+    exactness_rows = _topology_exactness_rows(payload["distributed_ffn"])
+    mismatch_keys = (
+        "forward_output",
+        "training_output",
+        "hidden_gradient",
+        "weight_gradient",
     )
-    axes[-1].legend(title="World size", loc="lower left")
-    figure.suptitle("MI300X collective latency by message size and rank count", y=0.98)
-    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+    mismatch_labels = (
+        "Forward\noutput",
+        "Training\noutput",
+        "dHidden",
+        "dWeights",
+    )
+    matrix = np.asarray(
+        [[row[key] for key in mismatch_keys] for row in exactness_rows],
+        dtype=float,
+    )
+    figure, axis = plt.subplots(figsize=(16, 11))
+    image = axis.imshow(matrix, cmap="RdYlGn_r", vmin=0, vmax=max(1.0, matrix.max()))
+    for y_position in range(matrix.shape[0]):
+        for x_position in range(matrix.shape[1]):
+            axis.text(
+                x_position,
+                y_position,
+                str(int(matrix[y_position, x_position])),
+                ha="center",
+                va="center",
+                fontsize=18,
+                fontweight="bold",
+            )
+    axis.set_xticks(range(len(mismatch_labels)), mismatch_labels)
+    axis.set_yticks(
+        range(len(exactness_rows)),
+        [
+            f"TP={row['tp_size']}, CP={row['cp_size']}, "
+            f"SP={'on' if row['sequence_parallel'] else 'off'}"
+            for row in exactness_rows
+        ],
+    )
+    axis.set_xlabel("Compared tensor category")
+    axis.set_ylabel("Distributed parallel configuration")
+    axis.set_title("Topology mismatch vs Triton TP=1")
+    colorbar = figure.colorbar(image, ax=axis, fraction=0.03, pad=0.03)
+    colorbar.set_label("Mismatched elements")
+    figure.tight_layout()
     figure.savefig(output_directory / "collective_overhead.png", dpi=180)
     plt.close(figure)
 
     rows = payload["distributed_ffn"]
-    labels = [
-        f"TP={row['tp_size']}, CP={row['cp_size']}, "
-        f"SP={'on' if row['sequence_parallel'] else 'off'}\n"
-        f"{'FWD' if row['direction'] == 'forward' else 'FWD+BWD'}"
-        for row in rows
-    ]
-    ratios = [row["overhead_ratio"] for row in rows]
-    figure, axis = plt.subplots(figsize=(24, 9))
-    positions = list(range(len(rows)))
-    bars = axis.bar(
-        positions,
-        ratios,
-        color="#8b5cf6",
-        label="Triton + deterministic RCCL",
+    figure, axes = plt.subplots(1, 2, figsize=(24, 10), sharey=True)
+    for axis, direction, direction_label in (
+        (axes[0], "forward", "Forward"),
+        (axes[1], "train_fwd_bwd", "Forward + backward"),
+    ):
+        direction_rows = [row for row in rows if row["direction"] == direction]
+        positions = np.arange(len(direction_rows))
+        labels = [row["name"].upper().replace("_", "\n") for row in direction_rows]
+        official_values = [
+            row["official_tp1"]["median_ms"] for row in direction_rows
+        ]
+        triton_values = [row["triton"]["median_ms"] for row in direction_rows]
+        official_bars = axis.bar(
+            positions - width / 2,
+            official_values,
+            width,
+            label="Official Qwen3MLP TP=1",
+            color="#2563eb",
+        )
+        triton_bars = axis.bar(
+            positions + width / 2,
+            triton_values,
+            width,
+            label="Deterministic distributed Triton",
+            color="#7c3aed",
+        )
+        for bars, values in (
+            (official_bars, official_values),
+            (triton_bars, triton_values),
+        ):
+            axis.bar_label(
+                bars,
+                labels=[f"{value:.2f}" for value in values],
+                padding=4,
+                fontsize=12,
+                rotation=90,
+            )
+        axis.set_yscale("log")
+        axis.set_xlabel("Parallel configuration\nM=32, H=4096, I=12288, BF16")
+        axis.set_title(direction_label)
+        axis.set_xticks(positions, labels)
+    axes[0].set_ylabel("Median latency (ms, log scale)")
+    axes[0].legend(loc="upper left")
+    figure.suptitle(
+        "MI300X distributed FFN speed: official TP=1 vs Triton",
+        y=0.99,
     )
-    axis.bar_label(
-        bars,
-        labels=[f"{value:.1f}×" for value in ratios],
-        padding=5,
-        fontsize=13,
-    )
-    axis.axhline(
-        1.0,
-        color="black",
-        linewidth=2,
-        label="Native ROCm/RCCL = 1.0×",
-    )
-    axis.set_yscale("log")
-    axis.set_ylim(0.8, max(ratios) * 1.4)
-    axis.set_xlabel("Parallel configuration and measured direction")
-    axis.set_ylabel(
-        "Median latency ratio (×, log scale)\n"
-        "Triton + deterministic RCCL / native"
-    )
-    axis.set_title("MI300X distributed FFN latency by TP / CP / SP configuration")
-    axis.set_xticks(positions, labels, rotation=50, ha="right")
-    axis.legend(loc="upper right")
-    figure.tight_layout()
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     figure.savefig(output_directory / "distributed_ffn_overhead.png", dpi=180)
     plt.close(figure)
 
-    figure, axis = plt.subplots(figsize=(19, 9))
-    positions = list(range(len(gemm_rows)))
-    width = 0.4
-    native_errors = [
-        row["native_vs_fp32"]["relative_l2"] * 100.0 for row in gemm_rows
-    ]
-    triton_errors = [
-        row["triton_vs_fp32"]["relative_l2"] * 100.0 for row in gemm_rows
-    ]
-    native_bars = axis.bar(
-        [position - width / 2 for position in positions],
-        native_errors,
-        width,
-        label="Native ROCm BF16 vs FP32",
-        color="#3b82f6",
+    dtype_row = payload["single_gpu"]["dtype_accuracy"][0]
+    relative_l2_percent = dtype_row["relative_l2"] * 100.0
+    figure, axis = plt.subplots(figsize=(11, 9))
+    bars = axis.bar(
+        [0],
+        [relative_l2_percent],
+        width=0.48,
+        color="#0f766e",
+        label="Official Qwen3MLP TP=1",
     )
-    triton_bars = axis.bar(
-        [position + width / 2 for position in positions],
-        triton_errors,
-        width,
-        label="Deterministic Triton BF16 vs FP32",
-        color="#8b5cf6",
+    axis.bar_label(
+        bars,
+        labels=[f"{relative_l2_percent:.4f}%"],
+        padding=7,
+        fontsize=19,
+        fontweight="bold",
     )
-    for bars, values in (
-        (native_bars, native_errors),
-        (triton_bars, triton_errors),
-    ):
-        axis.bar_label(
-            bars,
-            labels=[f"{value:.3f}%" for value in values],
-            padding=4,
-            fontsize=12,
-            rotation=90,
-        )
-    axis.set_ylim(0.0, max(triton_errors) * 1.3)
-    axis.set_xlabel("GEMM shape (M, K, N)")
-    axis.set_ylabel(
-        "Relative L2 error (%)\nReference: FP32 A.float() @ B.float()"
-    )
-    axis.set_title("MI300X BF16 GEMM numerical error by shape and implementation")
-    axis.set_xticks(
-        positions,
-        [f"({row['m']}, {row['k']}, {row['n']})" for row in gemm_rows],
-        rotation=45,
-        ha="right",
-    )
-    axis.legend(loc="upper left")
+    axis.set_ylim(0.0, max(0.01, relative_l2_percent * 1.3))
+    axis.set_xticks([0], ["FP16 output"])
+    axis.set_xlabel("Candidate dtype\n(M,H,I)=(8,4096,12288)")
+    axis.set_ylabel("Relative L2 error (%)\nReference: official Qwen3MLP FP32")
+    axis.set_title("MI300X simple FP16 vs FP32 accuracy observation")
+    axis.legend(loc="upper right")
     figure.tight_layout()
     figure.savefig(output_directory / "accuracy_tradeoff.png", dpi=180)
     plt.close(figure)
@@ -1550,12 +1189,13 @@ def _environment() -> dict[str, Any]:
         "gpu_count": torch.cuda.device_count(),
         "architecture": properties.gcnArchName,
         "torch": torch.__version__,
+        "transformers": transformers_version,
         "hip": torch.version.hip,
         "python": os.sys.version.split()[0],
         "git_commit": os.popen("git rev-parse HEAD").read().strip(),
-        "native_gemm": "torch.matmul (ROCm rocBLAS/hipBLASLt dispatch)",
+        "speed_baseline": "Hugging Face Transformers Qwen3MLP, TP=1",
         "deterministic_compute": "ROCm-native Triton",
-        "native_collective": "ProcessGroupNCCL (RCCL on ROCm)",
+        "deterministic_transport": "fixed-order RCCL on ROCm",
         "NCCL_IB_DISABLE": os.environ.get("NCCL_IB_DISABLE", ""),
     }
 
@@ -1602,7 +1242,6 @@ def main() -> None:
             samples=args.samples,
             training_samples=args.training_samples,
         ),
-        "collectives": [],
         "distributed_ffn": [],
     }
     torch.cuda.empty_cache()
@@ -1613,7 +1252,6 @@ def main() -> None:
             samples=args.samples,
             training_samples=args.training_samples,
         )
-        payload["collectives"].extend(result["collectives"])
         payload["distributed_ffn"].extend(result["distributed_ffn"])
     (args.output_dir / "results.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
