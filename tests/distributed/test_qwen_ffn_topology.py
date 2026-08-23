@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Real multi-GPU topology checks for the deterministic Qwen3 FFN.
+"""Real multi-GPU topology checks for the ROCm-native Triton Qwen3 FFN.
 
-PyTorch exposes both NCCL on NVIDIA and RCCL on AMD through the ``nccl``
-process-group backend.  The FFN's platform factory then selects CUDA IPC or
-RCCL AllGather transport without any test-side backend branching.
+PyTorch exposes RCCL through the ``nccl`` process-group backend. The FFN uses
+ROCm-native Triton compute and a rank-ordered RCCL transport collective.
 """
 
 from __future__ import annotations
@@ -21,29 +20,11 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-import rl_engine.kernels.ops.pytorch.ffn.ffn as ffn_module
-from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
-from rl_engine.kernels.ops.pytorch.ffn.ffn import (
+import rl_engine.kernels.ops.triton.ffn.ffn as ffn_module
+from rl_engine.kernels.ops.triton.ffn import (
     QWEN3_8B_HIDDEN_SIZE,
     QWEN3_8B_INTERMEDIATE_SIZE,
     qwen3_ffn,
-)
-from rl_engine.kernels.ops.triton.ffn import qwen3_ffn_triton
-
-_REQUIRED_FFN_SYMBOLS = (
-    "det_gemm_fwd",
-    "det_gemm_db",
-    "swiglu_forward",
-    "swiglu_backward",
-)
-_REQUIRED_CUDA_COLLECTIVE_SYMBOLS = (
-    "deterministic_collective_ipc_meta",
-    "deterministic_collective_create",
-    "deterministic_collective_destroy",
-    "deterministic_collective_stage",
-    "deterministic_collective_all_reduce",
-    "deterministic_collective_reduce_scatter",
-    "deterministic_collective_all_gather",
 )
 _IS_ROCM = getattr(torch.version, "hip", None) is not None
 _EXTERNAL_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
@@ -72,19 +53,13 @@ pytestmark = pytest.mark.skipif(
 
 
 def _has_topology_devices(count: int) -> bool:
-    if not (
-        torch.cuda.is_available()
-        and _EXT_AVAILABLE
-        and _C is not None
+    return bool(
+        _IS_ROCM
+        and torch.cuda.is_available()
         and torch.distributed.is_available()
         and torch.distributed.is_nccl_available()
         and torch.cuda.device_count() >= count
-        and all(hasattr(_C, name) for name in _REQUIRED_FFN_SYMBOLS)
-    ):
-        return False
-    # ROCm deliberately excludes the CUDA IPC source and uses the public RCCL
-    # transport collective.  NVIDIA still requires all legacy IPC symbols.
-    return _IS_ROCM or all(hasattr(_C, name) for name in _REQUIRED_CUDA_COLLECTIVE_SYMBOLS)
+    )
 
 
 def _has_qwen3_8b_capacity(count: int) -> bool:
@@ -183,14 +158,6 @@ def _canonical(
     return inference, training, inputs
 
 
-def _ffn_implementation(name: str):
-    if name == "native":
-        return qwen3_ffn
-    if name == "triton":
-        return qwen3_ffn_triton
-    raise ValueError(f"unknown FFN implementation: {name}")
-
-
 def _mesh_groups(
     dist: Any,
     tp_size: int,
@@ -235,7 +202,6 @@ def _run_topology(
     inference_reference: torch.Tensor,
     training_reference: torch.Tensor,
     reference_inputs: list[torch.Tensor],
-    implementation: str = "native",
 ) -> None:
     mesh_key = (tp_size, cp_size)
     if mesh_key not in meshes:
@@ -261,16 +227,15 @@ def _run_topology(
         down[:, feature_start:feature_end].contiguous(),
     )
 
-    target_ffn = _ffn_implementation(implementation)
     with torch.no_grad():
-        inference = target_ffn(
+        inference = qwen3_ffn(
             *shard,
             tp_group=tp_group,
             cp_group=cp_group,
             sequence_parallel=sequence_parallel,
         )
     inputs = [value.detach().clone().requires_grad_(True) for value in shard]
-    training = target_ffn(
+    training = qwen3_ffn(
         *inputs,
         tp_group=tp_group,
         cp_group=cp_group,
@@ -307,7 +272,6 @@ def _topology_worker(
     init_method: str,
     result_queue: Any,
     configs: tuple[tuple[str, int, int, bool], ...],
-    implementation: str = "native",
 ) -> None:
     try:
         import torch.distributed as dist
@@ -353,7 +317,6 @@ def _topology_worker(
                 inference_reference=inference_reference,
                 training_reference=training_reference,
                 reference_inputs=reference_inputs,
-                implementation=implementation,
             )
         result_queue.put({"ok": True, "rank": rank})
     except Exception:  # pragma: no cover - forwarded to the parent process.
@@ -490,7 +453,7 @@ def _spawn_workers(
         assert process.exitcode == 0
 
 
-def test_qwen3_ffn_tp2_and_tp_sp_match_tp1_bitwise() -> None:
+def test_triton_qwen3_ffn_tp2_and_tp_sp_match_tp1_bitwise() -> None:
     _spawn_workers(
         _topology_worker,
         2,
@@ -499,7 +462,7 @@ def test_qwen3_ffn_tp2_and_tp_sp_match_tp1_bitwise() -> None:
     )
 
 
-def test_qwen3_ffn_tp4_tp_cp_and_tp_cp_sp_match_tp1_bitwise() -> None:
+def test_triton_qwen3_ffn_tp4_tp_cp_and_tp_cp_sp_match_tp1_bitwise() -> None:
     _spawn_workers(
         _topology_worker,
         4,
@@ -508,7 +471,7 @@ def test_qwen3_ffn_tp4_tp_cp_and_tp_cp_sp_match_tp1_bitwise() -> None:
     )
 
 
-def test_qwen3_ffn_tp8_matches_tp1_bitwise() -> None:
+def test_triton_qwen3_ffn_tp8_matches_tp1_bitwise() -> None:
     _spawn_workers(
         _topology_worker,
         8,
@@ -517,34 +480,7 @@ def test_qwen3_ffn_tp8_matches_tp1_bitwise() -> None:
     )
 
 
-def test_qwen3_ffn_triton_tp2_and_tp_sp_match_native_tp1_bitwise() -> None:
-    _spawn_workers(
-        _topology_worker,
-        2,
-        (_WORLD2_CONFIGS, "triton"),
-        timeout_seconds=240,
-    )
-
-
-def test_qwen3_ffn_triton_tp4_tp_cp_and_tp_cp_sp_match_native_tp1_bitwise() -> None:
-    _spawn_workers(
-        _topology_worker,
-        4,
-        (_WORLD4_CONFIGS, "triton"),
-        timeout_seconds=300,
-    )
-
-
-def test_qwen3_ffn_triton_tp8_matches_native_tp1_bitwise() -> None:
-    _spawn_workers(
-        _topology_worker,
-        8,
-        (_WORLD8_CONFIGS, "triton"),
-        timeout_seconds=420,
-    )
-
-
-def test_qwen3_8b_ffn_tp2_smoke_matches_tp1_bitwise() -> None:
+def test_triton_qwen3_8b_ffn_tp2_smoke_matches_tp1_bitwise() -> None:
     if os.environ.get("RL_KERNEL_SKIP_QWEN3_8B_TOPOLOGY") == "1":
         pytest.skip("Qwen3-8B topology smoke disabled by environment")
     if not _has_qwen3_8b_capacity(2):

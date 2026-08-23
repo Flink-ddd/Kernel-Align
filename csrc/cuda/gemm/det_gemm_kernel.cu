@@ -6,24 +6,15 @@
 //
 //   SM90 path : TMA load + mma.sync (m16n8k16), FP32 accum, single-CTA-per-tile,
 //               fixed K order, NO split-K -> batch-invariant.
-//   Fallback  : naive scalar kernel (also the correctness ground truth).
+//   Fallback  : naive FP32 scalar kernel (also the correctness ground truth).
 //
-// BF16-output entry points use BF16 inputs, FP32 leaf accumulation, BF16 tree
-// nodes and store, no TF32, and no split-K. K is reduced with a canonical
-// midpoint tree whose leaves cover at most 32 values. A contiguous half-K
-// GEMM is therefore one child of the same tree, so TP shards can be combined
-// with the matching balanced collective without changing the arithmetic
-// graph. det_gemm_fwd_fp32 retains its ascending FP32 accumulation and FP32
-// output contract.
+// Both: BF16 in / FP32 accum / no TF32 / no split-K.
 //   fwd: C = A @ B   |   dA = dC @ B^T   |   dB = A^T @ dC
 // Backward reuses the forward kernel on transposed operands.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
-
-#include <type_traits>
 
 #if defined(RL_KERNEL_ENABLE_SM90)
 #include "det_gemm_tma.cuh"
@@ -41,108 +32,15 @@ __device__ __forceinline__ nv_bf16 cast_output<nv_bf16>(float value) {
   return __float2bfloat16(value);
 }
 
+template <>
+__device__ __forceinline__ float cast_output<float>(float value) {
+  return value;
+}
+
 __host__ __device__ constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
 
-// Keep this equal to the SM90 BK below.  Each leaf accumulates in FP32 and is
-// rounded to BF16 before the fixed midpoint tree combines it with its sibling.
-constexpr int K_TREE_LEAF = 32;
-
-__device__ __forceinline__ nv_bf16 bf16_add(nv_bf16 lower, nv_bf16 upper) {
-  return __float2bfloat16(
-      __bfloat162float(lower) + __bfloat162float(upper));
-}
-
-// True iff [lo, hi) is a node in the recursive midpoint partition of [0, n).
-// The SM90 implementation consumes leaves in ascending order and uses this
-// predicate to close exactly the same nodes as the scalar implementation.
-__device__ __forceinline__ bool is_mid_split_node(int lo, int hi, int n) {
-  int begin = 0;
-  int end = n;
-  while (end - begin > 1) {
-    if (begin == lo && end == hi) {
-      return true;
-    }
-    const int midpoint = begin + (end - begin) / 2;
-    if (hi <= midpoint) {
-      end = midpoint;
-    } else if (lo >= midpoint) {
-      begin = midpoint;
-    } else {
-      return false;
-    }
-  }
-  return begin == lo && end == hi;
-}
-
-// Evaluate the midpoint tree without device recursion.  A depth of 32 covers
-// every positive 32-bit K and is accepted by both NVCC and HIPCC without
-// relocatable-device-code support.
-__device__ nv_bf16 k_tree_naive(
-    const nv_bf16* __restrict__ A,
-    const nv_bf16* __restrict__ B,
-    int row,
-    int col,
-    int N,
-    int K) {
-  constexpr int MAX_TREE_DEPTH = 32;
-  int range_lo[MAX_TREE_DEPTH];
-  int range_hi[MAX_TREE_DEPTH];
-  unsigned char state[MAX_TREE_DEPTH];
-  nv_bf16 left_value[MAX_TREE_DEPTH];
-
-  int depth = 0;
-  range_lo[0] = 0;
-  range_hi[0] = K;
-  state[0] = 0;
-  nv_bf16 value = __float2bfloat16(0.0f);
-  bool have_value = false;
-
-  while (true) {
-    if (!have_value) {
-      const int lo = range_lo[depth];
-      const int hi = range_hi[depth];
-      if (hi - lo <= K_TREE_LEAF) {
-        float acc = 0.0f;
-        for (int k = lo; k < hi; ++k) {
-          acc += __bfloat162float(A[row * K + k]) *
-                 __bfloat162float(B[k * N + col]);
-        }
-        value = __float2bfloat16(acc);
-        have_value = true;
-      } else {
-        const int midpoint = lo + (hi - lo) / 2;
-        state[depth] = 1;
-        ++depth;
-        range_lo[depth] = lo;
-        range_hi[depth] = midpoint;
-        state[depth] = 0;
-      }
-      continue;
-    }
-
-    if (depth == 0) {
-      return value;
-    }
-
-    --depth;
-    if (state[depth] == 1) {
-      left_value[depth] = value;
-      state[depth] = 2;
-      const int midpoint =
-          range_lo[depth] + (range_hi[depth] - range_lo[depth]) / 2;
-      ++depth;
-      range_lo[depth] = midpoint;
-      range_hi[depth] = range_hi[depth - 1];
-      state[depth] = 0;
-      have_value = false;
-    } else {
-      value = bf16_add(left_value[depth], value);
-    }
-  }
-}
-
 // Naive FP32 scalar kernel (fallback + ground truth). Batch-invariant by
-// construction: one thread = one output element, canonical midpoint K tree.
+// construction: one thread = one output element, fixed ascending K loop.
 constexpr int NAIVE_TILE = 16;
 
 template <typename output_t>
@@ -153,19 +51,10 @@ __global__ void det_gemm_naive(const nv_bf16* __restrict__ A,
   const int row = blockIdx.y * NAIVE_TILE + threadIdx.y;
   const int col = blockIdx.x * NAIVE_TILE + threadIdx.x;
   if (row >= M || col >= N) return;
-  if constexpr (std::is_same_v<output_t, float>) {
-    // Preserve det_gemm_fwd_fp32's existing FP32-output contract.  The FFN
-    // path uses BF16 outputs and therefore takes the midpoint tree below.
-    float acc = 0.0f;
-    for (int k = 0; k < K; ++k) {
-      acc += __bfloat162float(A[row * K + k]) *
-             __bfloat162float(B[k * N + col]);
-    }
-    C[row * N + col] = acc;
-  } else {
-    C[row * N + col] = cast_output<output_t>(
-        __bfloat162float(k_tree_naive(A, B, row, col, N, K)));
-  }
+  float acc = 0.0f;
+  for (int k = 0; k < K; ++k)
+    acc += __bfloat162float(A[row * K + k]) * __bfloat162float(B[k * N + col]);
+  C[row * N + col] = cast_output<output_t>(acc);
 }
 
 template <typename output_t>
@@ -183,8 +72,6 @@ void launch_naive(const nv_bf16* A, const nv_bf16* B, output_t* C,
 // passing B^T ([N,K] row-major) so the B smem tile is [BN,BK] (row=n,col=k),
 // matching the validated logp ldmatrix addressing.
 constexpr int BM = 128, BN = 64, BK = 32;
-static_assert(BK == K_TREE_LEAF,
-              "SM90 tile width must match the scalar K-tree leaf");
 constexpr int WARPS = 4;
 constexpr int WG_THREADS = WARPS * 32;  // 128
 constexpr int STAGES = 2;
@@ -195,7 +82,6 @@ constexpr int M_TILES = WARP_M / MMA_M;   // 1
 constexpr int N_TILES = BN / MMA_N;       // 8
 constexpr int K_TILES = BK / MMA_K;       // 2
 constexpr int KK_GROUPS = BK / 32;        // 1
-constexpr int TREE_DEPTH = 16;
 
 __device__ __forceinline__ void ldmatrix_x4(uint32_t regs[4], uint32_t addr) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
@@ -256,12 +142,6 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
   for (int s = 0; s < STAGES; ++s) phase[s] = 0;
 
   float acc[M_TILES][N_TILES][4];
-  float tile_acc[M_TILES][N_TILES][4];
-  nv_bf16 tree_value[M_TILES][N_TILES][4];
-  nv_bf16 tree_stack[TREE_DEPTH][M_TILES][N_TILES][4];
-  int tree_lo[TREE_DEPTH];
-  int tree_hi[TREE_DEPTH];
-  int tree_stack_size = 0;
 #pragma unroll
   for (int mi = 0; mi < M_TILES; ++mi)
 #pragma unroll
@@ -273,7 +153,7 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
     for (int s = 0; s < STAGES - 1; ++s)
       if (s < kd) issue_load(s);
 
-  for (int k = 0; k < kd; ++k) {       // fixed ascending tile order, NO split-K
+  for (int k = 0; k < kd; ++k) {       // fixed ascending K order, NO split-K
     const int buf = k % STAGES;
     if (tid == 0 && k + (STAGES - 1) < kd) issue_load(k + (STAGES - 1));
     det_gemm::mbar_wait(mbar[buf], phase[buf]);
@@ -282,18 +162,6 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
 
     const uint32_t sA_buf = sA_base + buf * BM * BK * sizeof(nv_bf16);
     const uint32_t sB_buf = sB_base + buf * BN * BK * sizeof(nv_bf16);
-
-    if constexpr (!std::is_same_v<output_t, float>) {
-#pragma unroll
-      for (int mi = 0; mi < M_TILES; ++mi)
-#pragma unroll
-        for (int n = 0; n < N_TILES; ++n) {
-          tile_acc[mi][n][0] = 0.0f;
-          tile_acc[mi][n][1] = 0.0f;
-          tile_acc[mi][n][2] = 0.0f;
-          tile_acc[mi][n][3] = 0.0f;
-        }
-    }
 
     uint32_t A[M_TILES][K_TILES][4];
 #pragma unroll
@@ -319,62 +187,12 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
         const uint32_t B1[2] = {b4[2], b4[3]};
 #pragma unroll
         for (int mi = 0; mi < M_TILES; ++mi) {
-          if constexpr (std::is_same_v<output_t, float>) {
-            mma_m16n8k16(A[mi][2 * kk + 0], B0, acc[mi][n]);
-            mma_m16n8k16(A[mi][2 * kk + 1], B1, acc[mi][n]);
-          } else {
-            mma_m16n8k16(A[mi][2 * kk + 0], B0, tile_acc[mi][n]);
-            mma_m16n8k16(A[mi][2 * kk + 1], B1, tile_acc[mi][n]);
-          }
+          mma_m16n8k16(A[mi][2 * kk + 0], B0, acc[mi][n]);
+          mma_m16n8k16(A[mi][2 * kk + 1], B1, acc[mi][n]);
         }
       }
     }
     __syncthreads();
-
-    if constexpr (!std::is_same_v<output_t, float>) {
-#pragma unroll
-      for (int mi = 0; mi < M_TILES; ++mi)
-#pragma unroll
-        for (int n = 0; n < N_TILES; ++n)
-#pragma unroll
-          for (int value_index = 0; value_index < 4; ++value_index) {
-            tree_value[mi][n][value_index] =
-                __float2bfloat16(tile_acc[mi][n][value_index]);
-          }
-
-      int lo = k;
-      const int hi = k + 1;
-      while (tree_stack_size > 0 &&
-             tree_hi[tree_stack_size - 1] == lo &&
-             is_mid_split_node(tree_lo[tree_stack_size - 1], hi, kd)) {
-#pragma unroll
-        for (int mi = 0; mi < M_TILES; ++mi)
-#pragma unroll
-          for (int n = 0; n < N_TILES; ++n)
-#pragma unroll
-            for (int value_index = 0; value_index < 4; ++value_index) {
-              tree_value[mi][n][value_index] = bf16_add(
-                  tree_stack[tree_stack_size - 1][mi][n][value_index],
-                  tree_value[mi][n][value_index]);
-            }
-        lo = tree_lo[tree_stack_size - 1];
-        --tree_stack_size;
-      }
-      if (hi < kd) {
-#pragma unroll
-        for (int mi = 0; mi < M_TILES; ++mi)
-#pragma unroll
-          for (int n = 0; n < N_TILES; ++n)
-#pragma unroll
-            for (int value_index = 0; value_index < 4; ++value_index) {
-              tree_stack[tree_stack_size][mi][n][value_index] =
-                  tree_value[mi][n][value_index];
-            }
-        tree_lo[tree_stack_size] = lo;
-        tree_hi[tree_stack_size] = hi;
-        ++tree_stack_size;
-      }
-    }
   }
 
 #pragma unroll
@@ -384,22 +202,12 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
     for (int n = 0; n < N_TILES; ++n) {
       const int col = col_base + n * MMA_N + (lane % 4) * 2;
       if (row < M && col + 1 < N) {
-        if constexpr (std::is_same_v<output_t, float>) {
-          C[row * N + col + 0] = acc[mi][n][0];
-          C[row * N + col + 1] = acc[mi][n][1];
-        } else {
-          C[row * N + col + 0] = tree_value[mi][n][0];
-          C[row * N + col + 1] = tree_value[mi][n][1];
-        }
+        C[row * N + col + 0] = cast_output<output_t>(acc[mi][n][0]);
+        C[row * N + col + 1] = cast_output<output_t>(acc[mi][n][1]);
       }
       if (row + 8 < M && col + 1 < N) {
-        if constexpr (std::is_same_v<output_t, float>) {
-          C[(row + 8) * N + col + 0] = acc[mi][n][2];
-          C[(row + 8) * N + col + 1] = acc[mi][n][3];
-        } else {
-          C[(row + 8) * N + col + 0] = tree_value[mi][n][2];
-          C[(row + 8) * N + col + 1] = tree_value[mi][n][3];
-        }
+        C[(row + 8) * N + col + 0] = cast_output<output_t>(acc[mi][n][2]);
+        C[(row + 8) * N + col + 1] = cast_output<output_t>(acc[mi][n][3]);
       }
     }
   }
@@ -408,10 +216,7 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
 template <typename output_t>
 bool launch_sm90(const nv_bf16* A, const nv_bf16* Bt, output_t* C,
                  int M, int N, int K, cudaStream_t stream) {
-  if (M % BM != 0 || N % BN != 0 || K == 0 || K % BK != 0 ||
-      K / BK > (1 << TREE_DEPTH)) {
-    return false;  // fall back
-  }
+  if (M % BM != 0 || N % BN != 0 || K % BK != 0) return false;  // fall back
 
   CUtensorMap a_tmap, bt_tmap;
   det_gemm::init_tmap_noswizzle(&a_tmap, A, M, K, BM, BK);
@@ -446,13 +251,6 @@ void check_in(const torch::Tensor& t, const char* n) {
 
 torch::Tensor gemm_dispatch(const torch::Tensor& a, const torch::Tensor& b,
                             bool output_fp32 = false) {
-  TORCH_CHECK(
-      a.device() == b.device(),
-      "deterministic GEMM inputs must be on the same device, got ",
-      a.device(),
-      " and ",
-      b.device());
-  const at::cuda::OptionalCUDAGuard device_guard(at::device_of(a));
   const int M = a.size(0), K = a.size(1), N = b.size(1);
   auto options = a.options().dtype(output_fp32 ? torch::kFloat32 : torch::kBFloat16);
   auto c = torch::empty({M, N}, options);

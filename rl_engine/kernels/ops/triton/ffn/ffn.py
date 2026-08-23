@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Distributed deterministic Qwen3 FFN assembled from ROCm Triton kernels.
+"""ROCm-native distributed deterministic Qwen3 FFN built with Triton.
 
-The arithmetic and sharding contract matches the native PR #325 path exactly:
-BF16 is preserved at every GEMM/SwiGLU boundary, GEMMs use the canonical
+BF16 is preserved at every GEMM/SwiGLU boundary, GEMMs use a canonical
 FP32-leaf/BF16-node K tree, and TP reductions use the rank-ordered balanced
-collective.  CP gathers full token sequences before weight-gradient GEMMs so
-their K tree is identical to CP=1.
+RCCL transport collective. CP gathers full token sequences before
+weight-gradient GEMMs so their K tree is identical to CP=1.
 """
 
 from __future__ import annotations
@@ -16,19 +15,143 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from rl_engine.kernels.ops.pytorch.ffn.ffn import (
-    _all_gather_tokens,
-    _all_reduce_inplace,
-    _collective_for_group,
-    _reduce_scatter_tokens,
-    _require_parallel_group,
-    _validate_ffn_inputs,
-)
 from rl_engine.kernels.ops.triton.activation.swiglu import (
     _launch_swiglu_bwd,
     _launch_swiglu_fwd,
 )
 from rl_engine.kernels.ops.triton.matmul.det_gemm import _triton_tree_gemm
+
+QWEN3_8B_HIDDEN_SIZE = 4096
+QWEN3_8B_INTERMEDIATE_SIZE = 12288
+
+_COLLECTIVE_MIN_CAPACITY_BYTES = 64 * 1024 * 1024
+_COLLECTIVES: dict[tuple[int, int, int, int], Any] = {}
+
+
+def _require_parallel_group(group: Any, name: str):
+    if group is None:
+        return None
+
+    import torch.distributed as dist
+
+    if not dist.is_available():
+        raise RuntimeError(f"{name}-parallel FFN requires torch.distributed.")
+    if not dist.is_initialized():
+        raise RuntimeError(f"{name}-parallel FFN requires an initialized process group.")
+    if dist.get_world_size(group=group) <= 1:
+        raise ValueError(f"{name}_group must contain at least two ranks.")
+    return dist
+
+
+def _validate_ffn_inputs(
+    rmsnorm_output: Tensor,
+    gate_weight: Tensor,
+    up_weight: Tensor,
+    down_weight: Tensor,
+) -> None:
+    tensors = {
+        "rmsnorm_output": rmsnorm_output,
+        "gate_weight": gate_weight,
+        "up_weight": up_weight,
+        "down_weight": down_weight,
+    }
+    for name, tensor in tensors.items():
+        if not isinstance(tensor, Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor)!r}.")
+
+    if rmsnorm_output.dim() < 1:
+        raise ValueError("rmsnorm_output must have at least one dimension.")
+    if rmsnorm_output.numel() == 0:
+        raise ValueError("rmsnorm_output must contain at least one token.")
+    for name, weight in (
+        ("gate_weight", gate_weight),
+        ("up_weight", up_weight),
+        ("down_weight", down_weight),
+    ):
+        if weight.dim() != 2:
+            raise ValueError(f"{name} must be 2-D, got shape {tuple(weight.shape)}.")
+
+    hidden_size = rmsnorm_output.size(-1)
+    intermediate_size = gate_weight.size(0)
+    if intermediate_size == 0:
+        raise ValueError("FFN intermediate size must be positive.")
+    expected_shapes = {
+        "gate_weight": (intermediate_size, hidden_size),
+        "up_weight": (intermediate_size, hidden_size),
+        "down_weight": (hidden_size, intermediate_size),
+    }
+    for name, expected in expected_shapes.items():
+        actual = tuple(tensors[name].shape)
+        if actual != expected:
+            raise ValueError(f"{name} must have shape {expected}, got {actual}.")
+
+    for name, tensor in tensors.items():
+        if tensor.dtype != torch.bfloat16:
+            raise TypeError(f"{name} must have dtype bfloat16, got {tensor.dtype}.")
+        if not tensor.is_cuda:
+            raise RuntimeError(
+                f"{name} must be on a CUDA/ROCm GPU device, got '{tensor.device}'."
+            )
+        if tensor.device != rmsnorm_output.device:
+            raise RuntimeError(
+                f"all FFN inputs must be on {rmsnorm_output.device}, "
+                f"got {name} on {tensor.device}."
+            )
+
+
+def _create_collective(*, group: Any, max_size_bytes: int):
+    try:
+        from rl_engine.distributed import create_deterministic_collective
+    except ImportError as exc:
+        raise RuntimeError(
+            "parallel Triton FFN requires the deterministic collective factory"
+        ) from exc
+    return create_deterministic_collective(
+        group=group,
+        max_size_bytes=max_size_bytes,
+    )
+
+
+def _collective_for_group(group: Any, *, min_size_bytes: int):
+    if group is None:
+        return None
+
+    import torch.distributed as dist
+
+    rank = dist.get_rank(group=group)
+    world_size = dist.get_world_size(group=group)
+    device_index = torch.cuda.current_device()
+    key = (id(group), rank, world_size, device_index)
+    cached = _COLLECTIVES.get(key)
+    if cached is not None and cached.max_size_bytes >= min_size_bytes:
+        return cached
+    if cached is not None:
+        cached.close()
+
+    collective = _create_collective(
+        group=group,
+        max_size_bytes=max(_COLLECTIVE_MIN_CAPACITY_BYTES, min_size_bytes),
+    )
+    _COLLECTIVES[key] = collective
+    return collective
+
+
+def _all_gather_tokens(tensor: Tensor, collective: Any) -> Tensor:
+    return collective.all_gather(tensor.contiguous())
+
+
+def _reduce_scatter_tokens(tensor: Tensor, collective: Any) -> Tensor:
+    world_size = collective.world_size
+    if tensor.size(0) % world_size != 0:
+        raise ValueError(
+            "the gathered token count must be divisible by the tensor-parallel "
+            f"world size, got {tensor.size(0)} and {world_size}."
+        )
+    return collective.reduce_scatter(tensor.contiguous())
+
+
+def _all_reduce_inplace(tensor: Tensor, collective: Any) -> Tensor:
+    return collective.all_reduce(tensor, out=tensor)
 
 
 def _gemm(a: Tensor, b: Tensor) -> Tensor:
@@ -172,7 +295,7 @@ class _TritonDeterministicFFNFunction(torch.autograd.Function):
         )
 
 
-def qwen3_ffn_triton(
+def qwen3_ffn(
     rmsnorm_output: Tensor,
     gate_weight: Tensor,
     up_weight: Tensor,
@@ -198,3 +321,7 @@ def qwen3_ffn_triton(
         cp_group,
         sequence_parallel,
     )
+
+
+# Keep the explicit suffix for callers that select an implementation by name.
+qwen3_ffn_triton = qwen3_ffn
