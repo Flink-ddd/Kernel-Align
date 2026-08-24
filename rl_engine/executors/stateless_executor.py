@@ -16,6 +16,7 @@ from rl_engine.testing.reference_ops import selected_logprobs_reference
 StatelessForwardMode = Literal["reference", "reward", "both"]
 StatelessAttentionBackend = Literal["flash_attention_2", "sdpa", "eager", "model_default"]
 RewardAdapter = Callable[["StatelessForwardOutputs", "StatelessForwardInputs"], torch.Tensor]
+SelectedLogprobCallable = Callable[..., torch.Tensor]
 _MISSING = object()
 
 
@@ -57,6 +58,7 @@ class StatelessForwardInputs:
     attention_mask: torch.Tensor
     completion_mask: torch.Tensor
     labels: Optional[torch.Tensor] = None
+    position_ids: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -105,10 +107,12 @@ class StatelessForwardExecutor:
         config: Optional[StatelessForwardConfig] = None,
         *,
         reward_adapter: Optional[RewardAdapter] = None,
+        selected_logprob_fn: Optional[SelectedLogprobCallable] = None,
     ):
         self.model = model
         self.config = config or StatelessForwardConfig()
         self.reward_adapter = reward_adapter or default_reward_adapter
+        self.selected_logprob_fn = selected_logprob_fn
 
     def score(self, inputs: StatelessForwardInputs) -> StatelessForwardResult:
         _validate_inputs(inputs, self.config)
@@ -170,6 +174,7 @@ class StatelessForwardExecutor:
                         inputs,
                         temperature=self.config.temperature,
                         output_dtype=self.config.output_dtype,
+                        selected_logprob_fn=self.selected_logprob_fn,
                     )
                     if self.config.return_token_scores:
                         token_scores = reference_logps
@@ -215,8 +220,14 @@ def score_reference_logprobs(
     *,
     temperature: float = 1.0,
     output_dtype: torch.dtype = torch.float32,
+    selected_logprob_fn: Optional[SelectedLogprobCallable] = None,
 ) -> torch.Tensor:
-    """Compute causal next-token selected logprobs aligned to ``[B, S]`` masks."""
+    """Compute causal next-token selected logprobs aligned to ``[B, S]`` masks.
+
+    ``selected_logprob_fn`` is an exact injection seam with the same callable
+    contract as :func:`selected_logprobs_reference`. Leaving it unset preserves
+    the historical PyTorch-reference behavior.
+    """
 
     if logits.ndim != 3:
         raise ValueError(f"reference logits must have shape [B, S, V], got {tuple(logits.shape)}")
@@ -237,13 +248,21 @@ def score_reference_logprobs(
     shifted_logits = logits[:, :-1, :]
     shifted_labels = labels[:, 1:]
     shifted_mask = _bool_mask(inputs.completion_mask[:, 1:], device=logits.device)
-    shifted_logps = selected_logprobs_reference(
+    scorer = selected_logprob_fn or selected_logprobs_reference
+    shifted_logps = scorer(
         shifted_logits,
         shifted_labels.to(device=logits.device),
         mask=shifted_mask,
         temperature=temperature,
         output_dtype=output_dtype,
     )
+    if not isinstance(shifted_logps, torch.Tensor):
+        raise TypeError("selected_logprob_fn must return a torch.Tensor")
+    if shifted_logps.shape != shifted_labels.shape:
+        raise ValueError(
+            "selected_logprob_fn output shape must match selected token IDs, got "
+            f"{tuple(shifted_logps.shape)} and {tuple(shifted_labels.shape)}"
+        )
     result = torch.zeros(
         inputs.input_ids.shape,
         device=logits.device,
@@ -372,11 +391,20 @@ def _temporarily_configure_stateless_model(
     config: StatelessForwardConfig,
 ) -> Iterator[dict[str, float | int | str | bool]]:
     saved = _model_config_snapshot(model, config)
-    policy = configure_stateless_model(model, config)
+    saved_training_modes = tuple((module, module.training) for module in model.modules())
+    model.eval()
     try:
+        policy = configure_stateless_model(model, config)
+        policy["model_eval_during_forward"] = True
         yield policy
     finally:
-        _restore_model_config_snapshot(saved)
+        try:
+            _restore_model_config_snapshot(saved)
+        finally:
+            # Restore each module directly. Calling ``model.train(...)`` would
+            # flatten intentionally mixed child-module modes.
+            for module, was_training in saved_training_modes:
+                module.training = was_training
 
 
 def extract_kv_cache_outputs(raw_outputs: Any) -> Optional[Any]:
@@ -450,12 +478,16 @@ def _validate_inputs(inputs: StatelessForwardInputs, config: StatelessForwardCon
         raise ValueError("completion_mask shape must match input_ids shape")
     if inputs.labels is not None and inputs.labels.shape != input_ids.shape:
         raise ValueError("labels shape must match input_ids shape")
+    if inputs.position_ids is not None and inputs.position_ids.shape != input_ids.shape:
+        raise ValueError("position_ids shape must match input_ids shape")
     if attention_mask.device != input_ids.device:
         raise ValueError("attention_mask device must match input_ids device")
     if completion_mask.device != input_ids.device:
         raise ValueError("completion_mask device must match input_ids device")
     if inputs.labels is not None and inputs.labels.device != input_ids.device:
         raise ValueError("labels device must match input_ids device")
+    if inputs.position_ids is not None and inputs.position_ids.device != input_ids.device:
+        raise ValueError("position_ids device must match input_ids device")
     if config.max_batch_size is not None and input_ids.shape[0] > config.max_batch_size:
         raise ValueError(
             f"batch size {input_ids.shape[0]} exceeds max_batch_size {config.max_batch_size}"
@@ -479,6 +511,10 @@ def _run_no_cache_forward(
         "input_ids": inputs.input_ids,
         "attention_mask": inputs.attention_mask,
     }
+    if inputs.position_ids is not None:
+        if not _call_accepts_keyword(model, "position_ids"):
+            raise ValueError("model does not accept the canonical batch position_ids")
+        kwargs["position_ids"] = inputs.position_ids
     if _call_accepts_keyword(model, "use_cache"):
         kwargs["use_cache"] = False
         return model(**kwargs), True

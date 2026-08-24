@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
+import sys
+from types import ModuleType
+
 import torch
 
+import rl_engine.platforms.device as device_module
 from rl_engine.executors.rollout import RolloutExecutor
 from rl_engine.kernels.registry import KernelRegistry, OpBackend, kernel_registry
 from rl_engine.platforms.device import device_ctx
@@ -62,6 +66,42 @@ def test_registry_explicit_device_selects_device_platform(monkeypatch):
         OpBackend.ROCM_AITER if torch.version.hip is not None else OpBackend.CUDA_FUSED_LOGP_GENERIC
     )
     assert loaded[0] == expected
+
+
+def test_npu_registry_preserves_per_operator_cpu_fallbacks(monkeypatch):
+    registry = KernelRegistry()
+    loaded = []
+
+    class DummyOp:
+        pass
+
+    def fake_load_backend(backend):
+        loaded.append(backend)
+        return DummyOp
+
+    monkeypatch.setattr(registry, "_load_backend", fake_load_backend)
+    monkeypatch.setattr(device_ctx, "device_type", "npu")
+
+    registry.get_op("rms_norm")
+
+    assert registry._priority_map["npu"].keys() == registry._priority_map["cpu"].keys()
+    assert loaded[0] == OpBackend.PYTORCH_NATIVE_RMS_NORM
+    assert registry._priority_map["npu"]["batch_invariant_logp"] == [
+        OpBackend.ASCEND_BATCH_INVARIANT_LOGP,
+        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
+    ]
+
+
+def test_npu_available_handles_runtime_failure(monkeypatch):
+    class BrokenNPU:
+        @staticmethod
+        def is_available():
+            raise RuntimeError("driver unavailable")
+
+    monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
+    monkeypatch.setattr(device_module.torch, "npu", BrokenNPU(), raising=False)
+
+    assert device_module._npu_available() is False
 
 
 def test_executor_flow():
