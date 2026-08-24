@@ -19,6 +19,10 @@ _TP_SIZES = (1, 2, 4, 8)
 _EXTERNAL_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 
 pytestmark = [
+    # The deterministic collectives are CUDA-IPC kernels, compiled out of ROCm
+    # builds on purpose. ROCm reports GPUs through the CUDA device API, so the
+    # device_count guard below does not exclude it.
+    pytest.mark.cuda_only,
     pytest.mark.skipif(
         _EXTERNAL_WORLD_SIZE != 1,
         reason="this cross-TP test owns its worker processes; run pytest directly",

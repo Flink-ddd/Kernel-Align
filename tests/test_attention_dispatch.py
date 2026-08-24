@@ -93,25 +93,30 @@ def _platform(registry) -> str:
     return registry._platform()
 
 
-def test_only_rocm_autoregisters_and_only_when_the_vendor_stack_loads():
-    """Attention dispatch is opt-in per platform.
+def test_strict_rocm_core_is_registered_only_when_the_vendor_stack_loads():
+    """The strict core is conditional; every other candidate is static.
 
-    The strict ROCm core is the single auto-registration, and it appears only
-    when ``aiter.ops.mha`` really loaded.  No other platform gains an attention
-    candidate implicitly, so a CUDA or CPU WS2 caller still fails loudly rather
-    than being served something with different semantics.
+    ``ws2_attention`` is a static priority list, so a backend that exists only
+    on some machines cannot be declared there. It registers itself at runtime,
+    and only when ``aiter.ops.mha`` really loaded - otherwise dispatch would
+    offer a backend that fails at materialization.
     """
 
     fresh = KernelRegistry()
+    expected = _rocm_strict_attention_available()
 
-    for platform, candidates in fresh._attention_candidates.items():
-        if platform == "rocm":
-            expected = (
-                [OpBackend.ROCM_STRICT_ATTENTION] if _rocm_strict_attention_available() else []
-            )
-            assert candidates == expected
-        else:
-            assert candidates == []
+    rocm = fresh._priority_map["rocm"].get("ws2_attention", [])
+    assert (OpBackend.ROCM_STRICT_ATTENTION in rocm) is expected
+    if expected:
+        # It must lead: a strict caller should not land on a reference first.
+        assert rocm[0] is OpBackend.ROCM_STRICT_ATTENTION
+        assert OpBackend.ROCM_STRICT_ATTENTION in fresh._attention_capabilities
+
+    # It is a ROCm backend and must never appear on another platform.
+    for platform in ("cuda", "cpu"):
+        assert OpBackend.ROCM_STRICT_ATTENTION not in fresh._priority_map[platform].get(
+            "ws2_attention", []
+        )
 
 
 def test_registered_backend_resolves_with_provenance(registry):
@@ -129,10 +134,10 @@ def test_registered_backend_resolves_with_provenance(registry):
 
 
 def test_unregistered_contract_fails_loudly_instead_of_falling_back(registry):
-    # Drop every auto-registered candidate: a platform with no attention
-    # backend must raise rather than resolve something from the legacy lists.
-    for candidates in registry._attention_candidates.values():
-        candidates.clear()
+    # With no attention candidate at all, dispatch must raise rather than reach
+    # into the legacy priority lists for something with other semantics.
+    for ops in registry._priority_map.values():
+        ops["ws2_attention"] = []
 
     with pytest.raises(RuntimeError, match="No attention backend supports"):
         registry.get_attention_op(_contract(), requested_backend="auto")
@@ -180,9 +185,27 @@ def test_auto_is_rejected_under_context_parallelism(registry):
         registry.get_attention_op(_contract(cp_world_size=2), requested_backend="auto")
 
 
-def test_deterministic_is_not_a_dispatch_policy(registry):
-    with pytest.raises(AttentionContractError, match="not a dispatch policy"):
-        registry.get_attention_op(_contract(), requested_backend="deterministic")
+def test_deterministic_is_a_valid_attention_policy(registry):
+    """``deterministic`` is a real ``implementation_kind`` for attention.
+
+    It is not a policy for logprob dispatch, but ``AttentionBackendCapability``
+    admits it, and it is the default here, so requesting it must select a
+    deterministic backend rather than being rejected.
+    """
+
+    platform = _platform(registry)
+    registry._priority_map[platform]["ws2_attention"] = [OpBackend.ROCM_STRICT_ATTENTION]
+    registry.register_attention_backend(
+        OpBackend.ROCM_STRICT_ATTENTION,
+        _capability(implementation_kind="deterministic"),
+        platform=platform,
+    )
+
+    result = registry.get_attention_op(_contract(), requested_backend="deterministic")
+    assert result.capability.implementation_kind == "deterministic"
+
+    with pytest.raises(RuntimeError, match="does not satisfy requested_backend=production"):
+        registry.get_attention_op(_contract(), requested_backend="production")
 
 
 def test_implementation_kind_policy_filters_without_marking_fallback(registry):
@@ -202,15 +225,20 @@ def test_reregistration_replaces_capability_without_duplicating(registry):
     registry.register_attention_backend(
         OpBackend.ROCM_STRICT_ATTENTION, _capability(), platform=platform
     )
+    first = list(registry._priority_map[platform]["ws2_attention"])
     registry.register_attention_backend(
         OpBackend.ROCM_STRICT_ATTENTION,
         _capability(implementation_kind="reference"),
         platform=platform,
     )
+    second = registry._priority_map[platform]["ws2_attention"]
 
-    assert registry._attention_candidates[platform] == [OpBackend.ROCM_STRICT_ATTENTION]
-    capability = registry._attention_capabilities[platform][OpBackend.ROCM_STRICT_ATTENTION]
-    assert capability.implementation_kind == "reference"
+    assert first == second
+    assert second.count(OpBackend.ROCM_STRICT_ATTENTION) == 1
+    assert (
+        registry._attention_capabilities[OpBackend.ROCM_STRICT_ATTENTION].implementation_kind
+        == "reference"
+    )
 
 
 def test_register_rejects_wrong_types_and_unknown_platforms(registry):
@@ -224,7 +252,14 @@ def test_register_rejects_wrong_types_and_unknown_platforms(registry):
         )
 
 
-def test_legacy_priority_map_is_untouched_by_attention_registration(registry):
+def test_registration_touches_only_the_ws2_attention_list(registry):
+    """Registering must not perturb any legacy dispatch key.
+
+    ``ws2_attention`` lives inside the priority map, so registration does write
+    there - but the SDPA-shaped ``attn`` / ``attention`` keys that legacy
+    ``get_op`` callers resolve through must be left exactly as they were.
+    """
+
     platform = _platform(registry)
     before = {op: list(v) for op, v in registry._priority_map[platform].items()}
 
@@ -233,10 +268,12 @@ def test_legacy_priority_map_is_untouched_by_attention_registration(registry):
     )
 
     after = {op: list(v) for op, v in registry._priority_map[platform].items()}
-    assert before == after
-    # The strict core must not become reachable through legacy get_op keys.
-    for candidates in after.values():
-        assert OpBackend.ROCM_STRICT_ATTENTION not in candidates
+    changed = {op for op in after if before.get(op) != after[op]}
+    assert changed <= {"ws2_attention"}
+    for legacy in ("attn", "attention", "cp_attention", "kv_cache_attention"):
+        if legacy in before:
+            assert before[legacy] == after[legacy]
+            assert OpBackend.ROCM_STRICT_ATTENTION not in after[legacy]
 
 
 def test_contract_fingerprint_is_rank_independent():
@@ -351,37 +388,37 @@ def _tp_contract(tp_world_size: int, tp_rank: int = 0, seq_len: int = 128) -> At
     )
 
 
-def test_matching_degrees_pass_cross_config_alignment():
+def test_matching_contracts_pass_cross_config_alignment():
     validate_cross_config_alignment(_tp_contract(4, tp_rank=0), _tp_contract(4, tp_rank=3))
 
 
-def test_tp_degree_mismatch_fails_closed():
-    """A differing TP degree changes the bits, so it must not be comparable.
+def test_differing_tp_degrees_are_comparable():
+    """A TP-degree difference must NOT be rejected.
 
-    The qualified ROCm core's reduction order depends on the launch head count:
-    measured on MI300X the same head shard differs by up to 7.8125e-03 between
-    TP degrees at some shapes.  Binding the degree is what makes the strict
-    claim survive, so the mismatch has to fail rather than warn.
+    The provider pins every launch to one batch row and one KV group, which
+    makes a head shard's result independent of the TP degree that produced it
+    (verified bitwise at TP=1/2/4/8 on MI300X). Rejecting the comparison would
+    refuse results that are in fact identical.
     """
 
-    with pytest.raises(AttentionContractError, match="same parallel degrees"):
-        validate_cross_config_alignment(_tp_contract(4), _tp_contract(8))
+    validate_cross_config_alignment(_tp_contract(4), _tp_contract(8))
+    validate_cross_config_alignment(_tp_contract(1), _tp_contract(8))
 
 
-def test_cp_degree_mismatch_fails_closed():
+def test_head_layout_mismatch_fails_closed():
     train = _tp_contract(2)
     rollout_sharding = ShardingSpec(
         tp_rank=0,
         tp_world_size=2,
         cp_rank=0,
-        cp_world_size=2,
-        global_q_heads=32,
+        cp_world_size=1,
+        global_q_heads=16,
         global_kv_heads=8,
         local_q_head_start=0,
-        local_q_heads=16,
+        local_q_heads=8,
         local_kv_head_start=0,
         local_kv_heads=4,
-        global_sequence_length=256,
+        global_sequence_length=128,
         local_sequence_length=128,
         global_block_indices=(0,),
         global_block_token_starts=(0,),
@@ -401,19 +438,24 @@ def test_cp_degree_mismatch_fails_closed():
         split_kv=SplitKVSpec.disabled(),
         export_lse=True,
     )
-    with pytest.raises(AttentionContractError, match="same parallel degrees"):
+    with pytest.raises(AttentionContractError, match="global head layouts"):
         validate_cross_config_alignment(train, rollout)
 
 
-def test_contract_fingerprint_separates_tp_degrees():
-    """The cheap preflight must also catch it, not only the explaining validator."""
+def test_contract_fingerprint_is_a_per_invocation_rank_preflight():
+    """The fingerprint agrees across ranks of one invocation, and only there.
 
-    assert _tp_contract(4).cross_rank_fingerprint() != _tp_contract(8).cross_rank_fingerprint()
-    # ...while ranks of one TP degree still agree.
+    It still separates TP degrees, which is correct for its purpose: every rank
+    of a single logical invocation must agree on one topology. It is not a
+    train-vs-rollout equality token -- those may legitimately run different TP
+    degrees and still be bitwise equal.
+    """
+
     assert (
         _tp_contract(4, tp_rank=0).cross_rank_fingerprint()
         == _tp_contract(4, tp_rank=3).cross_rank_fingerprint()
     )
+    assert _tp_contract(4).cross_rank_fingerprint() != _tp_contract(8).cross_rank_fingerprint()
 
 
 def test_dtype_and_split_kv_mismatches_are_explained():

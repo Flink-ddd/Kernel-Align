@@ -4,6 +4,12 @@
 import torch
 import torch.nn.functional as F
 
+from rl_engine.kernels.ops.pytorch.attention.ablation import (
+    AttentionAblationConfig,
+    AttentionAblationOp,
+    AttentionAblationResult,
+)
+
 
 class NativeAttentionOp:
     """PyTorch SDPA fallback for FlashAttention-layout tensors."""
@@ -46,4 +52,9 @@ class NativeAttentionOp:
         return out.transpose(1, 2)
 
 
-__all__ = ["NativeAttentionOp"]
+__all__ = [
+    "AttentionAblationConfig",
+    "AttentionAblationOp",
+    "AttentionAblationResult",
+    "NativeAttentionOp",
+]

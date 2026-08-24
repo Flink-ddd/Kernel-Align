@@ -24,7 +24,9 @@ from rl_engine.testing.attention_comparison import (
     compare_decode_kv_replay,
     compare_single_gpu_attention,
     compare_single_gpu_rope_attention,
+    decode_kv_cache_fingerprint,
     decode_prefix_cache_fingerprint,
+    decode_rope_identity_fingerprint,
     run_decode_kv_replay,
     run_paged_kv_attention,
 )
@@ -71,6 +73,7 @@ def _decode_inputs(
     prefix_cache_enabled: bool = False,
     q_rope_state: Literal["pre_rope", "post_rope"] = "post_rope",
     k_cache_rope_state: Literal["pre_rope", "post_rope"] = "post_rope",
+    position_offset: int = 0,
 ) -> DecodeAttentionInputs:
     q, logical_k, logical_v = _qkv(seed=17)
     q = q[:, :, 4:6, :]
@@ -84,19 +87,25 @@ def _decode_inputs(
         physical_k[:, :, physical_slice, :] = logical_k[:, :, logical_slice, :]
         physical_v[:, :, physical_slice, :] = logical_v[:, :, logical_slice, :]
         positions[:, physical_slice] = torch.arange(
-            logical_page * page_size,
-            (logical_page + 1) * page_size,
+            position_offset + logical_page * page_size,
+            position_offset + (logical_page + 1) * page_size,
         )
     inputs = DecodeAttentionInputs(
         q=q,
         k_cache=physical_k,
         v_cache=physical_v,
         metadata=DecodeKVCacheMetadata(
-            cache_position=torch.tensor([[4, 5], [4, 5]], dtype=torch.long),
+            cache_position=torch.tensor(
+                [[position_offset + 4, position_offset + 5]] * 2,
+                dtype=torch.long,
+            ),
             kv_seq_lens=torch.tensor([6, 6], dtype=torch.long),
             block_table=torch.tensor([page_order, page_order], dtype=torch.long),
             global_token_positions=positions,
-            query_position_ids=torch.tensor([[4, 5], [4, 5]], dtype=torch.long),
+            query_position_ids=torch.tensor(
+                [[position_offset + 4, position_offset + 5]] * 2,
+                dtype=torch.long,
+            ),
             key_position_ids=positions.clone(),
             page_size=page_size,
             q_rope_state=q_rope_state,
@@ -112,14 +121,23 @@ def _decode_inputs(
     if not prefix_cache_enabled:
         return inputs
     prefix_length = 4
-    fingerprint = decode_prefix_cache_fingerprint(inputs, prefix_length=prefix_length)
-    return replace(
+    with_prefix_identity = replace(
         inputs,
         metadata=replace(
             inputs.metadata,
             prefix_cache_enabled=True,
             prefix_cache_key="shared-prefix",
             prefix_length=prefix_length,
+        ),
+    )
+    fingerprint = decode_prefix_cache_fingerprint(
+        with_prefix_identity,
+        prefix_length=prefix_length,
+    )
+    return replace(
+        with_prefix_identity,
+        metadata=replace(
+            with_prefix_identity.metadata,
             prefix_cache_fingerprint=fingerprint,
         ),
     )
@@ -247,11 +265,20 @@ def test_decode_replay_matches_full_prefill_for_single_and_few_query():
     assert drift.provenance["q_dtype"] == "float32"
     assert drift.provenance["k_cache_dtype"] == "float32"
     assert drift.provenance["v_cache_dtype"] == "float32"
-    assert drift.provenance["scale"] == pytest.approx(1.0 / (8.0**0.5))
+    assert drift.provenance["execution_scope"] == "single_device_logical_reference"
+    assert drift.provenance["runtime_verified"] is False
+    assert drift.provenance["supports_backward"] is False
+    assert drift.provenance["communication"] == "none"
+    assert drift.provenance["cache_execution_fingerprint"] == decode_kv_cache_fingerprint(inputs)
+    assert drift.provenance["kv_cache_identity_fingerprint"] == decode_kv_cache_fingerprint(inputs)
+    assert drift.provenance["rope_identity_fingerprint"] == decode_rope_identity_fingerprint(inputs)
+    assert drift.provenance["preprocess_policy"] == "reference_only_not_production"
+    assert drift.provenance["preprocess_fallback"] is True
     assert drift.provenance["logical_merge_orders"] == [
         [[0, 1, 2], [0, 1, 2]],
         [[0, 1, 2], [0, 1, 2]],
     ]
+    json.dumps(report.to_dict())
 
     single_query = DecodeAttentionInputs(
         q=inputs.q[:, :, -1:, :],
@@ -273,9 +300,23 @@ def test_decode_replay_matches_full_prefill_for_single_and_few_query():
     assert single_report.drifts[0].lse.max_abs <= 1.0e-6
 
 
+def test_strict_decode_replay_is_bitwise_across_logical_and_paged_materialization():
+    report = compare_decode_kv_replay(_decode_inputs(page_order=(2, 0, 1)), strict_bitwise=True)
+    assert report.reference_name == "strict_shared_core_logical_prefill"
+    assert len(report.drifts) == 1
+    drift = report.drifts[0]
+    assert drift.candidate_name == "strict_shared_core_paged_kv_layout"
+    assert drift.out.max_abs == 0.0
+    assert drift.lse.max_abs == 0.0
+    assert drift.provenance["strict_core_id"] == ("rlkernel.attention.deterministic_core.v1")
+    assert drift.provenance["strict_schedule"] == ("single_batch_single_query_global_kv_blocks")
+    assert drift.provenance["split_kv_policy"] == "disabled"
+
+
 def test_decode_replay_is_invariant_to_physical_page_and_prefix_layout():
     contiguous = run_decode_kv_replay(_decode_inputs())
-    permuted = run_decode_kv_replay(_decode_inputs(page_order=(2, 0, 1), prefix_cache_enabled=True))
+    permuted_inputs = _decode_inputs(page_order=(2, 0, 1), prefix_cache_enabled=True)
+    permuted = run_decode_kv_replay(permuted_inputs)
 
     torch.testing.assert_close(permuted.out, contiguous.out, atol=1.0e-6, rtol=0.0)
     torch.testing.assert_close(permuted.lse, contiguous.lse, atol=1.0e-6, rtol=0.0)
@@ -283,8 +324,150 @@ def test_decode_replay_is_invariant_to_physical_page_and_prefix_layout():
     assert permuted.provenance["prefix_cache_key"] == "shared-prefix"
     assert permuted.provenance["prefix_length"] == 4
     assert permuted.provenance["prefix_cache_fingerprint"] == decode_prefix_cache_fingerprint(
-        _decode_inputs(), prefix_length=4
+        permuted_inputs,
+        prefix_length=permuted_inputs.metadata.prefix_length,
     )
+
+
+def test_decode_replay_supports_nonzero_global_position_origin():
+    base = compare_decode_kv_replay(_decode_inputs())
+    offset = compare_decode_kv_replay(_decode_inputs(position_offset=128))
+
+    assert offset.drifts[0].out.max_abs <= 1.0e-6
+    assert offset.drifts[0].lse.max_abs <= 1.0e-6
+    assert base.drifts[0].out.max_abs <= 1.0e-6
+
+
+def test_decode_cache_execution_fingerprint_is_layout_invariant_and_content_bound():
+    contiguous = _decode_inputs()
+    permuted = _decode_inputs(page_order=(2, 0, 1))
+
+    assert decode_kv_cache_fingerprint(contiguous) == decode_kv_cache_fingerprint(permuted)
+    assert run_decode_kv_replay(contiguous).provenance[
+        "cache_execution_fingerprint"
+    ] == decode_kv_cache_fingerprint(contiguous)
+
+    changed_v = contiguous.v_cache.clone()
+    first_slot = int(contiguous.metadata.block_table[0, 0].item()) * contiguous.metadata.page_size
+    changed_v[0, 0, first_slot, 0] += 1.0
+    changed = replace(contiguous, v_cache=changed_v)
+    assert decode_kv_cache_fingerprint(changed) != decode_kv_cache_fingerprint(contiguous)
+
+    contiguous_prefix = _decode_inputs(prefix_cache_enabled=True)
+    permuted_prefix = _decode_inputs(page_order=(2, 0, 1), prefix_cache_enabled=True)
+    assert contiguous_prefix.metadata.prefix_cache_fingerprint == (
+        permuted_prefix.metadata.prefix_cache_fingerprint
+    )
+
+
+def test_decode_cache_fingerprint_ignores_inactive_physical_page_content():
+    inputs = _decode_inputs()
+    generator = torch.Generator().manual_seed(91)
+    extra_k = torch.randn(
+        inputs.k_cache.size(0),
+        inputs.k_cache.size(1),
+        inputs.metadata.page_size,
+        inputs.k_cache.size(3),
+        generator=generator,
+    )
+    extra_v = torch.randn(extra_k.shape, generator=generator)
+    extended = replace(
+        inputs,
+        k_cache=torch.cat((inputs.k_cache, extra_k), dim=2),
+        v_cache=torch.cat((inputs.v_cache, extra_v), dim=2),
+        metadata=replace(
+            inputs.metadata,
+            block_table=torch.cat(
+                (inputs.metadata.block_table, torch.full((2, 1), -1, dtype=torch.long)),
+                dim=1,
+            ),
+            global_token_positions=torch.cat(
+                (
+                    inputs.metadata.global_token_positions,
+                    torch.full((2, inputs.metadata.page_size), -1, dtype=torch.long),
+                ),
+                dim=1,
+            ),
+            key_position_ids=torch.cat(
+                (
+                    inputs.metadata.key_position_ids,
+                    torch.full((2, inputs.metadata.page_size), -1, dtype=torch.long),
+                ),
+                dim=1,
+            ),
+            cp_block_owners=torch.cat(
+                (
+                    inputs.metadata.cp_block_owners,
+                    torch.full((2, 1), -1, dtype=torch.long),
+                ),
+                dim=1,
+            ),
+        ),
+    )
+    changed_inactive = replace(
+        extended,
+        k_cache=extended.k_cache.clone(),
+        v_cache=extended.v_cache.clone(),
+    )
+    changed_inactive.k_cache[:, :, -2:, :].fill_(123.0)
+    changed_inactive.v_cache[:, :, -2:, :].fill_(-456.0)
+
+    assert decode_kv_cache_fingerprint(extended) == decode_kv_cache_fingerprint(changed_inactive)
+    extended_result = run_decode_kv_replay(extended)
+    changed_result = run_decode_kv_replay(changed_inactive)
+    torch.testing.assert_close(extended_result.out, changed_result.out)
+    torch.testing.assert_close(extended_result.lse, changed_result.lse)
+
+
+def test_decode_replay_supports_per_batch_lengths_and_partial_final_page():
+    inputs = _decode_inputs()
+    metadata = replace(
+        inputs.metadata,
+        cache_position=torch.tensor([[3, 4], [4, 5]], dtype=torch.long),
+        query_position_ids=torch.tensor([[3, 4], [4, 5]], dtype=torch.long),
+        kv_seq_lens=torch.tensor([5, 6], dtype=torch.long),
+        global_token_positions=inputs.metadata.global_token_positions.clone(),
+        key_position_ids=inputs.metadata.key_position_ids.clone(),
+    )
+    first_unused_slot = int(metadata.block_table[0, 2].item()) * metadata.page_size + 1
+    metadata.global_token_positions[0, first_unused_slot] = -1
+    metadata.key_position_ids[0, first_unused_slot] = -1
+    shortened = replace(inputs, metadata=metadata)
+
+    report = compare_decode_kv_replay(shortened)
+
+    assert report.drifts[0].out.max_abs <= 1.0e-6
+    assert report.drifts[0].lse.max_abs <= 1.0e-6
+    assert report.drifts[0].provenance["kv_seq_lens"] == [5, 6]
+
+
+@pytest.mark.parametrize("field_name", ["q", "k_cache", "v_cache"])
+def test_decode_replay_rejects_non_finite_active_values(field_name):
+    inputs = _decode_inputs()
+    tensor = getattr(inputs, field_name).clone()
+    tensor[0, 0, 0, 0] = float("nan")
+
+    with pytest.raises(ValueError, match="must be finite"):
+        run_decode_kv_replay(replace(inputs, **{field_name: tensor}))
+
+
+def test_decode_replay_rejects_finite_inputs_that_overflow_attention():
+    inputs = _decode_inputs()
+    huge = torch.full_like(inputs.q, torch.finfo(inputs.q.dtype).max)
+
+    with pytest.raises(ValueError, match="produced non-finite"):
+        compare_decode_kv_replay(replace(inputs, q=huge))
+
+
+def test_decode_replay_rejects_prefix_cache_key_drift():
+    inputs = _decode_inputs(prefix_cache_enabled=True)
+    changed_key = replace(
+        inputs,
+        metadata=replace(inputs.metadata, prefix_cache_key="different-prefix"),
+    )
+
+    with pytest.raises(ValueError, match="prefix_cache_fingerprint"):
+        run_decode_kv_replay(changed_key)
 
 
 def test_decode_replay_is_invariant_to_equivalent_cp_block_ownership():

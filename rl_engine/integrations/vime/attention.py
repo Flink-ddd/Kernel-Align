@@ -10,10 +10,15 @@ arithmetic and the ``(out, lse)`` export.
 
 Two boundaries are deliberate and are enforced rather than documented:
 
-* The core executes one logical batch row at a time.  Batching is a layout
-  choice, so a request of ``B`` rows must produce the same bits as ``B``
-  single-row requests; the provider materializes rows independently instead of
-  trusting a vendor kernel to be batch-composition invariant.
+* Every launch carries exactly one logical batch row and one KV group (that KV
+  head plus the Q heads that attend to it).  The AITER/CK reduction order
+  depends on the shape of the launch, so both batching and TP head-sharding
+  would otherwise change the bits: measured on MI300X, raw AITER differs by up
+  to ``1.5625e-02`` between a batch and its rows submitted singly, and by up to
+  ``7.8125e-03`` between TP degrees.  Pinning the launch shape makes the result
+  of a row/group independent of how many rows or heads its caller happened to
+  hold, which is what lets training and rollout compare bitwise across
+  different batch sizes and TP degrees.  It costs roughly 3x forward time.
 * CP is not a merge axis here.  The strict ROCm core owns single-rank attention
   arithmetic only; the cross-rank ``(out, lse)`` merge lives in the CP transport
   path.  CP rank and layout are recorded as row-ownership provenance and a
@@ -30,7 +35,7 @@ from typing import Any
 import torch
 
 from rl_engine.kernels.attention_contract import (
-    CROSS_CONFIG_BOUND_DEGREES,
+    CROSS_CONFIG_BOUND_FIELDS,
     AttentionContract,
     AttentionDType,
     AttentionMode,
@@ -361,30 +366,41 @@ def attention_provider(request: Any) -> AttentionProviderResult:
         raise RuntimeError("explicit strict attention dispatch changed during materialization")
 
     query_len = query.shape[2]
-    outs: list[torch.Tensor] = []
-    lses: list[torch.Tensor] = []
+    local_kv_heads = key.shape[1]
+    group_size = query.shape[1] // local_kv_heads
+
+    row_outs: list[torch.Tensor] = []
+    row_lses: list[torch.Tensor] = []
     core_provenance: dict[str, Any] | None = None
+    launches = 0
     for row in range(query.shape[0]):
         row_key_positions = key_positions[row : row + 1]
-        result = dispatch.op.forward_with_lse(
-            query[row : row + 1],
-            key[row : row + 1],
-            value[row : row + 1],
-            causal=contract.causal,
-            scale=scale,
-            key_padding_mask=None,
-            query_position_ids=row_key_positions[:, -query_len:] if contract.causal else None,
-            key_position_ids=row_key_positions if contract.causal else None,
-            output_dtype=query.dtype,
-        )
-        outs.append(result.out)
-        lses.append(result.lse)
-        if core_provenance is None:
-            core_provenance = dict(result.provenance)
+        group_outs: list[torch.Tensor] = []
+        group_lses: list[torch.Tensor] = []
+        for group in range(local_kv_heads):
+            q_lo, q_hi = group * group_size, (group + 1) * group_size
+            result = dispatch.op.forward_with_lse(
+                query[row : row + 1, q_lo:q_hi],
+                key[row : row + 1, group : group + 1],
+                value[row : row + 1, group : group + 1],
+                causal=contract.causal,
+                scale=scale,
+                key_padding_mask=None,
+                query_position_ids=row_key_positions[:, -query_len:] if contract.causal else None,
+                key_position_ids=row_key_positions if contract.causal else None,
+                output_dtype=query.dtype,
+            )
+            group_outs.append(result.out)
+            group_lses.append(result.lse)
+            launches += 1
+            if core_provenance is None:
+                core_provenance = dict(result.provenance)
+        row_outs.append(torch.cat(group_outs, dim=1))
+        row_lses.append(torch.cat(group_lses, dim=1))
 
-    out = torch.cat(outs, dim=0)
-    lse = torch.cat(lses, dim=0)
-    assert core_provenance is not None  # batch_size is validated positive
+    out = torch.cat(row_outs, dim=0)
+    lse = torch.cat(row_lses, dim=0)
+    assert core_provenance is not None  # batch_size and kv heads are validated positive
 
     provenance = dict(dispatch.provenance)
     provenance["core"] = core_provenance
@@ -402,7 +418,10 @@ def attention_provider(request: Any) -> AttentionProviderResult:
     provenance["execution"] = {
         "role": "vime_attention",
         "strict_backend": True,
+        "launch_granularity": "one_batch_row_one_kv_group",
+        "core_launches": launches,
         "batch_rows_materialized_independently": True,
+        "kv_groups_materialized_independently": True,
         "attention_mode": contract.mode.value,
     }
     provenance["cp_row_ownership"] = {
@@ -420,14 +439,16 @@ def attention_provider(request: Any) -> AttentionProviderResult:
     # rollout must run the same TP/CP degree.  ``contract_id`` encodes both, so
     # comparing it across the two sides is the preflight that enforces this.
     provenance["cross_config_binding"] = {
-        "bound_degrees": list(CROSS_CONFIG_BOUND_DEGREES),
+        "bound_fields": list(CROSS_CONFIG_BOUND_FIELDS),
         "tp_world_size": contract.sharding.tp_world_size,
         "cp_world_size": contract.sharding.cp_world_size,
         "binding_token": "contract_id",
-        "tp_degree_invariant": False,
+        "tp_degree_invariant": True,
+        "invariance_mechanism": "one_kv_group_per_launch",
         "reason": (
-            "AITER/CK dense MHA reduction order is launch-head-count dependent; "
-            "train and rollout must use the same TP degree"
+            "AITER/CK dense MHA reduction order depends on the launch head count, so "
+            "every launch is pinned to one KV group and its Q heads; the result of a "
+            "head shard is then independent of the TP degree that produced it"
         ),
     }
     return AttentionProviderResult(

@@ -71,7 +71,6 @@ torch::Tensor lm_head_sm90_forward(torch::Tensor hidden,
 torch::Tensor lm_head_sm90_forward_fp32(torch::Tensor hidden,
                                         torch::Tensor weight,
                                         torch::optional<torch::Tensor> bias);
-torch::Tensor det_gemm_rowwise_fwd_fp32(torch::Tensor a, torch::Tensor b);
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA) || defined(KERNEL_ALIGN_WITH_ROCM)
@@ -107,7 +106,6 @@ void deterministic_collective_all_gather(int64_t handle, torch::Tensor& output);
 
 // Batch-Invariant Deterministic GEMM Declarations
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
-torch::Tensor det_gemm_fwd_fp32(torch::Tensor a, torch::Tensor b);
 torch::Tensor det_gemm_da(torch::Tensor dc, torch::Tensor b);
 torch::Tensor det_gemm_db(torch::Tensor a, torch::Tensor dc);
 // SiLU / SwiGLU Declarations (elementwise activation, general CUDA)
@@ -259,14 +257,6 @@ std::vector<torch::Tensor> deterministic_attention_forward(
     double scale,
     torch::optional<torch::Tensor> key_padding_mask);
 
-std::vector<torch::Tensor> deterministic_attention_forward_fp32(
-    torch::Tensor q,
-    torch::Tensor k,
-    torch::Tensor v,
-    bool causal,
-    double scale,
-    torch::optional<torch::Tensor> key_padding_mask);
-
 std::vector<torch::Tensor> deterministic_attention_backward(
     torch::Tensor grad_output,
     torch::Tensor q,
@@ -374,8 +364,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Single-card SM90 batch-invariant LM-head forward");
     m.def("lm_head_sm90_forward_fp32", &lm_head_sm90_forward_fp32,
           "Single-card SM90 batch-invariant LM-head forward with fp32 output");
-    m.def("det_gemm_rowwise_fwd_fp32", &det_gemm_rowwise_fwd_fp32,
-          "SM90 deterministic rowwise GEMM with FP32 inputs/accumulation/output");
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA) || defined(KERNEL_ALIGN_WITH_ROCM)
@@ -394,7 +382,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deterministic_logp_forward_indexed_fp32", &deterministic_logp_forward_indexed_fp32, "Batch-invariant deterministic logp indexed fp32");
 
 #if !defined(USE_ROCM)
-    // Single-node TP=8 fixed-tree CUDA collectives.
+    // Single-node TP=8 fixed-tree CUDA collectives.  These use CUDA IPC and
+    // their declarations are ROCm-guarded above, so the registrations must be
+    // guarded too or a ROCm build fails on undeclared identifiers.
     m.def(
         "deterministic_collective_ipc_meta",
         &deterministic_collective_ipc_meta,
@@ -424,14 +414,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &deterministic_collective_all_gather,
         "Run the TP=8 deterministic rank-ordered all-gather kernel");
 
-    // registry Prefix-Shared Attention
+    // Prefix-shared attention uses NVIDIA PTX and falls back to PyTorch SDPA on
+    // ROCm; it is covered by the same guard opened above.
     m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
 #endif
 
     // registry Batch-Invariant Deterministic GEMM
     m.def("det_gemm_fwd", &det_gemm_fwd, "Batch-invariant deterministic GEMM forward (C=A@B)");
-    m.def("det_gemm_fwd_fp32", &det_gemm_fwd_fp32,
-          "Batch-invariant deterministic GEMM forward with FP32 output");
     m.def("det_gemm_da", &det_gemm_da, "Batch-invariant deterministic GEMM backward dA (dC@B^T)");
     m.def("det_gemm_db", &det_gemm_db, "Batch-invariant deterministic GEMM backward dB (A^T@dC)");
     // registry RMSNorm
@@ -450,10 +439,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "deterministic_attention_forward",
         &deterministic_attention_forward,
         "Deterministic standard softmax attention forward (out, lse)");
-    m.def(
-        "deterministic_attention_forward_fp32",
-        &deterministic_attention_forward_fp32,
-        "Deterministic standard softmax attention forward with FP32 output");
     m.def(
         "deterministic_attention_backward",
         &deterministic_attention_backward,

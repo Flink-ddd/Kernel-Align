@@ -273,28 +273,37 @@ def test_explicit_scale_is_honored():
 
 
 @requires_strict_rocm
-def test_provenance_records_the_cross_config_degree_binding():
-    """The binding must be auditable per call, not only documented.
+def test_provenance_records_the_launch_pinning():
+    """Launch granularity is the mechanism behind the bitwise claim.
 
-    RL-Kernel does not make the strict path TP-degree invariant: the qualified
-    vendor core's reduction order depends on the launch head count, and
-    removing that dependence costs ~3x forward time.  The path instead binds
-    the degree, so every result has to carry what it was bound to.
+    A reader of a strict report has to be able to tell that the result came
+    from pinned one-row/one-KV-group launches rather than a batched call that
+    happened to agree.
     """
 
     result = attention_provider(_request(seq_len=256))
+    execution = result.provenance["execution"]
     binding = result.provenance["cross_config_binding"]
 
-    assert binding["bound_degrees"] == ["tp_world_size", "cp_world_size"]
-    assert binding["tp_degree_invariant"] is False
-    assert binding["binding_token"] == "contract_id"
-    assert binding["tp_world_size"] == 1
-    assert binding["cp_world_size"] == 1
+    assert execution["launch_granularity"] == "one_batch_row_one_kv_group"
+    assert execution["kv_groups_materialized_independently"] is True
+    assert execution["batch_rows_materialized_independently"] is True
+    # B=1 request over a 32Q/8KV layout -> one launch per KV group.
+    assert execution["core_launches"] == GLOBAL_KV_HEADS
+    assert binding["tp_degree_invariant"] is True
+    assert binding["invariance_mechanism"] == "one_kv_group_per_launch"
 
 
 @requires_strict_rocm
-def test_tp_degree_change_changes_the_contract_id():
-    """Train and rollout on different TP degrees must not compare as equal."""
+@pytest.mark.parametrize("tp", [2, 4, 8])
+@pytest.mark.parametrize("seq_len", [512, 2048])
+def test_tp_degree_is_bitwise_invariant(tp, seq_len):
+    """A TP head shard must equal the same slice of an unsharded run.
+
+    TP performs no cross-rank reduction in attention, so this has to hold for
+    train and rollout to compare across TP degrees. Raw AITER does not provide
+    it (up to 7.8125e-03 drift); the per-KV-group launch rule is what does.
+    """
 
     class _Group:
         def __init__(self, rank, size):
@@ -306,15 +315,20 @@ def test_tp_degree_change_changes_the_contract_id():
         def size(self):
             return self._size
 
-    ids = {}
-    for tp in (1, 2, 4):
-        request = _request(seq_len=256, seed=4)
-        local_q, local_kv = GLOBAL_Q_HEADS // tp, GLOBAL_KV_HEADS // tp
-        request.query = request.query[:, :local_q]
-        request.key = request.key[:, :local_kv]
-        request.value = request.value[:, :local_kv]
-        request.metadata = _metadata(tp_rank=0, tp_world_size=tp)
-        request.tensor_parallel_group = _Group(0, tp)
-        ids[tp] = attention_provider(request).contract_id
+    base = _request(seq_len=seq_len, seed=3)
+    full = attention_provider(base)
 
-    assert len({ids[1], ids[2], ids[4]}) == 3
+    local_q, local_kv = GLOBAL_Q_HEADS // tp, GLOBAL_KV_HEADS // tp
+    for rank in range(tp):
+        shard = SimpleNamespace(
+            query=base.query[:, rank * local_q : (rank + 1) * local_q],
+            key=base.key[:, rank * local_kv : (rank + 1) * local_kv],
+            value=base.value[:, rank * local_kv : (rank + 1) * local_kv],
+            key_padding_mask=None,
+            tensor_parallel_group=_Group(rank, tp),
+            context_parallel=base.context_parallel,
+            metadata=_metadata(tp_rank=rank, tp_world_size=tp),
+        )
+        result = attention_provider(shard)
+        assert torch.equal(result.out, full.out[:, rank * local_q : (rank + 1) * local_q])
+        assert torch.equal(result.lse, full.lse[:, rank * local_q : (rank + 1) * local_q])

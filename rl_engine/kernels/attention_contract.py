@@ -21,6 +21,9 @@ _EnumT = TypeVar("_EnumT", bound=Enum)
 
 
 # Stable identities for Attention arithmetic shared by training and rollout.
+# The FA4 core is the strict production path on CUDA; AITER/CK dense MHA is its
+# ROCm counterpart. The materializing RL-Kernel core remains available as an
+# explicit reference and capability-gap fallback.
 STRICT_ATTENTION_PRODUCTION_CORE_ID = "rlkernel.attention.flash_attention4.num_splits1.v1"
 STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID = "rlkernel.attention.rocm.aiter_ck_dense_mha.v1"
 STRICT_ATTENTION_REFERENCE_CORE_ID = "rlkernel.attention.deterministic_core.v1"
@@ -75,6 +78,13 @@ class SplitKVMode(str, Enum):
     DISABLED = "disabled"
     FIXED = "fixed"
     AUTO = "auto"
+
+
+class ProjectionCollective(str, Enum):
+    NONE = "none"
+    ALL_REDUCE = "all_reduce"
+    ALL_GATHER = "all_gather"
+    REDUCE_SCATTER = "reduce_scatter"
 
 
 class RoPEState(str, Enum):
@@ -150,10 +160,16 @@ class ShardingSpec:
     global_block_token_starts: tuple[int, ...]
     local_block_offsets: tuple[int, ...]
     packed_sequence_offsets: tuple[int, ...] | None = None
+    sp_rank: int = 0
+    sp_world_size: int = 1
 
     def __post_init__(self) -> None:
         tp_world_size = _positive_int(self.tp_world_size, "tp_world_size")
         cp_world_size = _positive_int(self.cp_world_size, "cp_world_size")
+        sp_world_size = _positive_int(self.sp_world_size, "sp_world_size")
+        tp_rank = _non_negative_int(self.tp_rank, "tp_rank")
+        cp_rank = _non_negative_int(self.cp_rank, "cp_rank")
+        sp_rank = _non_negative_int(self.sp_rank, "sp_rank")
         tp_rank = _non_negative_int(self.tp_rank, "tp_rank")
         cp_rank = _non_negative_int(self.cp_rank, "cp_rank")
         if tp_rank >= tp_world_size:
@@ -163,6 +179,10 @@ class ShardingSpec:
         if cp_rank >= cp_world_size:
             raise AttentionContractError(
                 f"cp_rank={cp_rank} must be smaller than cp_world_size={cp_world_size}"
+            )
+        if sp_rank >= sp_world_size:
+            raise AttentionContractError(
+                f"sp_rank={sp_rank} must be smaller than sp_world_size={sp_world_size}"
             )
 
         global_q_heads = _positive_int(self.global_q_heads, "global_q_heads")
@@ -579,23 +599,19 @@ def validate_split_kv_alignment(
         )
 
 
-# Parallel degrees that must be identical on both sides of a cross-config
-# comparison.  This is not a portability preference: the qualified ROCm vendor
-# core (AITER/CK dense MHA) produces launch-shape-dependent reduction order, so
-# a head shard computed under TP=4 is not bit-identical to the same head shard
-# computed under TP=8 at some shapes.  Measured on MI300X, BF16, Hq=32/Hkv=8/
-# D=128, causal, TP=1 versus the sharded run:
+# What a bitwise cross-config comparison actually requires.
 #
-#     S=512   TP=2/4/8   bitwise
-#     S=1024  TP=2/4/8   out max abs 3.90625e-03
-#     S=2048  TP=4/8     out max abs 7.8125e-03   (TP=2 bitwise)
-#     S=4096  TP=8       out max abs 7.8125e-03   (TP=2/4 bitwise)
-#
-# Executing one KV group per launch removes the dependence and costs 2.7-3.9x
-# forward time.  RL-Kernel instead binds the degree: training and rollout must
-# run the same TP (and CP) degree, and a mismatch fails closed here rather than
-# silently producing different logprobs.
-CROSS_CONFIG_BOUND_DEGREES = ("tp_world_size", "cp_world_size")
+# TP degree and batch size are deliberately absent.  The qualified ROCm vendor
+# core (AITER/CK dense MHA) has a launch-shape-dependent reduction order, so
+# both would otherwise change the bits.  Measured on MI300X (BF16, Hq=32/
+# Hkv=8/D=128, causal), raw AITER differs by up to 1.5625e-02 between a batch
+# and its rows submitted singly, and by up to 7.8125e-03 between TP degrees.
+# The Vime provider removes the dependence by pinning every launch to one batch
+# row and one KV group, at roughly 3x forward time, so a head shard's result no
+# longer depends on the batch size or TP degree that produced it.  Requiring
+# those to match would therefore reject comparisons that are in fact bitwise
+# equal.  What remains here is the set that genuinely changes the arithmetic.
+CROSS_CONFIG_BOUND_FIELDS = ("dtype", "head_dim", "causal", "export_lse")
 
 
 def validate_cross_config_alignment(
@@ -604,28 +620,12 @@ def validate_cross_config_alignment(
 ) -> None:
     """Fail closed unless both sides describe one comparable attention invocation.
 
-    ``AttentionContract.cross_rank_fingerprint`` is the single token that
-    encodes this; comparing fingerprints is the cheap distributed preflight.
-    This function exists to explain *which* field diverged when they disagree,
-    so a cross-config drift investigation does not start from one opaque hash.
+    Names the field that diverged, so a cross-config drift investigation does
+    not start from one opaque fingerprint mismatch.
     """
 
     if not isinstance(training, AttentionContract) or not isinstance(rollout, AttentionContract):
         raise AttentionContractError("both sides must be AttentionContract instances")
-
-    degree_mismatches = [
-        f"{name}: train={getattr(training.sharding, name)} "
-        f"rollout={getattr(rollout.sharding, name)}"
-        for name in CROSS_CONFIG_BOUND_DEGREES
-        if getattr(training.sharding, name) != getattr(rollout.sharding, name)
-    ]
-    if degree_mismatches:
-        raise AttentionContractError(
-            "training and rollout must use the same parallel degrees for a bitwise "
-            "attention comparison; the qualified ROCm core's reduction order depends on "
-            "the launch head count, so a differing degree changes the numbers: "
-            + "; ".join(degree_mismatches)
-        )
 
     layout_mismatches = [
         name
@@ -640,7 +640,7 @@ def validate_cross_config_alignment(
 
     scalar_mismatches = [
         name
-        for name in ("dtype", "head_dim", "causal", "export_lse")
+        for name in CROSS_CONFIG_BOUND_FIELDS
         if getattr(training, name) != getattr(rollout, name)
     ]
     if scalar_mismatches:
@@ -921,6 +921,79 @@ def validate_split_kv_plan_set_alignment(
             ) from exc
 
 
+def build_split_kv_runtime_plan_set(
+    total_kv_tokens: Iterable[int],
+    *,
+    tp_world_size: int,
+    cp_world_size: int,
+    split_kv: SplitKVSpec,
+    backend: str = "contract_reference",
+) -> SplitKVRuntimePlanSet:
+    """Build a complete owner-local plan set for contract tests and adapters."""
+
+    totals = _integer_tuple(total_kv_tokens, "total_kv_tokens")
+    if not totals or any(total < cp_world_size for total in totals):
+        raise AttentionContractError(
+            "contract plan sets require at least one KV token per CP owner"
+        )
+    tp_world_size = _positive_int(tp_world_size, "tp_world_size")
+    cp_world_size = _positive_int(cp_world_size, "cp_world_size")
+    if not isinstance(split_kv, SplitKVSpec):
+        raise AttentionContractError("split_kv must be a SplitKVSpec")
+
+    entries: list[SplitKVRuntimePlanEntry] = []
+    for batch_index, total in enumerate(totals):
+        base = total // cp_world_size
+        remainder = total % cp_world_size
+        owner_ranges: list[tuple[int, int]] = []
+        start = 0
+        for owner_cp_rank in range(cp_world_size):
+            end = start + base + (1 if owner_cp_rank < remainder else 0)
+            owner_ranges.append((start, end))
+            start = end
+        for tp_rank in range(tp_world_size):
+            for cp_rank in range(cp_world_size):
+                for owner_cp_rank, (owner_start, owner_end) in enumerate(owner_ranges):
+                    local_total = owner_end - owner_start
+                    local = split_kv.resolve(local_total, backend=backend)
+                    execution = SplitKVExecutionPlan(
+                        requested_mode=local.requested_mode,
+                        requested_split_size=local.requested_split_size,
+                        actual_mode=local.actual_mode,
+                        actual_split_size=local.actual_split_size,
+                        boundaries=tuple(
+                            (owner_start + start, owner_start + end)
+                            for start, end in local.boundaries
+                        ),
+                        merge_order=local.merge_order,
+                        acc_dtype=local.acc_dtype,
+                        downcast_at=local.downcast_at,
+                        backend=local.backend,
+                        source=local.source,
+                        fallback=local.fallback,
+                        fallback_reason=local.fallback_reason,
+                    )
+                    entries.append(
+                        SplitKVRuntimePlanEntry(
+                            coordinate=SplitKVRuntimeCoordinate(
+                                batch_index=batch_index,
+                                tp_rank=tp_rank,
+                                cp_rank=cp_rank,
+                                owner_cp_rank=owner_cp_rank,
+                            ),
+                            expected_kv_range=(owner_start, owner_end),
+                            execution=execution,
+                        )
+                    )
+    return SplitKVRuntimePlanSet(
+        batch_size=len(totals),
+        tp_world_size=tp_world_size,
+        cp_world_size=cp_world_size,
+        total_kv_tokens=totals,
+        entries=tuple(entries),
+    )
+
+
 def _format_split_kv_coordinates(
     coordinates: Iterable[SplitKVRuntimeCoordinate],
 ) -> list[dict[str, int]]:
@@ -1168,6 +1241,98 @@ class RoPESpec:
 
 
 @dataclass(frozen=True)
+class AttentionProjectionSpec:
+    """Deterministic QKV or output-projection execution contract."""
+
+    name: str
+    input_dtype: AttentionDType = AttentionDType.BF16
+    output_dtype: AttentionDType = AttentionDType.BF16
+    acc_dtype: AttentionDType = AttentionDType.FP32
+    split_kv: SplitKVMode = SplitKVMode.DISABLED
+    k_order: str = "ascending"
+    backend_policy: str = "native_verified_then_common_deterministic"
+    deterministic_backend: str = "rlkernel.cuda.det_gemm"
+    tp_forward_collective: ProjectionCollective = ProjectionCollective.NONE
+    tp_backward_dgrad_collective: ProjectionCollective = ProjectionCollective.NONE
+    sp_forward_collective: ProjectionCollective = ProjectionCollective.NONE
+    sp_backward_collective: ProjectionCollective = ProjectionCollective.NONE
+    qkv_split_order: tuple[str, ...] = ()
+    require_runtime_readback: bool = True
+
+    @classmethod
+    def qkv(cls) -> "AttentionProjectionSpec":
+        return cls(
+            name="qkv",
+            tp_backward_dgrad_collective=ProjectionCollective.ALL_REDUCE,
+            sp_forward_collective=ProjectionCollective.ALL_GATHER,
+            sp_backward_collective=ProjectionCollective.REDUCE_SCATTER,
+            qkv_split_order=("q", "k", "v"),
+        )
+
+    @classmethod
+    def output(cls) -> "AttentionProjectionSpec":
+        return cls(
+            name="o_proj",
+            tp_forward_collective=ProjectionCollective.ALL_REDUCE,
+            sp_forward_collective=ProjectionCollective.REDUCE_SCATTER,
+            sp_backward_collective=ProjectionCollective.ALL_GATHER,
+        )
+
+    def __post_init__(self) -> None:
+        if self.name not in {"qkv", "o_proj"}:
+            raise AttentionContractError("projection name must be qkv or o_proj")
+        for field_name in ("input_dtype", "output_dtype", "acc_dtype"):
+            object.__setattr__(
+                self,
+                field_name,
+                _enum_value(AttentionDType, getattr(self, field_name), field_name),
+            )
+        object.__setattr__(
+            self,
+            "split_kv",
+            _enum_value(SplitKVMode, self.split_kv, "projection.split_kv"),
+        )
+        for field_name in (
+            "tp_forward_collective",
+            "tp_backward_dgrad_collective",
+            "sp_forward_collective",
+            "sp_backward_collective",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _enum_value(
+                    ProjectionCollective,
+                    getattr(self, field_name),
+                    field_name,
+                ),
+            )
+        if self.input_dtype is not AttentionDType.BF16:
+            raise AttentionContractError("Attention projections require BF16 input")
+        if self.output_dtype is not AttentionDType.BF16:
+            raise AttentionContractError("Attention projections require BF16 output")
+        if self.acc_dtype is not AttentionDType.FP32:
+            raise AttentionContractError("Attention projections require FP32 accumulation")
+        if self.split_kv is not SplitKVMode.DISABLED:
+            raise AttentionContractError("Attention projection GEMMs must disable Split-K")
+        if self.k_order != "ascending":
+            raise AttentionContractError("Attention projection GEMMs require ascending K order")
+        for field_name in ("backend_policy", "deterministic_backend"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise AttentionContractError(f"{field_name} must be a non-empty string")
+        if not isinstance(self.require_runtime_readback, bool) or not self.require_runtime_readback:
+            raise AttentionContractError("projection runtime readback must be required")
+        split_order = tuple(self.qkv_split_order)
+        if self.name == "qkv":
+            if split_order != ("q", "k", "v"):
+                raise AttentionContractError("QKV projection must split in Q, K, V order")
+        elif split_order:
+            raise AttentionContractError("o_proj must not declare a QKV split order")
+        object.__setattr__(self, "qkv_split_order", split_order)
+
+
+@dataclass(frozen=True)
 class AttentionContract:
     """Complete semantic request consumed by contract-aware dispatch."""
 
@@ -1185,6 +1350,10 @@ class AttentionContract:
     kv_cache: KVCacheSpec | None = None
     rope: RoPESpec | None = None
     export_lse: bool = True
+    qkv_projection: AttentionProjectionSpec = field(default_factory=AttentionProjectionSpec.qkv)
+    output_projection: AttentionProjectionSpec = field(
+        default_factory=AttentionProjectionSpec.output
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "role", _enum_value(AttentionRole, self.role, "role"))
@@ -1199,6 +1368,14 @@ class AttentionContract:
             raise AttentionContractError("reduction must be a ReductionSpec")
         if not isinstance(self.split_kv, SplitKVSpec):
             raise AttentionContractError("split_kv must be a SplitKVSpec")
+        if not isinstance(self.qkv_projection, AttentionProjectionSpec):
+            raise AttentionContractError("qkv_projection must be an AttentionProjectionSpec")
+        if self.qkv_projection.name != "qkv":
+            raise AttentionContractError("qkv_projection must use name='qkv'")
+        if not isinstance(self.output_projection, AttentionProjectionSpec):
+            raise AttentionContractError("output_projection must be an AttentionProjectionSpec")
+        if self.output_projection.name != "o_proj":
+            raise AttentionContractError("output_projection must use name='o_proj'")
         if (
             self.mode is AttentionMode.PREFILL
             and query_sequence_length != self.sharding.local_sequence_length
@@ -1283,6 +1460,8 @@ class AttentionContract:
             "tp_world_size": self.sharding.tp_world_size,
             "cp_rank": self.sharding.cp_rank,
             "cp_world_size": self.sharding.cp_world_size,
+            "sp_rank": self.sharding.sp_rank,
+            "sp_world_size": self.sharding.sp_world_size,
             "global_q_heads": self.sharding.global_q_heads,
             "global_kv_heads": self.sharding.global_kv_heads,
             "local_q_head_start": self.sharding.local_q_head_start,
@@ -1345,6 +1524,24 @@ class AttentionContract:
                 "output_dtype": self.rope.output_dtype.value,
                 "fusion_boundary": self.rope.fusion_boundary.value,
             }
+        projections = {
+            spec.name: {
+                "input_dtype": spec.input_dtype.value,
+                "output_dtype": spec.output_dtype.value,
+                "acc_dtype": spec.acc_dtype.value,
+                "split_kv": spec.split_kv.value,
+                "k_order": spec.k_order,
+                "backend_policy": spec.backend_policy,
+                "deterministic_backend": spec.deterministic_backend,
+                "tp_forward_collective": spec.tp_forward_collective.value,
+                "tp_backward_dgrad_collective": spec.tp_backward_dgrad_collective.value,
+                "sp_forward_collective": spec.sp_forward_collective.value,
+                "sp_backward_collective": spec.sp_backward_collective.value,
+                "qkv_split_order": list(spec.qkv_split_order),
+                "require_runtime_readback": spec.require_runtime_readback,
+            }
+            for spec in (self.qkv_projection, self.output_projection)
+        }
         return {
             "semantic_operator": "standard_softmax_attention",
             "role": self.role.value,
@@ -1364,6 +1561,7 @@ class AttentionContract:
             "split_kv": self.split_kv.to_dict(),
             "kv_cache": kv_cache,
             "rope": rope,
+            "projections": projections,
         }
 
     def cross_rank_fingerprint(self) -> str:
@@ -1554,6 +1752,7 @@ __all__ = [
     "AttentionBackendCapability",
     "AttentionDispatchResult",
     "AttentionDType",
+    "AttentionProjectionSpec",
     "AttentionMerge",
     "AttentionMode",
     "AttentionRole",
@@ -1562,11 +1761,13 @@ __all__ = [
     "ReductionEngine",
     "ReductionOrder",
     "ReductionSpec",
+    "ProjectionCollective",
     "RoPECastPoint",
     "RoPEFusionBoundary",
     "RoPESpec",
     "RoPEState",
     "ShardingSpec",
+    "build_split_kv_runtime_plan_set",
     "SplitKVExecutionPlan",
     "SplitKVMode",
     "SplitKVRuntimeCoordinate",
@@ -1581,7 +1782,7 @@ __all__ = [
     "STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID",
     "STRICT_ATTENTION_ROCM_SCHEDULE_ID",
     "STRICT_ATTENTION_SCHEDULE_ID",
-    "CROSS_CONFIG_BOUND_DEGREES",
+    "CROSS_CONFIG_BOUND_FIELDS",
     "validate_cross_config_alignment",
     "validate_split_kv_alignment",
     "validate_split_kv_plan_set_alignment",
