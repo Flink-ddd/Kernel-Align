@@ -11,6 +11,8 @@ an incompatible backend before any numerically different path is launched.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable, TypeVar
@@ -1288,6 +1290,41 @@ class AttentionContract:
             "kv_cache": kv_cache,
             "rope": rope,
         }
+
+    def cross_rank_fingerprint(self) -> str:
+        """Rank-independent identity for preflight agreement across ranks.
+
+        Excludes ``tp_rank``/``cp_rank`` and the local head/sequence bounds they
+        derive, so every rank of one logical attention invocation computes the
+        same value.  All-gathering this fingerprint together with the resolved
+        backend id and aborting on mismatch is the documented preflight for
+        distributed dispatch; ``requested_backend="auto"`` is not
+        distributed-safe without it.
+        """
+
+        payload = self.to_dict()
+        payload["sharding"] = {
+            key: value
+            for key, value in payload["sharding"].items()
+            if key
+            not in {
+                "tp_rank",
+                "cp_rank",
+                "local_q_head_start",
+                "local_q_heads",
+                "local_kv_head_start",
+                "local_kv_heads",
+                "local_sequence_length",
+                "global_block_indices",
+                "global_block_token_starts",
+                "local_block_offsets",
+            }
+        }
+        # Note: Any future extensions to this payload MUST maintain strict JSON
+        # serialization determinism across environments to prevent cross-rank
+        # hashing mismatches.
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)

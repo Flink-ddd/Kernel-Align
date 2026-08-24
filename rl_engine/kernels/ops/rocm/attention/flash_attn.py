@@ -30,6 +30,11 @@ from rl_engine.utils.logger import logger
 _MAX_TESTED_ROCM_TRITON_HEAD_DIM = 512
 _AITER_API_SOURCE = "aiter.ops.mha"
 
+# Stable dispatch identity for the strict ROCm attention core.  Kept at module
+# scope so contract-aware dispatch and the Vime adapter name one constant
+# instead of duplicating the string.
+BACKEND_ID = "aiter.rocm.ck_dense_mha"
+
 
 class StrictRocmAttentionUnavailable(RuntimeError):
     """Raised when the exact AITER CK strict contract is unavailable."""
@@ -134,7 +139,7 @@ class StrictRocmAiterCKAttentionCore:
 
     core_id = STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID
     strict_schedule = STRICT_ATTENTION_ROCM_SCHEDULE_ID
-    backend_id = "aiter.rocm.ck_dense_mha"
+    backend_id = BACKEND_ID
     api_source = _AITER_API_SOURCE
     merge_order = "global_block_index"
     accum_dtype = "fp32"

@@ -1,0 +1,373 @@
+{
+  "environment": {
+    "gpu": "AMD Instinct MI300X",
+    "arch": "gfx942:sramecc+:xnack-",
+    "device_count": 8,
+    "torch": "2.12.0+rocm7.14.0a20260608",
+    "hip": "7.14.60850",
+    "dtype": "bf16",
+    "q_heads": 32,
+    "kv_heads": 8,
+    "head_dim": 128
+  },
+  "latency": [
+    {
+      "batch": 1,
+      "seq_len": 1024,
+      "backend": "native",
+      "forward": {
+        "median_ms": 0.1438,
+        "p95_ms": 0.1668,
+        "peak_mib": 36.1
+      },
+      "forward_backward": {
+        "median_ms": 0.4741,
+        "p95_ms": 0.4915,
+        "peak_mib": 84.3
+      }
+    },
+    {
+      "batch": 1,
+      "seq_len": 1024,
+      "backend": "triton",
+      "forward": {
+        "median_ms": 0.3069,
+        "p95_ms": 0.33,
+        "peak_mib": 32.1
+      },
+      "forward_backward": {
+        "median_ms": 1.7754,
+        "p95_ms": 1.864,
+        "peak_mib": 52.2
+      }
+    },
+    {
+      "batch": 1,
+      "seq_len": 1024,
+      "backend": "strict",
+      "forward": {
+        "median_ms": 0.4045,
+        "p95_ms": 0.4261,
+        "peak_mib": 40.1
+      },
+      "forward_backward": {
+        "median_ms": 1.048,
+        "p95_ms": 1.0706,
+        "peak_mib": 1108.5
+      }
+    },
+    {
+      "batch": 1,
+      "seq_len": 2048,
+      "backend": "native",
+      "forward": {
+        "median_ms": 0.2963,
+        "p95_ms": 0.3018,
+        "peak_mib": 72.3
+      },
+      "forward_backward": {
+        "median_ms": 1.088,
+        "p95_ms": 1.0986,
+        "peak_mib": 168.8
+      }
+    },
+    {
+      "batch": 1,
+      "seq_len": 2048,
+      "backend": "triton",
+      "forward": {
+        "median_ms": 0.6404,
+        "p95_ms": 0.6551,
+        "peak_mib": 64.2
+      },
+      "forward_backward": {
+        "median_ms": 2.2759,
+        "p95_ms": 2.2853,
+        "peak_mib": 104.5
+      }
+    },
+    {
+      "batch": 1,
+      "seq_len": 2048,
+      "backend": "strict",
+      "forward": {
+        "median_ms": 0.4327,
+        "p95_ms": 0.4475,
+        "peak_mib": 80.3
+      },
+      "forward_backward": {
+        "median_ms": 2.0983,
+        "p95_ms": 2.2269,
+        "peak_mib": 4265.0
+      }
+    },
+    {
+      "batch": 1,
+      "seq_len": 4096,
+      "backend": "native",
+      "forward": {
+        "median_ms": 0.7014,
+        "p95_ms": 0.7219,
+        "peak_mib": 144.5
+      },
+      "forward_backward": {
+        "median_ms": 3.2456,
+        "p95_ms": 3.2945,
+        "peak_mib": 337.5
+      }
+    },
+    {
+      "batch": 1,
+      "seq_len": 4096,
+      "backend": "triton",
+      "forward": {
+        "median_ms": 1.4337,
+        "p95_ms": 1.4886,
+        "peak_mib": 128.5
+      },
+      "forward_backward": {
+        "median_ms": 4.6235,
+        "p95_ms": 4.672,
+        "peak_mib": 209.0
+      }
+    },
+    {
+      "batch": 1,
+      "seq_len": 4096,
+      "backend": "strict",
+      "forward": {
+        "median_ms": 0.7415,
+        "p95_ms": 0.7529,
+        "peak_mib": 160.5
+      },
+      "forward_backward": {
+        "median_ms": 5.8933,
+        "p95_ms": 5.9776,
+        "peak_mib": 16722.0
+      }
+    },
+    {
+      "batch": 2,
+      "seq_len": 2048,
+      "backend": "native",
+      "forward": {
+        "median_ms": 0.4437,
+        "p95_ms": 0.4696,
+        "peak_mib": 144.5
+      },
+      "forward_backward": {
+        "median_ms": 1.9135,
+        "p95_ms": 1.9372,
+        "peak_mib": 337.5
+      }
+    },
+    {
+      "batch": 2,
+      "seq_len": 2048,
+      "backend": "triton",
+      "forward": {
+        "median_ms": 0.9821,
+        "p95_ms": 0.9917,
+        "peak_mib": 128.5
+      },
+      "forward_backward": {
+        "median_ms": 2.6656,
+        "p95_ms": 2.6806,
+        "peak_mib": 209.0
+      }
+    },
+    {
+      "batch": 2,
+      "seq_len": 2048,
+      "backend": "strict",
+      "forward": {
+        "median_ms": 0.7912,
+        "p95_ms": 0.8101,
+        "peak_mib": 120.5
+      },
+      "forward_backward": {
+        "median_ms": 3.9666,
+        "p95_ms": 4.0203,
+        "peak_mib": 4369.3
+      }
+    },
+    {
+      "batch": 4,
+      "seq_len": 2048,
+      "backend": "native",
+      "forward": {
+        "median_ms": 0.8211,
+        "p95_ms": 0.8666,
+        "peak_mib": 289.0
+      },
+      "forward_backward": {
+        "median_ms": 3.5754,
+        "p95_ms": 3.6514,
+        "peak_mib": 675.0
+      }
+    },
+    {
+      "batch": 4,
+      "seq_len": 2048,
+      "backend": "triton",
+      "forward": {
+        "median_ms": 1.7571,
+        "p95_ms": 1.7957,
+        "peak_mib": 257.0
+      },
+      "forward_backward": {
+        "median_ms": 5.131,
+        "p95_ms": 5.1587,
+        "peak_mib": 418.0
+      }
+    },
+    {
+      "batch": 4,
+      "seq_len": 2048,
+      "backend": "strict",
+      "forward": {
+        "median_ms": 1.3856,
+        "p95_ms": 1.4119,
+        "peak_mib": 226.1
+      },
+      "forward_backward": {
+        "median_ms": 7.7189,
+        "p95_ms": 7.8018,
+        "peak_mib": 4610.3
+      }
+    }
+  ],
+  "determinism_cost": [
+    {
+      "seq_len": 1024,
+      "deterministic": {
+        "median_ms": 0.4455,
+        "p95_ms": 0.4746,
+        "peak_mib": 1188.3
+      },
+      "non_deterministic": {
+        "median_ms": 0.1917,
+        "p95_ms": 0.1971,
+        "peak_mib": 180.3
+      },
+      "time_ratio": 2.32,
+      "memory_ratio": 6.6
+    },
+    {
+      "seq_len": 2048,
+      "deterministic": {
+        "median_ms": 1.3399,
+        "p95_ms": 1.3742,
+        "peak_mib": 4328.5
+      },
+      "non_deterministic": {
+        "median_ms": 0.5687,
+        "p95_ms": 0.5762,
+        "peak_mib": 264.5
+      },
+      "time_ratio": 2.36,
+      "memory_ratio": 16.4
+    },
+    {
+      "seq_len": 4096,
+      "deterministic": {
+        "median_ms": 5.0313,
+        "p95_ms": 5.1068,
+        "peak_mib": 16753.0
+      },
+      "non_deterministic": {
+        "median_ms": 2.0607,
+        "p95_ms": 2.089,
+        "peak_mib": 433.0
+      },
+      "time_ratio": 2.44,
+      "memory_ratio": 38.7
+    }
+  ],
+  "batch_composition": [
+    {
+      "batch": 2,
+      "seq_len": 128,
+      "raw_aiter_out_max_abs": 0.0,
+      "raw_aiter_lse_max_abs": 0.0,
+      "raw_aiter_is_batch_invariant": true
+    },
+    {
+      "batch": 2,
+      "seq_len": 256,
+      "raw_aiter_out_max_abs": 0.0,
+      "raw_aiter_lse_max_abs": 0.0,
+      "raw_aiter_is_batch_invariant": true
+    },
+    {
+      "batch": 2,
+      "seq_len": 512,
+      "raw_aiter_out_max_abs": 0.015625,
+      "raw_aiter_lse_max_abs": 9.5367431640625e-07,
+      "raw_aiter_is_batch_invariant": false
+    },
+    {
+      "batch": 2,
+      "seq_len": 1024,
+      "raw_aiter_out_max_abs": 0.0,
+      "raw_aiter_lse_max_abs": 0.0,
+      "raw_aiter_is_batch_invariant": true
+    },
+    {
+      "batch": 2,
+      "seq_len": 2048,
+      "raw_aiter_out_max_abs": 0.0,
+      "raw_aiter_lse_max_abs": 0.0,
+      "raw_aiter_is_batch_invariant": true
+    },
+    {
+      "batch": 2,
+      "seq_len": 4096,
+      "raw_aiter_out_max_abs": 0.0,
+      "raw_aiter_lse_max_abs": 0.0,
+      "raw_aiter_is_batch_invariant": true
+    },
+    {
+      "batch": 4,
+      "seq_len": 128,
+      "raw_aiter_out_max_abs": 0.0,
+      "raw_aiter_lse_max_abs": 0.0,
+      "raw_aiter_is_batch_invariant": true
+    },
+    {
+      "batch": 4,
+      "seq_len": 256,
+      "raw_aiter_out_max_abs": 0.0078125,
+      "raw_aiter_lse_max_abs": 9.5367431640625e-07,
+      "raw_aiter_is_batch_invariant": false
+    },
+    {
+      "batch": 4,
+      "seq_len": 512,
+      "raw_aiter_out_max_abs": 0.015625,
+      "raw_aiter_lse_max_abs": 9.5367431640625e-07,
+      "raw_aiter_is_batch_invariant": false
+    },
+    {
+      "batch": 4,
+      "seq_len": 1024,
+      "raw_aiter_out_max_abs": 0.0,
+      "raw_aiter_lse_max_abs": 0.0,
+      "raw_aiter_is_batch_invariant": true
+    },
+    {
+      "batch": 4,
+      "seq_len": 2048,
+      "raw_aiter_out_max_abs": 0.0,
+      "raw_aiter_lse_max_abs": 0.0,
+      "raw_aiter_is_batch_invariant": true
+    },
+    {
+      "batch": 4,
+      "seq_len": 4096,
+      "raw_aiter_out_max_abs": 0.0,
+      "raw_aiter_lse_max_abs": 0.0,
+      "raw_aiter_is_batch_invariant": true
+    }
+  ]
+}

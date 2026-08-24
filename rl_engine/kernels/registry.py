@@ -8,8 +8,21 @@ from typing import Any, Dict, Optional, Set, Type
 
 import torch
 
+from rl_engine.kernels.attention_contract import (
+    AttentionBackendCapability,
+    AttentionContract,
+    AttentionContractError,
+    AttentionDispatchResult,
+    AttentionDType,
+    AttentionMode,
+    AttentionRole,
+)
 from rl_engine.platforms.device import device_ctx
 from rl_engine.utils.logger import logger
+
+# Dispatch policy keywords accepted by ``get_attention_op`` in place of an
+# exact backend id. They mirror ``AttentionBackendCapability.implementation_kind``.
+ATTENTION_IMPLEMENTATION_KINDS = frozenset({"production", "reference", "deterministic"})
 
 
 class _KernelEnumMeta(EnumMeta):
@@ -41,6 +54,13 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     ROCM_AITER = "rl_engine.kernels.ops.rocm.aiter.AiterOp"
     ROCM_CK = "rl_engine.kernels.ops.rocm.composable_kernel.CKOp"
     ROCM_FLASH_ATTN = "rl_engine.kernels.ops.rocm.attention.flash_attn.RocmFlashAttentionOp"
+    # WS2 strict ROCm attention core (AITER/CK dense MHA, Split-KV disabled).
+    # Registered for contract-aware dispatch only, never in the legacy
+    # ``get_op`` priority lists: it is not a drop-in for the SDPA-shaped
+    # ``attn`` wrappers and must not be reachable as a silent fallback.
+    ROCM_STRICT_ATTENTION = (
+        "rl_engine.kernels.ops.rocm.attention.flash_attn.StrictRocmAiterCKAttentionCore"
+    )
 
     # GRPO loss (group reward normalization + clipped surrogate + KL)
     TRITON_GRPO_LOSS = "rl_engine.kernels.ops.triton.loss.grpo_loss.TritonGRPOLossOp"
@@ -165,6 +185,28 @@ def resolve_logp_op_type(
                 f"got {logp_backend!r}"
             )
     return op_type
+
+
+def _rocm_strict_attention_available() -> bool:
+    """Return whether the strict ROCm AITER/CK attention core can actually load.
+
+    The probe mirrors the ROCm logprob backend gate: it must be true only when
+    this process can really execute the strict arithmetic, so an unavailable
+    vendor stack results in the backend never being registered rather than in a
+    registered backend that fails at materialization time.
+    """
+
+    if torch.version.hip is None:
+        return False
+    try:
+        from rl_engine.kernels.ops.rocm.attention.flash_attn import _load_aiter_ck_ops
+    except ImportError:
+        return False
+    try:
+        _load_aiter_ck_ops()
+    except Exception:  # StrictRocmAttentionUnavailable and vendor import errors
+        return False
+    return True
 
 
 class KernelRegistry:
@@ -312,6 +354,218 @@ class KernelRegistry:
         logger.info(f"KernelRegistry initialized for {device_ctx.device_type}")
         self._adjust_priority_for_hardware()
         self._adjust_priority_from_env()
+
+        # WS2 attention dispatch owns its own candidate list and starts empty on
+        # every platform. The legacy ``attn`` / ``attention`` priority lists stay
+        # untouched, so a strict WS2 caller can never be served by an SDPA-shaped
+        # wrapper that does not export attention-domain LSE, and the strict core
+        # can never be picked up by a legacy caller as a silent substitution.
+        self._attention_candidates: Dict[str, list] = {
+            platform: [] for platform in self._priority_map
+        }
+        self._attention_capabilities: Dict[str, Dict[OpBackend, AttentionBackendCapability]] = {
+            platform: {} for platform in self._priority_map
+        }
+
+        # Strict ROCm production core: AITER/CK dense MHA with Split-KV disabled.
+        # Registered only when the vendor entry points genuinely load, so an
+        # explicit request on a machine without AITER fails loudly in
+        # ``get_attention_op`` instead of resolving to different arithmetic.
+        rocm_strict_attention_capability = AttentionBackendCapability(
+            backend_id="aiter.rocm.ck_dense_mha",
+            roles=frozenset({AttentionRole.TRAIN, AttentionRole.INFER}),
+            modes=frozenset({AttentionMode.PREFILL, AttentionMode.CHUNKED_PREFILL}),
+            dtypes=frozenset({AttentionDType.BF16, AttentionDType.FP16}),
+            cp_world_sizes=(1,),
+            tp_world_sizes=None,
+            exports_attention_lse=True,
+            deterministic_cp_merge=False,
+            supports_packed_varlen=False,
+            supports_kv_cache=False,
+            supports_rope_metadata=True,
+            supports_fused_rope_attention=False,
+            supports_split_kv_disabled=True,
+            supports_split_kv_fixed=False,
+            supports_split_kv_auto=False,
+            reports_actual_split_kv_plan=True,
+            implementation_kind="production",
+        )
+        if _rocm_strict_attention_available() and "rocm" in self._priority_map:
+            self.register_attention_backend(
+                OpBackend.ROCM_STRICT_ATTENTION,
+                rocm_strict_attention_capability,
+                platform="rocm",
+                prepend=True,
+            )
+
+    def register_attention_backend(
+        self,
+        backend: OpBackend,
+        capability: AttentionBackendCapability,
+        *,
+        platform: Optional[str] = None,
+        prepend: bool = False,
+    ) -> None:
+        """Register (or replace) a backend for WS2 contract-aware attention dispatch.
+
+        This is the supported seam for making an attention backend selectable by
+        ``get_attention_op`` without touching the legacy ``get_op`` priority
+        lists. Registering the same backend again replaces its capability
+        without duplicating the candidate entry.
+        """
+
+        if not isinstance(backend, OpBackend):
+            raise AttentionContractError("backend must be an OpBackend")
+        if not isinstance(capability, AttentionBackendCapability):
+            raise AttentionContractError("capability must be an AttentionBackendCapability")
+        resolved_platform = platform if platform is not None else self._platform()
+        if resolved_platform not in self._priority_map:
+            raise AttentionContractError(
+                f"unsupported platform {resolved_platform!r}; expected one of "
+                f"{sorted(self._priority_map)}"
+            )
+        candidates = self._attention_candidates.setdefault(resolved_platform, [])
+        self._attention_capabilities.setdefault(resolved_platform, {})[backend] = capability
+        if backend not in candidates:
+            if prepend:
+                candidates.insert(0, backend)
+            else:
+                candidates.append(backend)
+
+    def get_attention_op(
+        self,
+        contract: AttentionContract,
+        *,
+        requested_backend: str = "auto",
+    ) -> AttentionDispatchResult:
+        """Resolve only a backend that explicitly supports the WS2 attention contract.
+
+        Deliberately separate from the legacy ``get_op``: existing callers keep
+        their current behavior, while WS2 callers cannot silently fall back to a
+        backend with different reduction or Split-KV semantics.
+
+        ``requested_backend`` is either a case-insensitive policy keyword
+        (``auto`` | ``production`` | ``reference``) or an exact, case-sensitive
+        stable backend id. Strictness comes from the contract's capability
+        checks rather than from this policy string. With ``cp_world_size > 1``,
+        ``auto`` is rejected: per-rank auto resolution can diverge across ranks,
+        so distributed callers must name a policy or backend id.
+        """
+
+        if not isinstance(contract, AttentionContract):
+            raise AttentionContractError("contract must be an AttentionContract")
+        if not isinstance(requested_backend, str) or not requested_backend.strip():
+            raise AttentionContractError("requested_backend must be a non-empty string")
+        requested_backend = requested_backend.strip()
+        if requested_backend.lower() == "deterministic":
+            raise AttentionContractError(
+                'requested_backend="deterministic" is not a dispatch policy; request '
+                "determinism through ReductionSpec/SplitKVSpec and match it against the "
+                "backend capability flags instead"
+            )
+        if requested_backend.lower() == "auto" and contract.sharding.cp_world_size > 1:
+            raise AttentionContractError(
+                "Unsafe dispatch: requested_backend='auto' is not permitted when "
+                "cp_world_size > 1 without explicit cross-rank preflighting."
+            )
+
+        platform = self._platform()
+        candidates = self._attention_candidates.get(platform, [])
+        rejected: list[str] = []
+        # provenance["fallback"] reports only capability/load rejections of
+        # otherwise-eligible candidates; skips caused purely by the caller's own
+        # requested_backend policy filter are not fallbacks.
+        capability_rejections = 0
+
+        platform_capabilities = self._attention_capabilities.get(platform, {})
+        for backend in candidates:
+            capability = platform_capabilities.get(backend)
+            if capability is None:
+                rejected.append(f"{backend.name}: no AttentionBackendCapability declared")
+                capability_rejections += 1
+                continue
+            policy_mismatch = self._attention_policy_mismatch(requested_backend, capability)
+            if policy_mismatch is not None:
+                rejected.append(f"{backend.name}: {policy_mismatch}")
+                continue
+            capability_incompat = list(capability.incompatibilities(contract))
+            if capability_incompat:
+                rejected.append(f"{backend.name}: " + "; ".join(capability_incompat))
+                capability_rejections += 1
+                continue
+
+            op = self._get_or_create_backend(backend)
+            if op is None:
+                rejected.append(f"{backend.name}: backend could not be loaded or instantiated")
+                capability_rejections += 1
+                continue
+
+            provenance = {
+                "requested_backend": requested_backend,
+                "actual_backend": capability.backend_id,
+                "backend_enum": backend.name,
+                "platform": platform,
+                "fallback": capability_rejections > 0,
+                "fallback_reason": None,
+                "prior_rejections": list(rejected),
+                "contract": contract.to_dict(),
+                "capability": capability.to_dict(),
+            }
+            return AttentionDispatchResult(op=op, capability=capability, provenance=provenance)
+
+        details = " | ".join(rejected) if rejected else "no candidates registered"
+        requested = contract.to_dict()
+        raise RuntimeError(
+            "No attention backend supports the requested WS2 contract on "
+            f"{platform}: role={requested['role']}, mode={requested['mode']}, "
+            f"dtype={requested['dtype']}, TP={contract.sharding.tp_world_size}, "
+            f"CP={contract.sharding.cp_world_size}, "
+            f"split_kv={contract.split_kv.mode.value}. Rejections: {details}"
+        )
+
+    @staticmethod
+    def _attention_policy_mismatch(
+        requested_backend: str,
+        capability: AttentionBackendCapability,
+    ) -> str | None:
+        policy = requested_backend.lower()
+        if policy == "auto":
+            return None
+        if policy in ATTENTION_IMPLEMENTATION_KINDS:
+            if capability.implementation_kind == policy:
+                return None
+            return (
+                f"implementation_kind={capability.implementation_kind} does not satisfy "
+                f"requested_backend={policy}"
+            )
+        if capability.backend_id == requested_backend:
+            return None
+        return (
+            f"backend_id={capability.backend_id} does not match "
+            f"requested_backend={requested_backend}"
+        )
+
+    def _platform(self) -> str:
+        return self._platform_for_device(None)
+
+    def _get_or_create_backend(self, backend: OpBackend) -> Any | None:
+        if backend.name in self._instance_cache:
+            return self._instance_cache[backend.name]
+        if backend.name in self._failed_backends:
+            return None
+
+        op_class = self._load_backend(backend)
+        if op_class is None:
+            self._failed_backends.add(backend.name)
+            return None
+        try:
+            op = op_class()
+        except Exception as exc:
+            logger.error(f"Failed to instantiate {backend.name}: {exc}")
+            self._failed_backends.add(backend.name)
+            return None
+        self._instance_cache[backend.name] = op
+        return op
 
     def _adjust_priority_from_env(self):
         rocm_attn_backend = os.getenv("RL_KERNEL_ROCM_ATTN_BACKEND", "").strip().lower()
