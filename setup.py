@@ -3,10 +3,13 @@
 
 import importlib.util
 import os
+import sysconfig
 import warnings
+from distutils.errors import CompileError
+from distutils.spawn import find_executable
 from pathlib import Path
 
-from setuptools import find_packages, setup
+from setuptools import Extension, find_packages, setup
 
 
 def _load_envs_module():
@@ -267,6 +270,8 @@ def get_extensions():
             )
         )
 
+    extensions.extend(_ascend_extensions())
+
     if _native_extension_required() and not extensions:
         raise RuntimeError(
             "rl_engine._C was requested but no CUDA/ROCm build environment is available. "
@@ -277,11 +282,108 @@ def get_extensions():
     return extensions
 
 
+def _ascend_extensions():
+    """Ascend C (CANN) kernels, built with bisheng. Gated on KERNEL_ALIGN_FORCE_ASCEND=1.
+
+    Follows the official torch_npu cpp_extension_asc pattern: .asc sources
+    (kernel + host + pybind) are compiled by the CANN bisheng compiler into a
+    single rl_engine._C_npu extension module. Requires CANN toolkit (bisheng on
+    PATH or ASCEND_HOME_PATH set) and torch_npu.
+    """
+    if not envs.env_flag(envs.KERNEL_ALIGN_FORCE_ASCEND):
+        return []
+    try:
+        import torch  # noqa: F401
+        import torch_npu  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(
+            "KERNEL_ALIGN_FORCE_ASCEND=1 requires torch and torch_npu to be installed"
+        ) from e
+
+    asc_srcs = sorted(str(p) for p in Path("csrc/ascend").glob("*.asc"))
+    if not asc_srcs:
+        raise RuntimeError("KERNEL_ALIGN_FORCE_ASCEND=1 but no .asc sources under csrc/ascend/")
+    return [Extension(name="rl_engine._C_npu", sources=asc_srcs, language="asc")]
+
+
+def _bisheng_compile_cmd(ext, ext_fullpath):
+    """Single-command bisheng build for an Ascend C extension (see op-plugin example)."""
+    import torch
+    import torch.utils.cpp_extension as cpp_extension
+    import torch_npu
+
+    if find_executable("bisheng") is None:
+        raise RuntimeError(
+            "bisheng compiler not found on PATH; source the CANN toolkit environment first"
+        )
+
+    soc = os.environ.get(envs.KERNEL_ALIGN_ASCEND_ARCH, "dav-2201")  # A2/A3; A5: dav-3510
+    abi_value = "1" if torch._C._GLIBCXX_USE_CXX11_ABI else "0"
+    module_name = ext.name.rsplit(".", 1)[-1]
+
+    torch_npu_dir = os.path.dirname(os.path.realpath(torch_npu.__file__))
+    ascend_home = os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")
+
+    include_dirs = [
+        *cpp_extension.include_paths(),
+        sysconfig.get_config_var("INCLUDEPY"),
+        os.path.join(torch_npu_dir, "include"),
+        os.path.join(torch_npu_dir, "include", "third_party", "acl", "inc"),
+        os.path.join(ascend_home, "include"),
+    ]
+    lib_dirs = [
+        sysconfig.get_config_var("LIBDIR"),
+        os.path.join(os.path.dirname(torch.__file__), "lib"),
+        os.path.join(torch_npu_dir, "lib"),
+        os.path.join(ascend_home, "lib64"),
+    ]
+
+    cmd = [
+        "bisheng",
+        "-x",
+        "asc",
+        f"--npu-arch={soc}",
+        "-shared",
+        "-fPIC",
+        "-std=c++17",
+        "-O2",
+        f"-D_GLIBCXX_USE_CXX11_ABI={abi_value}",
+        f"-DTORCH_EXTENSION_NAME={module_name}",
+        "-lascendcl",
+        "-ltorch_npu",
+        "-ltorch",
+        "-ltorch_cpu",
+        "-ltorch_python",
+        "-lc10",
+        *ext.sources,
+        "-o",
+        ext_fullpath,
+    ]
+    cmd += [f"-I{d}" for d in include_dirs if d]
+    cmd += [f"-L{d}" for d in lib_dirs if d]
+    return cmd
+
+
 def get_cmdclass():
     _, BuildExtension, _ = _load_torch_extension_tools()
     if BuildExtension is None:
         return {}
-    return {"build_ext": BuildExtension}
+
+    class AscendBuildExtension(BuildExtension):
+        """torch BuildExtension + bisheng path for language="asc" extensions."""
+
+        def build_extension(self, ext):
+            if getattr(ext, "language", None) != "asc":
+                super().build_extension(ext)
+                return
+            ext_fullpath = self.get_ext_fullpath(ext.name)
+            os.makedirs(os.path.dirname(ext_fullpath), exist_ok=True)
+            try:
+                self.spawn(_bisheng_compile_cmd(ext, ext_fullpath))
+            except Exception as e:
+                raise CompileError(str(e)) from e
+
+    return {"build_ext": AscendBuildExtension}
 
 
 setup(
