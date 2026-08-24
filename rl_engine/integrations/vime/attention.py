@@ -30,6 +30,7 @@ from typing import Any
 import torch
 
 from rl_engine.kernels.attention_contract import (
+    CROSS_CONFIG_BOUND_DEGREES,
     AttentionContract,
     AttentionDType,
     AttentionMode,
@@ -412,6 +413,23 @@ def attention_provider(request: Any) -> AttentionProviderResult:
         "cp_is_merge_axis": False,
     }
     provenance["lse_domain"] = "attention"
+    # The qualified ROCm core's reduction order depends on the launch head
+    # count, so a head shard computed under TP=4 is not bit-identical to the
+    # same shard under TP=8 at some shapes.  RL-Kernel binds the degree rather
+    # than paying ~3x forward time to remove the dependence: training and
+    # rollout must run the same TP/CP degree.  ``contract_id`` encodes both, so
+    # comparing it across the two sides is the preflight that enforces this.
+    provenance["cross_config_binding"] = {
+        "bound_degrees": list(CROSS_CONFIG_BOUND_DEGREES),
+        "tp_world_size": contract.sharding.tp_world_size,
+        "cp_world_size": contract.sharding.cp_world_size,
+        "binding_token": "contract_id",
+        "tp_degree_invariant": False,
+        "reason": (
+            "AITER/CK dense MHA reduction order is launch-head-count dependent; "
+            "train and rollout must use the same TP degree"
+        ),
+    }
     return AttentionProviderResult(
         out=out,
         lse=lse,

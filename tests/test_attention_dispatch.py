@@ -23,6 +23,7 @@ from rl_engine.kernels.attention_contract import (
     ReductionSpec,
     ShardingSpec,
     SplitKVSpec,
+    validate_cross_config_alignment,
 )
 from rl_engine.kernels.registry import KernelRegistry, OpBackend, _rocm_strict_attention_available
 
@@ -305,3 +306,131 @@ def test_contract_fingerprint_is_rank_independent():
     # Both TP ranks of one logical invocation agree; a different TP degree does not.
     assert left_tp2.cross_rank_fingerprint() == right_tp2.cross_rank_fingerprint()
     assert left.cross_rank_fingerprint() != left_tp2.cross_rank_fingerprint()
+
+
+# ---------------------------------------------------------------------------
+# Cross-config binding: train and rollout must use the same parallel degrees
+# ---------------------------------------------------------------------------
+
+
+def _tp_contract(tp_world_size: int, tp_rank: int = 0, seq_len: int = 128) -> AttentionContract:
+    """A contract for one TP rank of a 32Q/8KV layout."""
+
+    local_q = 32 // tp_world_size
+    local_kv = 8 // tp_world_size
+    sharding = ShardingSpec(
+        tp_rank=tp_rank,
+        tp_world_size=tp_world_size,
+        cp_rank=0,
+        cp_world_size=1,
+        global_q_heads=32,
+        global_kv_heads=8,
+        local_q_head_start=tp_rank * local_q,
+        local_q_heads=local_q,
+        local_kv_head_start=tp_rank * local_kv,
+        local_kv_heads=local_kv,
+        global_sequence_length=seq_len,
+        local_sequence_length=seq_len,
+        global_block_indices=(0,),
+        global_block_token_starts=(0,),
+        local_block_offsets=(0, seq_len),
+    )
+    return AttentionContract(
+        role=AttentionRole.TRAIN,
+        mode=AttentionMode.PREFILL,
+        dtype=AttentionDType.BF16,
+        batch_size=1,
+        query_sequence_length=seq_len,
+        head_dim=128,
+        causal=True,
+        causal_offsets=(0,),
+        sharding=sharding,
+        reduction=ReductionSpec(),
+        split_kv=SplitKVSpec.disabled(),
+        export_lse=True,
+    )
+
+
+def test_matching_degrees_pass_cross_config_alignment():
+    validate_cross_config_alignment(_tp_contract(4, tp_rank=0), _tp_contract(4, tp_rank=3))
+
+
+def test_tp_degree_mismatch_fails_closed():
+    """A differing TP degree changes the bits, so it must not be comparable.
+
+    The qualified ROCm core's reduction order depends on the launch head count:
+    measured on MI300X the same head shard differs by up to 7.8125e-03 between
+    TP degrees at some shapes.  Binding the degree is what makes the strict
+    claim survive, so the mismatch has to fail rather than warn.
+    """
+
+    with pytest.raises(AttentionContractError, match="same parallel degrees"):
+        validate_cross_config_alignment(_tp_contract(4), _tp_contract(8))
+
+
+def test_cp_degree_mismatch_fails_closed():
+    train = _tp_contract(2)
+    rollout_sharding = ShardingSpec(
+        tp_rank=0,
+        tp_world_size=2,
+        cp_rank=0,
+        cp_world_size=2,
+        global_q_heads=32,
+        global_kv_heads=8,
+        local_q_head_start=0,
+        local_q_heads=16,
+        local_kv_head_start=0,
+        local_kv_heads=4,
+        global_sequence_length=256,
+        local_sequence_length=128,
+        global_block_indices=(0,),
+        global_block_token_starts=(0,),
+        local_block_offsets=(0, 128),
+    )
+    rollout = AttentionContract(
+        role=AttentionRole.INFER,
+        mode=AttentionMode.PREFILL,
+        dtype=AttentionDType.BF16,
+        batch_size=1,
+        query_sequence_length=128,
+        head_dim=128,
+        causal=True,
+        causal_offsets=(0,),
+        sharding=rollout_sharding,
+        reduction=ReductionSpec(),
+        split_kv=SplitKVSpec.disabled(),
+        export_lse=True,
+    )
+    with pytest.raises(AttentionContractError, match="same parallel degrees"):
+        validate_cross_config_alignment(train, rollout)
+
+
+def test_contract_fingerprint_separates_tp_degrees():
+    """The cheap preflight must also catch it, not only the explaining validator."""
+
+    assert _tp_contract(4).cross_rank_fingerprint() != _tp_contract(8).cross_rank_fingerprint()
+    # ...while ranks of one TP degree still agree.
+    assert (
+        _tp_contract(4, tp_rank=0).cross_rank_fingerprint()
+        == _tp_contract(4, tp_rank=3).cross_rank_fingerprint()
+    )
+
+
+def test_dtype_and_split_kv_mismatches_are_explained():
+    train = _tp_contract(2)
+    rollout = AttentionContract(
+        role=train.role,
+        mode=train.mode,
+        dtype=AttentionDType.FP16,
+        batch_size=train.batch_size,
+        query_sequence_length=train.query_sequence_length,
+        head_dim=train.head_dim,
+        causal=train.causal,
+        causal_offsets=train.causal_offsets,
+        sharding=train.sharding,
+        reduction=train.reduction,
+        split_kv=train.split_kv,
+        export_lse=True,
+    )
+    with pytest.raises(AttentionContractError, match="dtype"):
+        validate_cross_config_alignment(train, rollout)

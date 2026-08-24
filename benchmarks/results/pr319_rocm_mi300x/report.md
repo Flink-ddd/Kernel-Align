@@ -21,21 +21,21 @@ Triton backend; `strict` = `aiter.rocm.ck_dense_mha` through WS2 contract dispat
 
 | B | S | Backend | Fwd median (ms) | Fwd p95 (ms) | Fwd peak MiB | Fwd+bwd median (ms) | Fwd+bwd peak MiB |
 |---:|---:|---|---:|---:|---:|---:|---:|
-| 1 | 1024 | native | 0.1438 | 0.1668 | 36.1 | 0.4741 | 84.3 |
-| 1 | 1024 | triton | 0.3069 | 0.3300 | 32.1 | 1.7754 | 52.2 |
-| 1 | 1024 | strict | 0.4045 | 0.4261 | 40.1 | 1.0480 | 1108.5 |
-| 1 | 2048 | native | 0.2963 | 0.3018 | 72.3 | 1.0880 | 168.8 |
-| 1 | 2048 | triton | 0.6404 | 0.6551 | 64.2 | 2.2759 | 104.5 |
-| 1 | 2048 | strict | 0.4327 | 0.4475 | 80.3 | 2.0983 | 4265.0 |
-| 1 | 4096 | native | 0.7014 | 0.7219 | 144.5 | 3.2456 | 337.5 |
-| 1 | 4096 | triton | 1.4337 | 1.4886 | 128.5 | 4.6235 | 209.0 |
-| 1 | 4096 | strict | 0.7415 | 0.7529 | 160.5 | 5.8933 | 16722.0 |
-| 2 | 2048 | native | 0.4437 | 0.4696 | 144.5 | 1.9135 | 337.5 |
-| 2 | 2048 | triton | 0.9821 | 0.9917 | 128.5 | 2.6656 | 209.0 |
-| 2 | 2048 | strict | 0.7912 | 0.8101 | 120.5 | 3.9666 | 4369.3 |
-| 4 | 2048 | native | 0.8211 | 0.8666 | 289.0 | 3.5754 | 675.0 |
-| 4 | 2048 | triton | 1.7571 | 1.7957 | 257.0 | 5.1310 | 418.0 |
-| 4 | 2048 | strict | 1.3856 | 1.4119 | 226.1 | 7.7189 | 4610.3 |
+| 1 | 1024 | native | 0.1449 | 0.1503 | 36.1 | 0.4758 | 84.3 |
+| 1 | 1024 | triton | 0.3021 | 0.3315 | 32.1 | 1.2487 | 52.2 |
+| 1 | 1024 | strict | 0.3980 | 0.4205 | 40.1 | 1.0305 | 1108.5 |
+| 1 | 2048 | native | 0.2972 | 0.3010 | 72.3 | 1.0875 | 168.8 |
+| 1 | 2048 | triton | 0.6379 | 0.6535 | 64.2 | 2.5059 | 104.5 |
+| 1 | 2048 | strict | 0.4265 | 0.4365 | 80.3 | 2.1164 | 4265.0 |
+| 1 | 4096 | native | 0.7020 | 0.7232 | 144.5 | 3.2428 | 337.5 |
+| 1 | 4096 | triton | 1.4280 | 1.4877 | 128.5 | 4.6182 | 209.0 |
+| 1 | 4096 | strict | 0.7343 | 0.7502 | 160.5 | 5.9652 | 16722.0 |
+| 2 | 2048 | native | 0.4499 | 0.4715 | 144.5 | 1.9132 | 337.5 |
+| 2 | 2048 | triton | 0.9764 | 0.9864 | 128.5 | 2.6696 | 209.0 |
+| 2 | 2048 | strict | 0.7826 | 0.8113 | 120.5 | 3.9917 | 4369.3 |
+| 4 | 2048 | native | 0.8225 | 0.8474 | 289.0 | 3.5825 | 675.0 |
+| 4 | 2048 | triton | 1.7539 | 1.7674 | 257.0 | 5.1151 | 418.0 |
+| 4 | 2048 | strict | 1.3809 | 1.4118 | 226.1 | 7.6638 | 4610.3 |
 
 ## Cost of the deterministic backward
 
@@ -44,9 +44,9 @@ already-resident forward tensors, so read the absolute det=on column for scaling
 
 | S | det=on median (ms) | det=off median (ms) | Time | det=on peak MiB | det=off peak MiB |
 |---:|---:|---:|---:|---:|---:|
-| 1024 | 0.4455 | 0.1917 | 2.32x | 1188.3 | 180.3 |
-| 2048 | 1.3399 | 0.5687 | 2.36x | 4328.5 | 264.5 |
-| 4096 | 5.0313 | 2.0607 | 2.44x | 16753.0 | 433.0 |
+| 1024 | 0.4490 | 0.1903 | 2.36x | 1188.3 | 180.3 |
+| 2048 | 1.3386 | 0.5687 | 2.35x | 4328.5 | 264.5 |
+| 4096 | 5.0450 | 2.0415 | 2.47x | 16753.0 | 433.0 |
 
 Deterministic backward peak memory scales as O(S^2): each doubling of S quadruples it.
 
@@ -71,6 +71,32 @@ core materializes one logical row per call.
 | 4 | 4096 | 0.000000e+00 | 0.000000e+00 | yes |
 
 Through the provider, every shape above is bitwise identical (max abs `0`).
+
+## TP-degree invariance of raw AITER
+
+A head shard computed under TP=N vs the same slice of an unsharded run. TP performs no
+cross-rank reduction in attention, so any nonzero value here means the kernel's result
+depends on how many heads shared the launch - i.e. changing TP degree changes the numbers.
+
+| S | TP | Local Hq | Local Hkv | out max abs | lse max abs | Invariant |
+|---:|---:|---:|---:|---:|---:|---|
+| 512 | 2 | 16 | 4 | 0.000000e+00 | 0.000000e+00 | yes |
+| 512 | 4 | 8 | 2 | 0.000000e+00 | 0.000000e+00 | yes |
+| 512 | 8 | 4 | 1 | 0.000000e+00 | 0.000000e+00 | yes |
+| 1024 | 2 | 16 | 4 | 3.906250e-03 | 1.430511e-06 | **no** |
+| 1024 | 4 | 8 | 2 | 3.906250e-03 | 1.430511e-06 | **no** |
+| 1024 | 8 | 4 | 1 | 3.906250e-03 | 1.430511e-06 | **no** |
+| 2048 | 2 | 16 | 4 | 0.000000e+00 | 0.000000e+00 | yes |
+| 2048 | 4 | 8 | 2 | 7.812500e-03 | 2.861023e-06 | **no** |
+| 2048 | 8 | 4 | 1 | 7.812500e-03 | 2.861023e-06 | **no** |
+| 4096 | 2 | 16 | 4 | 0.000000e+00 | 0.000000e+00 | yes |
+| 4096 | 4 | 8 | 2 | 0.000000e+00 | 0.000000e+00 | yes |
+| 4096 | 8 | 4 | 1 | 7.812500e-03 | 4.768372e-06 | **no** |
+
+RL-Kernel does not remove this dependence (per-KV-group execution would, at 2.7-3.9x
+forward time). It binds the degree instead: `AttentionContract.cross_rank_fingerprint`
+includes `tp_world_size`, and `validate_cross_config_alignment` fails closed when training
+and rollout disagree.
 
 ## Reproduce
 

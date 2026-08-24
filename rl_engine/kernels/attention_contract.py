@@ -579,6 +579,81 @@ def validate_split_kv_alignment(
         )
 
 
+# Parallel degrees that must be identical on both sides of a cross-config
+# comparison.  This is not a portability preference: the qualified ROCm vendor
+# core (AITER/CK dense MHA) produces launch-shape-dependent reduction order, so
+# a head shard computed under TP=4 is not bit-identical to the same head shard
+# computed under TP=8 at some shapes.  Measured on MI300X, BF16, Hq=32/Hkv=8/
+# D=128, causal, TP=1 versus the sharded run:
+#
+#     S=512   TP=2/4/8   bitwise
+#     S=1024  TP=2/4/8   out max abs 3.90625e-03
+#     S=2048  TP=4/8     out max abs 7.8125e-03   (TP=2 bitwise)
+#     S=4096  TP=8       out max abs 7.8125e-03   (TP=2/4 bitwise)
+#
+# Executing one KV group per launch removes the dependence and costs 2.7-3.9x
+# forward time.  RL-Kernel instead binds the degree: training and rollout must
+# run the same TP (and CP) degree, and a mismatch fails closed here rather than
+# silently producing different logprobs.
+CROSS_CONFIG_BOUND_DEGREES = ("tp_world_size", "cp_world_size")
+
+
+def validate_cross_config_alignment(
+    training: "AttentionContract",
+    rollout: "AttentionContract",
+) -> None:
+    """Fail closed unless both sides describe one comparable attention invocation.
+
+    ``AttentionContract.cross_rank_fingerprint`` is the single token that
+    encodes this; comparing fingerprints is the cheap distributed preflight.
+    This function exists to explain *which* field diverged when they disagree,
+    so a cross-config drift investigation does not start from one opaque hash.
+    """
+
+    if not isinstance(training, AttentionContract) or not isinstance(rollout, AttentionContract):
+        raise AttentionContractError("both sides must be AttentionContract instances")
+
+    degree_mismatches = [
+        f"{name}: train={getattr(training.sharding, name)} "
+        f"rollout={getattr(rollout.sharding, name)}"
+        for name in CROSS_CONFIG_BOUND_DEGREES
+        if getattr(training.sharding, name) != getattr(rollout.sharding, name)
+    ]
+    if degree_mismatches:
+        raise AttentionContractError(
+            "training and rollout must use the same parallel degrees for a bitwise "
+            "attention comparison; the qualified ROCm core's reduction order depends on "
+            "the launch head count, so a differing degree changes the numbers: "
+            + "; ".join(degree_mismatches)
+        )
+
+    layout_mismatches = [
+        name
+        for name in ("global_q_heads", "global_kv_heads")
+        if getattr(training.sharding, name) != getattr(rollout.sharding, name)
+    ]
+    if layout_mismatches:
+        raise AttentionContractError(
+            "training and rollout describe different global head layouts: "
+            + ", ".join(layout_mismatches)
+        )
+
+    scalar_mismatches = [
+        name
+        for name in ("dtype", "head_dim", "causal", "export_lse")
+        if getattr(training, name) != getattr(rollout, name)
+    ]
+    if scalar_mismatches:
+        raise AttentionContractError(
+            "training and rollout attention contracts differ: " + ", ".join(scalar_mismatches)
+        )
+
+    if training.split_kv != rollout.split_kv:
+        raise AttentionContractError("training and rollout Split-KV policies differ")
+    if training.reduction != rollout.reduction:
+        raise AttentionContractError("training and rollout reduction specs differ")
+
+
 @dataclass(frozen=True, order=True)
 class SplitKVRuntimeCoordinate:
     """Identity of one batch/rank/owner Split-KV runtime plan."""
@@ -1506,6 +1581,8 @@ __all__ = [
     "STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID",
     "STRICT_ATTENTION_ROCM_SCHEDULE_ID",
     "STRICT_ATTENTION_SCHEDULE_ID",
+    "CROSS_CONFIG_BOUND_DEGREES",
+    "validate_cross_config_alignment",
     "validate_split_kv_alignment",
     "validate_split_kv_plan_set_alignment",
 ]

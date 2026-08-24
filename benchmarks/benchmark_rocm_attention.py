@@ -19,13 +19,16 @@ Three backends are compared:
     ``aiter.rocm.ck_dense_mha`` through the WS2 contract dispatch, i.e. the path
     this PR adds.
 
-Two extra sections quantify what the strict contract actually costs, because
-both are properties of the vendor backward rather than of the integration:
+Three extra sections quantify what the strict contract actually costs and
+where it stops holding.  All three are properties of the vendor kernel rather
+than of the integration:
 
 * ``determinism_cost`` — AITER ``mha_bwd`` with ``deterministic`` on vs off.
 * ``batch_composition`` — whether raw AITER returns the same bits for a batch
   and for the same rows submitted one at a time, swept over shapes because the
   answer varies with shape.
+* ``tp_head_count_sensitivity`` — whether a head shard depends on how many
+  heads shared its launch, i.e. whether the path is TP-degree invariant.
 """
 
 from __future__ import annotations
@@ -288,6 +291,77 @@ def _batch_composition(q_heads, kv_heads, head_dim, dtype, shapes):
     return rows
 
 
+def _tp_head_count_sensitivity(q_heads, kv_heads, head_dim, dtype, seq_lens, tp_degrees):
+    """Does a head shard depend on how many heads shared its launch?
+
+    TP shards attention by head and performs no cross-rank reduction, so a rank
+    computing its own head slice ought to match the corresponding slice of an
+    unsharded run.  Where it does not, the strict path is not TP-degree
+    invariant and training/rollout must be pinned to one degree.
+    """
+
+    from aiter.ops.mha import mha_fwd
+
+    scale = 1.0 / math.sqrt(head_dim)
+
+    def forward(query, key, value):
+        out, lse, _mask, _rng = mha_fwd(
+            query.transpose(1, 2).contiguous(),
+            key.transpose(1, 2).contiguous(),
+            value.transpose(1, 2).contiguous(),
+            0.0,
+            scale,
+            True,
+            -1,
+            -1,
+            0,
+            True,
+            False,
+        )
+        return out.transpose(1, 2).contiguous(), lse
+
+    rows = []
+    for seq_len in seq_lens:
+        query, key, value = _tensors(1, q_heads, kv_heads, seq_len, head_dim, dtype, seed=3)
+        full_out, full_lse = forward(query, key, value)
+        for tp in tp_degrees:
+            if q_heads % tp or kv_heads % tp:
+                continue
+            local_q, local_kv = q_heads // tp, kv_heads // tp
+            worst_out = worst_lse = 0.0
+            for rank in range(tp):
+                shard_out, shard_lse = forward(
+                    query[:, rank * local_q : (rank + 1) * local_q],
+                    key[:, rank * local_kv : (rank + 1) * local_kv],
+                    value[:, rank * local_kv : (rank + 1) * local_kv],
+                )
+                ref_out = full_out[:, rank * local_q : (rank + 1) * local_q]
+                ref_lse = full_lse[:, rank * local_q : (rank + 1) * local_q]
+                worst_out = max(worst_out, (shard_out - ref_out).abs().max().item())
+                worst_lse = max(worst_lse, (shard_lse - ref_lse).abs().max().item())
+            invariant = worst_out == 0.0 and worst_lse == 0.0
+            rows.append(
+                {
+                    "seq_len": seq_len,
+                    "tp": tp,
+                    "local_q_heads": local_q,
+                    "local_kv_heads": local_kv,
+                    "out_max_abs": worst_out,
+                    "lse_max_abs": worst_lse,
+                    "tp_degree_invariant": invariant,
+                }
+            )
+            print(
+                f"tp-sensitivity S={seq_len:5d} TP={tp} (Hq={local_q},Hkv={local_kv}) "
+                f"out {worst_out:.6e} lse {worst_lse:.6e} "
+                f"{'invariant' if invariant else 'NOT INVARIANT'}",
+                flush=True,
+            )
+        del query, key, value, full_out, full_lse
+        torch.cuda.empty_cache()
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("attention_results.json"))
@@ -359,6 +433,14 @@ def main() -> None:
     composition = _batch_composition(
         args.q_heads, args.kv_heads, args.head_dim, dtype, composition_shapes
     )
+    tp_sensitivity = _tp_head_count_sensitivity(
+        args.q_heads,
+        args.kv_heads,
+        args.head_dim,
+        dtype,
+        sorted({512, *seq_lens}),
+        (2, 4, 8),
+    )
 
     properties = torch.cuda.get_device_properties(0)
     payload = {
@@ -376,6 +458,7 @@ def main() -> None:
         "latency": rows,
         "determinism_cost": determinism,
         "batch_composition": composition,
+        "tp_head_count_sensitivity": tp_sensitivity,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2))

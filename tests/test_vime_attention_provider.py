@@ -270,3 +270,51 @@ def test_explicit_scale_is_honored():
     explicit = attention_provider(_request(seq_len=128, seed=8, softmax_scale=scale))
 
     assert torch.equal(default.out, explicit.out)
+
+
+@requires_strict_rocm
+def test_provenance_records_the_cross_config_degree_binding():
+    """The binding must be auditable per call, not only documented.
+
+    RL-Kernel does not make the strict path TP-degree invariant: the qualified
+    vendor core's reduction order depends on the launch head count, and
+    removing that dependence costs ~3x forward time.  The path instead binds
+    the degree, so every result has to carry what it was bound to.
+    """
+
+    result = attention_provider(_request(seq_len=256))
+    binding = result.provenance["cross_config_binding"]
+
+    assert binding["bound_degrees"] == ["tp_world_size", "cp_world_size"]
+    assert binding["tp_degree_invariant"] is False
+    assert binding["binding_token"] == "contract_id"
+    assert binding["tp_world_size"] == 1
+    assert binding["cp_world_size"] == 1
+
+
+@requires_strict_rocm
+def test_tp_degree_change_changes_the_contract_id():
+    """Train and rollout on different TP degrees must not compare as equal."""
+
+    class _Group:
+        def __init__(self, rank, size):
+            self._rank, self._size = rank, size
+
+        def rank(self):
+            return self._rank
+
+        def size(self):
+            return self._size
+
+    ids = {}
+    for tp in (1, 2, 4):
+        request = _request(seq_len=256, seed=4)
+        local_q, local_kv = GLOBAL_Q_HEADS // tp, GLOBAL_KV_HEADS // tp
+        request.query = request.query[:, :local_q]
+        request.key = request.key[:, :local_kv]
+        request.value = request.value[:, :local_kv]
+        request.metadata = _metadata(tp_rank=0, tp_world_size=tp)
+        request.tensor_parallel_group = _Group(0, tp)
+        ids[tp] = attention_provider(request).contract_id
+
+    assert len({ids[1], ids[2], ids[4]}) == 3
