@@ -12,6 +12,7 @@ on:
       - 'requirements*.txt'
       - 'docker/Dockerfile.cuda'
       - 'ci/run_gpu_ci.sh'
+      - 'scripts/ci_smoke.py'
       - '.github/workflows/gpu-ci.yml'
     types: [ opened, synchronize, reopened, labeled ]
 

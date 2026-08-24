@@ -15,6 +15,12 @@ def fused_linear_logp_sm90(
     target: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> list[torch.Tensor]: ...
+def batch_invariant_linear_logp_sm90(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> list[torch.Tensor]: ...
 def fused_linear_logp_sm90_global_target(
     hidden: torch.Tensor,
     weight: torch.Tensor,

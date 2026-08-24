@@ -14,8 +14,15 @@ python benchmarks/profiler.py --format json --output reports/profile.json
 python benchmarks/benchmark_sampling.py
 python benchmarks/benchmark_grpo_op.py
 python benchmarks/benchmark_pack.py --smoke
+python benchmarks/benchmark_batch_invariant_linear_logp.py
 python scripts/run_perf.py
 ```
+
+The batch-invariant linear-logp entry point is a manual three-path comparison,
+not a single profiler workload; it reports invariant-versus-throughput overhead
+over the same logical values. The fused paths share BF16 inputs; the materialized
+path uses FP32 copies, and each memory result is relative to its own prepared-input
+baseline.
 
 The automated profiler records one row per workload shape with:
 

@@ -8,6 +8,8 @@ from typing import Any, Optional
 
 import torch
 
+from rl_engine.kernels.ops.pytorch.linear.lm_head import NativeLMHeadOp
+
 # Backward token-chunk target: process at most this many ``[chunk, V]`` logit
 # elements per cuBLAS step so peak backward memory stays ~``chunk*V`` instead of
 # ``N*V``.
@@ -662,3 +664,51 @@ class NativeLinearLogpOp:
         target_1d = target_ids.reshape(-1).to(device=logits.device, dtype=torch.long)
         selected = torch.gather(log_probs, dim=-1, index=target_1d.unsqueeze(1)).squeeze(-1)
         return selected.reshape(lead_shape)
+
+    def forward_fp32(
+        self,
+        hidden: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        target_ids: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        *,
+        tp_group: Any = None,
+        vocab_start_index: int = 0,
+        global_vocab_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        """FP32 oracle without low-precision logit rounding."""
+        if hidden.shape[:-1] != target_ids.shape:
+            raise ValueError(
+                f"hidden leading shape {tuple(hidden.shape[:-1])} must match "
+                f"target_ids shape {tuple(target_ids.shape)}"
+            )
+        if lm_head_weight.size(-1) != hidden.size(-1):
+            raise ValueError(
+                f"hidden dim {hidden.size(-1)} must match lm_head_weight dim "
+                f"{lm_head_weight.size(-1)}"
+            )
+        if should_use_tensor_parallel_linear_logp(
+            tp_group,
+            int(vocab_start_index),
+            global_vocab_size,
+            lm_head_weight.size(0),
+        ):
+            hidden_fp32 = hidden.float()
+            weight_fp32 = lm_head_weight.float()
+            bias_fp32 = None if bias is None else bias.float()
+            with NativeLMHeadOp._strict_fp32_matmul(hidden.device.type):
+                return tensor_parallel_linear_logp(
+                    hidden_fp32,
+                    weight_fp32,
+                    target_ids,
+                    bias_fp32,
+                    tp_group=tp_group,
+                    vocab_start_index=vocab_start_index,
+                    global_vocab_size=global_vocab_size,
+                )
+
+        logits = NativeLMHeadOp().forward_fp32(hidden, lm_head_weight, bias=bias)
+        with torch.autocast(device_type=logits.device.type, enabled=False):
+            log_probs = torch.log_softmax(logits, dim=-1)
+            target = target_ids.to(device=logits.device, dtype=torch.long).unsqueeze(-1)
+            return torch.gather(log_probs, dim=-1, index=target).squeeze(-1)

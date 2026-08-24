@@ -118,6 +118,13 @@ class TestMusaPlatform:
         with pytest.raises(RuntimeError, match="No functional backend"):
             registry.get_op("det_gemm", device="musa")
 
+    def test_musa_batch_invariant_linear_logp_fails_closed(self, monkeypatch):
+        self._mock_musa_device(monkeypatch)
+        registry = KernelRegistry()
+
+        with pytest.raises(RuntimeError, match="No functional backend"):
+            registry.get_op("batch_invariant_linear_logp", device="musa")
+
 
 def test_registry_explicit_device_selects_device_platform(monkeypatch):
     registry = KernelRegistry()

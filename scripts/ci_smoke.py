@@ -11,8 +11,9 @@ occurs, so GPU CI cannot pass while silently running only native fallbacks:
     succeeds (``dlopen`` does not check arch) but the first kernel launch raises
     ``cudaErrorNoKernelImageForDevice`` once the stream is synchronized.
 
-Uses only ``fused_logp`` - the op registered unconditionally in ``csrc/ops.cpp`` -
-so it does not require ``KERNEL_ALIGN_FORCE_SM90=1`` / a Hopper build.
+Every GPU runs the generic ``fused_logp`` launch. Hopper additionally requires
+and launches the batch-invariant fused linear-logp symbol, so an SM90 build
+cannot pass CI while silently omitting the feature under test.
 """
 import sys
 
@@ -70,7 +71,49 @@ def main() -> int:
         )
         return 1
 
-    print(f"[smoke] OK: rl_engine._C built and fused_logp ran on sm_{cc[0]}{cc[1]}.")
+    if cc[0] == 9:
+        symbol = "batch_invariant_linear_logp_sm90"
+        if not hasattr(_C, symbol):
+            print(
+                f"[smoke] FATAL: Hopper extension is missing _C.{symbol}.\n"
+                "        Rebuild with KERNEL_ALIGN_FORCE_SM90=1 and TARGET_SM=9.0.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            hidden = torch.randn(1, 32, device="cuda", dtype=torch.bfloat16)
+            weight = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
+            target = torch.tensor([63], device="cuda", dtype=torch.int32)
+            logp, lse = _C.batch_invariant_linear_logp_sm90(
+                hidden,
+                weight,
+                target,
+                None,
+            )
+            torch.cuda.synchronize()
+        except Exception as exc:
+            print(
+                f"[smoke] FATAL: _C.{symbol} failed to launch on sm_{cc[0]}{cc[1]}.\n"
+                f"        Underlying error: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
+        if tuple(logp.shape) != (1,) or tuple(lse.shape) != (1,):
+            print(
+                f"[smoke] FATAL: _C.{symbol} returned shapes "
+                f"{tuple(logp.shape)}, {tuple(lse.shape)}",
+                file=sys.stderr,
+            )
+            return 1
+        if not bool(torch.isfinite(logp).all() and torch.isfinite(lse).all()):
+            print(
+                f"[smoke] FATAL: _C.{symbol} returned non-finite values",
+                file=sys.stderr,
+            )
+            return 1
+
+    print(f"[smoke] OK: required extension kernels ran on sm_{cc[0]}{cc[1]}.")
     return 0
 
 

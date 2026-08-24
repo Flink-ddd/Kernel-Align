@@ -143,6 +143,41 @@ def _sm90_inputs(seed, *, bias=True, dtype=torch.bfloat16, lead=None):
     return hidden, weight, target, bias_t
 
 
+def _select_sm90_fused_backward(monkeypatch):
+    """Disable Python alternatives so the public op reaches the fused C++ backward."""
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_FUSED_BACKWARD", "1")
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_FUSED_BWD_PRECISION", "auto")
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_FUSED_BWD_BF16_DLOGITS", "1")
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_SAVE_PROBS_BF16", "0")
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_FUSED_TILE_BWD_FULL", "0")
+
+
+def _select_sm90_streaming_backward(monkeypatch, *, logits_mode, grad_weight_mode=""):
+    """Pin the public op to one streaming CUDA-backward implementation."""
+    _select_sm90_fused_backward(monkeypatch)
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD", "1")
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD_MODE", "tiled")
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD_VOCAB_TILE", "128")
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD_LOGITS", logits_mode)
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD_GW", grad_weight_mode)
+    monkeypatch.setenv(
+        "RL_KERNEL_LINEAR_LOGP_FUSED_TILE_BWD",
+        "1" if grad_weight_mode == "fused_tile" else "0",
+    )
+
+
+def _copy_with_storage_offset(tensor, offset):
+    storage = torch.empty(
+        tensor.numel() + offset,
+        device=tensor.device,
+        dtype=tensor.dtype,
+    )
+    result = storage[offset:].view_as(tensor)
+    result.copy_(tensor)
+    assert result.is_contiguous()
+    return result
+
+
 # Deliberately non-multiples of the kernel block sizes (32 / 64 / 64).
 _N = 40
 _D = 80
@@ -219,6 +254,57 @@ def test_native_matches_manual_reference():
     ref = _manual_reference(hidden, weight, target, bias)
     assert out.dtype == torch.float32
     assert torch.allclose(out, ref, atol=1e-5)
+
+
+def test_native_forward_fp32_avoids_bf16_logit_rounding():
+    generator = torch.Generator().manual_seed(2027)
+    hidden = torch.randn(2, 3, 32, generator=generator).bfloat16()
+    weight = torch.randn(67, 32, generator=generator).bfloat16()
+    bias = torch.randn(67, generator=generator).bfloat16()
+    target = torch.randint(0, 67, (2, 3), generator=generator)
+
+    actual = NativeLinearLogpOp().forward_fp32(
+        hidden,
+        weight,
+        target,
+        bias,
+        tp_group=None,
+        vocab_start_index=0,
+        global_vocab_size=None,
+    )
+    logits = torch.nn.functional.linear(hidden.float(), weight.float(), bias.float())
+    expected = (
+        torch.log_softmax(logits, dim=-1)
+        .gather(
+            -1,
+            target.unsqueeze(-1),
+        )
+        .squeeze(-1)
+    )
+
+    assert actual.dtype == torch.float32
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=0.0)
+
+
+def test_native_forward_fp32_ignores_ambient_autocast_and_restores_tf32():
+    generator = torch.Generator().manual_seed(2028)
+    hidden = torch.randn(2, 3, 32, generator=generator).bfloat16()
+    weight = torch.randn(67, 32, generator=generator).bfloat16()
+    target = torch.randint(0, 67, (2, 3), generator=generator)
+    op = NativeLinearLogpOp()
+
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        expected = op.forward_fp32(hidden, weight, target)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            actual = op.forward_fp32(hidden, weight, target)
+
+        assert actual.dtype == torch.float32
+        assert torch.equal(actual, expected)
+        assert torch.backends.cuda.matmul.allow_tf32 is True
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
 
 
 def test_linear_logp_handoff_matches_masked_reference_across_layouts():
@@ -399,7 +485,10 @@ def test_tied_embedding_lm_head_shared_gradient_is_layout_invariant():
         model.zero_grad(set_to_none=True)
         hidden = model(input_ids)
         logps = op(
-            hidden, model.lm_head.weight, _safe_token_ids(masked_target, mask), model.lm_head.bias
+            hidden,
+            model.lm_head.weight,
+            _safe_token_ids(masked_target, mask),
+            model.lm_head.bias,
         )
         logps = logps.masked_fill(~mask, 0.0)
         logits = torch.nn.functional.linear(hidden.float(), model.lm_head.weight.float(), None)
@@ -830,6 +919,144 @@ def test_sm90_streaming_tiled_cuda_logits_backward_matches_tiled(monkeypatch):
 
 
 @requires_sm90
+@pytest.mark.parametrize("logits_mode", ["sm90_mma", "sm90_mma_dz"])
+@pytest.mark.parametrize("misaligned_input", ["hidden", "weight"])
+def test_sm90_streaming_mma_backward_realigns_tma_inputs(
+    monkeypatch, misaligned_input, logits_mode
+):
+    from rl_engine.kernels.ops.base import _C
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
+
+    assert hasattr(_C, "fused_linear_logp_sm90_backward")
+    op = FusedLinearLogpSM90Op()
+    hidden, weight, target, _ = _sm90_inputs(138, bias=False)
+    grad_out = torch.randn(_SM90_N, device="cuda")
+
+    misaligned_hidden = (
+        _copy_with_storage_offset(hidden, 1) if misaligned_input == "hidden" else hidden
+    )
+    misaligned_weight = (
+        _copy_with_storage_offset(weight, 1) if misaligned_input == "weight" else weight
+    )
+    misaligned_tensor = misaligned_hidden if misaligned_input == "hidden" else misaligned_weight
+    assert misaligned_tensor.data_ptr() % 16 != 0
+    misaligned_weight = misaligned_weight.detach().requires_grad_(True)
+
+    aligned_hidden = misaligned_hidden.clone()
+    aligned_weight = misaligned_weight.detach().clone().requires_grad_(True)
+    assert aligned_hidden.data_ptr() % 16 == 0
+    assert aligned_weight.data_ptr() % 16 == 0
+
+    _select_sm90_streaming_backward(monkeypatch, logits_mode=logits_mode)
+
+    misaligned_out = op(misaligned_hidden, misaligned_weight, target, None)
+    misaligned_out.backward(grad_out)
+    aligned_out = op(aligned_hidden, aligned_weight, target, None)
+    aligned_out.backward(grad_out)
+
+    assert torch.equal(misaligned_out, aligned_out)
+    assert misaligned_weight.grad is not None
+    assert torch.isfinite(misaligned_weight.grad).all()
+    assert torch.allclose(misaligned_weight.grad, aligned_weight.grad, atol=8e-2, rtol=8e-2)
+
+
+@requires_sm90
+@pytest.mark.parametrize("grad_weight_mode", ["wmma", "fused_tile"])
+def test_sm90_streaming_wmma_backward_realigns_hidden(monkeypatch, grad_weight_mode):
+    from rl_engine.kernels.ops.base import _C
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
+
+    assert hasattr(_C, "fused_linear_logp_sm90_backward")
+    gen = torch.Generator(device="cuda").manual_seed(139)
+    hidden = torch.randn(_SM90_N, _SM90_D, device="cuda", dtype=torch.bfloat16, generator=gen)
+    weight = torch.randn(512, _SM90_D, device="cuda", dtype=torch.bfloat16, generator=gen)
+    target = torch.randint(0, 512, (_SM90_N,), device="cuda", generator=gen)
+    grad_out = torch.randn(_SM90_N, device="cuda", generator=gen)
+
+    misaligned_hidden = _copy_with_storage_offset(hidden, 8)
+    assert misaligned_hidden.data_ptr() % 16 == 0
+    assert misaligned_hidden.data_ptr() % 32 != 0
+
+    misaligned_weight = weight.detach().clone().requires_grad_(True)
+    aligned_hidden = misaligned_hidden.clone()
+    aligned_weight = weight.detach().clone().requires_grad_(True)
+    assert aligned_hidden.data_ptr() % 32 == 0
+    _select_sm90_streaming_backward(
+        monkeypatch,
+        logits_mode="",
+        grad_weight_mode=grad_weight_mode,
+    )
+
+    op = FusedLinearLogpSM90Op()
+    misaligned_out = op(misaligned_hidden, misaligned_weight, target, None)
+    misaligned_out.backward(grad_out)
+    aligned_out = op(aligned_hidden, aligned_weight, target, None)
+    aligned_out.backward(grad_out)
+
+    assert torch.equal(misaligned_out, aligned_out)
+    assert misaligned_weight.grad is not None
+    assert torch.isfinite(misaligned_weight.grad).all()
+    assert torch.allclose(misaligned_weight.grad, aligned_weight.grad, atol=8e-2, rtol=8e-2)
+
+
+@requires_sm90
+@pytest.mark.parametrize(
+    ("full_mode", "misaligned_input", "offset"),
+    [
+        ("tile_cublas", "hidden", 1),
+        ("tile_cublas", "weight", 1),
+        ("from_logits", "hidden", 8),
+    ],
+)
+def test_sm90_full_backward_realigns_inputs(monkeypatch, full_mode, misaligned_input, offset):
+    from rl_engine.kernels.ops.base import _C
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
+
+    assert hasattr(_C, "fused_linear_logp_sm90_backward")
+    gen = torch.Generator(device="cuda").manual_seed(140)
+    hidden = torch.randn(_SM90_N, _SM90_D, device="cuda", dtype=torch.bfloat16, generator=gen)
+    weight = torch.randn(512, _SM90_D, device="cuda", dtype=torch.bfloat16, generator=gen)
+    target = torch.randint(0, 512, (_SM90_N,), device="cuda", generator=gen)
+    grad_out = torch.randn(_SM90_N, device="cuda", generator=gen)
+
+    misaligned_hidden = (
+        _copy_with_storage_offset(hidden, offset) if misaligned_input == "hidden" else hidden
+    )
+    misaligned_weight = (
+        _copy_with_storage_offset(weight, offset) if misaligned_input == "weight" else weight
+    )
+    misaligned_tensor = misaligned_hidden if misaligned_input == "hidden" else misaligned_weight
+    required_alignment = 32 if full_mode == "from_logits" else 16
+    assert misaligned_tensor.data_ptr() % required_alignment != 0
+
+    misaligned_weight = misaligned_weight.detach().requires_grad_(True)
+    aligned_hidden = misaligned_hidden.clone()
+    aligned_weight = misaligned_weight.detach().clone().requires_grad_(True)
+    aligned_tensor = aligned_hidden if misaligned_input == "hidden" else aligned_weight
+    assert aligned_tensor.data_ptr() % required_alignment == 0
+    _select_sm90_fused_backward(monkeypatch)
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_STREAMING_BWD", "0")
+    op = FusedLinearLogpSM90Op()
+
+    def run(hidden_input, weight_input):
+        # Keep the regular autograd wrapper for forward, then select the raw
+        # full-backward branch only after it has saved the original views.
+        monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_FUSED_TILE_BWD_FULL", "0")
+        output = op(hidden_input, weight_input, target, None)
+        monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_FUSED_TILE_BWD_FULL", full_mode)
+        output.backward(grad_out)
+        return output.detach(), weight_input.grad
+
+    misaligned_out, misaligned_grad = run(misaligned_hidden, misaligned_weight)
+    aligned_out, aligned_grad = run(aligned_hidden, aligned_weight)
+
+    assert torch.equal(misaligned_out, aligned_out)
+    assert misaligned_grad is not None
+    assert torch.isfinite(misaligned_grad).all()
+    assert torch.allclose(misaligned_grad, aligned_grad, atol=8e-2, rtol=8e-2)
+
+
+@requires_sm90
 def test_sm90_preserves_leading_shape():
     from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
 
@@ -917,6 +1144,119 @@ def test_sm90_rejects_out_of_range_target():
     assert out.shape == target.shape and torch.isfinite(out).all()
 
 
+@requires_sm90
+@pytest.mark.parametrize(
+    "vocab_start_index,error",
+    [
+        (-1, "vocab_start_index"),
+        (2**32, "vocab_start_index"),
+        (2**31 - 250, "local vocabulary range"),
+    ],
+)
+def test_sm90_raw_tp_symbol_rejects_unrepresentable_vocab_ranges(
+    vocab_start_index,
+    error,
+):
+    from rl_engine.kernels.ops.base import _C
+
+    hidden, weight, target, _ = _sm90_inputs(319, bias=False)
+    with pytest.raises(RuntimeError, match=error):
+        _C.fused_linear_logp_sm90_global_target(
+            hidden[:8],
+            weight,
+            target[:8],
+            None,
+            vocab_start_index,
+        )
+
+
+@requires_sm90
+def test_sm90_raw_tp_symbol_does_not_wrap_extreme_int64_target():
+    from rl_engine.kernels.ops.base import _C
+
+    hidden, weight, target, _ = _sm90_inputs(321, bias=False)
+    target[0] = 2**40
+
+    local_target_logit, local_lse = _C.fused_linear_logp_sm90_global_target(
+        hidden[:8],
+        weight,
+        target[:8],
+        None,
+        0,
+    )
+
+    assert local_target_logit[0].item() == 0.0
+    assert torch.isfinite(local_lse).all()
+
+
+@requires_sm90
+def test_sm90_raw_tp_extreme_target_cannot_alias_legal_int32_max_class():
+    from rl_engine.kernels.ops.base import _C
+
+    int32_max = torch.iinfo(torch.int32).max
+    hidden = torch.ones(1, 32, device="cuda", dtype=torch.bfloat16)
+    weight = torch.ones(1, 32, device="cuda", dtype=torch.bfloat16)
+    invalid_target = torch.tensor([2**40], device="cuda", dtype=torch.int64)
+    valid_target = torch.tensor([int32_max], device="cuda", dtype=torch.int64)
+
+    invalid_logit, invalid_lse = _C.fused_linear_logp_sm90_global_target(
+        hidden,
+        weight,
+        invalid_target,
+        None,
+        int32_max,
+    )
+    valid_logit, valid_lse = _C.fused_linear_logp_sm90_global_target(
+        hidden,
+        weight,
+        valid_target,
+        None,
+        int32_max,
+    )
+
+    assert invalid_logit.item() == 0.0
+    assert valid_logit.item() == 32.0
+    assert torch.isfinite(invalid_lse).all() and torch.isfinite(valid_lse).all()
+
+
+@requires_sm90
+def test_sm90_backward_extreme_target_matches_out_of_shard_sentinel(monkeypatch):
+    from rl_engine.kernels.ops.base import _C
+
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_FUSED_BWD_PRECISION", "fp32")
+    hidden, weight, _target, _ = _sm90_inputs(322, bias=False)
+    grad_logp = torch.randn(_SM90_N, device="cuda")
+    logits = hidden.float().matmul(weight.float().t())
+    lse = torch.logsumexp(logits, dim=-1)
+
+    def grad_weight_for(target_value):
+        target = torch.full(
+            (_SM90_N,),
+            target_value,
+            device="cuda",
+            dtype=torch.int64,
+        )
+        _grad_hidden, grad_weight, _grad_bias = _C.fused_linear_logp_sm90_backward(
+            grad_logp,
+            hidden,
+            weight,
+            target,
+            lse,
+            None,
+            0,
+            False,
+            True,
+            False,
+            True,
+        )
+        return grad_weight
+
+    sentinel_grad = grad_weight_for(-1)
+    extreme_grad = grad_weight_for(2**40)
+
+    assert torch.equal(extreme_grad, sentinel_grad)
+
+
 def test_sm90_tp_metadata_prefers_sm90_tp_helper(monkeypatch):
     from rl_engine.kernels.ops.cuda.loss import linear_logp as cuda_linear_logp
 
@@ -987,7 +1327,14 @@ def test_sm90_tp_metadata_prefers_save_probs_for_output_only(monkeypatch):
     monkeypatch.setattr(cuda_linear_logp, "_sm90_save_probs_bf16_tp_available", lambda: True)
 
     def fake_save_probs_apply(hidden_arg, weight_arg, target_arg, vocab_start, global_vocab, group):
-        calls["save_probs"] = (hidden_arg, weight_arg, target_arg, vocab_start, global_vocab, group)
+        calls["save_probs"] = (
+            hidden_arg,
+            weight_arg,
+            target_arg,
+            vocab_start,
+            global_vocab,
+            group,
+        )
         return sentinel
 
     def forbidden_sm90_tp(*args, **kwargs):
@@ -1125,7 +1472,11 @@ def test_sm90_backward_prefers_fused_extension_when_available(monkeypatch):
         @staticmethod
         def fused_linear_logp_sm90_backward(*args):
             calls["backward"] = args
-            return torch.ones_like(hidden), torch.ones_like(weight), torch.ones_like(bias)
+            return (
+                torch.ones_like(hidden),
+                torch.ones_like(weight),
+                torch.ones_like(bias),
+            )
 
     monkeypatch.setattr(cuda_linear_logp, "_EXT_AVAILABLE", True)
     monkeypatch.setattr(cuda_linear_logp, "_C", FakeC)

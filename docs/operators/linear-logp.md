@@ -13,6 +13,11 @@ This differs from [Fused LogP](fused-logp.md), which takes already-materialized
 logits as input. Here the LM-head projection is fused into the forward reduction,
 so the forward `[N, V]` tensor never lands in HBM.
 
+The default operator is throughput-oriented and does not promise bitwise batch
+invariance: its SM90 split-V schedule may adapt to the token-row count. Use
+[Batch-Invariant Fused Linear LogP](batch-invariant-linear-logp.md) when the same
+row must produce identical bits across batch layouts.
+
 ## Entry Point
 
 ```python

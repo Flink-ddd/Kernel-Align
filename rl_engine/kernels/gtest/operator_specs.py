@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -22,6 +22,7 @@ class OperatorSpec:
     gold_method: str
     candidate_paths: dict[str, str]
     grad_input_names: tuple[str, ...] = ()
+    candidate_methods: dict[str, str] = field(default_factory=dict)
 
 
 def _load_object(path: str) -> Any:
@@ -87,6 +88,20 @@ OP_SPECS = {
             "cuda-sm90": "rl_engine.kernels.ops.cuda.loss.linear_logp.FusedLinearLogpSM90Op",
         },
         grad_input_names=("hidden", "lm_head_weight"),
+    ),
+    "batch_invariant_linear_logp": OperatorSpec(
+        name="batch_invariant_linear_logp",
+        op_class="logprob",
+        gold_path="rl_engine.kernels.ops.pytorch.loss.linear_logp.NativeLinearLogpOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.loss.linear_logp.NativeLinearLogpOp",
+            "cuda-sm90": (
+                "rl_engine.kernels.ops.cuda.loss.batch_invariant_linear_logp."
+                "BatchInvariantLinearLogpSM90Op"
+            ),
+        },
+        candidate_methods={"pytorch": "forward_fp32"},
     ),
     "embedding": OperatorSpec(
         name="embedding",
@@ -214,6 +229,9 @@ def make_candidate(args: argparse.Namespace) -> CandidateSpec:
 
     if candidate_name in spec.candidate_paths:
         candidate_op = _load_object(spec.candidate_paths[candidate_name])()
+        candidate_method = spec.candidate_methods.get(candidate_name)
+        if candidate_method is not None:
+            candidate_op = getattr(candidate_op, candidate_method)
         if args.op == "logp" and candidate_name == "cuda-sm90":
             candidate_op = _LogpSM90CandidateAdapter(candidate_op)
         return CandidateSpec(

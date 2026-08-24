@@ -50,6 +50,10 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     CUDA_FUSED_LINEAR_LOGP_SM90 = (
         "rl_engine.kernels.ops.cuda.loss.linear_logp.FusedLinearLogpSM90Op"
     )
+    CUDA_BATCH_INVARIANT_LINEAR_LOGP_SM90 = (
+        "rl_engine.kernels.ops.cuda.loss.batch_invariant_linear_logp."
+        "BatchInvariantLinearLogpSM90Op"
+    )
     TRITON_LINEAR_LOGP = "rl_engine.kernels.ops.triton.loss.linear_logp.TritonLinearLogpOp"
     PYTORCH_LINEAR_LOGP = "rl_engine.kernels.ops.pytorch.loss.linear_logp.NativeLinearLogpOp"
     # Fused policy-ratio + KL-penalty front-end (PPO/GRPO), logits -> (ratio, kl)
@@ -207,6 +211,10 @@ class KernelRegistry:
                     OpBackend.TRITON_LINEAR_LOGP,
                     OpBackend.PYTORCH_LINEAR_LOGP,
                 ],
+                # Strict single-card contract: no non-invariant fallback.
+                "batch_invariant_linear_logp": [
+                    OpBackend.CUDA_BATCH_INVARIANT_LINEAR_LOGP_SM90,
+                ],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
                 "det_gemm": [OpBackend.CUDA_DET_GEMM, OpBackend.TRITON_DET_GEMM],
@@ -253,6 +261,7 @@ class KernelRegistry:
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "rope": [OpBackend.TRITON_ROPE, OpBackend.PYTORCH_NATIVE_ROPE],
                 "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
+                "batch_invariant_linear_logp": [],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
                 "det_gemm": [OpBackend.TRITON_DET_GEMM],
@@ -280,6 +289,7 @@ class KernelRegistry:
                 "grpo_loss": [OpBackend.PYTORCH_GRPO_LOSS],
                 "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
                 "linear_logp": [OpBackend.PYTORCH_LINEAR_LOGP],
+                "batch_invariant_linear_logp": [],
                 "ratio_kl": [OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
                 "det_gemm": [],
@@ -301,6 +311,7 @@ class KernelRegistry:
                 "grpo_loss": [OpBackend.PYTORCH_GRPO_LOSS],
                 "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
                 "linear_logp": [OpBackend.PYTORCH_LINEAR_LOGP],
+                "batch_invariant_linear_logp": [],
                 "ratio_kl": [OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
                 "batch_invariant_logp": [OpBackend.PYTORCH_BATCH_INVARIANT_LOGP],
@@ -405,6 +416,8 @@ class KernelRegistry:
         candidates = self._priority_map.get(platform, {}).get(op_type, [OpBackend.PYTORCH_NATIVE])
 
         for backend in candidates:
+            if not self._backend_supports_device(backend, device):
+                continue
             if backend.name in self._instance_cache:
                 return self._instance_cache[backend.name]
 
@@ -424,6 +437,34 @@ class KernelRegistry:
                 self._failed_backends.add(backend.name)
 
         raise RuntimeError(f"No functional backend found for {op_type} on {platform}")
+
+    @staticmethod
+    def _backend_supports_device(
+        backend: OpBackend,
+        device: torch.device | str | None,
+    ) -> bool:
+        if backend is not OpBackend.CUDA_BATCH_INVARIANT_LINEAR_LOGP_SM90:
+            return True
+        if torch.version.hip is not None:
+            return False
+
+        from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
+
+        if not _EXT_AVAILABLE or not hasattr(_C, "batch_invariant_linear_logp_sm90"):
+            return False
+
+        resolved = torch.device("cuda" if device is None else device)
+        if resolved.type != "cuda":
+            return False
+        try:
+            return torch.cuda.get_device_capability(resolved)[0] == 9
+        except Exception as error:
+            logger.warning(
+                "Failed to probe %s for batch-invariant linear_logp: %s",
+                resolved,
+                error,
+            )
+            return False
 
     def _platform_for_device(self, device: torch.device | str | None) -> str:
         if device is None:

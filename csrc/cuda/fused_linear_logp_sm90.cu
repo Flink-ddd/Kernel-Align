@@ -7,10 +7,13 @@
 #include "../utils/tma_utils.cuh"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <cuda_bf16.h>
+#include <limits>
 #include <math_constants.h>
 #include <mma.h>
 #include <string>
@@ -54,12 +57,80 @@ constexpr int GRAD_W_WMMA_K = 16;
 constexpr int GRAD_W_WMMA_WARPS = 8;
 constexpr int GRAD_W_WMMA_THREADS = GRAD_W_WMMA_WARPS * 32;
 
+// The batch-invariant entry point uses a split-V schedule derived only from V.
+// In particular, it must never use N (the batch/token dimension) to choose a
+// different floating-point reduction topology.
+constexpr int MAX_BATCH_INVARIANT_VOCAB_SPLITS = 32;
+
+enum class VocabSplitPolicy {
+    kThroughput,
+    kBatchInvariant,
+};
+
 static_assert(WARP_M % MMA_M == 0, "rows per warp must be a multiple of MMA_M");
 static_assert(BK % 32 == 0, "BK must be a multiple of 32 (ldmatrix.x4 spans 32 cols)");
 
 inline void init_tensor_map_noswizzle(CUtensorMap *tmap, const nv_bfloat16 *gmem,
                                       uint64_t gmem_height, uint64_t gmem_width,
                                       uint32_t box_height, uint32_t box_width);
+
+constexpr int select_batch_invariant_vocab_splits(int total_vtiles) {
+    // Keep at most MAX_BATCH_INVARIANT_VOCAB_SPLITS non-empty, contiguous
+    // ranges. Both the partition and the combine order depend on V only.
+    const int vtiles_per_split =
+        (total_vtiles + MAX_BATCH_INVARIANT_VOCAB_SPLITS - 1) /
+        MAX_BATCH_INVARIANT_VOCAB_SPLITS;
+    return (total_vtiles + vtiles_per_split - 1) / vtiles_per_split;
+}
+
+static_assert(
+    select_batch_invariant_vocab_splits(MAX_BATCH_INVARIANT_VOCAB_SPLITS + 1) <=
+        MAX_BATCH_INVARIANT_VOCAB_SPLITS,
+    "batch-invariant split selection must respect its workspace cap");
+
+int select_throughput_vocab_splits(int row_blocks, int total_vtiles) {
+    // The performance path intentionally adapts split-V to occupancy.
+    const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    const int target_ctas = sm_count * 4;
+    return std::max(1, std::min(target_ctas / std::max(row_blocks, 1), total_vtiles));
+}
+
+bool is_aligned(const torch::Tensor &tensor, std::uintptr_t alignment) {
+    return reinterpret_cast<std::uintptr_t>(tensor.data_ptr()) % alignment == 0;
+}
+
+torch::Tensor ensure_aligned(torch::Tensor tensor, std::uintptr_t alignment,
+                             const char *name, const char *consumer) {
+    if (is_aligned(tensor, alignment))
+        return tensor;
+
+    auto aligned = tensor.clone();
+    TORCH_CHECK(is_aligned(aligned, alignment), name, " could not be copied to ", alignment,
+                "-byte-aligned storage for ", consumer);
+    return aligned;
+}
+
+torch::Tensor ensure_tma_aligned(torch::Tensor tensor, const char *name) {
+    return ensure_aligned(tensor, 16, name, "TMA");
+}
+
+torch::Tensor ensure_wmma_aligned(torch::Tensor tensor, const char *name) {
+    // wmma::load_matrix_sync requires a 256-bit-aligned base pointer.
+    return ensure_aligned(tensor, 32, name, "WMMA");
+}
+
+torch::Tensor prepare_int32_targets(torch::Tensor target) {
+    auto target_i = target.to(torch::kInt32).contiguous();
+    if (target.scalar_type() == at::kLong) {
+        const auto invalid = target.lt(std::numeric_limits<int>::min()) |
+                             target.gt(std::numeric_limits<int>::max());
+        // All supported vocab ranges are non-negative, so -1 can never alias a
+        // real class ID. Saturating to INT_MAX would be wrong for a TP shard
+        // whose final legitimate class is exactly INT_MAX.
+        target_i.masked_fill_(invalid, -1);
+    }
+    return target_i;
+}
 
 // Tensor-core helpers (Ampere/Hopper warp-level MMA). Same layout as
 // prefix_shared_attention.cu, validated on this repo's Hopper GPUs.
@@ -87,7 +158,8 @@ __global__ void fused_linear_logp_sm90_kernel(const __grid_constant__ CUtensorMa
                                               float *__restrict__ part_sum,   // [n_split, N]
                                               float *__restrict__ part_zt,    // [n_split, N]
                                               int N, int D, int V, int n_split,
-                                              int vocab_start_index) {
+                                              int vocab_start_index,
+                                              bool target_must_be_local) {
     const int tid = threadIdx.x;
     const int warp = tid / 32;
     const int lane = tid % 32;
@@ -99,7 +171,8 @@ __global__ void fused_linear_logp_sm90_kernel(const __grid_constant__ CUtensorMa
 
     // This CTA owns a contiguous slice of the vocab tiles (split-V): partitioning
     // the V loop across blockIdx.y fills the GPU when N/BM alone is too few CTAs.
-    const int total_vtiles = (V + BN - 1) / BN;
+    const int total_vtiles =
+        static_cast<int>((static_cast<int64_t>(V) + BN - 1) / BN);
     const int vtiles_per_split = (total_vtiles + n_split - 1) / n_split;
     const int vt_begin = split * vtiles_per_split;
     const int vt_end = min(vt_begin + vtiles_per_split, total_vtiles);
@@ -127,7 +200,15 @@ __global__ void fused_linear_logp_sm90_kernel(const __grid_constant__ CUtensorMa
     for (int r = tid; r < num_rows; r += WG_THREADS) {
         sMax[r] = -CUDART_INF_F;
         sSum[r] = 0.0f;
-        sZt[r] = 0.0f;
+        const int tgt = target[row_base + r];
+        const int64_t local_begin = static_cast<int64_t>(vocab_start_index);
+        const int64_t local_end = local_begin + V;
+        const bool target_is_local = static_cast<int64_t>(tgt) >= local_begin &&
+                                     static_cast<int64_t>(tgt) < local_end;
+        // The public single-card path remains asynchronous by default. Mark an
+        // invalid target as NaN instead of silently treating its logit as zero;
+        // the global-target TP path intentionally permits out-of-shard IDs.
+        sZt[r] = target_must_be_local && !target_is_local ? CUDART_NAN_F : 0.0f;
     }
     if (tid == 0) {
 #pragma unroll
@@ -247,7 +328,8 @@ __global__ void fused_linear_logp_sm90_kernel(const __grid_constant__ CUtensorMa
                 if (bias != nullptr)
                     val += bias[col];
                 tmax = fmaxf(tmax, val);
-                if (vocab_start_index + col == tgt)
+                if (static_cast<int64_t>(vocab_start_index) + col ==
+                    static_cast<int64_t>(tgt))
                     sZt[r] = val;
             }
             float tsum = 0.0f;
@@ -271,7 +353,7 @@ __global__ void fused_linear_logp_sm90_kernel(const __grid_constant__ CUtensorMa
     // Emit this split's partial online-softmax state; a combine pass merges the
     // per-split (max, sum, target-logit) into the final logp/lse.
     for (int r = tid; r < num_rows; r += WG_THREADS) {
-        const int idx = split * N + row_base + r;
+        const int64_t idx = static_cast<int64_t>(split) * N + row_base + r;
         part_max[idx] = sMax[r];
         part_sum[idx] = sSum[r];
         part_zt[idx] = sZt[r];
@@ -450,12 +532,12 @@ __global__ void fused_linear_logp_sm90_combine_kernel(const float *__restrict__ 
 
     float M = -CUDART_INF_F;
     for (int s = 0; s < n_split; ++s)
-        M = fmaxf(M, part_max[s * N + r]);
+        M = fmaxf(M, part_max[static_cast<int64_t>(s) * N + r]);
 
     float S = 0.0f;
     float zt = 0.0f;
     for (int s = 0; s < n_split; ++s) {
-        const int idx = s * N + r;
+        const int64_t idx = static_cast<int64_t>(s) * N + r;
         S += part_sum[idx] * __expf(part_max[idx] - M);
         zt += part_zt[idx];
     }
@@ -1198,6 +1280,8 @@ void launch_logits_tile_bf16_mma(torch::Tensor hidden,
                 "bf16 MMA logits tile requires bf16 hidden and weight");
     TORCH_CHECK(hidden.is_contiguous() && weight.is_contiguous(),
                 "bf16 MMA logits tile requires contiguous hidden and weight");
+    TORCH_CHECK(is_aligned(hidden, 16) && is_aligned(weight, 16),
+                "bf16 MMA logits tile requires 16-byte-aligned hidden and weight");
     const int N = hidden.size(0);
     const int D = hidden.size(1);
     const int V = weight.size(0);
@@ -1241,6 +1325,8 @@ void launch_dlogits_tile_bf16_mma(torch::Tensor hidden,
                 "bf16 MMA dlogits tile requires bf16 dlogits output");
     TORCH_CHECK(hidden.is_contiguous() && weight.is_contiguous(),
                 "bf16 MMA dlogits tile requires contiguous hidden and weight");
+    TORCH_CHECK(is_aligned(hidden, 16) && is_aligned(weight, 16),
+                "bf16 MMA dlogits tile requires 16-byte-aligned hidden and weight");
     TORCH_CHECK(target.is_contiguous() && grad_logp.is_contiguous() && lse.is_contiguous(),
                 "bf16 MMA dlogits tile requires contiguous target, grad_logp, and lse");
     const int N = hidden.size(0);
@@ -1285,6 +1371,8 @@ void launch_grad_weight_tile_wmma(torch::Tensor dlogits,
                     grad_weight.scalar_type() == at::kBFloat16,
                 "WMMA grad_weight tile requires bf16 dlogits, hidden, and grad_weight");
     TORCH_CHECK(hidden.is_contiguous(), "WMMA grad_weight tile requires contiguous hidden");
+    TORCH_CHECK(is_aligned(hidden, 32),
+                "WMMA grad_weight tile requires 32-byte-aligned hidden");
     TORCH_CHECK(grad_weight.dim() == 2 && dlogits.dim() == 2 && hidden.dim() == 2,
                 "WMMA grad_weight tile expects 2-D tensors");
     const int N = dlogits.size(0);
@@ -1324,6 +1412,8 @@ void launch_grad_weight_from_logits_tile_wmma(torch::Tensor logits_or_probs,
                     grad_weight.scalar_type() == at::kBFloat16,
                 "fused tile grad_weight requires bf16 hidden and grad_weight");
     TORCH_CHECK(hidden.is_contiguous(), "fused tile grad_weight requires contiguous hidden");
+    TORCH_CHECK(is_aligned(hidden, 32),
+                "fused tile grad_weight requires 32-byte-aligned hidden");
     TORCH_CHECK(logits_or_probs.dim() == 2 && hidden.dim() == 2 && grad_weight.dim() == 2,
                 "fused tile grad_weight expects 2-D tensors");
     TORCH_CHECK(logits_or_probs.stride(1) == 1 && hidden.stride(1) == 1 &&
@@ -1772,25 +1862,74 @@ torch::Tensor linear_logp_logits_bf16_to_dlogits(torch::Tensor logits,
 
 std::vector<torch::Tensor> fused_linear_logp_sm90_forward_impl(
     torch::Tensor hidden, torch::Tensor weight, torch::Tensor target,
-    torch::optional<torch::Tensor> bias, int64_t vocab_start_index, bool return_target_logit) {
-    TORCH_CHECK(hidden.is_cuda() && weight.is_cuda(), "hidden and weight must be CUDA tensors");
+    torch::optional<torch::Tensor> bias, int64_t vocab_start_index, bool return_target_logit,
+    VocabSplitPolicy split_policy) {
+    TORCH_CHECK(hidden.dim() == 2, "hidden must be 2-D [N, D]");
+    TORCH_CHECK(weight.dim() == 2, "weight must be 2-D [V, D]");
+    TORCH_CHECK(target.dim() == 1, "target must be 1-D [N]");
+    TORCH_CHECK(hidden.is_cuda() && weight.is_cuda() && target.is_cuda(),
+                "hidden, weight, and target must be CUDA tensors");
     TORCH_CHECK(weight.device() == hidden.device(),
                 "lm_head_weight must be on the same device as hidden");
+    TORCH_CHECK(target.device() == hidden.device(),
+                "target must be on the same device as hidden");
     TORCH_CHECK(hidden.scalar_type() == at::kBFloat16, "hidden must be bfloat16");
     TORCH_CHECK(weight.scalar_type() == at::kBFloat16, "weight must be bfloat16");
     TORCH_CHECK(hidden.is_contiguous() && weight.is_contiguous(), "inputs must be contiguous");
-    const int N = hidden.size(0);
-    const int D = hidden.size(1);
-    const int V = weight.size(0);
+    TORCH_CHECK(hidden.size(0) <= std::numeric_limits<int>::max(),
+                "hidden row count exceeds the SM90 kernel's int32 indexing limit");
+    TORCH_CHECK(hidden.size(1) <= std::numeric_limits<int>::max(),
+                "hidden dimension exceeds the SM90 kernel's int32 indexing limit");
+    TORCH_CHECK(weight.size(0) <= std::numeric_limits<int>::max(),
+                "vocabulary size exceeds the SM90 kernel's int32 indexing limit");
+    const int N = static_cast<int>(hidden.size(0));
+    const int D = static_cast<int>(hidden.size(1));
+    const int V = static_cast<int>(weight.size(0));
+    TORCH_CHECK(N > 0, "hidden must contain at least one token row");
+    TORCH_CHECK(D > 0, "hidden dimension must be positive");
+    TORCH_CHECK(V > 0, "weight must contain at least one vocabulary row");
     TORCH_CHECK(weight.size(1) == D, "hidden/weight hidden-dim mismatch");
     TORCH_CHECK(D % BK == 0, "D must be a multiple of ", BK, " for the SM90 kernel");
     TORCH_CHECK(target.numel() == N, "target must have one id per token: expected ", N,
                 " (hidden rows), got ", target.numel());
+    TORCH_CHECK(vocab_start_index >= 0 &&
+                    vocab_start_index <= std::numeric_limits<int>::max(),
+                "vocab_start_index must be representable as a non-negative int32 value");
+    TORCH_CHECK(vocab_start_index + static_cast<int64_t>(V) <=
+                    static_cast<int64_t>(std::numeric_limits<int>::max()) + 1,
+                "local vocabulary range exceeds the SM90 kernel's int32 target limit");
+
+    const auto target_type = target.scalar_type();
+    TORCH_CHECK(target_type == at::kByte || target_type == at::kChar ||
+                    target_type == at::kShort || target_type == at::kInt ||
+                    target_type == at::kLong,
+                "target must have dtype uint8, int8, int16, int32, or int64");
+
+    const bool batch_invariant = split_policy == VocabSplitPolicy::kBatchInvariant;
     if (bias.has_value()) {
+        TORCH_CHECK(bias->dim() == 1, "bias must be 1-D [V]");
         TORCH_CHECK(bias->device() == hidden.device(),
                     "bias must be on the same device as hidden");
         TORCH_CHECK(bias->numel() == V, "bias must have V=", V, " elements, got ", bias->numel());
+        if (batch_invariant) {
+            const auto bias_type = bias->scalar_type();
+            TORCH_CHECK(bias_type == at::kHalf || bias_type == at::kBFloat16 ||
+                            bias_type == at::kFloat,
+                        "bias must have dtype float16, bfloat16, or float32");
+        }
     }
+
+    c10::cuda::CUDAGuard device_guard(hidden.device());
+    const auto *device_properties = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(device_properties->major == 9,
+                "fused_linear_logp_sm90 requires an SM90 Hopper GPU, got compute capability ",
+                device_properties->major, ".", device_properties->minor);
+
+    // A contiguous view may still start at a non-zero storage offset. TMA
+    // requires a 16-byte-aligned global base address, so copy only those rare
+    // misaligned views into allocator-aligned storage.
+    hidden = ensure_tma_aligned(hidden, "hidden");
+    weight = ensure_tma_aligned(weight, "weight");
 
     auto opts_f = hidden.options().dtype(torch::kFloat);
     auto out_value = torch::empty({N}, opts_f);
@@ -1814,48 +1953,65 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_forward_impl(
 
     const int smem = STAGES * (BM * BK + BN * BK) * sizeof(nv_bfloat16) +
                      (BM * BN) * sizeof(float) + 3 * BM * sizeof(float) + STAGES * 8;
-    const int row_blocks = (N + BM - 1) / BM;
-    const int total_vtiles = (V + BN - 1) / BN;
-    auto target_i = target.to(torch::kInt32).contiguous();
+    const int row_blocks = static_cast<int>((static_cast<int64_t>(N) + BM - 1) / BM);
+    const int total_vtiles =
+        static_cast<int>((static_cast<int64_t>(V) + BN - 1) / BN);
+    auto target_i = prepare_int32_targets(target);
 
-    // Split the vocab loop across CTAs so the grid fills the GPU: aim for a few
-    // CTAs per SM, capped by the number of vocab tiles available to split.
-    int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-    int target_ctas = sm_count * 4;
-    int n_split = std::max(1, std::min(target_ctas / std::max(row_blocks, 1), total_vtiles));
+    const int n_split =
+        split_policy == VocabSplitPolicy::kBatchInvariant
+            ? select_batch_invariant_vocab_splits(total_vtiles)
+            : select_throughput_vocab_splits(row_blocks, total_vtiles);
 
     auto part_max = torch::empty({n_split, N}, opts_f);
     auto part_sum = torch::empty({n_split, N}, opts_f);
     auto part_zt = torch::empty({n_split, N}, opts_f);
 
     if (smem > 48 * 1024) {
-        cudaFuncSetAttribute(fused_linear_logp_sm90_kernel,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        C10_CUDA_CHECK(cudaFuncSetAttribute(fused_linear_logp_sm90_kernel,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     }
 
     dim3 grid(row_blocks, n_split);
-    fused_linear_logp_sm90_kernel<<<grid, WG_THREADS, smem>>>(
+    fused_linear_logp_sm90_kernel<<<grid, WG_THREADS, smem,
+                                    at::cuda::getCurrentCUDAStream()>>>(
         h_tmap, w_tmap, target_i.data_ptr<int>(), bias_ptr, part_max.data_ptr<float>(),
         part_sum.data_ptr<float>(), part_zt.data_ptr<float>(), N, D, V, n_split,
-        static_cast<int>(vocab_start_index));
+        static_cast<int>(vocab_start_index), !return_target_logit);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     const int combine_threads = 256;
-    const int combine_blocks = (N + combine_threads - 1) / combine_threads;
-    fused_linear_logp_sm90_combine_kernel<<<combine_blocks, combine_threads>>>(
+    const int combine_blocks =
+        static_cast<int>((static_cast<int64_t>(N) + combine_threads - 1) / combine_threads);
+    fused_linear_logp_sm90_combine_kernel<<<combine_blocks, combine_threads, 0,
+                                            at::cuda::getCurrentCUDAStream()>>>(
         part_max.data_ptr<float>(), part_sum.data_ptr<float>(), part_zt.data_ptr<float>(),
         out_value.data_ptr<float>(), lse.data_ptr<float>(), N, n_split, return_target_logit);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return {out_value, lse};
 }
 
 // Forward: hidden [N, D] bf16, weight [V, D] bf16, target [N] int32, optional
 // bias [V] f32. Returns (logp [N] f32, lse [N] f32). Logits are never
-// materialized; peak extra memory is the per-CTA shared-memory tiles.
+// materialized. Global scratch grows with n_split (which depends on V up to a
+// fixed cap), so its worst-case bound is O(N).
 std::vector<torch::Tensor> fused_linear_logp_sm90_forward(torch::Tensor hidden,
                                                           torch::Tensor weight,
                                                           torch::Tensor target,
                                                           torch::optional<torch::Tensor> bias) {
-    return fused_linear_logp_sm90_forward_impl(hidden, weight, target, bias, 0, false);
+    return fused_linear_logp_sm90_forward_impl(hidden, weight, target, bias, 0, false,
+                                               VocabSplitPolicy::kThroughput);
+}
+
+// Single-card batch-invariant forward. It deliberately shares the validated
+// TMA+MMA device kernel with the throughput path, but pins split-V independently
+// of N so each row sees the same D and V reduction topology across batch layouts.
+std::vector<torch::Tensor> batch_invariant_linear_logp_sm90_forward(
+    torch::Tensor hidden, torch::Tensor weight, torch::Tensor target,
+    torch::optional<torch::Tensor> bias) {
+    return fused_linear_logp_sm90_forward_impl(hidden, weight, target, bias, 0, false,
+                                               VocabSplitPolicy::kBatchInvariant);
 }
 
 // Vocab-parallel local-shard forward. Target ids stay in global-vocab
@@ -1865,7 +2021,8 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_global_target_forward(
     torch::Tensor hidden, torch::Tensor weight, torch::Tensor target,
     torch::optional<torch::Tensor> bias, int64_t vocab_start_index) {
     return fused_linear_logp_sm90_forward_impl(
-        hidden, weight, target, bias, vocab_start_index, true);
+        hidden, weight, target, bias, vocab_start_index, true,
+        VocabSplitPolicy::kThroughput);
 }
 
 // Backward fast path: compute local dlogits in one CUDA kernel, then use GEMMs
@@ -1907,6 +2064,7 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_backward(torch::Tensor grad_lo
     c10::cuda::CUDAGuard device_guard(hidden.device());
     auto opts_f = hidden.options().dtype(torch::kFloat);
     auto empty = torch::empty({0}, opts_f);
+    auto target_i = prepare_int32_targets(target.reshape({N}));
 
     if (streaming_output_backward_enabled() && !compute_grad_hidden && compute_grad_weight &&
         hidden.scalar_type() == at::kBFloat16 && weight.scalar_type() == at::kBFloat16 &&
@@ -1915,8 +2073,6 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_backward(torch::Tensor grad_lo
             auto grad_weight = torch::empty_like(weight);
             auto grad_f = grad_logp.reshape({N}).to(torch::kFloat).contiguous();
             auto lse_f = lse.reshape({N}).to(torch::kFloat).contiguous();
-            auto target_i = target.reshape({N}).to(torch::kInt32).contiguous();
-            auto hidden_gemm = hidden.contiguous();
             const int tile_v = streaming_output_backward_vocab_tile(V);
             const int threads = 256;
             const bool use_cuda_tf32_logits = streaming_output_backward_cuda_logits_enabled();
@@ -1936,6 +2092,17 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_backward(torch::Tensor grad_lo
             const bool use_bf16_mma_tile = use_bf16_mma_logits || use_bf16_mma_dz;
             const bool use_grad_weight_wmma =
                 !use_fused_tile_dw && streaming_output_backward_grad_weight_wmma_enabled();
+            if (use_fused_tile_dw)
+                hidden = ensure_wmma_aligned(hidden, "hidden");
+            if (use_bf16_mma_tile) {
+                // Forward accepts misaligned contiguous views by copying them
+                // before TMA setup. Autograd saves the original views, so do
+                // the same only when this backward actually creates tensor maps.
+                hidden = ensure_tma_aligned(hidden, "hidden");
+                weight = ensure_tma_aligned(weight, "weight");
+            }
+            auto hidden_gemm = hidden.contiguous();
+            bool grad_weight_wmma_inputs_aligned = false;
             torch::Tensor hidden_logits;
             if (!use_bf16_mma_tile)
                 hidden_logits = hidden.to(torch::kFloat).contiguous();
@@ -1997,6 +2164,10 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_backward(torch::Tensor grad_lo
 
                 auto grad_weight_view = grad_weight.narrow(0, v0, vc);
                 if (use_grad_weight_wmma && can_use_grad_weight_tile_wmma(N, D, vc)) {
+                    if (!grad_weight_wmma_inputs_aligned) {
+                        hidden_gemm = ensure_wmma_aligned(hidden_gemm, "hidden");
+                        grad_weight_wmma_inputs_aligned = true;
+                    }
                     launch_grad_weight_tile_wmma(dlogits_gemm, hidden_gemm, grad_weight_view);
                 } else {
                     auto grad_weight_tile =
@@ -2014,7 +2185,6 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_backward(torch::Tensor grad_lo
 
         auto grad_f = grad_logp.reshape({N}).to(torch::kFloat).contiguous();
         auto lse_f = lse.reshape({N}).to(torch::kFloat).contiguous();
-        auto target_i = target.reshape({N}).to(torch::kInt32).contiguous();
         torch::Tensor bias_f;
         const float *bias_ptr = nullptr;
         if (bias.has_value()) {
@@ -2040,9 +2210,11 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_backward(torch::Tensor grad_lo
         (compute_grad_hidden || compute_grad_weight) && !compute_grad_bias &&
         !bias.has_value() && hidden.scalar_type() == at::kBFloat16 &&
         weight.scalar_type() == at::kBFloat16 && D % BK == 0) {
+        // This branch always uses the TMA-backed dlogits tile kernel.
+        hidden = ensure_tma_aligned(hidden, "hidden");
+        weight = ensure_tma_aligned(weight, "weight");
         auto grad_f = grad_logp.reshape({N}).to(torch::kFloat).contiguous();
         auto lse_f = lse.reshape({N}).to(torch::kFloat).contiguous();
-        auto target_i = target.reshape({N}).to(torch::kInt32).contiguous();
         auto hidden_gemm = hidden.contiguous();
         const int tile_v = streaming_output_backward_vocab_tile(V);
         auto dlogits_workspace = torch::empty({N, tile_v}, hidden.options());
@@ -2121,7 +2293,6 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_backward(torch::Tensor grad_lo
 
     auto grad_f = grad_logp.reshape({N}).to(torch::kFloat).contiguous();
     auto lse_f = lse.reshape({N}).to(torch::kFloat).contiguous();
-    auto target_i = target.reshape({N}).to(torch::kInt32).contiguous();
     const int threads = 256;
     const int64_t total = static_cast<int64_t>(N) * V;
     const int blocks = static_cast<int>((total + threads - 1) / threads);
@@ -2195,6 +2366,7 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_backward(torch::Tensor grad_lo
             hidden_grad_gemm.scalar_type() == at::kBFloat16 &&
             can_use_grad_weight_tile_wmma(N, D, V);
         if (use_full_fused_tile_dw) {
+            hidden_grad_gemm = ensure_wmma_aligned(hidden_grad_gemm, "hidden");
             grad_weight = torch::empty_like(weight);
             if (full_fused_tile_mode == "from_logits" ||
                 full_fused_tile_mode == "logits" ||

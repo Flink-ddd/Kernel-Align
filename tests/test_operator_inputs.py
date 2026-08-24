@@ -39,6 +39,7 @@ def _args(**overrides):
         "attention",
         "logp",
         "linear_logp",
+        "batch_invariant_linear_logp",
         "batch_invariant_logp",
         "rope",
         "silu",
