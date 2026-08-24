@@ -89,6 +89,53 @@ The baseline remains the full logical M=32 official FFN at TP=1 for every row. P
 | tp4_cp2_sp | forward | 0.1692 | 2.1856 | 12.92x |
 | tp4_cp2_sp | train_fwd_bwd | 0.6325 | 8.6635 | 13.70x |
 
+## CUDA GPU and CPU performance context
+
+The additional measurements come from [PR #321 deterministic CUDA FFN performance report](https://github.com/RL-Align/RL-Kernel/pull/321) at CUDA commit `8576fa4bf449734ae99e9b50be8756bb282a8916`. H100 Triton replays use this PR's code at `e64abab904880b877d26d04c0cfad020b992aa51`.
+
+The same-H100 CUDA/Triton ratio is the hardware-matched comparison. CPU and MI300X columns provide absolute-latency context only; they are not hardware-normalized speed claims.
+
+| Comparison environment | Value |
+|---|---|
+| CUDA GPU | NVIDIA H100 80GB HBM3 (sm_90) |
+| CUDA / PyTorch | 13.0 / 2.13.0+cu130 |
+| CPU | Intel(R) Xeon(R) Platinum 8468, 96 intra-op threads |
+| Transformers | 5.13.1 |
+
+### Single-GPU and CPU absolute latency
+
+| Shape / direction | CPU official (ms) | H100 official TP=1 (ms) | H100 Triton replay (ms) | H100 CUDA (ms) | CUDA / Triton H100 | MI300X official TP=1 (ms) | MI300X Triton (ms) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| M=1, forward | 12.9558 | 0.1193 | 1.7381 | 3.9988 | 2.30x | 0.1183 | 1.9102 |
+| M=1, forward+backward | 58.5765 | 0.5184 | 4.2997 | 9.0704 | 2.11x | 0.6008 | 4.4312 |
+| M=8, forward | 12.7676 | 0.1239 | 1.8293 | 3.9923 | 2.18x | 0.2263 | 2.0424 |
+| M=8, forward+backward | 82.3669 | 0.5414 | 4.5028 | 9.4500 | 2.10x | 0.3997 | 4.6210 |
+| M=32, forward | 8.5392 | 0.1311 | 2.2529 | 4.0277 | 1.79x | 0.1108 | 2.5334 |
+| M=32, forward+backward | 65.9689 | 0.7842 | 5.4261 | 9.1635 | 1.69x | 0.7081 | 5.7710 |
+
+### Distributed absolute latency
+
+No distributed CPU or H100 Triton replay measurement was supplied. Each deterministic implementation is therefore compared with its own hardware's official TP=1 baseline.
+
+| Layout | Direction | H100 official TP=1 (ms) | H100 CUDA (ms) | CUDA / H100 official | MI300X official TP=1 (ms) | MI300X Triton (ms) | Triton / MI300X official |
+|---|---|---:|---:|---:|---:|---:|---:|
+| tp2 | forward | 0.1552 | 2.7896 | 17.97x | 0.1575 | 1.9598 | 12.44x |
+| tp2 | train_fwd_bwd | 0.6301 | 7.8125 | 12.40x | 0.6511 | 5.1613 | 7.93x |
+| tp2_sp | forward | 0.1552 | 3.3310 | 21.46x | 0.1575 | 2.4866 | 15.79x |
+| tp2_sp | train_fwd_bwd | 0.6301 | 11.7695 | 18.68x | 0.6511 | 9.0512 | 13.90x |
+| tp4 | forward | 0.1530 | 2.1687 | 14.17x | 0.1644 | 1.5044 | 9.15x |
+| tp4 | train_fwd_bwd | 0.5714 | 9.3954 | 16.44x | 0.7244 | 5.3938 | 7.45x |
+| tp2_cp2 | forward | 0.1530 | 2.8261 | 18.47x | 0.1644 | 1.8202 | 11.07x |
+| tp2_cp2 | train_fwd_bwd | 0.5714 | 16.1722 | 28.30x | 0.7244 | 10.1842 | 14.06x |
+| tp2_cp2_sp | forward | 0.1530 | 3.5814 | 23.41x | 0.1644 | 2.3788 | 14.47x |
+| tp2_cp2_sp | train_fwd_bwd | 0.5714 | 16.7894 | 29.38x | 0.7244 | 9.7862 | 13.51x |
+| tp8 | forward | 0.1537 | 2.3206 | 15.10x | 0.1692 | 1.7434 | 10.31x |
+| tp8 | train_fwd_bwd | 0.5006 | 10.1375 | 20.25x | 0.6325 | 5.1244 | 8.10x |
+| tp4_cp2 | forward | 0.1537 | 2.2141 | 14.41x | 0.1692 | 1.4826 | 8.76x |
+| tp4_cp2 | train_fwd_bwd | 0.5006 | 16.5617 | 33.08x | 0.6325 | 7.2102 | 11.40x |
+| tp4_cp2_sp | forward | 0.1537 | 3.2972 | 21.45x | 0.1692 | 2.1856 | 12.92x |
+| tp4_cp2_sp | train_fwd_bwd | 0.5006 | 17.1457 | 34.25x | 0.6325 | 8.6635 | 13.70x |
+
 ## Topology exactness versus Triton TP=1
 
 All columns are element mismatch counts. This table does not compare against the official FFN.
@@ -120,8 +167,8 @@ In backward, the gate and up contributions to dHidden are independent until thei
 
 ## Figures
 
-![Single-GPU official TP=1 versus Triton speed](single_gpu_overhead.png)
+![Single-GPU CUDA, Triton, and CPU latency](single_gpu_overhead.png)
 
 ![Topology mismatch versus Triton TP=1](collective_overhead.png)
 
-![Distributed official TP=1 versus Triton speed](distributed_ffn_overhead.png)
+![Distributed H100 CUDA and MI300X Triton latency](distributed_ffn_overhead.png)

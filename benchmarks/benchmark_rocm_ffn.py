@@ -784,7 +784,20 @@ def _topology_exactness_rows(
     return list(merged.values())
 
 
-def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
+def _load_cuda_cpu_comparison(
+    output_directory: Path,
+) -> dict[str, Any] | None:
+    comparison_path = output_directory / "cuda_cpu_comparison.json"
+    if not comparison_path.exists():
+        return None
+    return json.loads(comparison_path.read_text(encoding="utf-8"))
+
+
+def _write_report(
+    payload: dict[str, Any],
+    output_directory: Path,
+    comparison_payload: dict[str, Any] | None = None,
+) -> None:
     environment = payload["environment"]
     methodology = payload["methodology"]
     single_speed = payload["single_gpu"]["speed"]
@@ -924,6 +937,92 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
             f"{row['latency_ratio_vs_official_tp1']:.2f}x |"
         )
 
+    if comparison_payload is not None:
+        comparison_environment = comparison_payload["environment"]
+        comparison_source = comparison_payload["source"]
+        local_single = {
+            (row["tokens"], row["direction"]): row for row in single_speed
+        }
+        local_distributed = {
+            (row["name"], row["direction"]): row for row in distributed_speed
+        }
+        lines.extend(
+            (
+                "",
+                "## CUDA GPU and CPU performance context",
+                "",
+                f"The additional measurements come from [{comparison_source['report']}]"
+                f"({comparison_source['pull_request']}) at CUDA commit "
+                f"`{comparison_source['cuda_commit']}`. H100 Triton replays use "
+                "this PR's code at "
+                f"`{comparison_source['h100_triton_replay_commit']}`.",
+                "",
+                "The same-H100 CUDA/Triton ratio is the hardware-matched comparison. "
+                "CPU and MI300X columns provide absolute-latency context only; they "
+                "are not hardware-normalized speed claims.",
+                "",
+                "| Comparison environment | Value |",
+                "|---|---|",
+                f"| CUDA GPU | {comparison_environment['gpu']} "
+                f"({comparison_environment['architecture']}) |",
+                f"| CUDA / PyTorch | {comparison_environment['cuda']} / "
+                f"{comparison_environment['torch']} |",
+                f"| CPU | {comparison_environment['cpu']}, "
+                f"{comparison_environment['cpu_threads']} intra-op threads |",
+                f"| Transformers | {comparison_environment['transformers']} |",
+                "",
+                "### Single-GPU and CPU absolute latency",
+                "",
+                "| Shape / direction | CPU official (ms) | H100 official TP=1 "
+                "(ms) | H100 Triton replay (ms) | H100 CUDA (ms) | CUDA / "
+                "Triton H100 | MI300X official TP=1 (ms) | MI300X Triton (ms) |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|",
+            )
+        )
+        for row in comparison_payload["single_gpu"]:
+            local = local_single[(row["tokens"], row["direction"])]
+            direction = (
+                "forward"
+                if row["direction"] == "forward"
+                else "forward+backward"
+            )
+            lines.append(
+                f"| M={row['tokens']}, {direction} | "
+                f"{row['official_cpu_ms']:.4f} | "
+                f"{row['official_h100_ms']:.4f} | "
+                f"{row['triton_h100_ms']:.4f} | "
+                f"{row['cuda_h100_ms']:.4f} | "
+                f"{row['cuda_h100_ms'] / row['triton_h100_ms']:.2f}x | "
+                f"{local['official_tp1']['median_ms']:.4f} | "
+                f"{local['triton']['median_ms']:.4f} |"
+            )
+        lines.extend(
+            (
+                "",
+                "### Distributed absolute latency",
+                "",
+                "No distributed CPU or H100 Triton replay measurement was supplied. "
+                "Each deterministic implementation is therefore compared with its "
+                "own hardware's official TP=1 baseline.",
+                "",
+                "| Layout | Direction | H100 official TP=1 (ms) | H100 CUDA "
+                "(ms) | CUDA / H100 official | MI300X official TP=1 (ms) | "
+                "MI300X Triton (ms) | Triton / MI300X official |",
+                "|---|---|---:|---:|---:|---:|---:|---:|",
+            )
+        )
+        for row in comparison_payload["distributed"]:
+            local = local_distributed[(row["name"], row["direction"])]
+            lines.append(
+                f"| {row['name']} | {row['direction']} | "
+                f"{row['official_h100_ms']:.4f} | "
+                f"{row['cuda_h100_ms']:.4f} | "
+                f"{row['cuda_h100_ms'] / row['official_h100_ms']:.2f}x | "
+                f"{local['official_tp1']['median_ms']:.4f} | "
+                f"{local['triton']['median_ms']:.4f} | "
+                f"{local['latency_ratio_vs_official_tp1']:.2f}x |"
+            )
+
     lines.extend(
         (
             "",
@@ -977,11 +1076,12 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
             "",
             "## Figures",
             "",
-            "![Single-GPU official TP=1 versus Triton speed](single_gpu_overhead.png)",
+            "![Single-GPU CUDA, Triton, and CPU latency](single_gpu_overhead.png)",
             "",
             "![Topology mismatch versus Triton TP=1](collective_overhead.png)",
             "",
-            "![Distributed official TP=1 versus Triton speed](distributed_ffn_overhead.png)",
+            "![Distributed H100 CUDA and MI300X Triton latency]"
+            "(distributed_ffn_overhead.png)",
             "",
         )
     )
@@ -990,7 +1090,11 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
     )
 
 
-def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
+def _write_figures(
+    payload: dict[str, Any],
+    output_directory: Path,
+    comparison_payload: dict[str, Any] | None = None,
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -1010,45 +1114,132 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
     )
 
     single_rows = payload["single_gpu"]["speed"]
-    single_labels = [
-        f"M={row['tokens']}\n"
-        f"{'FWD' if row['direction'] == 'forward' else 'FWD+BWD'}"
-        for row in single_rows
-    ]
-    positions = np.arange(len(single_rows))
-    width = 0.37
-    figure, axis = plt.subplots(figsize=(17, 10))
-    official_values = [row["official_tp1"]["median_ms"] for row in single_rows]
-    triton_values = [row["triton"]["median_ms"] for row in single_rows]
-    official_bars = axis.bar(
-        positions - width / 2,
-        official_values,
-        width,
-        label="Official Qwen3MLP TP=1",
-        color="#2563eb",
-    )
-    triton_bars = axis.bar(
-        positions + width / 2,
-        triton_values,
-        width,
-        label="Deterministic Triton FFN",
-        color="#7c3aed",
-    )
-    for bars, values in ((official_bars, official_values), (triton_bars, triton_values)):
-        axis.bar_label(
-            bars,
-            labels=[f"{value:.2f}" for value in values],
-            padding=4,
-            fontsize=13,
-            rotation=90,
+    if comparison_payload is None:
+        single_labels = [
+            f"M={row['tokens']}\n"
+            f"{'FWD' if row['direction'] == 'forward' else 'FWD+BWD'}"
+            for row in single_rows
+        ]
+        positions = np.arange(len(single_rows))
+        width = 0.37
+        figure, axis = plt.subplots(figsize=(17, 10))
+        official_values = [
+            row["official_tp1"]["median_ms"] for row in single_rows
+        ]
+        triton_values = [row["triton"]["median_ms"] for row in single_rows]
+        official_bars = axis.bar(
+            positions - width / 2,
+            official_values,
+            width,
+            label="Official Qwen3MLP TP=1",
+            color="#2563eb",
         )
-    axis.set_yscale("log")
-    axis.set_xlabel("Token count M and measured direction\nH=4096, I=12288, BF16")
-    axis.set_ylabel("Median latency (ms, log scale)")
-    axis.set_title("MI300X single-GPU FFN speed: official TP=1 vs Triton")
-    axis.set_xticks(positions, single_labels)
-    axis.legend(loc="upper left")
-    figure.tight_layout()
+        triton_bars = axis.bar(
+            positions + width / 2,
+            triton_values,
+            width,
+            label="Deterministic Triton FFN",
+            color="#7c3aed",
+        )
+        for bars, values in (
+            (official_bars, official_values),
+            (triton_bars, triton_values),
+        ):
+            axis.bar_label(
+                bars,
+                labels=[f"{value:.2f}" for value in values],
+                padding=4,
+                fontsize=13,
+                rotation=90,
+            )
+        axis.set_yscale("log")
+        axis.set_xlabel(
+            "Token count M and measured direction\nH=4096, I=12288, BF16"
+        )
+        axis.set_ylabel("Median latency (ms, log scale)")
+        axis.set_title("MI300X single-GPU FFN speed: official TP=1 vs Triton")
+        axis.set_xticks(positions, single_labels)
+        axis.legend(loc="upper left")
+        figure.tight_layout()
+    else:
+        local_lookup = {
+            (row["tokens"], row["direction"]): row for row in single_rows
+        }
+        comparison_lookup = {
+            (row["tokens"], row["direction"]): row
+            for row in comparison_payload["single_gpu"]
+        }
+        figure, axes = plt.subplots(1, 2, figsize=(24, 10), sharey=True)
+        series = (
+            ("CPU official BF16", "official_cpu_ms", "#6b7280"),
+            ("H100 official TP=1", "official_h100_ms", "#60a5fa"),
+            ("H100 Triton replay", "triton_h100_ms", "#06b6d4"),
+            ("H100 deterministic CUDA", "cuda_h100_ms", "#dc2626"),
+            ("MI300X official TP=1", "official_mi300x_ms", "#86efac"),
+            ("MI300X deterministic Triton", "triton_mi300x_ms", "#7c3aed"),
+        )
+        width = 0.13
+        for axis, direction, direction_label in (
+            (axes[0], "forward", "Forward"),
+            (axes[1], "train_fwd_bwd", "Forward + backward"),
+        ):
+            tokens = (1, 8, 32)
+            positions = np.arange(len(tokens))
+            combined_rows = []
+            for token_count in tokens:
+                external = comparison_lookup[(token_count, direction)]
+                local = local_lookup[(token_count, direction)]
+                combined_rows.append(
+                    {
+                        **external,
+                        "official_mi300x_ms": local["official_tp1"]["median_ms"],
+                        "triton_mi300x_ms": local["triton"]["median_ms"],
+                    }
+                )
+            for series_index, (label, key, color) in enumerate(series):
+                values = [row[key] for row in combined_rows]
+                offset = (series_index - (len(series) - 1) / 2) * width
+                bars = axis.bar(
+                    positions + offset,
+                    values,
+                    width,
+                    label=label,
+                    color=color,
+                )
+                axis.bar_label(
+                    bars,
+                    labels=[f"{value:.2f}" for value in values],
+                    padding=3,
+                    fontsize=9,
+                    rotation=90,
+                )
+            axis.set_yscale("log")
+            axis.set_xlabel("Token count M\nH=4096, I=12288, BF16")
+            axis.set_title(direction_label)
+            axis.set_xticks(positions, [f"M={value}" for value in tokens])
+        axes[0].set_ylabel("Median latency (ms, log scale)")
+        axes[0].set_ylim(0.07, 140.0)
+        handles, labels = axes[0].get_legend_handles_labels()
+        figure.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.91),
+            ncol=3,
+        )
+        figure.suptitle(
+            "Single-GPU / CPU FFN absolute latency across platforms",
+            y=0.99,
+        )
+        figure.text(
+            0.5,
+            0.01,
+            "Cross-hardware values are context only; H100 CUDA vs H100 Triton "
+            "is the hardware-matched comparison.",
+            ha="center",
+            fontsize=14,
+        )
+        figure.tight_layout(rect=(0.0, 0.06, 1.0, 0.82))
     figure.savefig(output_directory / "single_gpu_overhead.png", dpi=180)
     plt.close(figure)
 
@@ -1107,7 +1298,25 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
     plt.close(figure)
 
     rows = payload["distributed_ffn"]
-    figure, axes = plt.subplots(1, 2, figsize=(24, 10), sharey=True)
+    figure, axes = plt.subplots(1, 2, figsize=(26, 10), sharey=True)
+    if comparison_payload is None:
+        distributed_series = (
+            ("Official Qwen3MLP TP=1", "official_mi300x_ms", "#2563eb"),
+            ("Deterministic distributed Triton", "triton_mi300x_ms", "#7c3aed"),
+        )
+        width = 0.37
+    else:
+        comparison_lookup = {
+            (row["name"], row["direction"]): row
+            for row in comparison_payload["distributed"]
+        }
+        distributed_series = (
+            ("H100 official TP=1", "official_h100_ms", "#60a5fa"),
+            ("H100 deterministic CUDA", "cuda_h100_ms", "#dc2626"),
+            ("MI300X official TP=1", "official_mi300x_ms", "#86efac"),
+            ("MI300X deterministic Triton", "triton_mi300x_ms", "#7c3aed"),
+        )
+        width = 0.19
     for axis, direction, direction_label in (
         (axes[0], "forward", "Forward"),
         (axes[1], "train_fwd_bwd", "Forward + backward"),
@@ -1115,33 +1324,32 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
         direction_rows = [row for row in rows if row["direction"] == direction]
         positions = np.arange(len(direction_rows))
         labels = [row["name"].upper().replace("_", "\n") for row in direction_rows]
-        official_values = [
-            row["official_tp1"]["median_ms"] for row in direction_rows
-        ]
-        triton_values = [row["triton"]["median_ms"] for row in direction_rows]
-        official_bars = axis.bar(
-            positions - width / 2,
-            official_values,
-            width,
-            label="Official Qwen3MLP TP=1",
-            color="#2563eb",
-        )
-        triton_bars = axis.bar(
-            positions + width / 2,
-            triton_values,
-            width,
-            label="Deterministic distributed Triton",
-            color="#7c3aed",
-        )
-        for bars, values in (
-            (official_bars, official_values),
-            (triton_bars, triton_values),
-        ):
+        combined_rows = []
+        for row in direction_rows:
+            combined = {
+                "official_mi300x_ms": row["official_tp1"]["median_ms"],
+                "triton_mi300x_ms": row["triton"]["median_ms"],
+            }
+            if comparison_payload is not None:
+                combined.update(comparison_lookup[(row["name"], direction)])
+            combined_rows.append(combined)
+        for series_index, (label, key, color) in enumerate(distributed_series):
+            values = [row[key] for row in combined_rows]
+            offset = (
+                series_index - (len(distributed_series) - 1) / 2
+            ) * width
+            bars = axis.bar(
+                positions + offset,
+                values,
+                width,
+                label=label,
+                color=color,
+            )
             axis.bar_label(
                 bars,
                 labels=[f"{value:.2f}" for value in values],
-                padding=4,
-                fontsize=12,
+                padding=3,
+                fontsize=9 if comparison_payload is not None else 12,
                 rotation=90,
             )
         axis.set_yscale("log")
@@ -1149,12 +1357,36 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
         axis.set_title(direction_label)
         axis.set_xticks(positions, labels)
     axes[0].set_ylabel("Median latency (ms, log scale)")
-    axes[0].legend(loc="upper left")
-    figure.suptitle(
-        "MI300X distributed FFN speed: official TP=1 vs Triton",
-        y=0.99,
-    )
-    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    handles, labels = axes[0].get_legend_handles_labels()
+    if comparison_payload is None:
+        axes[0].legend(loc="upper left")
+        figure.suptitle(
+            "MI300X distributed FFN speed: official TP=1 vs Triton",
+            y=0.99,
+        )
+        figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    else:
+        axes[0].set_ylim(0.1, 30.0)
+        figure.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.91),
+            ncol=4,
+        )
+        figure.suptitle(
+            "Distributed FFN absolute latency: H100 CUDA vs MI300X Triton",
+            y=0.99,
+        )
+        figure.text(
+            0.5,
+            0.01,
+            "Absolute latency across different hardware; each deterministic path "
+            "uses its own platform's official TP=1 baseline.",
+            ha="center",
+            fontsize=14,
+        )
+        figure.tight_layout(rect=(0.0, 0.06, 1.0, 0.82))
     figure.savefig(output_directory / "distributed_ffn_overhead.png", dpi=180)
     plt.close(figure)
 
@@ -1233,8 +1465,9 @@ def main() -> None:
     (args.output_dir / "results.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
     )
-    _write_report(payload, args.output_dir)
-    _write_figures(payload, args.output_dir)
+    comparison_payload = _load_cuda_cpu_comparison(args.output_dir)
+    _write_report(payload, args.output_dir, comparison_payload)
+    _write_figures(payload, args.output_dir, comparison_payload)
     print(json.dumps({"output_dir": str(args.output_dir), "status": "ok"}))
 
 
