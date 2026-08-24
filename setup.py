@@ -217,6 +217,16 @@ def get_extensions():
                 "DETERMINISTIC_LOGP_BACKWARD_BLOCK_SIZE",
             ):
                 nvcc_flags.extend(_cuda_define_from_env(tile_knob, tile_knob))
+        else:
+            # Same idea for the CUDA tile-stats kernel: the defaults are tuned for
+            # sm_90, and a different architecture or vocabulary split may prefer
+            # another block size or vector width.
+            for tile_knob in (
+                "DETERMINISTIC_LOGP_TILE_BLOCK_SIZE_NARROW",
+                "DETERMINISTIC_LOGP_TILE_BLOCK_SIZE_WIDE",
+                "DETERMINISTIC_LOGP_TILE_VECTOR_BYTES",
+            ):
+                nvcc_flags.extend(_cuda_define_from_env(tile_knob, tile_knob))
         if not is_rocm and envs.env_flag(envs.KERNEL_ALIGN_NCU_LINEINFO):
             nvcc_flags.append("-lineinfo")
         if (

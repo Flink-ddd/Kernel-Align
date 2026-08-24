@@ -36,11 +36,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
+import platform
 import statistics
 import tempfile
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -57,6 +60,10 @@ from rl_engine.kernels.logprob_contract import (
     ShardingSpec,
 )
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
+from rl_engine.kernels.ops.cuda.loss.vocab_parallel_logp import (
+    CudaVocabParallelLogprobOp,
+    native_tile_stats_available,
+)
 from rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp import NativeBatchInvariantLogpOp
 from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import (
     VocabParallelLogprobOp,
@@ -80,8 +87,8 @@ TOPOLOGIES = (
     ("tp4_cp2", 4, 2),
     ("tp2_cp4", 2, 4),
 )
-DISTRIBUTED_PATHS = ("native", "ws2-reference", "ws2-triton", "ws2-rocm")
-WS2_KERNEL_PATHS = ("ws2-triton", "ws2-rocm")
+DISTRIBUTED_PATHS = ("native", "ws2-reference", "ws2-triton", "ws2-cuda", "ws2-rocm")
+WS2_KERNEL_PATHS = ("ws2-triton", "ws2-cuda", "ws2-rocm")
 _DTYPES = {"bf16": torch.bfloat16, "fp32": torch.float32}
 _SPAWN_TIMEOUT_S = 1800
 
@@ -156,8 +163,78 @@ def _gpu_event_samples(function: Callable[[], Any], *, warmup: int, samples: int
     return [float(start.elapsed_time(end)) for start, end in events]
 
 
-def _peak_memory_mib(function: Callable[[], Any]) -> float:
-    """Peak device memory allocated by one call, above what was live before it."""
+def _host_wall_samples(function: Callable[[], Any], *, warmup: int, samples: int) -> list[float]:
+    """Wall-clock timing for host execution, where CUDA events do not apply."""
+    for _ in range(warmup):
+        function()
+    timings = []
+    for _ in range(samples):
+        start = time.perf_counter()
+        function()
+        timings.append((time.perf_counter() - start) * 1000.0)
+    return timings
+
+
+def _timed_samples(
+    function: Callable[[], Any], *, warmup: int, samples: int, device: torch.device
+) -> list[float]:
+    if device.type == "cuda":
+        return _gpu_event_samples(function, warmup=warmup, samples=samples)
+    return _host_wall_samples(function, warmup=warmup, samples=samples)
+
+
+def _device_synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def _device_empty_cache(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    else:
+        gc.collect()
+
+
+def _rss_mib() -> float:
+    with open("/proc/self/statm", "r", encoding="ascii") as handle:
+        resident_pages = int(handle.read().split()[1])
+    return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024.0 * 1024.0)
+
+
+def _host_peak_rss_mib(function: Callable[[], Any]) -> float:
+    """Peak resident-set increase during one host call, sampled from /proc.
+
+    This is the closest host analogue of ``torch.cuda.max_memory_allocated``,
+    but it is an RSS high-water delta rather than an allocator statistic: it
+    includes caching-allocator reuse and page-level granularity, so it is an
+    approximation and not directly comparable to the device figures.  A call
+    served entirely from already-resident pages can legitimately report ~0.
+    """
+    gc.collect()
+    baseline = _rss_mib()
+    peak = baseline
+    stop = threading.Event()
+
+    def sampler() -> None:
+        nonlocal peak
+        while not stop.is_set():
+            peak = max(peak, _rss_mib())
+            stop.wait(0.001)
+
+    thread = threading.Thread(target=sampler, daemon=True)
+    thread.start()
+    try:
+        function()
+    finally:
+        stop.set()
+        thread.join()
+    return float(max(peak, _rss_mib()) - baseline)
+
+
+def _peak_memory_mib(function: Callable[[], Any], device: torch.device) -> float:
+    """Peak memory used by one call, above what was live before it."""
+    if device.type != "cuda":
+        return _host_peak_rss_mib(function)
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -243,7 +320,6 @@ def _single_gpu_paths(
 ) -> dict[str, tuple[Callable[..., Any], Callable[..., Any]]]:
     ws1_pytorch = NativeBatchInvariantLogpOp()
     ws2_reference = VocabParallelLogprobOp()
-    ws2_rocm = RocmVocabParallelLogprobOp()
 
     def ws1_pytorch_fn(logits, targets, active, contract):
         ignore_targets = torch.where(active, targets, torch.full_like(targets, IGNORE_INDEX))
@@ -258,11 +334,6 @@ def _single_gpu_paths(
             logits, targets, contract=contract, num_vocab_tiles=NUM_TILES, validate=False
         )
 
-    def ws2_rocm_fn(logits, targets, active, contract):
-        return ws2_rocm.apply(
-            logits, targets, contract=contract, num_vocab_tiles=NUM_TILES, validate=False
-        )
-
     # path -> (forward returning (logp, lse), training forward returning logp with autograd)
     paths: dict[str, tuple[Callable[..., Any], Callable[..., Any]]] = {
         "native": (
@@ -271,6 +342,11 @@ def _single_gpu_paths(
         ),
         "ws1-pytorch": (ws1_pytorch_fn, ws1_pytorch_train),
     }
+    if device.type != "cuda":
+        # Triton and the native extensions have no host backend; the reference
+        # tile loop and the plain-PyTorch baseline are the whole CPU story.
+        paths["ws2-reference"] = (ws2_reference_fn, lambda *a: ws2_reference_fn(*a)[0])
+        return paths
     try:
         from rl_engine.kernels.ops.triton.loss.batch_invariant_logp import (
             TritonBatchInvariantLogpOp,
@@ -304,20 +380,55 @@ def _single_gpu_paths(
         )
 
     paths["ws2-triton"] = (ws2_triton_fn, lambda *a: ws2_triton_fn(*a)[0])
-    paths["ws2-rocm"] = (ws2_rocm_fn, lambda *a: ws2_rocm_fn(*a)[0])
+
+    if native_tile_stats_available():
+        ws2_cuda = CudaVocabParallelLogprobOp()
+
+        def ws2_cuda_fn(logits, targets, active, contract):
+            return ws2_cuda.apply(
+                logits, targets, contract=contract, num_vocab_tiles=NUM_TILES, validate=False
+            )
+
+        paths["ws2-cuda"] = (ws2_cuda_fn, lambda *a: ws2_cuda_fn(*a)[0])
+
+    if torch.version.hip is not None:
+        ws2_rocm = RocmVocabParallelLogprobOp()
+
+        def ws2_rocm_fn(logits, targets, active, contract):
+            return ws2_rocm.apply(
+                logits, targets, contract=contract, num_vocab_tiles=NUM_TILES, validate=False
+            )
+
+        paths["ws2-rocm"] = (ws2_rocm_fn, lambda *a: ws2_rocm_fn(*a)[0])
     return paths
 
 
 def _single_gpu_benchmarks(
-    *, warmup: int, samples: int, training_samples: int, tokens: tuple[int, ...]
+    *,
+    warmup: int,
+    samples: int,
+    training_samples: int,
+    tokens: tuple[int, ...],
+    device: torch.device,
 ) -> dict[str, Any]:
-    device = torch.device("cuda", 0)
-    torch.cuda.set_device(device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     paths = _single_gpu_paths(device)
     bounds = ((0, REAL_VOCAB),)
     cases: list[dict[str, Any]] = []
     validate_overhead: list[dict[str, Any]] = []
-    ws2_rocm_op = RocmVocabParallelLogprobOp()
+    # The validate=True overhead is measured on the fastest native backend the
+    # platform actually has: HIP on ROCm, the CUDA tile-stats kernel on CUDA,
+    # and the reference tile loop on the host.
+    if torch.version.hip is not None:
+        validate_op: Any = RocmVocabParallelLogprobOp()
+        validate_op_path = "ws2-rocm"
+    elif device.type == "cuda" and native_tile_stats_available():
+        validate_op = CudaVocabParallelLogprobOp()
+        validate_op_path = "ws2-cuda"
+    else:
+        validate_op = VocabParallelLogprobOp()
+        validate_op_path = "ws2-reference"
 
     for dtype_name in SINGLE_DTYPES:
         dtype = _DTYPES[dtype_name]
@@ -371,17 +482,22 @@ def _single_gpu_benchmarks(
                         row_contract,
                     )
                     train_step()
-                    torch.cuda.synchronize()
+                    _device_synchronize(device)
                 except Exception as exc:
                     print(f"{path_name} failed for {dtype_name} M={num_tokens}: {exc}")
                     continue
                 outputs[path_name] = (first_logp.detach(), first_lse.detach())
-                forward_times = _gpu_event_samples(forward, warmup=warmup, samples=samples)
-                train_times = _gpu_event_samples(
-                    train_step, warmup=max(1, warmup // 2), samples=training_samples
+                forward_times = _timed_samples(
+                    forward, warmup=warmup, samples=samples, device=device
+                )
+                train_times = _timed_samples(
+                    train_step,
+                    warmup=max(1, warmup // 2),
+                    samples=training_samples,
+                    device=device,
                 )
                 grad = train_step()
-                torch.cuda.synchronize()
+                _device_synchronize(device)
                 active_idx = active.nonzero().squeeze(1)
                 cases.append(
                     {
@@ -390,8 +506,8 @@ def _single_gpu_benchmarks(
                         "path": path_name,
                         "forward": _summary_ms(forward_times),
                         "train_fwd_bwd": _summary_ms(train_times),
-                        "forward_peak_mib": _peak_memory_mib(forward),
-                        "train_peak_mib": _peak_memory_mib(train_step),
+                        "forward_peak_mib": _peak_memory_mib(forward, device),
+                        "train_peak_mib": _peak_memory_mib(train_step, device),
                         "logp_vs_fp64": _accuracy(first_logp[active_idx], oracle_logp[active_idx]),
                         "lse_vs_fp64": _accuracy(first_lse, oracle_lse),
                         "repeat_bitwise": _bitwise_equal(first_logp, second_logp)
@@ -430,12 +546,12 @@ def _single_gpu_benchmarks(
             if dtype_name == "bf16":
 
                 def validated():
-                    return ws2_rocm_op.apply(
+                    return validate_op.apply(
                         logits, targets, contract=contract, num_vocab_tiles=NUM_TILES, validate=True
                     )
 
                 def unvalidated():
-                    return ws2_rocm_op.apply(
+                    return validate_op.apply(
                         logits,
                         targets,
                         contract=contract,
@@ -446,25 +562,40 @@ def _single_gpu_benchmarks(
                 validate_overhead.append(
                     {
                         "tokens": num_tokens,
+                        "path": validate_op_path,
                         "validate_true": _summary_ms(
-                            _gpu_event_samples(validated, warmup=warmup, samples=samples)
+                            _timed_samples(validated, warmup=warmup, samples=samples, device=device)
                         ),
                         "validate_false": _summary_ms(
-                            _gpu_event_samples(unvalidated, warmup=warmup, samples=samples)
+                            _timed_samples(
+                                unvalidated, warmup=warmup, samples=samples, device=device
+                            )
                         ),
                     }
                 )
             logits = oracle_logp = oracle_lse = outputs = None
-            torch.cuda.empty_cache()
+            _device_empty_cache(device)
 
-    return {"cases": cases, "validate_overhead": validate_overhead, "paths": list(paths)}
+    return {
+        "cases": cases,
+        "validate_overhead": validate_overhead,
+        "paths": list(paths),
+        "device": device.type,
+    }
 
 
 def _tile_stats_component(
-    *, warmup: int, samples: int, tokens: tuple[int, ...]
+    *, warmup: int, samples: int, tokens: tuple[int, ...], device: torch.device
 ) -> list[dict[str, Any]]:
-    """HIP tile-stats kernel versus the PyTorch tile loop it replaces."""
-    device = torch.device("cuda", 0)
+    """Native tile-stats kernel versus the PyTorch tile loop it replaces.
+
+    ``hip_deterministic_logp_tile_stats`` on ROCm, ``deterministic_logp_tile_stats``
+    (``csrc/deterministic_logp_kernel.cu``) on CUDA.  The two kernels share the
+    same fixed per-tile reduction contract, so the row means the same thing on
+    either platform; the ``hip_*`` result keys are kept for schema stability.
+    """
+    if device.type != "cuda":
+        return []
     rows: list[dict[str, Any]] = []
     tile = REAL_VOCAB // NUM_TILES
     for dtype_name in SINGLE_DTYPES:
@@ -483,6 +614,11 @@ def _tile_stats_component(
             tile_stats = getattr(
                 _C, "hip_deterministic_logp_tile_stats", _C.deterministic_logp_tile_stats
             )
+            kernel_symbol = (
+                "hip_deterministic_logp_tile_stats"
+                if hasattr(_C, "hip_deterministic_logp_tile_stats")
+                else "deterministic_logp_tile_stats"
+            )
 
             def hip_kernel_fp32():
                 return tile_stats(z32, 0, REAL_VOCAB, NUM_TILES)
@@ -497,17 +633,22 @@ def _tile_stats_component(
                 {
                     "dtype": dtype_name,
                     "tokens": num_tokens,
+                    "kernel_symbol": kernel_symbol,
                     "pytorch_loop": _summary_ms(
-                        _gpu_event_samples(pytorch_loop, warmup=warmup, samples=samples)
+                        _timed_samples(pytorch_loop, warmup=warmup, samples=samples, device=device)
                     ),
                     "hip_fp32_input": _summary_ms(
-                        _gpu_event_samples(hip_kernel_fp32, warmup=warmup, samples=samples)
+                        _timed_samples(
+                            hip_kernel_fp32, warmup=warmup, samples=samples, device=device
+                        )
                     ),
                     "hip_native_dtype_input": _summary_ms(
-                        _gpu_event_samples(hip_kernel_input_dtype, warmup=warmup, samples=samples)
+                        _timed_samples(
+                            hip_kernel_input_dtype, warmup=warmup, samples=samples, device=device
+                        )
                     ),
-                    "pytorch_loop_peak_mib": _peak_memory_mib(pytorch_loop),
-                    "hip_peak_mib": _peak_memory_mib(hip_kernel_fp32),
+                    "pytorch_loop_peak_mib": _peak_memory_mib(pytorch_loop, device),
+                    "hip_peak_mib": _peak_memory_mib(hip_kernel_fp32, device),
                     "max_bitwise": _bitwise_equal(hip_m, ref_m),
                     "sumexp_rel_l2": _relative_l2(hip_s, ref_s),
                     "sumexp_max_rel": float(
@@ -524,7 +665,7 @@ def _tile_stats_component(
                 flush=True,
             )
             logits = z32 = None
-            torch.cuda.empty_cache()
+            _device_empty_cache(device)
     return rows
 
 
@@ -674,11 +815,14 @@ def _distributed_worker(
                 tp_group = group
         bounds = _tp_bounds(tp_world_size)
         vocab_start, vocab_end = bounds[tp_rank]
-        ops = {
+        ops: dict[str, Any] = {
             "ws2-reference": VocabParallelLogprobOp(),
             "ws2-triton": TritonVocabParallelLogprobOp(),
-            "ws2-rocm": RocmVocabParallelLogprobOp(),
         }
+        if native_tile_stats_available():
+            ops["ws2-cuda"] = CudaVocabParallelLogprobOp()
+        if torch.version.hip is not None:
+            ops["ws2-rocm"] = RocmVocabParallelLogprobOp()
         results: list[dict[str, Any]] = []
 
         for num_tokens in tokens_list:
@@ -711,6 +855,8 @@ def _distributed_worker(
             )
             outputs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
             for path_name in DISTRIBUTED_PATHS:
+                if path_name != "native" and path_name not in ops:
+                    continue
                 if path_name == "native":
 
                     def forward(x=shard):
@@ -764,8 +910,8 @@ def _distributed_worker(
                     "path": path_name,
                     "forward": _slowest_rank_summary(forward_times),
                     "train_fwd_bwd": _slowest_rank_summary(train_times),
-                    "forward_peak_mib": _all_max(_peak_memory_mib(forward)),
-                    "train_peak_mib": _all_max(_peak_memory_mib(train_step)),
+                    "forward_peak_mib": _all_max(_peak_memory_mib(forward, device)),
+                    "train_peak_mib": _all_max(_peak_memory_mib(train_step, device)),
                     "logp_vs_fp64_max_abs": _all_max(logp_acc["max_abs"]),
                     "logp_vs_fp64_rel_l2": _all_max(logp_acc["relative_l2"]),
                     "lse_vs_fp64_max_abs": _all_max(lse_acc["max_abs"]),
@@ -789,6 +935,8 @@ def _distributed_worker(
                     )
             ref_logp, ref_lse = outputs["ws2-reference"]
             for other_path in ("native",) + WS2_KERNEL_PATHS:
+                if other_path not in outputs:
+                    continue
                 o_logp, o_lse = outputs[other_path]
                 mismatch = _mismatch_count(o_logp, ref_logp) + _mismatch_count(o_lse, ref_lse)
                 rel = max(_relative_l2(o_logp, ref_logp), _relative_l2(o_lse, ref_lse))
@@ -867,6 +1015,13 @@ PATH_DESCRIPTIONS = {
         "Triton kernels (tile statistics read from the stored shard, fused backward); one "
         "source for CUDA and ROCm"
     ),
+    "ws2-cuda": (
+        "`cuda-vocab-parallel-logp-ws2`, the same contract, transport, and merge with two "
+        "CUDA kernels from `csrc/deterministic_logp_kernel.cu`: "
+        "`deterministic_logp_tile_stats` reads the stored BF16/FP16/FP32 shard directly "
+        "(16-byte vector loads, no FP32 copy) and `deterministic_logp_backward` produces the "
+        "gradient in one fused pass"
+    ),
     "ws2-rocm": (
         "`rocm-vocab-parallel-logp-ws2`, the same contract, transport, and merge with two HIP "
         "kernels: `hip_deterministic_logp_tile_stats` reads the stored BF16/FP16/FP32 shard "
@@ -884,6 +1039,7 @@ DISTRIBUTED_DESCRIPTIONS = {
         "in fixed global tile order; CP ranks shard tokens and never enter the merge"
     ),
     "ws2-triton": "",
+    "ws2-cuda": "",
     "ws2-rocm": "",
 }
 
@@ -961,28 +1117,115 @@ def _yes(flag: Any) -> str:
     return "yes" if flag else "no"
 
 
-def _write_report(payload: dict[str, Any], output_directory: Path, style: ReportStyle) -> None:
+def _default_compare_label(payload: dict[str, Any]) -> str:
+    env = payload.get("environment", {})
+    if env.get("device") == "cpu":
+        return "cpu"
+    gpu = str(env.get("gpu", "device"))
+    for token in ("MI300X", "MI250X", "MI325X", "H100", "H200", "A100", "B200"):
+        if token.lower() in gpu.lower():
+            return token.lower()
+    return gpu.split()[0].lower() if gpu else "device"
+
+
+def _report_platforms(
+    payload: dict[str, Any], comparisons: list[str], label: str | None
+) -> list[tuple[str, dict[str, Any]]]:
+    """This run first, then every ``--compare-with`` platform, in the given order.
+
+    Each entry feeds the same tables, so one report can carry several devices.
+    """
+
+    platforms: list[tuple[str, dict[str, Any]]] = [
+        (label or _default_compare_label(payload), payload)
+    ]
+    for spec in comparisons:
+        if "=" not in spec:
+            raise ValueError(f"--compare-with must be LABEL=path/to/results.json, got {spec!r}")
+        other_label, _, other_path = spec.partition("=")
+        platforms.append(
+            (other_label.strip(), json.loads(Path(other_path).read_text(encoding="utf-8")))
+        )
+    return platforms
+
+
+def _write_report(
+    payload: dict[str, Any],
+    output_directory: Path,
+    style: ReportStyle,
+    platforms: list[tuple[str, dict[str, Any]]] | None = None,
+) -> None:
     env = payload["environment"]
     cfg = payload["config"]
-    single = [c for c in payload["single_gpu"]["cases"] if c["path"] in style.paths]
-    component = payload["tile_stats_component"]
-    distributed = [d for d in payload["distributed"] if d["path"] in style.paths]
+    if platforms is None:
+        platforms = _report_platforms(payload, [], None)
+    multi = len(platforms) > 1
+    plat_head = "Platform | " if multi else ""
+    plat_div = "---|" if multi else ""
+
+    def plat_cell(label: str) -> str:
+        return f"{label} | " if multi else ""
+
+    def tagged(rows: list[dict[str, Any]], label: str) -> list[dict[str, Any]]:
+        return [dict(row, platform=label) for row in rows]
+
+    single = [
+        case
+        for label, pl in platforms
+        for case in tagged(pl["single_gpu"]["cases"], label)
+        if case["path"] in style.paths
+    ]
+    component = [
+        row for label, pl in platforms for row in tagged(pl.get("tile_stats_component", []), label)
+    ]
+    distributed = [
+        row
+        for label, pl in platforms
+        for row in tagged(pl.get("distributed", []), label)
+        if row["path"] in style.paths
+    ]
     base = style.baseline
     base_name = style.name(base)
     others = [path for path in style.paths if path != base]
     lines: list[str] = []
     add = lines.append
 
-    add("# PR #328 ROCm vocab-parallel logprob performance analysis")
+    device_type = env.get("device", "cuda")
+    is_host = device_type == "cpu"
+    platform_label = (
+        "host (CPU)" if is_host else ("ROCm" if env.get("hip") not in (None, "None") else "CUDA")
+    )
+    if multi:
+        add("# PR #328 vocab-parallel logprob performance analysis")
+    else:
+        add(f"# PR #328 {platform_label} vocab-parallel logprob performance analysis")
     add("")
     add("> Operator-only benchmark. No model checkpoint or serving engine was used.")
+    if multi:
+        add("")
+        add(
+            "> Every platform below ran this same harness, so the seeded logits, the "
+            f"`V={REAL_VOCAB}` / {NUM_TILES}-tile split, and the FP64 oracle are identical and "
+            "only the device and backend differ. Backends are not available everywhere: "
+            "`ws2-rocm` is ROCm-only, `ws2-cuda` is CUDA-only, `ws2-triton` compiles from one "
+            "source on both, and the PyTorch paths are the only ones that also run on the host. "
+            "A missing row means the backend cannot exist on that platform, not that it failed."
+        )
     add("")
     add("## Environment")
     add("")
-    add("| Item | Value |")
-    add("|---|---|")
-    for key in sorted(env):
-        add(f"| {key} | {env[key]} |")
+    if multi:
+        keys = sorted({key for _, pl in platforms for key in pl["environment"]})
+        add("| Item | " + " | ".join(label for label, _ in platforms) + " |")
+        add("|---|" + "---|" * len(platforms))
+        for key in keys:
+            values = " | ".join(str(pl["environment"].get(key, "n/a")) for _, pl in platforms)
+            add(f"| {key} | {values} |")
+    else:
+        add("| Item | Value |")
+        add("|---|---|")
+        for key in sorted(env):
+            add(f"| {key} | {env[key]} |")
     add("")
     add("## Methodology")
     add("")
@@ -997,18 +1240,40 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
     dist_notes = [
         DISTRIBUTED_DESCRIPTIONS.get(p, "") for p in style.paths if DISTRIBUTED_DESCRIPTIONS.get(p)
     ]
-    if dist_notes:
-        add("- Distributed: one process per GPU; " + "; ".join(dist_notes) + ".")
+    if dist_notes and distributed:
+        collective = "/".join(
+            sorted(
+                {
+                    "RCCL" if pl["environment"].get("hip") not in (None, "None") else "NCCL"
+                    for _, pl in platforms
+                    if pl.get("distributed")
+                }
+            )
+        )
+        add(
+            "- Distributed: one process per GPU; "
+            + "; ".join(note.replace("RCCL", collective) for note in dist_notes)
+            + "."
+        )
     add(
         "- Forward returns the selected-token logprob and the vocabulary LSE; forward+backward "
         "computes `grad_logits` for `sum(active * logp)`. The WS2 operators run with "
         "`validate=False`; the `validate=True` production entry point is measured separately."
     )
-    add(
-        "- Single-GPU timing: GPU events, median and p95. Distributed timing: synchronized wall "
-        "clock, slowest rank per sample. Peak memory is the per-call increase in "
-        "`torch.cuda.max_memory_allocated` (distributed: max over ranks)."
-    )
+    if is_host:
+        add(
+            "- Timing: `time.perf_counter` wall clock, median and p95. Peak memory is the "
+            "per-call increase in resident set size sampled from `/proc/self/statm`, which is "
+            "an allocator-inclusive high-water approximation rather than the exact tensor "
+            "bytes reported by `torch.cuda.max_memory_allocated` on device runs; treat the "
+            "host memory column as indicative only."
+        )
+    else:
+        add(
+            "- Single-GPU timing: GPU events, median and p95. Distributed timing: synchronized "
+            "wall clock, slowest rank per sample. Peak memory is the per-call increase in "
+            "`torch.cuda.max_memory_allocated` (distributed: max over ranks)."
+        )
     add(
         "- Accuracy is against an FP64 `logsumexp` of the same (BF16-rounded) logits. Repeat = "
         "two identical calls are bitwise equal; batch-invariant = a row computed alone is "
@@ -1035,123 +1300,150 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
     add("")
 
     # ---- key findings
+    all_single, all_distributed, all_component = single, distributed, component
     add("## Key findings")
     add("")
-    for path in others:
-        name = style.name(path)
-        speed_fwd, speed_train, mem = [], [], []
-        for dtype_name in SINGLE_DTYPES:
-            for case in single:
-                if case["dtype"] != dtype_name or case["path"] != path:
+    for _plat, _payload in platforms:
+        prefix = f"{_plat} " if multi else ""
+        single = [c for c in all_single if c["platform"] == _plat]
+        distributed = [d for d in all_distributed if d["platform"] == _plat]
+        component = [r for r in all_component if r["platform"] == _plat]
+        _env = _payload["environment"]
+        single_label = "Host" if _env.get("device") == "cpu" else "Single GPU"
+        _tile_symbol = (
+            "hip_deterministic_logp_tile_stats"
+            if _env.get("hip") not in (None, "None")
+            else "deterministic_logp_tile_stats"
+        )
+        if component:
+            _tile_symbol = component[0].get("kernel_symbol", _tile_symbol)
+        for path in others:
+            name = style.name(path)
+            speed_fwd, speed_train, mem = [], [], []
+            for dtype_name in SINGLE_DTYPES:
+                for case in single:
+                    if case["dtype"] != dtype_name or case["path"] != path:
+                        continue
+                    if not style.keep_tokens(case["tokens"]):
+                        continue
+                    ref = _lookup(single, dtype=dtype_name, tokens=case["tokens"], path=base)
+                    if ref is None:
+                        continue
+                    speed_fwd.append(ref["forward"]["median_ms"] / case["forward"]["median_ms"])
+                    speed_train.append(
+                        ref["train_fwd_bwd"]["median_ms"] / case["train_fwd_bwd"]["median_ms"]
+                    )
+                    mem.append(case["train_peak_mib"] / max(ref["train_peak_mib"], 1e-6))
+            if speed_fwd:
+                add(
+                    f"- {prefix}{single_label}: `{name}` is "
+                    f"{_range_text(speed_fwd, '{:.2f}')}x faster than "
+                    f"`{base_name}` in forward and {_range_text(speed_train, '{:.2f}')}x in "
+                    f"forward+backward, with {_range_text(mem, '{:.2f}')}x its peak memory."
+                )
+            d_fwd, d_train, d_mem, d_abs = [], [], [], []
+            for d in distributed:
+                if d["path"] != path or not style.keep_tokens(d["tokens"]):
                     continue
-                if not style.keep_tokens(case["tokens"]):
-                    continue
-                ref = _lookup(single, dtype=dtype_name, tokens=case["tokens"], path=base)
+                ref = _lookup(distributed, topology=d["topology"], tokens=d["tokens"], path=base)
                 if ref is None:
                     continue
-                speed_fwd.append(ref["forward"]["median_ms"] / case["forward"]["median_ms"])
-                speed_train.append(
-                    ref["train_fwd_bwd"]["median_ms"] / case["train_fwd_bwd"]["median_ms"]
+                d_fwd.append(ref["forward"]["median_ms"] / d["forward"]["median_ms"])
+                d_train.append(ref["train_fwd_bwd"]["median_ms"] / d["train_fwd_bwd"]["median_ms"])
+                d_mem.append(d["train_peak_mib"] / max(ref["train_peak_mib"], 1e-6))
+                d_abs.append(d["forward"]["median_ms"])
+            if d_fwd:
+                add(
+                    f"- {prefix}Distributed: `{name}` is "
+                    f"{_range_text(d_fwd, '{:.2f}')}x faster than "
+                    f"`{base_name}` in forward and {_range_text(d_train, '{:.2f}')}x in "
+                    f"forward+backward across {len({d['topology'] for d in distributed})} TP/CP "
+                    f"topologies, at {_range_text(d_mem, '{:.2f}')}x the per-rank peak memory "
+                    f"(absolute forward {_range_text(d_abs, '{:.3f}')} ms)."
                 )
-                mem.append(case["train_peak_mib"] / max(ref["train_peak_mib"], 1e-6))
-        if speed_fwd:
-            add(
-                f"- Single GPU: `{name}` is {_range_text(speed_fwd, '{:.2f}')}x faster than "
-                f"`{base_name}` in forward and {_range_text(speed_train, '{:.2f}')}x in "
-                f"forward+backward, with {_range_text(mem, '{:.2f}')}x its peak memory."
-            )
-        d_fwd, d_train, d_mem, d_abs = [], [], [], []
-        for d in distributed:
-            if d["path"] != path or not style.keep_tokens(d["tokens"]):
+        for kernel_path in WS2_KERNEL_PATHS:
+            if kernel_path not in style.paths or "ws1-triton" not in style.paths:
                 continue
-            ref = _lookup(distributed, topology=d["topology"], tokens=d["tokens"], path=base)
-            if ref is None:
-                continue
-            d_fwd.append(ref["forward"]["median_ms"] / d["forward"]["median_ms"])
-            d_train.append(ref["train_fwd_bwd"]["median_ms"] / d["train_fwd_bwd"]["median_ms"])
-            d_mem.append(d["train_peak_mib"] / max(ref["train_peak_mib"], 1e-6))
-            d_abs.append(d["forward"]["median_ms"])
-        if d_fwd:
-            add(
-                f"- Distributed: `{name}` is {_range_text(d_fwd, '{:.2f}')}x faster than "
-                f"`{base_name}` in forward and {_range_text(d_train, '{:.2f}')}x in "
-                f"forward+backward across {len({d['topology'] for d in distributed})} TP/CP "
-                f"topologies, at {_range_text(d_mem, '{:.2f}')}x the per-rank peak memory "
-                f"(absolute forward {_range_text(d_abs, '{:.3f}')} ms)."
-            )
-    for kernel_path in WS2_KERNEL_PATHS:
-        if kernel_path not in style.paths or "ws1-triton" not in style.paths:
-            continue
-        ratios_fwd, ratios_train = [], []
-        for dtype_name in SINGLE_DTYPES:
-            for case in single:
-                if case["path"] != kernel_path or case["dtype"] != dtype_name:
-                    continue
-                if not style.keep_tokens(case["tokens"]):
-                    continue
-                tri = _lookup(single, dtype=dtype_name, tokens=case["tokens"], path="ws1-triton")
-                if tri is None:
-                    continue
-                ratios_fwd.append(case["forward"]["median_ms"] / tri["forward"]["median_ms"])
-                ratios_train.append(
-                    case["train_fwd_bwd"]["median_ms"] / tri["train_fwd_bwd"]["median_ms"]
+            ratios_fwd, ratios_train = [], []
+            for dtype_name in SINGLE_DTYPES:
+                for case in single:
+                    if case["path"] != kernel_path or case["dtype"] != dtype_name:
+                        continue
+                    if not style.keep_tokens(case["tokens"]):
+                        continue
+                    tri = _lookup(
+                        single, dtype=dtype_name, tokens=case["tokens"], path="ws1-triton"
+                    )
+                    if tri is None:
+                        continue
+                    ratios_fwd.append(case["forward"]["median_ms"] / tri["forward"]["median_ms"])
+                    ratios_train.append(
+                        case["train_fwd_bwd"]["median_ms"] / tri["train_fwd_bwd"]["median_ms"]
+                    )
+            if ratios_fwd:
+                add(
+                    f"- {prefix}`{style.name(kernel_path)}` runs at "
+                    f"{_range_text(ratios_fwd, '{:.2f}')}x the "
+                    f"latency of `{style.name('ws1-triton')}` in forward and "
+                    f"{_range_text(ratios_train, '{:.2f}')}x in forward+backward with the same "
+                    "peak memory, while carrying the vocab-parallel contract (tile partials, "
+                    "all-gather, fixed tile-order merge, vocab-domain LSE export) that the "
+                    "single-shard Triton op does not provide; the gap is the operator's fixed "
+                    "Python/launch floor, not the kernels."
                 )
-        if ratios_fwd:
+        if component:
+            comp_speed = [
+                r["pytorch_loop"]["median_ms"] / r["hip_fp32_input"]["median_ms"]
+                for r in component
+                if style.keep_tokens(r["tokens"])
+            ]
+            comp_mem = [
+                r["pytorch_loop_peak_mib"] / max(r["hip_peak_mib"], 1e-6)
+                for r in component
+                if style.keep_tokens(r["tokens"])
+            ]
             add(
-                f"- `{style.name(kernel_path)}` runs at {_range_text(ratios_fwd, '{:.2f}')}x the "
-                f"latency of `{style.name('ws1-triton')}` in forward and "
-                f"{_range_text(ratios_train, '{:.2f}')}x in forward+backward with the same peak "
-                "memory, while carrying the vocab-parallel contract (tile partials, all-gather, "
-                "fixed tile-order merge, vocab-domain LSE export) that the single-shard Triton op "
-                "does not provide; the gap is the operator's fixed Python/launch floor, not the "
-                "kernels."
+                f"- {prefix}The `{_tile_symbol}` kernel alone is "
+                f"{_range_text(comp_speed, '{:.1f}')}x faster than the PyTorch tile loop and "
+                f"allocates {_range_text(comp_mem, '{:.0f}')}x less transient memory (it writes "
+                f"only the `[tokens, {NUM_TILES}]` FP32 partials)."
             )
-    if component and "ws2-rocm" in style.paths:
-        comp_speed = [
-            r["pytorch_loop"]["median_ms"] / r["hip_fp32_input"]["median_ms"]
-            for r in component
-            if style.keep_tokens(r["tokens"])
-        ]
-        comp_mem = [
-            r["pytorch_loop_peak_mib"] / max(r["hip_peak_mib"], 1e-6)
-            for r in component
-            if style.keep_tokens(r["tokens"])
-        ]
-        add(
-            f"- The `hip_deterministic_logp_tile_stats` kernel alone is "
-            f"{_range_text(comp_speed, '{:.1f}')}x faster than the PyTorch tile loop and "
-            f"allocates {_range_text(comp_mem, '{:.0f}')}x less transient memory (it writes only "
-            f"the `[tokens, {NUM_TILES}]` FP32 partials)."
-        )
-    for kernel_path in WS2_KERNEL_PATHS:
-        if kernel_path not in style.paths or "ws2-reference" not in style.paths:
-            continue
-        mism = [
-            c.get("mismatch_vs_reference")
-            for c in single
-            if c["path"] == kernel_path and c.get("mismatch_vs_reference") is not None
-        ]
-        relr = [c.get("rel_l2_vs_reference", 0.0) for c in single if c["path"] == kernel_path]
-        add(
-            f"- `{style.name(kernel_path)}` vs `{style.name('ws2-reference')}`: tile maxima are "
-            "bitwise equal; sumexp partials differ only by FP32 summation order, so final outputs "
-            f"differ in {_range_text([float(m) for m in mism], '{:.0f}')} elements per case with "
-            f"relative-L2 {_range_text(relr, '{:.1e}')}. Both paths are equally close to FP64."
-        )
-    ws2 = [c for c in single if c["path"].startswith("ws2")]
-    if ws2:
-        add(
-            f"- Repeat bitwise: {_yes(all(c['repeat_bitwise'] for c in ws2))}; batch-invariant: "
-            f"{_yes(all(c['batch_invariant'] for c in ws2))}; all gradients finite: "
-            f"{_yes(all(c['grad_finite'] for c in ws2))}."
-        )
-    ws2_dist = [d for d in distributed if d["path"].startswith("ws2")]
-    if ws2_dist:
-        add(
-            "- Distributed: TP-replicated and repeat bitwise on every topology: "
-            f"{_yes(all(d['tp_replicated'] and d['repeat_bitwise'] for d in ws2_dist))}."
-        )
+        for kernel_path in WS2_KERNEL_PATHS:
+            if kernel_path not in style.paths or "ws2-reference" not in style.paths:
+                continue
+            mism = [
+                c.get("mismatch_vs_reference")
+                for c in single
+                if c["path"] == kernel_path and c.get("mismatch_vs_reference") is not None
+            ]
+            relr = [c.get("rel_l2_vs_reference", 0.0) for c in single if c["path"] == kernel_path]
+            if not mism:
+                continue
+            add(
+                f"- {prefix}`{style.name(kernel_path)}` vs "
+                f"`{style.name('ws2-reference')}`: tile maxima are "
+                "bitwise equal; sumexp partials differ only by FP32 summation order, so final "
+                "outputs differ in "
+                f"{_range_text([float(m) for m in mism], '{:.0f}')} elements per case with "
+                f"relative-L2 {_range_text(relr, '{:.1e}')}. Both paths are equally close to FP64."
+            )
+        ws2 = [c for c in single if c["path"].startswith("ws2")]
+        if ws2:
+            add(
+                f"- {prefix}Repeat bitwise: "
+                f"{_yes(all(c['repeat_bitwise'] for c in ws2))}; batch-invariant: "
+                f"{_yes(all(c['batch_invariant'] for c in ws2))}; all gradients finite: "
+                f"{_yes(all(c['grad_finite'] for c in ws2))}."
+            )
+        ws2_dist = [d for d in distributed if d["path"].startswith("ws2")]
+        if ws2_dist:
+            add(
+                f"- {prefix}Distributed: TP-replicated and repeat bitwise on every topology: "
+                f"{_yes(all(d['tp_replicated'] and d['repeat_bitwise'] for d in ws2_dist))}."
+            )
     add("")
+
+    single, distributed, component = all_single, all_distributed, all_component
 
     # ---- single GPU tables
     for dtype_name in SINGLE_DTYPES:
@@ -1163,78 +1455,94 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
         add("### Forward")
         add("")
         add(
-            f"| Tokens | Path | Median (ms) | p95 (ms) | Speedup vs {base_name} | Peak MiB | "
-            "logp max-abs vs FP64 | LSE max-abs vs FP64 | Repeat | Batch-inv |"
+            f"| Tokens | {plat_head}Path | Median (ms) | p95 (ms) | Speedup vs {base_name} | "
+            "Peak MiB | logp max-abs vs FP64 | LSE max-abs vs FP64 | Repeat | Batch-inv |"
         )
-        add("|---:|---|---:|---:|---:|---:|---:|---:|:---:|:---:|")
+        add("|---:|" + plat_div + "---|---:|---:|---:|---:|---:|---:|:---:|:---:|")
         for tokens in sorted({c["tokens"] for c in rows}):
-            ref = _lookup(single, dtype=dtype_name, tokens=tokens, path=base)
-            for path in style.paths:
-                case = _lookup(rows, tokens=tokens, path=path)
-                if case is None:
-                    continue
-                add(
-                    f"| {tokens} | {style.name(path)} | {case['forward']['median_ms']:.4f} | "
-                    f"{case['forward']['p95_ms']:.4f} | {_median_ratio(ref, case, 'forward')} | "
-                    f"{case['forward_peak_mib']:.1f} | {case['logp_vs_fp64']['max_abs']:.3e} | "
-                    f"{case['lse_vs_fp64']['max_abs']:.3e} | {_yes(case['repeat_bitwise'])} | "
-                    f"{_yes(case['batch_invariant'])} |"
-                )
+            for label, _ in platforms:
+                # Speedups are always against that platform's own baseline.
+                ref = _lookup(single, dtype=dtype_name, tokens=tokens, path=base, platform=label)
+                for path in style.paths:
+                    case = _lookup(rows, tokens=tokens, path=path, platform=label)
+                    if case is None:
+                        continue
+                    add(
+                        f"| {tokens} | {plat_cell(label)}{style.name(path)} | "
+                        f"{case['forward']['median_ms']:.4f} | "
+                        f"{case['forward']['p95_ms']:.4f} | "
+                        f"{_median_ratio(ref, case, 'forward')} | "
+                        f"{case['forward_peak_mib']:.1f} | "
+                        f"{case['logp_vs_fp64']['max_abs']:.3e} | "
+                        f"{case['lse_vs_fp64']['max_abs']:.3e} | "
+                        f"{_yes(case['repeat_bitwise'])} | "
+                        f"{_yes(case['batch_invariant'])} |"
+                    )
         add("")
         add("### Forward+backward")
         add("")
         add(
-            f"| Tokens | Path | Median (ms) | p95 (ms) | Speedup vs {base_name} | Peak MiB | "
-            f"Memory vs {base_name} | Grad finite |"
+            f"| Tokens | {plat_head}Path | Median (ms) | p95 (ms) | Speedup vs {base_name} | "
+            f"Peak MiB | Memory vs {base_name} | Grad finite |"
         )
-        add("|---:|---|---:|---:|---:|---:|---:|:---:|")
+        add("|---:|" + plat_div + "---|---:|---:|---:|---:|---:|:---:|")
         for tokens in sorted({c["tokens"] for c in rows}):
-            ref = _lookup(single, dtype=dtype_name, tokens=tokens, path=base)
-            for path in style.paths:
-                case = _lookup(rows, tokens=tokens, path=path)
-                if case is None:
-                    continue
-                add(
-                    f"| {tokens} | {style.name(path)} | {case['train_fwd_bwd']['median_ms']:.4f} | "
-                    f"{case['train_fwd_bwd']['p95_ms']:.4f} | "
-                    f"{_median_ratio(ref, case, 'train_fwd_bwd')} | {case['train_peak_mib']:.1f} | "
-                    f"{_field_ratio(case, ref, 'train_peak_mib')} | {_yes(case['grad_finite'])} |"
-                )
+            for label, _ in platforms:
+                ref = _lookup(single, dtype=dtype_name, tokens=tokens, path=base, platform=label)
+                for path in style.paths:
+                    case = _lookup(rows, tokens=tokens, path=path, platform=label)
+                    if case is None:
+                        continue
+                    add(
+                        f"| {tokens} | {plat_cell(label)}{style.name(path)} | "
+                        f"{case['train_fwd_bwd']['median_ms']:.4f} | "
+                        f"{case['train_fwd_bwd']['p95_ms']:.4f} | "
+                        f"{_median_ratio(ref, case, 'train_fwd_bwd')} | "
+                        f"{case['train_peak_mib']:.1f} | "
+                        f"{_field_ratio(case, ref, 'train_peak_mib')} | "
+                        f"{_yes(case['grad_finite'])} |"
+                    )
         add("")
         kernel_paths = [p for p in WS2_KERNEL_PATHS if p in style.paths]
         if kernel_paths and "ws2-reference" in style.paths:
             add(f"### Numerics versus `{style.name('ws2-reference')}`")
             add("")
-            add("| Tokens | Path | Mismatched elements (logp+LSE) | Relative L2 |")
-            add("|---:|---|---:|---:|")
+            add(f"| Tokens | {plat_head}Path | Mismatched elements (logp+LSE) | Relative L2 |")
+            add("|---:|" + plat_div + "---|---:|---:|")
             for tokens in sorted({c["tokens"] for c in rows}):
-                for kernel_path in kernel_paths:
-                    case = _lookup(rows, tokens=tokens, path=kernel_path)
-                    if case is None:
-                        continue
-                    add(
-                        f"| {tokens} | {style.name(kernel_path)} | "
-                        f"{case.get('mismatch_vs_reference', 'n/a')} | "
-                        f"{case.get('rel_l2_vs_reference', float('nan')):.3e} |"
-                    )
+                for label, _ in platforms:
+                    for kernel_path in kernel_paths:
+                        case = _lookup(rows, tokens=tokens, path=kernel_path, platform=label)
+                        if case is None:
+                            continue
+                        add(
+                            f"| {tokens} | {plat_cell(label)}{style.name(kernel_path)} | "
+                            f"{case.get('mismatch_vs_reference', 'n/a')} | "
+                            f"{case.get('rel_l2_vs_reference', float('nan')):.3e} |"
+                        )
             add("")
 
-    overhead = [
-        row
-        for row in payload["single_gpu"].get("validate_overhead", [])
-        if style.keep_tokens(row["tokens"])
-    ]
-    if overhead and "ws2-rocm" in style.paths:
-        add(f"### `validate=True` production entry point ({style.name('ws2-rocm')}, BF16)")
+    overhead_rows: list[tuple[str, str, dict[str, Any]]] = []
+    for label, pl in platforms:
+        for row in pl["single_gpu"].get("validate_overhead", []):
+            if not style.keep_tokens(row["tokens"]):
+                continue
+            row_path = row.get("path", "ws2-rocm")
+            if row_path in style.paths:
+                overhead_rows.append((label, row_path, row))
+    if overhead_rows:
+        measured = sorted({style.name(path) for _, path, _ in overhead_rows})
+        add(f"### `validate=True` production entry point ({', '.join(measured)}, BF16)")
         add("")
-        add("| Tokens | validate=False (ms) | validate=True (ms) | Overhead |")
-        add("|---:|---:|---:|---:|")
-        for row in overhead:
+        add(f"| Tokens | {plat_head}Path | validate=False (ms) | validate=True (ms) | Overhead |")
+        add("|---:|" + plat_div + "---|---:|---:|---:|")
+        for label, row_path, row in overhead_rows:
             overhead_ratio = _fmt_ratio(
                 row["validate_true"]["median_ms"], row["validate_false"]["median_ms"]
             )
             add(
-                f"| {row['tokens']} | {row['validate_false']['median_ms']:.4f} | "
+                f"| {row['tokens']} | {plat_cell(label)}{style.name(row_path)} | "
+                f"{row['validate_false']['median_ms']:.4f} | "
                 f"{row['validate_true']['median_ms']:.4f} | {overhead_ratio} |"
             )
         add("")
@@ -1245,29 +1553,47 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
         add("")
 
     # ---- tile-stats component
+    plat_order = {label: index for index, (label, _) in enumerate(platforms)}
     comp_rows = [r for r in component if style.keep_tokens(r["tokens"])]
-    if comp_rows and "ws2-rocm" in style.paths:
+    comp_rows.sort(key=lambda r: (r["dtype"], r["tokens"], plat_order.get(r["platform"], 99)))
+    if comp_rows:
         add("## Tile-stats kernel")
         add("")
+
+        def _symbol(row: dict[str, Any]) -> str:
+            # results.json written before kernel_symbol existed: infer from the platform.
+            hip_build = dict(platforms)[row["platform"]]["environment"].get("hip") not in (
+                None,
+                "None",
+            )
+            default = (
+                "hip_deterministic_logp_tile_stats"
+                if hip_build
+                else "deterministic_logp_tile_stats"
+            )
+            return row.get("kernel_symbol", default)
+
+        symbols = sorted({_symbol(row) for row in comp_rows})
         add(
-            "`hip_deterministic_logp_tile_stats` computes the per-row, per-tile FP32 "
+            f"{', '.join(f'`{s}`' for s in symbols)} computes the per-row, per-tile FP32 "
             "`(max, sumexp)` partials that the operator all-gathers and merges; the PyTorch tile "
             f"loop is what `{style.name('ws2-reference')}` uses for the same step. Tile maxima are "
             "bitwise equal; sums differ only by FP32 summation order."
         )
         add("")
         add(
-            "| Logits dtype | Tokens | PyTorch tile loop (ms) | HIP kernel on FP32 (ms) | "
-            "HIP kernel on stored dtype (ms) | Speedup | Loop peak MiB | HIP peak MiB | "
-            "Max bitwise | sumexp max rel | Repeat |"
+            f"| Logits dtype | Tokens | {plat_head}Kernel | PyTorch tile loop (ms) | "
+            "Kernel on FP32 (ms) | Kernel on stored dtype (ms) | Speedup | Loop peak MiB | "
+            "Kernel peak MiB | Max bitwise | sumexp max rel | Repeat |"
         )
-        add("|---|---:|---:|---:|---:|---:|---:|---:|:---:|---:|:---:|")
+        add("|---|---:|" + plat_div + "---|---:|---:|---:|---:|---:|---:|:---:|---:|:---:|")
         for row in comp_rows:
             kernel_speedup = _fmt_ratio(
                 row["pytorch_loop"]["median_ms"], row["hip_fp32_input"]["median_ms"]
             )
             add(
-                f"| {row['dtype']} | {row['tokens']} | {row['pytorch_loop']['median_ms']:.4f} | "
+                f"| {row['dtype']} | {row['tokens']} | {plat_cell(row['platform'])}"
+                f"`{_symbol(row)}` | {row['pytorch_loop']['median_ms']:.4f} | "
                 f"{row['hip_fp32_input']['median_ms']:.4f} | "
                 f"{row['hip_native_dtype_input']['median_ms']:.4f} | "
                 f"{kernel_speedup} | "
@@ -1278,14 +1604,29 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
         add("")
 
     # ---- distributed
+    topo_order = {name: index for index, (name, _, _) in enumerate(TOPOLOGIES)}
+    path_order = {path: index for index, path in enumerate(style.paths)}
     dist_rows = [d for d in distributed if style.keep_tokens(d["tokens"])]
+    dist_rows.sort(
+        key=lambda d: (
+            topo_order.get(d["topology"], 99),
+            d["tokens"],
+            plat_order.get(d["platform"], 99),
+            path_order.get(d["path"], 99),
+        )
+    )
     if dist_rows:
-        add("## Distributed vocab-parallel logprob (BF16, RCCL)")
+        collectives = sorted(
+            {
+                "RCCL" if pl["environment"].get("hip") not in (None, "None") else "NCCL"
+                for label, pl in platforms
+                if pl.get("distributed")
+            }
+        )
+        add(f"## Distributed vocab-parallel logprob (BF16, {'/'.join(collectives)})")
         add("")
         absent = [
-            style.name(path)
-            for path in style.paths
-            if path not in {d["path"] for d in payload["distributed"]}
+            style.name(path) for path in style.paths if path not in {d["path"] for d in distributed}
         ]
         if absent:
             add(
@@ -1299,14 +1640,22 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
         add("### Forward")
         add("")
         add(
-            f"| Topology | Tokens | Path | Median (ms) | p95 (ms) | Speedup vs {base_name} | "
-            "Peak MiB/rank | logp max-abs vs FP64 | TP-replicated | Repeat |"
+            f"| Topology | Tokens | {plat_head}Path | Median (ms) | p95 (ms) | "
+            f"Speedup vs {base_name} | Peak MiB/rank | logp max-abs vs FP64 | TP-replicated | "
+            "Repeat |"
         )
-        add("|---|---:|---|---:|---:|---:|---:|---:|:---:|:---:|")
+        add("|---|---:|" + plat_div + "---|---:|---:|---:|---:|---:|:---:|:---:|")
         for d in dist_rows:
-            ref = _lookup(distributed, topology=d["topology"], tokens=d["tokens"], path=base)
+            ref = _lookup(
+                distributed,
+                topology=d["topology"],
+                tokens=d["tokens"],
+                path=base,
+                platform=d["platform"],
+            )
             add(
-                f"| {d['topology']} | {d['tokens']} | {style.name(d['path'])} | "
+                f"| {d['topology']} | {d['tokens']} | {plat_cell(d['platform'])}"
+                f"{style.name(d['path'])} | "
                 f"{d['forward']['median_ms']:.4f} | {d['forward']['p95_ms']:.4f} | "
                 f"{_median_ratio(ref, d, 'forward')} | {d['forward_peak_mib']:.1f} | "
                 f"{d['logp_vs_fp64_max_abs']:.3e} | {_yes(d['tp_replicated'])} | "
@@ -1316,14 +1665,21 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
         add("### Forward+backward")
         add("")
         add(
-            f"| Topology | Tokens | Path | Median (ms) | p95 (ms) | Speedup vs {base_name} | "
-            f"Peak MiB/rank | Memory vs {base_name} | Grad finite |"
+            f"| Topology | Tokens | {plat_head}Path | Median (ms) | p95 (ms) | "
+            f"Speedup vs {base_name} | Peak MiB/rank | Memory vs {base_name} | Grad finite |"
         )
-        add("|---|---:|---|---:|---:|---:|---:|---:|:---:|")
+        add("|---|---:|" + plat_div + "---|---:|---:|---:|---:|---:|:---:|")
         for d in dist_rows:
-            ref = _lookup(distributed, topology=d["topology"], tokens=d["tokens"], path=base)
+            ref = _lookup(
+                distributed,
+                topology=d["topology"],
+                tokens=d["tokens"],
+                path=base,
+                platform=d["platform"],
+            )
             add(
-                f"| {d['topology']} | {d['tokens']} | {style.name(d['path'])} | "
+                f"| {d['topology']} | {d['tokens']} | {plat_cell(d['platform'])}"
+                f"{style.name(d['path'])} | "
                 f"{d['train_fwd_bwd']['median_ms']:.4f} | {d['train_fwd_bwd']['p95_ms']:.4f} | "
                 f"{_median_ratio(ref, d, 'train_fwd_bwd')} | {d['train_peak_mib']:.1f} | "
                 f"{_field_ratio(d, ref, 'train_peak_mib')} | {_yes(d['grad_finite'])} |"
@@ -1333,13 +1689,17 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
         if kernel_paths and "ws2-reference" in style.paths:
             add(f"### Numerics versus `{style.name('ws2-reference')}` (distributed)")
             add("")
-            add("| Topology | Tokens | Path | Mismatched elements (logp+LSE) | Relative L2 |")
-            add("|---|---:|---|---:|---:|")
+            add(
+                f"| Topology | Tokens | {plat_head}Path | Mismatched elements (logp+LSE) | "
+                "Relative L2 |"
+            )
+            add("|---|---:|" + plat_div + "---|---:|---:|")
             for d in dist_rows:
                 if d["path"] not in kernel_paths:
                     continue
                 add(
-                    f"| {d['topology']} | {d['tokens']} | {style.name(d['path'])} | "
+                    f"| {d['topology']} | {d['tokens']} | {plat_cell(d['platform'])}"
+                    f"{style.name(d['path'])} | "
                     f"{d.get('mismatch_vs_reference', 'n/a')} | "
                     f"{d.get('rel_l2_vs_reference', float('nan')):.3e} |"
                 )
@@ -1384,9 +1744,27 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
 
     add("## Figures")
     add("")
-    add("![Single-GPU latency](single_gpu_latency.png)")
+    if multi:
+        add(
+            "One line per backend and device across the full token sweep. The grid puts "
+            "latency and peak memory, forward and forward+backward, on one page."
+        )
+        add("")
+    add("![Single-device latency and memory grid](single_gpu_grid.png)")
     add("")
-    add("![Single-GPU peak memory](single_gpu_memory.png)")
+    if multi:
+        add(
+            "The host and reference paths span three orders of magnitude, which flattens the "
+            "kernel backends against each other. The second grid drops them and re-scales to "
+            "the kernel backends alone, where the differences between Triton and the two "
+            "vendor kernels are legible."
+        )
+        add("")
+        add("![Kernel backends only](single_gpu_grid_kernels.png)")
+        add("")
+    add("![Single-device latency](single_gpu_latency.png)")
+    add("")
+    add("![Single-device peak memory](single_gpu_memory.png)")
     add("")
     if distributed:
         add("![Distributed latency](distributed_logp_latency.png)")
@@ -1394,99 +1772,212 @@ def _write_report(payload: dict[str, Any], output_directory: Path, style: Report
     (output_directory / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-_LINE_STYLES = (
-    {"marker": "o", "linestyle": "-", "linewidth": 2.2, "markersize": 7},
-    {"marker": "s", "linestyle": "--", "linewidth": 1.8, "markersize": 6},
-    {"marker": "^", "linestyle": ":", "linewidth": 2.4, "markersize": 6},
-    {"marker": "D", "linestyle": "-.", "linewidth": 1.6, "markersize": 5},
-    {"marker": "x", "linestyle": "-", "linewidth": 1.2, "markersize": 7},
-)
+def _platform_kind(payload: dict[str, Any]) -> str:
+    env = payload.get("environment", {})
+    if env.get("device") == "cpu" or str(env.get("gpu", "")).startswith("n/a"):
+        return "cpu"
+    return "rocm" if env.get("hip") not in (None, "None") else "cuda"
 
 
-def _write_figures(payload: dict[str, Any], output_directory: Path, style: ReportStyle) -> None:
+# Fixed colours so a series looks the same in every figure of the set.
+_SERIES_STYLE = {
+    "cpu": {"color": "#7f7f7f", "marker": "v", "linestyle": ":"},
+    "native-torch": {"color": "#000000", "marker": "o", "linestyle": "-"},
+    "triton-cuda": {"color": "#1f77b4", "marker": "s", "linestyle": "--"},
+    "triton-rocm": {"color": "#d62728", "marker": "^", "linestyle": "--"},
+    "cuda": {"color": "#2ca02c", "marker": "D", "linestyle": "-"},
+    "hip": {"color": "#ff7f0e", "marker": "P", "linestyle": "-"},
+}
+_SERIES_ORDER = ("cpu", "native-torch", "triton-cuda", "triton-rocm", "cuda", "hip")
+
+
+def _figure_series(
+    platforms: list[tuple[str, dict[str, Any]]],
+) -> list[tuple[str, str, str]]:
+    """``(display label, platform label, path)`` for one line per backend/device.
+
+    The PyTorch reference is drawn once from the primary accelerator as
+    ``native-torch``; the host run contributes the ``cpu`` line.  Each
+    accelerator adds its Triton line and its vendor-kernel line, so a ROCm +
+    CUDA + host set yields the six series in ``_SERIES_ORDER``.
+    """
+
+    kinds = {label: _platform_kind(pl) for label, pl in platforms}
+    measured = {
+        label: {case["path"] for case in pl["single_gpu"]["cases"]} for label, pl in platforms
+    }
+    series: list[tuple[str, str, str]] = []
+
+    for label, kind in kinds.items():
+        if kind == "cpu" and "ws2-reference" in measured[label]:
+            series.append(("cpu", label, "ws2-reference"))
+            break
+
+    # The reference line is drawn once, from the primary accelerator. On a
+    # host-only run the "cpu" entry above already is that line, so skip it.
+    primary = next((label for label, kind in kinds.items() if kind != "cpu"), None)
+    if primary is not None and "ws2-reference" in measured.get(primary, set()):
+        series.append(("native-torch", primary, "ws2-reference"))
+
+    for label, kind in kinds.items():
+        if kind == "cpu":
+            continue
+        if "ws2-triton" in measured[label]:
+            series.append((f"triton-{kind}", label, "ws2-triton"))
+        vendor = "ws2-rocm" if kind == "rocm" else "ws2-cuda"
+        if vendor in measured[label]:
+            series.append(("hip" if kind == "rocm" else "cuda", label, vendor))
+
+    rank = {name: index for index, name in enumerate(_SERIES_ORDER)}
+    series.sort(key=lambda item: rank.get(item[0], len(rank)))
+    return series
+
+
+def _series_value(case: dict[str, Any] | None, key: str) -> float:
+    if case is None:
+        return float("nan")
+    value = case[key]
+    return float(value["median_ms"] if isinstance(value, dict) else value)
+
+
+def _write_figures(
+    payload: dict[str, Any],
+    output_directory: Path,
+    style: ReportStyle,
+    platforms: list[tuple[str, dict[str, Any]]] | None = None,
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    single = [
-        c
-        for c in payload["single_gpu"]["cases"]
-        if c["dtype"] == "bf16" and c["path"] in style.paths
-    ]
-    tokens = sorted({c["tokens"] for c in single})
+    if platforms is None:
+        platforms = _report_platforms(payload, [], None)
+    series = _figure_series(platforms)
+    if not series:
+        return
+    by_label = dict(platforms)
 
-    for filename, keys, ylabel, title in (
-        ("single_gpu_latency.png", ("forward", "train_fwd_bwd"), "median ms", "latency"),
-        (
-            "single_gpu_memory.png",
-            ("forward_peak_mib", "train_peak_mib"),
-            "peak MiB above live",
-            "peak device memory",
-        ),
+    single: dict[str, list[dict[str, Any]]] = {
+        label: [c for c in pl["single_gpu"]["cases"] if c["dtype"] == "bf16"]
+        for label, pl in platforms
+    }
+    tokens = sorted({c["tokens"] for cases in single.values() for c in cases})
+
+    panels = (
+        ("forward", "Forward latency", "median ms", True),
+        ("train_fwd_bwd", "Forward+backward latency", "median ms", True),
+        ("forward_peak_mib", "Forward peak memory", "peak MiB above live", False),
+        ("train_peak_mib", "Forward+backward peak memory", "peak MiB above live", False),
+    )
+
+    def draw(axis, key, title, ylabel, log_y, chosen_series=None) -> None:
+        for index, (name, platform_label, path) in enumerate(chosen_series or series):
+            ys = [
+                _series_value(_lookup(single[platform_label], tokens=t, path=path), key)
+                for t in tokens
+            ]
+            # Series routinely coincide (cuda tracks the reference's memory; triton
+            # and hip share it). Draw later ones thinner so the overlap stays legible.
+            axis.plot(
+                tokens,
+                ys,
+                label=name,
+                linewidth=3.2 - 0.4 * index,
+                markersize=7 - 0.5 * index,
+                zorder=3 + index,
+                **_SERIES_STYLE.get(name, {}),
+            )
+        axis.set_xscale("log", base=2)
+        if log_y:
+            axis.set_yscale("log")
+        else:
+            # symlog keeps the host run's legitimate ~0 MiB readings on the axis;
+            # memory is never negative, so clip the mirrored half away.
+            axis.set_yscale("symlog", linthresh=1.0)
+            axis.set_ylim(bottom=0)
+        axis.set_xlabel("tokens")
+        axis.set_ylabel(ylabel)
+        axis.set_title(f"BF16: {title}", fontsize=11)
+        axis.grid(True, which="both", alpha=0.3)
+        axis.legend(fontsize=8)
+
+    # Latency and memory keep their own files; the grid puts all four panels together.
+    for filename, chosen in (
+        ("single_gpu_latency.png", panels[:2]),
+        ("single_gpu_memory.png", panels[2:]),
     ):
         figure, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-        for axis, key, direction in zip(axes, keys, ("Forward", "Forward+backward")):
-            for path in style.paths:
-                ys = []
-                for t in tokens:
-                    case = _lookup(single, tokens=t, path=path)
-                    if case is None:
-                        ys.append(float("nan"))
-                    elif isinstance(case[key], dict):
-                        ys.append(case[key]["median_ms"])
-                    else:
-                        ys.append(case[key])
-                # Distinct styles and z-order keep coincident series visible (for example
-                # triton and strict-hip share the same forward+backward peak memory).
-                line_style = _LINE_STYLES[style.paths.index(path) % len(_LINE_STYLES)]
-                axis.plot(
-                    tokens,
-                    ys,
-                    label=style.name(path),
-                    zorder=3 + style.paths.index(path),
-                    **line_style,
-                )
-            axis.set_xscale("log", base=2)
-            axis.set_yscale("log")
-            axis.set_xlabel("tokens")
-            axis.set_ylabel(ylabel)
-            axis.set_title(f"Single MI300X, BF16: {direction} {title}", fontsize=11)
-            axis.grid(True, which="both", alpha=0.3)
-            if style.paths:
-                axis.legend(fontsize=8)
+        for axis, (key, title, ylabel, log_y) in zip(axes, chosen):
+            draw(axis, key, title, ylabel, log_y)
         figure.tight_layout()
         figure.savefig(output_directory / filename, dpi=180)
         plt.close(figure)
 
-    distributed = [d for d in payload["distributed"] if d["path"] in style.paths]
-    if not distributed:
-        return
-    # Only paths with distributed measurements get a bar (single-shard ops have none).
-    dist_paths = tuple(p for p in style.paths if any(d["path"] == p for d in distributed))
-    labels = []
-    series: dict[tuple[str, str], list[float]] = {
-        (path, key): [] for path in dist_paths for key in ("forward", "train_fwd_bwd")
+    def grid(filename: str, chosen_series, subtitle: str) -> None:
+        figure, axes = plt.subplots(2, 2, figsize=(13, 9))
+        for axis, (key, title, ylabel, log_y) in zip(axes.flat, panels):
+            draw(axis, key, title, ylabel, log_y, chosen_series)
+        figure.suptitle(
+            f"Single-device vocab-parallel logprob, BF16, V={REAL_VOCAB} — {subtitle} ("
+            + ", ".join(name for name, _, _ in chosen_series)
+            + ")",
+            fontsize=12,
+        )
+        figure.tight_layout(rect=(0, 0, 1, 0.96))
+        figure.savefig(output_directory / filename, dpi=180)
+        plt.close(figure)
+
+    grid("single_gpu_grid.png", series, "all paths")
+
+    # The host and reference lines span three orders of magnitude, which flattens
+    # the kernel backends against each other. Re-draw them on their own scale.
+    kernel_series = [item for item in series if item[0] not in ("cpu", "native-torch")]
+    if len(kernel_series) >= 2 and len(kernel_series) != len(series):
+        grid("single_gpu_grid_kernels.png", kernel_series, "kernel backends only")
+
+    # ---- distributed: same series minus the host run
+    dist_series = [item for item in series if item[0] != "cpu"]
+    distributed = {
+        label: pl.get("distributed", []) or [] for label, pl in platforms if label in by_label
     }
-    for d in distributed:
-        if d["path"] != style.baseline:
-            continue
-        labels.append(f"{d['topology']}\nM={d['tokens']}")
-        for path in dist_paths:
-            other = _lookup(distributed, path=path, topology=d["topology"], tokens=d["tokens"])
-            for key in ("forward", "train_fwd_bwd"):
-                series[(path, key)].append(
-                    other[key]["median_ms"] if other is not None else float("nan")
-                )
-    figure, axes = plt.subplots(1, 2, figsize=(max(12, 1.1 * len(labels)), 4.8))
+    dist_series = [item for item in dist_series if distributed.get(item[1])]
+    if not dist_series:
+        return
+
+    cells: list[tuple[str, int]] = []
+    for _, platform_label, _ in dist_series:
+        for row in distributed[platform_label]:
+            key = (row["topology"], row["tokens"])
+            if key not in cells:
+                cells.append(key)
+    topo_rank = {name: index for index, (name, _, _) in enumerate(TOPOLOGIES)}
+    cells.sort(key=lambda c: (topo_rank.get(c[0], 99), c[1]))
+    labels = [f"{topology}\nM={tokens_}" for topology, tokens_ in cells]
+
+    figure, axes = plt.subplots(1, 2, figsize=(max(12, 1.15 * len(labels)), 5.0))
     xs = list(range(len(labels)))
-    width = 0.8 / max(len(dist_paths), 1)
+    width = 0.8 / max(len(dist_series), 1)
     for axis, key, direction in zip(
         axes, ("forward", "train_fwd_bwd"), ("Forward", "Forward+backward")
     ):
-        for index, path in enumerate(dist_paths):
-            offset = (index - (len(dist_paths) - 1) / 2) * width
-            axis.bar([x + offset for x in xs], series[(path, key)], width, label=style.name(path))
+        for index, (name, platform_label, path) in enumerate(dist_series):
+            values = [
+                _series_value(
+                    _lookup(distributed[platform_label], path=path, topology=topology, tokens=t),
+                    key,
+                )
+                for topology, t in cells
+            ]
+            offset = (index - (len(dist_series) - 1) / 2) * width
+            axis.bar(
+                [x + offset for x in xs],
+                values,
+                width,
+                label=name,
+                color=_SERIES_STYLE.get(name, {}).get("color"),
+                zorder=3,
+            )
         axis.set_xticks(xs)
         axis.set_xticklabels(labels, fontsize=8)
         axis.set_ylabel("slowest-rank median ms")
@@ -1498,36 +1989,96 @@ def _write_figures(payload: dict[str, Any], output_directory: Path, style: Repor
     plt.close(figure)
 
 
-def _environment() -> dict[str, Any]:
-    properties = torch.cuda.get_device_properties(0)
-    return {
-        "gpu": torch.cuda.get_device_name(0),
-        "gpu_count": torch.cuda.device_count(),
-        "architecture": properties.gcnArchName,
+def _extension_symbols() -> str:
+    if not _EXT_AVAILABLE or _C is None:
+        return "none (pure-Python fallback)"
+    candidates = (
+        "deterministic_logp_tile_stats",
+        "hip_deterministic_logp_tile_stats",
+        "hip_deterministic_logp_backward",
+    )
+    present = [name for name in candidates if hasattr(_C, name)]
+    return ", ".join(present) if present else "none"
+
+
+def _environment(device: torch.device) -> dict[str, Any]:
+    environment: dict[str, Any] = {
+        "device": device.type,
         "torch": torch.__version__,
+        "cuda": torch.version.cuda,
         "hip": torch.version.hip,
         "python": os.sys.version.split()[0],
         "git_commit": os.popen("git rev-parse HEAD").read().strip(),
-        "native_collective": "torch.distributed ProcessGroupNCCL (RCCL on ROCm)",
-        "extension_symbols": "hip_deterministic_logp_tile_stats, hip_deterministic_logp_backward",
+        "extension_symbols": _extension_symbols(),
     }
+    if device.type == "cuda":
+        properties = torch.cuda.get_device_properties(0)
+        environment.update(
+            {
+                "gpu": torch.cuda.get_device_name(0),
+                "gpu_count": torch.cuda.device_count(),
+                "architecture": (
+                    getattr(properties, "gcnArchName", "unknown")
+                    if torch.version.hip is not None
+                    else f"sm_{properties.major}{properties.minor}"
+                ),
+                "native_collective": (
+                    "torch.distributed ProcessGroupNCCL"
+                    + (" (RCCL on ROCm)" if torch.version.hip is not None else " (NCCL)")
+                ),
+            }
+        )
+    else:
+        environment.update(
+            {
+                "gpu": "n/a (host execution)",
+                "gpu_count": 0,
+                "architecture": platform.processor() or platform.machine(),
+                "cpu_count": os.cpu_count(),
+                "torch_threads": torch.get_num_threads(),
+                "native_collective": "n/a (single-process host run)",
+            }
+        )
+    return environment
 
 
-def _validate_environment(require_distributed: bool) -> None:
-    if getattr(torch.version, "hip", None) is None:
-        raise RuntimeError("this benchmark requires a ROCm PyTorch build")
+def _validate_environment(require_distributed: bool, device: torch.device) -> None:
+    if device.type == "cpu":
+        if require_distributed:
+            raise RuntimeError(
+                "--device cpu cannot run the distributed section; add --skip-distributed"
+            )
+        return
     if not torch.cuda.is_available():
-        raise RuntimeError("no ROCm GPU is visible")
-    if not _EXT_AVAILABLE or _C is None or not hasattr(_C, "hip_deterministic_logp_backward"):
-        raise RuntimeError(
-            "rl_engine._C with hip_deterministic_logp_* is unavailable; build with "
-            "PYTORCH_ROCM_ARCH=gfx942 RL_KERNEL_REQUIRE_EXT=1 python setup.py build_ext --inplace"
+        raise RuntimeError("no CUDA/ROCm GPU is visible")
+    if torch.version.hip is not None:
+        if not _EXT_AVAILABLE or _C is None or not hasattr(_C, "hip_deterministic_logp_backward"):
+            raise RuntimeError(
+                "rl_engine._C with hip_deterministic_logp_* is unavailable; build with "
+                "PYTORCH_ROCM_ARCH=gfx942 RL_KERNEL_REQUIRE_EXT=1 "
+                "python setup.py build_ext --inplace"
+            )
+    elif not native_tile_stats_available():
+        # Not fatal: ws2-triton and the reference still run, only ws2-cuda drops out.
+        print(
+            "warning: rl_engine._C with deterministic_logp_tile_stats is unavailable; "
+            "the ws2-cuda path will be skipped. Build with "
+            "TORCH_CUDA_ARCH_LIST=9.0 RL_KERNEL_REQUIRE_EXT=1 "
+            "python setup.py build_ext --inplace"
         )
     if require_distributed and (not dist.is_available() or not dist.is_nccl_available()):
-        raise RuntimeError("PyTorch RCCL/ProcessGroupNCCL support is unavailable")
+        raise RuntimeError("PyTorch NCCL/ProcessGroupNCCL support is unavailable")
 
 
-ALL_PATHS = ("native", "ws1-pytorch", "ws1-triton", "ws2-reference", "ws2-triton", "ws2-rocm")
+ALL_PATHS = (
+    "native",
+    "ws1-pytorch",
+    "ws1-triton",
+    "ws2-reference",
+    "ws2-triton",
+    "ws2-cuda",
+    "ws2-rocm",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1535,6 +2086,12 @@ def parse_args() -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--output-dir", type=Path, default=Path("benchmarks/results/rocm_logp"))
+    parser.add_argument(
+        "--device",
+        choices=("cuda", "cpu"),
+        default="cuda",
+        help="device for the single-device section; 'cpu' implies --skip-distributed",
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--training-samples", type=int, default=5)
@@ -1582,6 +2139,23 @@ def parse_args() -> argparse.Namespace:
         default=",".join(name for name, _, _ in TOPOLOGIES),
         help="comma-separated subset of " + ",".join(name for name, _, _ in TOPOLOGIES),
     )
+    parser.add_argument(
+        "--compare-with",
+        action="append",
+        default=[],
+        metavar="LABEL=PATH",
+        help=(
+            "results.json from another platform's run of this harness; adds a cross-platform "
+            "comparison section to the report. Repeat for each platform, e.g. "
+            "--compare-with h100=benchmarks/results/pr328_cuda_h100/results.json"
+        ),
+    )
+    parser.add_argument(
+        "--compare-label",
+        type=str,
+        default=None,
+        help="label for this run inside the comparison section (default: derived from the GPU)",
+    )
     parser.add_argument("--tokens", type=str, default=",".join(str(t) for t in SINGLE_TOKENS))
     parser.add_argument(
         "--distributed-tokens", type=str, default=",".join(str(t) for t in DISTRIBUTED_TOKENS)
@@ -1617,6 +2191,10 @@ def _report_style(
         command_parts.append(f"  --report-baseline {args.report_baseline} \\")
     if table_tokens:
         command_parts.append(f"  --table-tokens {','.join(str(t) for t in table_tokens)} \\")
+    for spec in getattr(args, "compare_with", []) or []:
+        command_parts.append(f"  --compare-with {spec} \\")
+    if getattr(args, "compare_label", None):
+        command_parts.append(f"  --compare-label {args.compare_label} \\")
     command_parts.append(f"  --output-dir {output_directory.as_posix()}")
     return ReportStyle(
         paths=paths,
@@ -1636,7 +2214,11 @@ def main() -> None:
     if args.render_from is not None:
         payload = json.loads(args.render_from.read_text(encoding="utf-8"))
     else:
-        _validate_environment(require_distributed=not args.skip_distributed)
+        device = torch.device("cuda", 0) if args.device == "cuda" else torch.device("cpu")
+        if device.type == "cpu":
+            # Triton, the native kernels, and NCCL are all device-only.
+            args.skip_distributed = True
+        _validate_environment(require_distributed=not args.skip_distributed, device=device)
         config = {
             "warmup": args.warmup,
             "samples": args.samples,
@@ -1646,7 +2228,7 @@ def main() -> None:
         distributed_tokens = tuple(int(t) for t in args.distributed_tokens.split(",") if t)
         selected = {name.strip() for name in args.topologies.split(",") if name.strip()}
         payload = {
-            "environment": _environment(),
+            "environment": _environment(device),
             "config": config,
             "single_gpu": {"cases": [], "validate_overhead": [], "paths": []},
             "tile_stats_component": [],
@@ -1658,9 +2240,10 @@ def main() -> None:
                 samples=args.samples,
                 training_samples=args.training_samples,
                 tokens=tokens,
+                device=device,
             )
             payload["tile_stats_component"] = _tile_stats_component(
-                warmup=args.warmup, samples=args.samples, tokens=tokens
+                warmup=args.warmup, samples=args.samples, tokens=tokens, device=device
             )
         if not args.skip_distributed:
             device_count = torch.cuda.device_count()
@@ -1688,8 +2271,9 @@ def main() -> None:
     (output_directory / "results.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
     )
-    _write_report(payload, output_directory, style)
-    _write_figures(payload, output_directory, style)
+    platforms = _report_platforms(payload, args.compare_with, args.compare_label)
+    _write_report(payload, output_directory, style, platforms)
+    _write_figures(payload, output_directory, style, platforms)
     print(json.dumps({"output_dir": str(output_directory), "status": "ok"}))
 
 

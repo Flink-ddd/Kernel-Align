@@ -93,6 +93,15 @@ std::vector<torch::Tensor> deterministic_logp_tile_stats(
     int64_t vocab_start,
     int64_t real_vocab,
     int64_t num_tiles);
+torch::Tensor deterministic_logp_backward(
+    torch::Tensor logits,
+    torch::Tensor lse,
+    torch::Tensor coef_logp,
+    torch::Tensor coef_lse,
+    torch::Tensor target_local,
+    int64_t vocab_start,
+    int64_t real_vocab,
+    bool has_lse_grad);
 
 // ROCm-tuned WS2 vocab-parallel logprob kernels (csrc/hip/hip_deterministic_logp_kernel.hip).
 #if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
@@ -409,6 +418,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deterministic_logp_forward_indexed_fp32", &deterministic_logp_forward_indexed_fp32, "Batch-invariant deterministic logp indexed fp32");
     m.def("deterministic_logp_tile_stats", &deterministic_logp_tile_stats,
           "Deterministic local vocab-tile FP32 max and sumexp partials");
+    m.def("deterministic_logp_backward", &deterministic_logp_backward,
+          "Fused vocab-parallel selected-logprob/LSE backward on the local shard");
 #if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
     m.def("hip_deterministic_logp_tile_stats", &hip_deterministic_logp_tile_stats,
           "ROCm-tuned vocab-tile FP32 max and sumexp partials read from the stored shard");

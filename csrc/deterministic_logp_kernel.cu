@@ -2,11 +2,13 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <limits>
 #include <torch/extension.h>
 
 namespace {
 
+constexpr int kDeterministicLogpTinyBlockSize = 64;
 constexpr int kDeterministicLogpSmallBlockSize = 128;
 constexpr int kDeterministicLogpMediumBlockSize = 256;
 constexpr int kDeterministicLogpLargeBlockSize = 512;
@@ -27,7 +29,8 @@ __device__ __forceinline__ T deterministic_logp_shfl_down_32(T value, unsigned i
 template <int BlockSize>
 struct DeterministicLogpBlockTraits {
     static_assert(
-        BlockSize == kDeterministicLogpSmallBlockSize ||
+        BlockSize == kDeterministicLogpTinyBlockSize ||
+            BlockSize == kDeterministicLogpSmallBlockSize ||
             BlockSize == kDeterministicLogpMediumBlockSize ||
             BlockSize == kDeterministicLogpLargeBlockSize,
         "deterministic logp reduction topology requires a supported fixed block size");
@@ -361,10 +364,92 @@ torch::Tensor deterministic_logp_forward_indexed_fp32(
 
 namespace {
 
-constexpr int kDeterministicLogpTileBlockSize = 256;
+// Tuned on sm_90 (H100) for the Qwen3 shape (V=151936 split into 64 tiles of
+// 2374 columns). Two things dominate: 16-byte vector loads, and a block small
+// enough that a tile splits into several balanced chunks. The previous fixed
+// block of 256 left only ~1.2 chunks per tile, so most of each pass ran with
+// idle lanes and the kernel stalled well short of memory bandwidth.
+#ifndef DETERMINISTIC_LOGP_TILE_BLOCK_SIZE_NARROW
+#define DETERMINISTIC_LOGP_TILE_BLOCK_SIZE_NARROW 64  // 1- and 2-byte inputs
+#endif
+#ifndef DETERMINISTIC_LOGP_TILE_BLOCK_SIZE_WIDE
+#define DETERMINISTIC_LOGP_TILE_BLOCK_SIZE_WIDE 128  // 4-byte inputs
+#endif
+#ifndef DETERMINISTIC_LOGP_TILE_VECTOR_BYTES
+#define DETERMINISTIC_LOGP_TILE_VECTOR_BYTES 16
+#endif
 
-template <typename scalar_t, int BlockSize>
-__global__ void deterministic_logp_tile_stats_kernel(
+template <int Bytes>
+struct DeterministicLogpPacked;
+template <>
+struct DeterministicLogpPacked<16> {
+    using type = int4;
+};
+template <>
+struct DeterministicLogpPacked<8> {
+    using type = int2;
+};
+template <>
+struct DeterministicLogpPacked<4> {
+    using type = int;
+};
+template <>
+struct DeterministicLogpPacked<2> {
+    using type = short;
+};
+
+template <typename scalar_t, int Vec>
+__device__ __forceinline__ void deterministicLogpLoadVector(
+    const scalar_t* __restrict__ pointer,
+    scalar_t (&out)[Vec]) {
+    constexpr int Bytes = Vec * static_cast<int>(sizeof(scalar_t));
+    constexpr int PieceBytes = Bytes < 16 ? Bytes : 16;
+    constexpr int Pieces = Bytes / PieceBytes;
+    using packed_t = typename DeterministicLogpPacked<PieceBytes>::type;
+    if ((reinterpret_cast<uintptr_t>(pointer) % alignof(packed_t)) == 0) {
+        packed_t packed[Pieces];
+#pragma unroll
+        for (int piece = 0; piece < Pieces; ++piece) {
+            packed[piece] = reinterpret_cast<const packed_t*>(pointer)[piece];
+        }
+        __builtin_memcpy(out, packed, Bytes);
+    } else {
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            out[i] = pointer[i];
+        }
+    }
+}
+
+template <typename scalar_t, int Vec>
+__device__ __forceinline__ void deterministicLogpStoreVector(
+    scalar_t* __restrict__ pointer,
+    const scalar_t (&in)[Vec]) {
+    constexpr int Bytes = Vec * static_cast<int>(sizeof(scalar_t));
+    constexpr int PieceBytes = Bytes < 16 ? Bytes : 16;
+    constexpr int Pieces = Bytes / PieceBytes;
+    using packed_t = typename DeterministicLogpPacked<PieceBytes>::type;
+    if ((reinterpret_cast<uintptr_t>(pointer) % alignof(packed_t)) == 0) {
+        packed_t packed[Pieces];
+        __builtin_memcpy(packed, in, Bytes);
+#pragma unroll
+        for (int piece = 0; piece < Pieces; ++piece) {
+            reinterpret_cast<packed_t*>(pointer)[piece] = packed[piece];
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            pointer[i] = in[i];
+        }
+    }
+}
+
+// Per-row, per-tile FP32 (max, sumexp) partials over the real-vocabulary part of
+// the tile. The reduction tree is fixed by (BlockSize, Vec) and the position
+// inside the tile, never by the row count or the tile's place in the global
+// order, so the partials stay batch-invariant and TP-replicated.
+template <typename scalar_t, int BlockSize, int Vec>
+__global__ void __launch_bounds__(BlockSize) deterministic_logp_tile_stats_kernel(
     const scalar_t* __restrict__ logits,
     float* __restrict__ tile_max,
     float* __restrict__ tile_sum,
@@ -374,6 +459,7 @@ __global__ void deterministic_logp_tile_stats_kernel(
     int64_t real_vocab,
     int64_t tile_size,
     int64_t local_tiles) {
+    constexpr int Chunk = BlockSize * Vec;
     const int64_t tile_index = static_cast<int64_t>(blockIdx.y);
     const int64_t row = static_cast<int64_t>(blockIdx.x);
     if (row >= rows || tile_index >= local_tiles) {
@@ -381,30 +467,147 @@ __global__ void deterministic_logp_tile_stats_kernel(
     }
     const int64_t col_begin = tile_index * tile_size;
     const int64_t col_end = min(col_begin + tile_size, local_vocab);
+    // Columns at or beyond the real vocabulary are padding; hoisting the bound
+    // keeps the per-element predicate out of the inner loop.
+    const int64_t real_end =
+        min(col_end, max(real_vocab - vocab_start, static_cast<int64_t>(0)));
+    const scalar_t* __restrict__ row_pointer = logits + row * local_vocab;
+
     float local_max = -std::numeric_limits<float>::infinity();
-    for (int64_t col = col_begin + threadIdx.x; col < col_end; col += BlockSize) {
-        const int64_t global_col = vocab_start + col;
-        if (global_col < real_vocab) {
-            local_max = fmaxf(local_max, static_cast<float>(logits[row * local_vocab + col]));
+    for (int64_t base = col_begin + static_cast<int64_t>(threadIdx.x) * Vec; base < real_end;
+         base += Chunk) {
+        scalar_t values[Vec];
+        if (base + Vec <= real_end) {
+            deterministicLogpLoadVector<scalar_t, Vec>(row_pointer + base, values);
+#pragma unroll
+            for (int i = 0; i < Vec; ++i) {
+                local_max = fmaxf(local_max, static_cast<float>(values[i]));
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < Vec; ++i) {
+                if (base + i < real_end) {
+                    local_max = fmaxf(local_max, static_cast<float>(row_pointer[base + i]));
+                }
+            }
         }
     }
     const float max_value = deterministicBlockReduceMax<BlockSize>(local_max);
     __shared__ float row_max;
     if (threadIdx.x == 0) row_max = max_value;
     __syncthreads();
+    const float tile_max_value = row_max;
 
-    float local_sum = 0.0f;
-    for (int64_t col = col_begin + threadIdx.x; col < col_end; col += BlockSize) {
-        const int64_t global_col = vocab_start + col;
-        if (global_col < real_vocab) {
-            local_sum += expf(static_cast<float>(logits[row * local_vocab + col]) - row_max);
+    float sum_value = 0.0f;
+    if (isfinite(tile_max_value)) {
+        float local_sum = 0.0f;
+        for (int64_t base = col_begin + static_cast<int64_t>(threadIdx.x) * Vec; base < real_end;
+             base += Chunk) {
+            scalar_t values[Vec];
+            if (base + Vec <= real_end) {
+                deterministicLogpLoadVector<scalar_t, Vec>(row_pointer + base, values);
+#pragma unroll
+                for (int i = 0; i < Vec; ++i) {
+                    local_sum += expf(static_cast<float>(values[i]) - tile_max_value);
+                }
+            } else {
+#pragma unroll
+                for (int i = 0; i < Vec; ++i) {
+                    if (base + i < real_end) {
+                        local_sum +=
+                            expf(static_cast<float>(row_pointer[base + i]) - tile_max_value);
+                    }
+                }
+            }
         }
+        sum_value = deterministicBlockReduceSum<BlockSize>(local_sum);
     }
-    const float sum_value = deterministicBlockReduceSum<BlockSize>(local_sum);
     if (threadIdx.x == 0) {
         const int64_t output_index = row * local_tiles + tile_index;
-        tile_max[output_index] = row_max;
-        tile_sum[output_index] = isfinite(row_max) ? sum_value : 0.0f;
+        tile_max[output_index] = tile_max_value;
+        tile_sum[output_index] = sum_value;
+    }
+}
+
+
+#ifndef DETERMINISTIC_LOGP_BACKWARD_BLOCK_SIZE
+#define DETERMINISTIC_LOGP_BACKWARD_BLOCK_SIZE 256
+#endif
+
+// grad = coef_logp * (onehot - p) + coef_lse * p, with p = exp(z - lse) on finite
+// rows, 0 on non-finite rows and on padding columns. Purely elementwise, so the
+// result does not depend on the launch geometry or on the batch.
+template <typename scalar_t, int BlockSize, int Vec>
+__global__ void __launch_bounds__(BlockSize) deterministic_logp_backward_kernel(
+    const scalar_t* __restrict__ logits,
+    const float* __restrict__ lse,
+    const float* __restrict__ coef_logp,
+    const float* __restrict__ coef_lse,
+    const int64_t* __restrict__ target_local,
+    scalar_t* __restrict__ grad,
+    int64_t rows,
+    int64_t local_vocab,
+    int64_t vocab_start,
+    int64_t real_vocab,
+    bool has_lse_grad) {
+    constexpr int Chunk = BlockSize * Vec;
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    if (row >= rows) {
+        return;
+    }
+    const float row_lse = lse[row];
+    const bool finite_row = isfinite(row_lse);
+    const float lse_safe = finite_row ? row_lse : 0.0f;
+    const float g_logp = coef_logp[row];
+    const float g_lse = has_lse_grad ? coef_lse[row] : 0.0f;
+    const int64_t hit = target_local[row];
+    const int64_t real_end =
+        min(local_vocab, max(real_vocab - vocab_start, static_cast<int64_t>(0)));
+    const scalar_t* __restrict__ row_in = logits + row * local_vocab;
+    scalar_t* __restrict__ row_out = grad + row * local_vocab;
+    const int64_t stride = static_cast<int64_t>(gridDim.y) * Chunk;
+
+    for (int64_t base = static_cast<int64_t>(blockIdx.y) * Chunk +
+                        static_cast<int64_t>(threadIdx.x) * Vec;
+         base < local_vocab;
+         base += stride) {
+        scalar_t values[Vec];
+        scalar_t outputs[Vec];
+        const bool full = base + Vec <= local_vocab;
+        if (full) {
+            deterministicLogpLoadVector<scalar_t, Vec>(row_in + base, values);
+        } else {
+#pragma unroll
+            for (int i = 0; i < Vec; ++i) {
+                values[i] =
+                    (base + i < local_vocab) ? row_in[base + i] : static_cast<scalar_t>(0.0f);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            const int64_t col = base + i;
+            float value = 0.0f;
+            if (col < real_end) {
+                const float p =
+                    finite_row ? expf(static_cast<float>(values[i]) - lse_safe) : 0.0f;
+                const float onehot = (col == hit) ? 1.0f : 0.0f;
+                value = g_logp * (onehot - p);
+                if (has_lse_grad) {
+                    value = value + g_lse * p;
+                }
+            }
+            outputs[i] = static_cast<scalar_t>(value);
+        }
+        if (full) {
+            deterministicLogpStoreVector<scalar_t, Vec>(row_out + base, outputs);
+        } else {
+#pragma unroll
+            for (int i = 0; i < Vec; ++i) {
+                if (base + i < local_vocab) {
+                    row_out[base + i] = outputs[i];
+                }
+            }
+        }
     }
 }
 
@@ -437,12 +640,76 @@ std::vector<torch::Tensor> deterministic_logp_tile_stats(
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(),
         "deterministic_logp_tile_stats", ([&] {
-            deterministic_logp_tile_stats_kernel<scalar_t, kDeterministicLogpTileBlockSize>
-                <<<grid, kDeterministicLogpTileBlockSize, 0, stream>>>(
+            // 16-byte loads per thread; narrow inputs also want the smaller block
+            // so a tile splits into enough chunks to keep every lane busy.
+            constexpr int Vec = DETERMINISTIC_LOGP_TILE_VECTOR_BYTES / sizeof(scalar_t);
+            constexpr int BlockSize = sizeof(scalar_t) >= 4
+                                          ? DETERMINISTIC_LOGP_TILE_BLOCK_SIZE_WIDE
+                                          : DETERMINISTIC_LOGP_TILE_BLOCK_SIZE_NARROW;
+            deterministic_logp_tile_stats_kernel<scalar_t, BlockSize, Vec>
+                <<<grid, BlockSize, 0, stream>>>(
                     input.data_ptr<scalar_t>(), tile_max.data_ptr<float>(),
                     tile_sum.data_ptr<float>(), rows, local_vocab, vocab_start,
                     real_vocab, tile_size, num_tiles);
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {tile_max, tile_sum};
+}
+
+torch::Tensor deterministic_logp_backward(
+    torch::Tensor logits,
+    torch::Tensor lse,
+    torch::Tensor coef_logp,
+    torch::Tensor coef_lse,
+    torch::Tensor target_local,
+    int64_t vocab_start,
+    int64_t real_vocab,
+    bool has_lse_grad) {
+    TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA/ROCm tensor");
+    TORCH_CHECK(logits.dim() == 2, "logits must be 2D [tokens, local_vocab]");
+    TORCH_CHECK(logits.scalar_type() == at::ScalarType::Half ||
+                    logits.scalar_type() == at::ScalarType::BFloat16 ||
+                    logits.scalar_type() == at::ScalarType::Float,
+                "logits must be float16, bfloat16, or float32");
+    TORCH_CHECK(vocab_start >= 0 && real_vocab > 0, "invalid vocabulary metadata");
+    auto input = logits.contiguous();
+    const int64_t rows = input.size(0);
+    const int64_t local_vocab = input.size(1);
+    auto check_row_vector =
+        [&](const torch::Tensor& tensor, at::ScalarType dtype, const char* name) {
+            TORCH_CHECK(tensor.is_cuda() && tensor.device() == input.device(), name,
+                        " must live on the logits device");
+            TORCH_CHECK(tensor.scalar_type() == dtype, name, " has the wrong dtype");
+            TORCH_CHECK(tensor.dim() == 1 && tensor.size(0) == rows, name,
+                        " must have one entry per token");
+            TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+        };
+    check_row_vector(lse, at::ScalarType::Float, "lse");
+    check_row_vector(coef_logp, at::ScalarType::Float, "coef_logp");
+    check_row_vector(coef_lse, at::ScalarType::Float, "coef_lse");
+    check_row_vector(target_local, at::ScalarType::Long, "target_local");
+    auto grad = torch::empty_like(input);
+    if (rows == 0 || local_vocab == 0) {
+        return grad;
+    }
+    TORCH_CHECK(rows <= std::numeric_limits<int>::max(), "row count exceeds CUDA grid-x limit");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(),
+        "deterministic_logp_backward", ([&] {
+            constexpr int Vec = DETERMINISTIC_LOGP_TILE_VECTOR_BYTES / sizeof(scalar_t);
+            constexpr int BlockSize = DETERMINISTIC_LOGP_BACKWARD_BLOCK_SIZE;
+            constexpr int Chunk = BlockSize * Vec;
+            const int64_t chunks = (local_vocab + Chunk - 1) / Chunk;
+            const dim3 grid(static_cast<unsigned int>(rows),
+                            static_cast<unsigned int>(std::min<int64_t>(chunks, 65535)), 1);
+            deterministic_logp_backward_kernel<scalar_t, BlockSize, Vec>
+                <<<grid, BlockSize, 0, stream>>>(
+                    input.data_ptr<scalar_t>(), lse.data_ptr<float>(),
+                    coef_logp.data_ptr<float>(), coef_lse.data_ptr<float>(),
+                    target_local.data_ptr<int64_t>(), grad.data_ptr<scalar_t>(), rows,
+                    local_vocab, vocab_start, real_vocab, has_lse_grad);
+        }));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return grad;
 }
