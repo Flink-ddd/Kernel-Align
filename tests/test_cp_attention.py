@@ -14,8 +14,20 @@ import math
 import pytest
 import torch
 
+from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
+    SplitKVSpec,
+)
+from rl_engine.kernels.ops.cuda.attention import deterministic_attn as deterministic_attn_module
+from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
+    RLKernelDeterministicAttentionCore,
+)
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     AttentionPartialState,
+    AttentionRingSchedule,
+    AttentionSavedForwardState,
+    DeterministicAttentionCore,
     DeterministicCPAttentionReferenceOp,
     compare_cp_attention_backward,
     merge_attention_partial_states,
@@ -30,6 +42,17 @@ _N_KV = 8
 _HEAD_DIM = 128
 _ATOL = 3.0e-6
 _GRAD_ATOL = 1.0e-5
+
+
+def test_ring_schedule_separates_compute_and_merge_order():
+    schedule = AttentionRingSchedule.build(12, cp_world_size=2, kv_chunk_size=2)
+
+    assert schedule.schedule_id == "rlkernel.attention.strict_ring_state.v1"
+    assert schedule.compute_communication == "decoupled"
+    assert schedule.overlap == "disabled"
+    assert schedule.merge_order == tuple(range(6))
+    assert schedule.compute_order == (0, 5, 1, 4, 2, 3)
+    assert [block.owner_cp_rank for block in schedule.blocks] == [0, 0, 0, 1, 1, 1]
 
 
 @contextlib.contextmanager
@@ -81,6 +104,28 @@ def _full_lse(q, k, *, causal, scale=None, key_padding_mask=None):
     if key_padding_mask is not None:
         scores = scores.masked_fill(~key_padding_mask[:, None, None, :], float("-inf"))
     return torch.logsumexp(scores, dim=-1)
+
+
+def test_strict_attention_core_freezes_plan_and_final_write():
+    q, k, v = _qkv(1, 3, 4, seed=17, dtype=torch.bfloat16)
+    core = DeterministicAttentionCore()
+    result = core.forward_with_lse(q, k, v, output_dtype=torch.bfloat16)
+
+    assert result.out.dtype is torch.bfloat16
+    assert result.lse.dtype is torch.float32
+    assert result.provenance["strict_core_id"] == STRICT_ATTENTION_CORE_ID
+    assert result.provenance["strict_schedule"] == STRICT_ATTENTION_SCHEDULE_ID
+    assert result.provenance["merge_order"] == "global_block_index"
+    assert result.provenance["accum_dtype"] == "fp32"
+    assert result.provenance["downcast_at"] == "final_write"
+    assert result.provenance["fallback"] is False
+    assert result.provenance["native_attention_arithmetic"] is False
+
+
+@pytest.mark.parametrize("split_kv", [SplitKVSpec.fixed(2), SplitKVSpec.auto()])
+def test_strict_attention_core_rejects_split_kv(split_kv):
+    with pytest.raises(ValueError, match="requires Split-KV to be disabled"):
+        DeterministicAttentionCore(split_kv=split_kv)
 
 
 def test_cp1_matches_native_attention_and_exports_lse():
@@ -384,6 +429,12 @@ def test_backward_report_cp2_prefill_matches_cp1_reference():
     assert drift.provenance["merge_order"] == "global_block_index"
     assert drift.provenance["te_backward_oracle"] == "not_used"
     assert drift.provenance["decode_backward"] == "not_supported"
+    assert drift.provenance["projection_scope"] == "attention_core_only"
+    assert drift.provenance["qkv_projection_backward_dgrad_collective"] == "all_reduce"
+    assert drift.provenance["qkv_projection_sp_backward_collective"] == "reduce_scatter"
+    assert drift.provenance["o_proj_backward_dgrad_collective"] == "none"
+    assert drift.provenance["o_proj_sp_backward_collective"] == "all_gather"
+    assert drift.provenance["projection_collectives_executed"] is False
     json.dumps(report.to_dict())
 
 
@@ -445,6 +496,183 @@ def test_backward_report_cp2_chunked_prefill_matches_cp1_reference():
             "split_kv_fallback_reason": None,
         },
     ]
+
+
+def test_saved_forward_backward_matches_independent_dense_autograd():
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(2, 5, 7, seed=31, heads=4, kv_heads=2, dim=8)
+    mask = torch.tensor(
+        [[True, True, True, True, True, True, False], [True] * 7],
+        dtype=torch.bool,
+    )
+    query_offsets = torch.tensor([11, 23], dtype=torch.long)
+    key_offsets = torch.tensor([9, 21], dtype=torch.long)
+    dout = torch.randn(q.shape, generator=torch.Generator().manual_seed(32))
+
+    state = op.save_forward_state(
+        q,
+        k,
+        v,
+        causal=True,
+        scale=0.37,
+        key_padding_mask=mask,
+        query_position_offsets=query_offsets,
+        key_position_offsets=key_offsets,
+        cp_world_size=2,
+        kv_chunk_size=2,
+    )
+    result = op.backward_reference(
+        q,
+        k,
+        v,
+        dout,
+        causal=True,
+        scale=0.37,
+        key_padding_mask=mask,
+        query_position_offsets=query_offsets,
+        key_position_offsets=key_offsets,
+        cp_world_size=2,
+        kv_chunk_size=2,
+        saved_forward_state=state,
+    )
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    k_expanded = k_ref.repeat_interleave(2, dim=1)
+    v_expanded = v_ref.repeat_interleave(2, dim=1)
+    scores = torch.matmul(q_ref, k_expanded.transpose(-1, -2)) * 0.37
+    q_pos = query_offsets[:, None] + torch.arange(q.size(2))
+    k_pos = key_offsets[:, None] + torch.arange(k.size(2))
+    scores = scores.masked_fill(
+        (k_pos[:, None, :] > q_pos[:, :, None])[:, None, :, :],
+        float("-inf"),
+    )
+    scores = scores.masked_fill(~mask[:, None, None, :], float("-inf"))
+    out_ref = torch.matmul(torch.softmax(scores, dim=-1), v_expanded)
+    out_ref.backward(dout)
+
+    assert isinstance(result.saved_forward_state, AttentionSavedForwardState)
+    assert result.saved_forward_state is state
+    assert result.provenance["saved_forward_state_source"] == "caller"
+    torch.testing.assert_close(result.out, out_ref, atol=_ATOL, rtol=0.0)
+    torch.testing.assert_close(result.gradients.dq, q_ref.grad, atol=_GRAD_ATOL, rtol=0.0)
+    torch.testing.assert_close(result.gradients.dk, k_ref.grad, atol=_GRAD_ATOL, rtol=0.0)
+    torch.testing.assert_close(result.gradients.dv, v_ref.grad, atol=_GRAD_ATOL, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    ("tensor_name", "message"),
+    [("q", "q_fingerprint"), ("k", "k_fingerprint"), ("v", "v_fingerprint")],
+)
+def test_saved_forward_state_rejects_stale_qkv(tensor_name, message):
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(1, 4, 4, seed=33, heads=4, kv_heads=2, dim=8)
+    state = op.save_forward_state(q, k, v, cp_world_size=2, kv_chunk_size=2)
+    inputs = {"q": q.clone(), "k": k.clone(), "v": v.clone()}
+    inputs[tensor_name].flatten()[0] += 1.0
+
+    with pytest.raises(ValueError, match=message):
+        op.backward_reference(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            torch.ones_like(q),
+            cp_world_size=2,
+            kv_chunk_size=2,
+            saved_forward_state=state,
+        )
+
+
+@pytest.mark.parametrize(
+    ("tensor_name", "message"),
+    [
+        ("out", "out_fingerprint"),
+        ("lse", "lse_fingerprint"),
+        ("key_padding_mask", "key_padding_mask_fingerprint"),
+        ("query_position_offsets", "query_position_offsets_fingerprint"),
+        ("key_position_offsets", "key_position_offsets_fingerprint"),
+    ],
+)
+def test_saved_forward_state_rejects_mutated_saved_tensors(tensor_name, message):
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(1, 4, 4, seed=34, heads=4, kv_heads=2, dim=8)
+    mask = torch.ones(1, 4, dtype=torch.bool)
+    offsets = torch.tensor([7], dtype=torch.long)
+    state = op.save_forward_state(
+        q,
+        k,
+        v,
+        key_padding_mask=mask,
+        query_position_offsets=offsets,
+        key_position_offsets=offsets,
+        cp_world_size=2,
+        kv_chunk_size=2,
+    )
+    tensor = getattr(state, tensor_name)
+    if tensor.dtype == torch.bool:
+        tensor.flatten()[0].logical_not_()
+    else:
+        tensor.flatten()[0].add_(1)
+
+    with pytest.raises(ValueError, match=message):
+        op.backward_reference(
+            q,
+            k,
+            v,
+            torch.ones_like(q),
+            key_padding_mask=mask,
+            query_position_offsets=offsets,
+            key_position_offsets=offsets,
+            cp_world_size=2,
+            kv_chunk_size=2,
+            saved_forward_state=state,
+        )
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"causal": False}, "causal"),
+        ({"scale": 0.5}, "scale"),
+        ({"cp_world_size": 1}, "cp_world_size"),
+        ({"kv_chunk_size": None}, "kv_chunk_size"),
+        ({"query_position_offsets": torch.tensor([8])}, "query_position_offsets"),
+        ({"key_position_offsets": torch.tensor([8])}, "key_position_offsets"),
+    ],
+)
+def test_saved_forward_state_rejects_execution_metadata_mismatch(override, message):
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(1, 4, 4, seed=35, heads=4, kv_heads=2, dim=8)
+    offsets = torch.tensor([7], dtype=torch.long)
+    state = op.save_forward_state(
+        q,
+        k,
+        v,
+        query_position_offsets=offsets,
+        key_position_offsets=offsets,
+        cp_world_size=2,
+        kv_chunk_size=2,
+    )
+    kwargs = {
+        "causal": True,
+        "scale": None,
+        "query_position_offsets": offsets,
+        "key_position_offsets": offsets,
+        "cp_world_size": 2,
+        "kv_chunk_size": 2,
+    }
+    kwargs.update(override)
+
+    with pytest.raises(ValueError, match=message):
+        op.backward_reference(
+            q,
+            k,
+            v,
+            torch.ones_like(q),
+            saved_forward_state=state,
+            **kwargs,
+        )
 
 
 def test_split_kv_plan_never_crosses_cp_owner_boundaries():
@@ -626,6 +854,27 @@ def test_invalid_scale_fails_before_attention_math(scale):
         op.forward_fp32_with_lse(q, k, v, scale=scale)
 
 
+def test_forward_reference_provenance_does_not_claim_production_communication():
+    provenance = DeterministicCPAttentionReferenceOp.execution_provenance(
+        8,
+        cp_world_size=2,
+        kv_chunk_size=2,
+    )
+
+    assert provenance["execution_scope"] == "logical_single_process_cp_reference"
+    assert provenance["query_scope"] == "logical_global_query_reference"
+    assert provenance["kv_scope"] == "logical_owner_local_cp_shards"
+    assert provenance["production_cp_protocol"] == "ag_query_local_kv_rs_out_lse"
+    assert provenance["communication_executed"] == "none"
+    assert provenance["merge_order"] == "global_block_index"
+    plans = provenance["actual_split_kv_plans"]
+    assert [plan["owner_cp_rank"] for plan in plans] == [0, 1]
+    assert [plan["actual_split_boundaries"] for plan in plans] == [
+        [[0, 2], [2, 4]],
+        [[4, 6], [6, 8]],
+    ]
+
+
 def test_qkv_dtype_and_floating_contract_fails_closed():
     op = DeterministicCPAttentionReferenceOp()
     q, k, v = _qkv(1, 4, 4, seed=25, heads=4, kv_heads=2, dim=8)
@@ -690,23 +939,151 @@ def test_registry_dispatches_cp_attention_reference():
     assert isinstance(kernel_registry.get_op("cp_attention"), DeterministicCPAttentionReferenceOp)
 
 
-def test_strict_reference_is_bitwise_across_batch_cp_and_backward():
-    q, k, v = _qkv(2, 4, 8, seed=41, heads=4, kv_heads=2, dim=8)
-    dout = torch.randn_like(q)
+def test_shared_strict_core_reports_canonical_cuda_schedule(monkeypatch):
+    class FakeCUDAAttentionOp:
+        @staticmethod
+        def forward_with_lse(q, k, v, **_kwargs):
+            del k, v
+            return (
+                torch.zeros_like(q),
+                torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device),
+            )
+
+    monkeypatch.setattr(
+        deterministic_attn_module,
+        "DeterministicAttentionOp",
+        FakeCUDAAttentionOp,
+    )
+    q, k, v = _qkv(1, 3, 4, seed=41, heads=4, kv_heads=2, dim=8)
+    q_positions = torch.arange(1, 4).view(1, -1)
+    k_positions = torch.arange(4).view(1, -1)
+    result = RLKernelDeterministicAttentionCore().forward_with_lse(
+        q,
+        k,
+        v,
+        query_position_ids=q_positions,
+        key_position_ids=k_positions,
+    )
+    assert result.provenance["strict_core_id"] == STRICT_ATTENTION_CORE_ID
+    assert result.provenance["strict_schedule"] == STRICT_ATTENTION_SCHEDULE_ID
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_strict_forward_is_bitwise_invariant_to_batch_cp_and_chunk(dtype):
+    q, k, v = _qkv(2, 5, 9, seed=41, dtype=dtype, heads=4, kv_heads=2, dim=8)
+    op = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
+
+    full_out, full_lse = op.forward_with_lse(q, k, v, cp_world_size=1)
+    chunked_out, chunked_lse = op.forward_with_lse(
+        q,
+        k,
+        v,
+        cp_world_size=2,
+        kv_chunk_size=3,
+    )
+    single_out, single_lse = op.forward_with_lse(
+        q[:1],
+        k[:1],
+        v[:1],
+        cp_world_size=4,
+        kv_chunk_size=1,
+    )
+    assert torch.equal(full_out, chunked_out)
+    assert torch.equal(full_lse, chunked_lse)
+    assert torch.equal(full_out[:1], single_out)
+    assert torch.equal(full_lse[:1], single_lse)
+
+
+def test_strict_backward_is_bitwise_invariant_to_batch_cp_and_chunk():
+    q, k, v = _qkv(2, 5, 9, seed=42, heads=4, kv_heads=2, dim=8)
+    dout = torch.randn(q.shape, generator=torch.Generator().manual_seed(43))
+    op = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
+
+    full = op.backward_reference(q, k, v, dout, cp_world_size=1)
+    chunked = op.backward_reference(
+        q,
+        k,
+        v,
+        dout,
+        cp_world_size=2,
+        kv_chunk_size=3,
+    )
+    single = op.backward_reference(
+        q[:1],
+        k[:1],
+        v[:1],
+        dout[:1],
+        cp_world_size=4,
+        kv_chunk_size=1,
+    )
+
+    for full_tensor, chunked_tensor, single_tensor in (
+        (full.out, chunked.out, single.out),
+        (full.lse, chunked.lse, single.lse),
+        (full.gradients.dq, chunked.gradients.dq, single.gradients.dq),
+        (full.gradients.dk, chunked.gradients.dk, single.gradients.dk),
+        (full.gradients.dv, chunked.gradients.dv, single.gradients.dv),
+    ):
+        assert torch.equal(full_tensor, chunked_tensor)
+        assert torch.equal(full_tensor[:1], single_tensor)
+
+    assert chunked.provenance["strict_core_id"] == STRICT_ATTENTION_CORE_ID
+    assert chunked.provenance["strict_schedule"] == STRICT_ATTENTION_SCHEDULE_ID
+    assert chunked.provenance["actual_split_kv_policy"] == "disabled"
+    assert chunked.provenance["backward_algorithm"] == ("saved_out_lse_canonical_row_reference")
+    assert all(
+        plan["actual_split_kv_policy"] == "disabled"
+        and plan["actual_split_boundaries"] == [[0, k.size(2)]]
+        for plan in chunked.provenance["actual_split_kv_plans"]
+    )
+
+
+def test_strict_backward_rejects_non_strict_saved_forward_state():
+    q, k, v = _qkv(1, 4, 6, seed=44, heads=4, kv_heads=2, dim=8)
+    state = DeterministicCPAttentionReferenceOp().save_forward_state(q, k, v)
+
+    with pytest.raises(ValueError, match="strict_bitwise"):
+        DeterministicCPAttentionReferenceOp(strict_bitwise=True).backward_reference(
+            q,
+            k,
+            v,
+            torch.ones_like(q),
+            saved_forward_state=state,
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_strict_core_is_bitwise_invariant_to_batch_and_cp_schedule(dtype):
+    """The strict candidate must not change arithmetic with batch/CP shape."""
+
+    q, k, v = _qkv(2, 5, 9, seed=41, dtype=dtype, heads=4, kv_heads=2, dim=8)
     op = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
 
     cp1_out, cp1_lse = op.forward_with_lse(q, k, v, cp_world_size=1, kv_chunk_size=3)
     cp2_out, cp2_lse = op.forward_with_lse(q, k, v, cp_world_size=2, kv_chunk_size=3)
-    single_out, single_lse = op.forward_with_lse(
-        q[:1], k[:1], v[:1], cp_world_size=1, kv_chunk_size=3
-    )
     assert torch.equal(cp1_out, cp2_out)
     assert torch.equal(cp1_lse, cp2_lse)
-    assert torch.equal(cp1_out[:1], single_out)
-    assert torch.equal(cp1_lse[:1], single_lse)
 
-    cp1 = op.backward_reference(q, k, v, dout, cp_world_size=1, kv_chunk_size=3)
+    single_out, single_lse = op.forward_with_lse(
+        q[:1],
+        k[:1],
+        v[:1],
+        cp_world_size=1,
+        kv_chunk_size=1,
+    )
+    assert torch.equal(single_out, cp1_out[:1])
+    assert torch.equal(single_lse, cp1_lse[:1])
+
+
+def test_strict_core_backward_is_bitwise_invariant_to_cp_schedule():
+    q, k, v = _qkv(1, 4, 8, seed=42, dtype=torch.float32, heads=4, kv_heads=2, dim=8)
+    dout = torch.randn_like(q)
+    op = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
+
+    cp1 = op.backward_reference(q, k, v, dout, cp_world_size=1, kv_chunk_size=None)
     cp2 = op.backward_reference(q, k, v, dout, cp_world_size=2, kv_chunk_size=3)
+    assert torch.equal(cp1.out, cp2.out)
+    assert torch.equal(cp1.lse, cp2.lse)
     assert torch.equal(cp1.gradients.dq, cp2.gradients.dq)
     assert torch.equal(cp1.gradients.dk, cp2.gradients.dk)
     assert torch.equal(cp1.gradients.dv, cp2.gradients.dv)

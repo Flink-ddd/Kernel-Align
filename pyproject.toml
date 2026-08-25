@@ -20,6 +20,9 @@ dependencies = [
     "transformers==5.13.1",
 ]
 
+[project.entry-points."vllm.general_plugins"]
+rl_kernel = "rl_engine.integrations.vllm_runtime:register_vllm_plugin"
+
 [project.optional-dependencies]
 cuda = ["flashinfer-python>=0.1.6", "nvidia-ml-py"]
 rocm = ["aiter"]

@@ -15,6 +15,7 @@ COPY pyproject.toml setup.py* requirements*.txt ./
 
 RUN pip install --no-cache-dir -U pip \
  && pip install --no-cache-dir -r requirements.txt \
+ && pip install --no-cache-dir "flashinfer-python>=0.6.0,<0.7" \
  && pip install --no-cache-dir pytest
 
 WORKDIR /workspace

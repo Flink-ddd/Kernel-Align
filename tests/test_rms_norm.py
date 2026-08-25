@@ -5,14 +5,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from rl_engine.kernels.ops.cuda.norm.rmsnorm import rmsnorm_cuda
+from rl_engine.kernels.ops.cuda.norm.rmsnorm import RMSNormCudaOp, rmsnorm_cuda
 from rl_engine.kernels.ops.pytorch.norm.rms_norm import NativeRMSNormOp
 from rl_engine.kernels.ops.triton.rmsnorm_triton import rmsnorm_triton
 
 try:
     from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 
-    _HAS_CUDA_RMSNORM = _EXT_AVAILABLE and hasattr(_C, "rmsnorm_forward")
+    _HAS_CUDA_RMSNORM = _EXT_AVAILABLE and all(
+        hasattr(_C, name)
+        for name in ("rmsnorm_forward", "rmsnorm_backward_dx", "rmsnorm_backward_dw")
+    )
 except ImportError:  # pragma: no cover - import can fail when the extension is not built.
     _HAS_CUDA_RMSNORM = False
 
@@ -236,8 +239,12 @@ def test_registry_dispatches_rms_norm():
     from rl_engine.kernels.registry import kernel_registry
 
     op = kernel_registry.get_op("rms_norm")
-    assert isinstance(op, NativeRMSNormOp)
-    assert hasattr(op, "forward") and hasattr(op, "forward_fp32")
+    if torch.cuda.is_available() and _HAS_CUDA_RMSNORM:
+        assert isinstance(op, RMSNormCudaOp)
+        assert hasattr(op, "forward")
+    else:
+        assert isinstance(op, NativeRMSNormOp)
+        assert hasattr(op, "forward") and hasattr(op, "forward_fp32")
 
 
 @requires_cuda

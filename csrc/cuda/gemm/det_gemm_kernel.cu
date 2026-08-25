@@ -27,6 +27,19 @@ namespace {
 
 using nv_bf16 = __nv_bfloat16;
 
+template <typename output_t>
+__device__ __forceinline__ output_t cast_output(float value);
+
+template <>
+__device__ __forceinline__ nv_bf16 cast_output<nv_bf16>(float value) {
+  return __float2bfloat16(value);
+}
+
+template <>
+__device__ __forceinline__ float cast_output<float>(float value) {
+  return value;
+}
+
 __host__ __device__ constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
 
 // Must match SM90 BK so an aligned-K naive tree equals the SM90 tile tree.
@@ -105,9 +118,10 @@ __device__ nv_bf16 k_tree_naive(const nv_bf16* __restrict__ A, const nv_bf16* __
 // construction: one thread = one output element, mid-split K tree.
 constexpr int NAIVE_TILE = 16;
 
+template <typename output_t>
 __global__ void det_gemm_naive(const nv_bf16* __restrict__ A,
                                const nv_bf16* __restrict__ B,
-                               nv_bf16* __restrict__ C,
+                               output_t* __restrict__ C,
                                int M, int N, int K) {
   const int row = blockIdx.y * NAIVE_TILE + threadIdx.y;
   const int col = blockIdx.x * NAIVE_TILE + threadIdx.x;
@@ -116,11 +130,12 @@ __global__ void det_gemm_naive(const nv_bf16* __restrict__ A,
       __bfloat162float(k_tree_naive(A, B, row, col, N, K, 0, K)));
 }
 
-void launch_naive(const nv_bf16* A, const nv_bf16* B, nv_bf16* C,
+template <typename output_t>
+void launch_naive(const nv_bf16* A, const nv_bf16* B, output_t* C,
                   int M, int N, int K, cudaStream_t stream) {
   dim3 block(NAIVE_TILE, NAIVE_TILE);
   dim3 grid(cdiv(N, NAIVE_TILE), cdiv(M, NAIVE_TILE));
-  det_gemm_naive<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
+  det_gemm_naive<output_t><<<grid, block, 0, stream>>>(A, B, C, M, N, K);
 }
 
 #if defined(RL_KERNEL_ENABLE_SM90)
@@ -156,9 +171,10 @@ __device__ __forceinline__ void mma_m16n8k16(const uint32_t A[4], const uint32_t
                  "f"(D[0]), "f"(D[1]), "f"(D[2]), "f"(D[3]));
 }
 
+template <typename output_t>
 __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
                                      const __grid_constant__ CUtensorMap bt_tmap,
-                                     nv_bf16* __restrict__ C,
+                                     output_t* __restrict__ C,
                                      int M, int N, int K) {
   const int tid = threadIdx.x;
   const int warp = tid / 32;
@@ -308,7 +324,8 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
   }
 }
 
-bool launch_sm90(const nv_bf16* A, const nv_bf16* Bt, nv_bf16* C,
+template <typename output_t>
+bool launch_sm90(const nv_bf16* A, const nv_bf16* Bt, output_t* C,
                  int M, int N, int K, cudaStream_t stream) {
   if (M % BM != 0 || N % BN != 0 || K % BK != 0) return false;  // fall back
 
@@ -318,11 +335,11 @@ bool launch_sm90(const nv_bf16* A, const nv_bf16* Bt, nv_bf16* C,
 
   const int smem = STAGES * (BM * BK + BN * BK) * sizeof(nv_bf16) + STAGES * 8;
   if (smem > 48 * 1024)
-    cudaFuncSetAttribute(det_gemm_sm90_kernel,
+    cudaFuncSetAttribute(det_gemm_sm90_kernel<output_t>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
   dim3 grid(cdiv(N, BN), cdiv(M, BM));
-  det_gemm_sm90_kernel<<<grid, WG_THREADS, smem, stream>>>(a_tmap, bt_tmap, C, M, N, K);
+  det_gemm_sm90_kernel<output_t><<<grid, WG_THREADS, smem, stream>>>(a_tmap, bt_tmap, C, M, N, K);
   return true;
 }
 #endif  // RL_KERNEL_ENABLE_SM90
@@ -343,9 +360,11 @@ void check_in(const torch::Tensor& t, const char* n) {
   TORCH_CHECK(t.scalar_type() == torch::kBFloat16, n, " must be bf16");
 }
 
-torch::Tensor gemm_dispatch(const torch::Tensor& a, const torch::Tensor& b) {
+torch::Tensor gemm_dispatch(const torch::Tensor& a, const torch::Tensor& b,
+                            bool output_fp32 = false) {
   const int M = a.size(0), K = a.size(1), N = b.size(1);
-  auto c = torch::empty({M, N}, a.options());
+  auto options = a.options().dtype(output_fp32 ? torch::kFloat32 : torch::kBFloat16);
+  auto c = torch::empty({M, N}, options);
   auto stream = at::cuda::getCurrentCUDAStream();
 
 #if defined(RL_KERNEL_ENABLE_SM90)
@@ -360,15 +379,21 @@ torch::Tensor gemm_dispatch(const torch::Tensor& a, const torch::Tensor& b) {
       a_use = torch::zeros({Mp, K}, a.options());
       a_use.narrow(0, 0, M).copy_(a);
     }
-    torch::Tensor c_use = (Mp != M) ? torch::empty({Mp, N}, a.options()) : c;
+    torch::Tensor c_use = (Mp != M) ? torch::empty({Mp, N}, options) : c;
     auto bt = b.t().contiguous();  // [N,K]
-    if (launch_sm90(bf16(a_use), bf16(bt), bf16o(c_use), Mp, N, K, stream)) {
+    const bool launched = output_fp32
+        ? launch_sm90<float>(bf16(a_use), bf16(bt), c_use.data_ptr<float>(), Mp, N, K, stream)
+        : launch_sm90<nv_bf16>(bf16(a_use), bf16(bt), bf16o(c_use), Mp, N, K, stream);
+    if (launched) {
       if (Mp != M) c.copy_(c_use.narrow(0, 0, M));
       return c;
     }
   }
 #endif
-  launch_naive(bf16(a), bf16(b), bf16o(c), M, N, K, stream);
+  if (output_fp32)
+    launch_naive<float>(bf16(a), bf16(b), c.data_ptr<float>(), M, N, K, stream);
+  else
+    launch_naive<nv_bf16>(bf16(a), bf16(b), bf16o(c), M, N, K, stream);
   return c;
 }
 

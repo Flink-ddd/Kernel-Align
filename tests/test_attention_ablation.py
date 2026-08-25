@@ -279,6 +279,13 @@ def test_cp_production_wrapper_preserves_runtime_backend_provenance():
     assert result.provenance["production_ready"] is True
 
 
+def test_deterministic_attention_rejects_runtime_split_kv_auto():
+    q, k, v = _qkv()
+    contract = _contract(split_kv=SplitKVSpec.auto(strict_consistency=False))
+    with pytest.raises(AttentionContractError, match="Split-KV"):
+        AttentionAblationOp()(q, k, v, contract=contract)
+
+
 @pytest.mark.parametrize(
     ("missing_field", "replacement"),
     [

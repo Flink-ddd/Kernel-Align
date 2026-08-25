@@ -137,6 +137,8 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_NATIVE_KV_CACHE_ATTN = (
         "rl_engine.kernels.ops.pytorch.attention.kv_cache.NativeKVCacheAttnOp"
     )
+    # WS2 correctness-first context-parallel attention reference. It emulates
+    # CP prefill/chunked-prefill with fp32 attention-domain LSE merges.
     PYTORCH_CP_ATTENTION = (
         "rl_engine.kernels.ops.pytorch.attention.cp_attention."
         "DeterministicCPAttentionReferenceOp"

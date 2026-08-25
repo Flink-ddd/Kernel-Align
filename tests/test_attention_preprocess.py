@@ -152,6 +152,7 @@ def _inputs():
 @requires_h100_preprocess
 def test_h100_preprocessor_executes_cuda_qk_norm_and_zigzag_rope():
     q, k, q_weight, k_weight, positions = _inputs()
+    result = H100AttentionPreprocessor()(q, k, q_weight, k_weight, positions)
     result = H100AttentionPreprocessor(reuse_transformer_engine_qk_norm=False)(
         q, k, q_weight, k_weight, positions
     )
@@ -179,6 +180,7 @@ def test_h100_preprocessor_executes_cuda_qk_norm_and_zigzag_rope():
 @requires_h100_preprocess
 def test_h100_preprocessor_is_bitwise_batch_invariant_for_2d_positions():
     q, k, q_weight, k_weight, positions = _inputs()
+    op = H100AttentionPreprocessor()
     op = H100AttentionPreprocessor(reuse_transformer_engine_qk_norm=False)
     full = op(q, k, q_weight, k_weight, positions)
 

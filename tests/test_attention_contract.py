@@ -11,13 +11,17 @@ from dataclasses import replace
 import pytest
 
 from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
     AttentionBackendCapability,
     AttentionContract,
     AttentionContractError,
     AttentionDType,
     AttentionMode,
+    AttentionProjectionSpec,
     AttentionRole,
     KVCacheSpec,
+    ProjectionCollective,
     ReductionSpec,
     RoPEFusionBoundary,
     RoPESpec,
@@ -32,6 +36,11 @@ from rl_engine.kernels.attention_contract import (
 from rl_engine.kernels.registry import KernelRegistry, OpBackend
 
 
+def test_strict_attention_identity_pins_core_and_arithmetic_schedule():
+    assert STRICT_ATTENTION_CORE_ID == "rlkernel.attention.deterministic_core.v1"
+    assert STRICT_ATTENTION_SCHEDULE_ID == "single_batch_single_query_global_kv_blocks"
+
+
 def _sharding(
     *,
     tp_rank: int = 0,
@@ -44,6 +53,8 @@ def _sharding(
     global_block_token_starts: tuple[int, ...] = (0,),
     local_block_offsets: tuple[int, ...] = (0, 2048),
     packed_sequence_offsets: tuple[int, ...] | None = None,
+    sp_rank: int = 0,
+    sp_world_size: int = 1,
 ) -> ShardingSpec:
     local_q_heads = 32 // tp_world_size
     local_kv_heads = 8 // tp_world_size
@@ -64,6 +75,8 @@ def _sharding(
         global_block_token_starts=global_block_token_starts,
         local_block_offsets=local_block_offsets,
         packed_sequence_offsets=packed_sequence_offsets,
+        sp_rank=sp_rank,
+        sp_world_size=sp_world_size,
     )
 
 
@@ -681,3 +694,48 @@ def test_packed_sequence_count_must_match_logical_batch_size():
 
     contract = _contract(sharding=sharding, causal_offsets=(0, 0), batch_size=2)
     assert contract.batch_size == 2
+
+
+def test_projection_contract_pins_gemm_and_tp_sp_collectives():
+    contract = _contract(sharding=_sharding(sp_rank=1, sp_world_size=2))
+    provenance = contract.to_dict()
+
+    assert provenance["sharding"]["sp_rank"] == 1
+    assert provenance["sharding"]["sp_world_size"] == 2
+    assert provenance["projections"]["qkv"] == {
+        "input_dtype": "bf16",
+        "output_dtype": "bf16",
+        "acc_dtype": "fp32",
+        "split_kv": "disabled",
+        "k_order": "ascending",
+        "backend_policy": "native_verified_then_common_deterministic",
+        "deterministic_backend": "rlkernel.cuda.det_gemm",
+        "tp_forward_collective": "none",
+        "tp_backward_dgrad_collective": "all_reduce",
+        "sp_forward_collective": "all_gather",
+        "sp_backward_collective": "reduce_scatter",
+        "qkv_split_order": ["q", "k", "v"],
+        "require_runtime_readback": True,
+    }
+    assert provenance["projections"]["o_proj"]["tp_forward_collective"] == "all_reduce"
+    assert provenance["projections"]["o_proj"]["sp_forward_collective"] == "reduce_scatter"
+    assert provenance["projections"]["o_proj"]["sp_backward_collective"] == "all_gather"
+
+
+def test_projection_contract_rejects_split_k_and_wrong_collective_identity():
+    with pytest.raises(AttentionContractError, match="disable Split-K"):
+        replace(AttentionProjectionSpec.qkv(), split_kv="fixed")
+
+    with pytest.raises(AttentionContractError, match="qkv_projection"):
+        replace(
+            _contract(),
+            qkv_projection=replace(
+                AttentionProjectionSpec.output(),
+                tp_forward_collective=ProjectionCollective.NONE,
+            ),
+        )
+
+
+def test_sharding_rejects_out_of_range_sp_rank():
+    with pytest.raises(AttentionContractError, match="sp_rank=2"):
+        _sharding(sp_rank=2, sp_world_size=2)

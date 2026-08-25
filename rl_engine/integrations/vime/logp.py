@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-
+from rl_engine.integrations.ablation import Implementation, operator_ablation_case
 from rl_engine.kernels.logprob_contract import (
     LogprobContract,
     LogprobDType,
@@ -53,6 +53,18 @@ class ProviderResult:
     backend_id: str
     contract_id: str
     provenance: Mapping[str, Any]
+
+
+_DEFAULT_STRICT_LINEAR_LOGP: Any | None = None
+
+
+def _default_strict_linear_logp() -> Any:
+    global _DEFAULT_STRICT_LINEAR_LOGP
+    if _DEFAULT_STRICT_LINEAR_LOGP is None:
+        from rl_engine.integrations.linear_logp import LinearLogpWrapper
+
+        _DEFAULT_STRICT_LINEAR_LOGP = LinearLogpWrapper()
+    return _DEFAULT_STRICT_LINEAR_LOGP
 
 
 def _as_positive_int(value: Any, name: str) -> int:
@@ -189,7 +201,7 @@ def _contract_for_request(request: Any) -> tuple[LogprobContract, int]:
     return contract, _tile_count(metadata, padded_vocab_size)
 
 
-def provider(request: Any) -> ProviderResult:
+def _provider_impl(request: Any, *, linear_logp: Any = None) -> ProviderResult:
     """Compute Vime selected logprobs on the explicit WS2 TP/CP contract.
 
     Top-p replay is deliberately unavailable until it has a separately
@@ -197,6 +209,104 @@ def provider(request: Any) -> ProviderResult:
     native execution; in ``strict`` mode it fails instead of changing sampled
     distribution semantics.
     """
+
+    strict = os.getenv("VIME_RL_KERNEL_STRICT", "").strip().lower() in {"1", "true", "yes", "on"}
+    if strict and not isinstance(getattr(request, "hidden", None), torch.Tensor):
+        raise RuntimeError(
+            "strict Vime linear_logp request is missing hidden/LM-head structural inputs"
+        )
+    if strict and getattr(request, "log_prob_keep_mask", None) is not None:
+        raise RuntimeError("strict Vime linear_logp does not support top-p replay in this contract")
+    if (
+        linear_logp is None
+        and strict
+        and isinstance(getattr(request, "hidden", None), torch.Tensor)
+    ):
+        linear_logp = _default_strict_linear_logp()
+    if linear_logp is not None and isinstance(getattr(request, "hidden", None), torch.Tensor):
+        hidden = request.hidden
+        weight = getattr(request, "lm_head_weight", None)
+        if not isinstance(weight, torch.Tensor):
+            raise RuntimeError("linear_logp request must expose lm_head_weight")
+        selected = linear_logp(
+            hidden,
+            weight,
+            request.target_ids,
+            getattr(request, "lm_head_bias", None),
+            tp_group=getattr(request, "tensor_parallel_group", None),
+            vocab_start_index=int(getattr(request, "vocab_start_index", 0)),
+            global_vocab_size=getattr(request, "global_vocab_size", None),
+            real_vocab_size=getattr(request, "metadata", {}).get("real_vocab_size"),
+            temperature=getattr(request, "temperature", None),
+        )
+        entropy = None
+        entropy_provenance: dict[str, Any] = {}
+        if getattr(request, "with_entropy", False):
+            # Entropy is a separate loss metric from selected logprob. Keep
+            # the strict selected path on linear_logp, while using the
+            # explicit TP vocab reduction for the full-vocabulary entropy
+            # requested by Vime's policy loss.
+            entropy_contract, entropy_tiles = _contract_for_request(request)
+            entropy_dispatch = kernel_registry.get_logprob_op(
+                entropy_contract, requested_backend=BACKEND_ID
+            )
+            if (
+                entropy_dispatch.provenance["actual_backend"] != BACKEND_ID
+                or entropy_dispatch.provenance["fallback"]
+            ):
+                raise RuntimeError(
+                    "explicit WS2 entropy dispatch changed during strict linear_logp execution"
+                )
+            _, _, entropy = entropy_dispatch.op.apply_with_entropy(
+                request.logits,
+                request.target_ids,
+                contract=entropy_contract,
+                tp_group=getattr(request, "tensor_parallel_group", None),
+                num_vocab_tiles=entropy_tiles,
+                with_entropy_grad=bool(getattr(request, "with_entropy_grad", False)),
+            )
+            entropy_provenance = {
+                "backend_id": entropy_dispatch.capability.backend_id,
+                "contract_id": entropy_contract.cross_rank_fingerprint(),
+                "num_vocab_tiles": entropy_tiles,
+                "logits_materialized": True,
+            }
+        provenance = dict(getattr(linear_logp, "provenance", {}))
+        provenance.update(
+            {
+                "execution": {
+                    "role": "vime_training_linear_logprob",
+                    "strict_backend": True,
+                    "top_p_replay": False,
+                    "cp_is_merge_axis": False,
+                    "logits_materialized": bool(getattr(request, "with_entropy", False)),
+                    "entropy": entropy_provenance,
+                },
+                "request": {
+                    "hidden_shape": list(hidden.shape),
+                    "hidden_dtype": str(hidden.dtype).replace("torch.", ""),
+                    "target_shape": list(request.target_ids.shape),
+                    "tp_world_size": int(getattr(request, "metadata", {}).get("tp_world_size", 1)),
+                    "tp_rank": int(getattr(request, "metadata", {}).get("tp_rank", 0)),
+                    "cp_world_size": int(getattr(request, "context_parallel", None).world_size),
+                    "cp_rank": int(getattr(request, "context_parallel", None).rank),
+                },
+            }
+        )
+        backend_id = str(provenance.get("actual_backend", linear_logp.backend_id))
+        contract_id = (
+            "linear_logp:"
+            f"tp={getattr(request, 'metadata', {}).get('tp_world_size', 1)}:"
+            f"cp={getattr(request, 'context_parallel', None).world_size}:"
+            f"vocab={getattr(request, 'global_vocab_size', None)}"
+        )
+        return ProviderResult(
+            selected_logprobs=selected.reshape(-1, 1),
+            entropy=entropy,
+            backend_id=backend_id,
+            contract_id=contract_id,
+            provenance=provenance,
+        )
 
     if getattr(request, "log_prob_keep_mask", None) is not None:
         raise SelectedLogprobProviderUnavailable(
@@ -246,7 +356,7 @@ def provider(request: Any) -> ProviderResult:
     provenance["cp_row_ownership"] = {
         "cp_rank": contract.sharding.cp_rank,
         "cp_world_size": contract.sharding.cp_world_size,
-        "layout": getattr(request.context_parallel, "layout"),
+        "layout": request.context_parallel.layout,
         "local_token_rows": int(request.logits.shape[0]),
         "cp_is_merge_axis": False,
     }
@@ -258,6 +368,33 @@ def provider(request: Any) -> ProviderResult:
         contract_id=contract.cross_rank_fingerprint(),
         provenance=provenance,
     )
+
+
+_provider_impl.backend_id = BACKEND_ID  # type: ignore[attr-defined]
+
+
+def provider(request: Any) -> ProviderResult:
+    """Route Vime training logp through the active Megatron integration."""
+
+    # PR230's P/R axis is selected independently for training and rollout.
+    # The Megatron provider is only the training boundary, so a production
+    # training side must bypass the RL-Kernel integration entirely.
+    case = operator_ablation_case("logp", os.getenv("RL_KERNEL_LOGP_CASE", "P/P"))
+    if case.training is Implementation.PRODUCTION:
+        return _provider_impl(request)
+
+    from rl_engine.integrations.state import get_active_integration
+
+    integration = get_active_integration("megatron")
+    if integration is None:
+        return _provider_impl(request)
+
+    def native_unavailable(_request: Any) -> ProviderResult:
+        raise RuntimeError(
+            "the structural provider was invoked for a production Megatron logp route"
+        )
+
+    return integration.execute("logp", native_unavailable, request)
 
 
 __all__ = ["ProviderResult", "SelectedLogprobProviderUnavailable", "provider"]
