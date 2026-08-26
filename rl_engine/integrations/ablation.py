@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
@@ -49,8 +50,18 @@ class OperatorAblationCase:
 _CASE_DEFINITIONS = (
     ("P/P", Implementation.PRODUCTION, Implementation.PRODUCTION, "native baseline"),
     ("R/R", Implementation.RL_KERNEL, Implementation.RL_KERNEL, "RL-Kernel control"),
-    ("P/R", Implementation.PRODUCTION, Implementation.RL_KERNEL, "rollout-only mismatch"),
-    ("R/P", Implementation.RL_KERNEL, Implementation.PRODUCTION, "training-only mismatch"),
+    (
+        "P/R",
+        Implementation.PRODUCTION,
+        Implementation.RL_KERNEL,
+        "rollout-only mismatch",
+    ),
+    (
+        "R/P",
+        Implementation.RL_KERNEL,
+        Implementation.PRODUCTION,
+        "training-only mismatch",
+    ),
 )
 
 
@@ -121,10 +132,39 @@ class IntegrationPlan:
         }
 
 
+def integration_plan_from_environment() -> IntegrationPlan:
+    """Materialize the one plan inherited by framework worker processes."""
+
+    return IntegrationPlan.from_case_ids(
+        attention=os.getenv("RL_KERNEL_ATTENTION_CASE", "P/P"),
+        ffn=os.getenv("RL_KERNEL_FFN_CASE", "P/P"),
+        logp=os.getenv("RL_KERNEL_LOGP_CASE", "P/P"),
+    )
+
+
+def configure_integration_environment(
+    plan: IntegrationPlan,
+    *,
+    readback_dir: str | None = None,
+) -> None:
+    """Export one plan for Megatron actors and vLLM subprocesses."""
+
+    for module, variable in (
+        ("attention", "RL_KERNEL_ATTENTION_CASE"),
+        ("ffn", "RL_KERNEL_FFN_CASE"),
+        ("logp", "RL_KERNEL_LOGP_CASE"),
+    ):
+        os.environ[variable] = plan.cases[module].case_id
+    if readback_dir:
+        os.environ["RL_KERNEL_READBACK_DIR"] = readback_dir
+
+
 __all__ = [
     "Implementation",
     "IntegrationPlan",
     "OperatorAblationCase",
+    "configure_integration_environment",
+    "integration_plan_from_environment",
     "operator_ablation_case",
     "operator_ablation_cases",
 ]

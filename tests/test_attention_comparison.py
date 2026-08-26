@@ -14,6 +14,7 @@ from typing import Literal
 import pytest
 import torch
 
+from rl_engine.kernels.attention_contract import SplitKVSpec
 from rl_engine.kernels.gtest import run_operator_suite
 from rl_engine.kernels.gtest.operator_specs import make_candidate, make_operator_case
 from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp
@@ -111,6 +112,7 @@ def _decode_inputs(
             q_rope_state=q_rope_state,
             k_cache_rope_state=k_cache_rope_state,
             cp_block_owners=torch.tensor([[0, 1, 0], [0, 1, 0]], dtype=torch.long),
+            cp_world_size=2,
         ),
         lm_head_weight=torch.randn(
             11, q.size(1) * q.size(3), generator=torch.Generator().manual_seed(18)
@@ -158,11 +160,37 @@ def test_single_gpu_attention_harness_reports_out_lse_and_dlogp_drift():
         assert drift.dlogp is not None
         assert drift.dlogp.active_count == 7
         assert drift.dlogp.p95_abs <= 1.0e-6
+        assert drift.provenance["execution_scope"] == "single_device_correctness_reference"
+        assert drift.provenance["native_backend_executed"] is False
+        assert drift.provenance["preprocess_fallback"] is True
+        assert drift.provenance["qkv_projection_executed"] is False
 
     payload = report.to_dict()
     assert payload["reference_name"] == "full_prefill"
     assert payload["drifts"][0]["out"]["p99_abs"] >= 0.0
     json.dumps(payload)
+
+
+def test_strict_shared_core_is_bitwise_across_full_chunked_and_paged_layouts():
+    report = compare_single_gpu_attention(
+        _comparison_inputs(),
+        query_chunk_size=2,
+        kv_page_size=3,
+        strict_bitwise=True,
+    )
+
+    assert report.reference_name == "strict_shared_core_full_prefill"
+    by_name = {drift.candidate_name: drift for drift in report.drifts}
+    assert set(by_name) == {
+        "strict_shared_core_chunked_prefill",
+        "strict_shared_core_paged_kv",
+    }
+    for drift in by_name.values():
+        assert drift.out.max_abs == 0.0
+        assert drift.lse.max_abs == 0.0
+        assert drift.provenance["strict_core_id"] == ("rlkernel.attention.deterministic_core.v1")
+        assert drift.provenance["strict_schedule"] == ("single_batch_single_query_global_kv_blocks")
+        assert drift.provenance["split_kv_policy"] == "disabled"
 
 
 def test_single_gpu_attention_harness_preserves_key_padding_mask():
@@ -228,6 +256,11 @@ def test_single_gpu_rope_attention_harness_reports_rope_and_attention_drift():
     assert drift.provenance["rotary_dim"] == base.q.size(-1)
     assert drift.provenance["rope_cast_at"] == "after_rope"
     assert drift.provenance["fusion_boundary"] == "fused_rope_attention"
+    assert drift.provenance["preprocess_backends"] == {
+        "rope": "rlkernel.pytorch.rope_reference",
+        "qk_rmsnorm": "not_executed_projected_qk_input",
+    }
+    assert drift.provenance["preprocess_policy"] == "reference_only_not_production"
 
     payload = report.to_dict()
     assert payload["drifts"][0]["post_rope_q"]["active_count"] == base.q.numel()
@@ -293,6 +326,7 @@ def test_decode_replay_matches_full_prefill_for_single_and_few_query():
             key_position_ids=inputs.metadata.key_position_ids,
             page_size=inputs.metadata.page_size,
             cp_block_owners=inputs.metadata.cp_block_owners,
+            cp_world_size=inputs.metadata.cp_world_size,
         ),
     )
     single_report = compare_decode_kv_replay(single_query)
@@ -658,6 +692,7 @@ def test_decode_replay_fails_loudly_on_position_identity_mismatch():
         key_position_ids=inputs.metadata.key_position_ids,
         page_size=inputs.metadata.page_size,
         cp_block_owners=inputs.metadata.cp_block_owners,
+        cp_world_size=inputs.metadata.cp_world_size,
     )
 
     with pytest.raises(ValueError, match="cache_position and query_position_ids"):
@@ -684,6 +719,7 @@ def test_decode_replay_fails_loudly_on_invalid_page_identity():
         key_position_ids=bad_positions.clone(),
         page_size=inputs.metadata.page_size,
         cp_block_owners=inputs.metadata.cp_block_owners,
+        cp_world_size=inputs.metadata.cp_world_size,
     )
 
     with pytest.raises(ValueError, match="reconstruct logical positions"):
@@ -716,6 +752,7 @@ def test_decode_replay_covers_qwen3_gqa_head_layout():
             key_position_ids=positions.clone(),
             page_size=2,
             cp_block_owners=torch.tensor([[0, 1]], dtype=torch.long),
+            cp_world_size=2,
         ),
         output_dtype=torch.bfloat16,
     )
@@ -723,6 +760,84 @@ def test_decode_replay_covers_qwen3_gqa_head_layout():
     report = compare_decode_kv_replay(inputs)
     assert report.drifts[0].out.max_abs <= 2 * torch.finfo(torch.bfloat16).eps
     assert report.drifts[0].lse.max_abs <= 1.0e-6
+
+
+def test_decode_append_matches_full_prefill_suffix():
+    generator = torch.Generator().manual_seed(71)
+    q = torch.randn(1, 4, 2, 8, generator=generator)
+    k_past = torch.randn(1, 2, 4, 8, generator=generator)
+    v_past = torch.randn(1, 2, 4, 8, generator=generator)
+    k_new = torch.randn(1, 2, 2, 8, generator=generator)
+    v_new = torch.randn(1, 2, 2, 8, generator=generator)
+    inputs = DecodeAttentionInputs(
+        q=q,
+        k_cache=k_past,
+        v_cache=v_past,
+        k_new=k_new,
+        v_new=v_new,
+        metadata=DecodeKVCacheMetadata(
+            cache_position=torch.tensor([[104, 105]], dtype=torch.long),
+            kv_seq_lens=torch.tensor([4], dtype=torch.long),
+            block_table=torch.tensor([[0, 1]], dtype=torch.long),
+            global_token_positions=torch.tensor([[100, 101, 102, 103]], dtype=torch.long),
+            query_position_ids=torch.tensor([[104, 105]], dtype=torch.long),
+            key_position_ids=torch.tensor([[100, 101, 102, 103]], dtype=torch.long),
+            page_size=2,
+            cp_block_owners=torch.tensor([[0, 1]], dtype=torch.long),
+            cp_world_size=2,
+        ),
+        split_kv=SplitKVSpec.fixed(2),
+    )
+
+    report = compare_decode_kv_replay(inputs)
+    drift = report.drifts[0]
+    assert drift.out.max_abs <= 1.0e-6
+    assert drift.lse.max_abs <= 1.0e-6
+    assert drift.provenance["decode_semantics"] == "past_kv_plus_new_kv_append"
+    assert drift.provenance["past_kv_lengths"] == [4]
+    assert drift.provenance["new_kv_length"] == 2
+    assert drift.provenance["actual_split_kv_plans"][0][1]["actual_split_boundaries"] == [
+        [0, 2],
+        [2, 4],
+        [4, 6],
+    ]
+
+
+def test_decode_replay_supports_nonzero_global_position_offset():
+    base = _decode_inputs()
+    offset = 4096
+    active = base.metadata.global_token_positions >= 0
+    positions = torch.where(
+        active,
+        base.metadata.global_token_positions + offset,
+        base.metadata.global_token_positions,
+    )
+    inputs = replace(
+        base,
+        metadata=replace(
+            base.metadata,
+            cache_position=base.metadata.cache_position + offset,
+            query_position_ids=base.metadata.query_position_ids + offset,
+            global_token_positions=positions,
+            key_position_ids=positions.clone(),
+        ),
+    )
+
+    report = compare_decode_kv_replay(inputs)
+    assert report.drifts[0].out.max_abs <= 1.0e-6
+    assert report.drifts[0].provenance["global_token_positions"][0][0] >= offset
+
+
+def test_decode_split_k_disabled_and_fixed_share_cache_layout():
+    base = _decode_inputs()
+    disabled = run_decode_kv_replay(replace(base, split_kv=SplitKVSpec.disabled()))
+    fixed = run_decode_kv_replay(replace(base, split_kv=SplitKVSpec.fixed(2)))
+
+    torch.testing.assert_close(fixed.out, disabled.out, atol=1.0e-6, rtol=0.0)
+    torch.testing.assert_close(fixed.lse, disabled.lse, atol=1.0e-6, rtol=0.0)
+    assert disabled.provenance["requested_split_kv_policy"] == "disabled"
+    assert fixed.provenance["requested_split_kv_policy"] == "fixed"
+    assert disabled.provenance["block_table"] == fixed.provenance["block_table"]
 
 
 def test_decode_transformer_engine_oracle_reuses_sorted_partial_states(monkeypatch):

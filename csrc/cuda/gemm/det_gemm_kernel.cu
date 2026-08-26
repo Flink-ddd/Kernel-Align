@@ -18,6 +18,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
+#include <cstdint>
 
 #if defined(RL_KERNEL_ENABLE_SM90)
 #include "det_gemm_tma.cuh"
@@ -41,6 +42,27 @@ __device__ __forceinline__ float cast_output<float>(float value) {
 }
 
 __host__ __device__ constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
+
+enum class RhsLayout {
+  // Physical RHS is the logical [K,N] matrix.
+  kKN,
+  // Physical RHS is [N,K] and represents the transpose of the logical RHS.
+  kNK,
+};
+
+enum class OutputLayout {
+  // Store the logical [M,N] result in its usual contiguous layout.
+  kMN,
+  // Store logical (m,n) at contiguous [N,M](n,m).
+  kNM,
+};
+
+template <bool TRANSPOSE_OUTPUT>
+__device__ __forceinline__ int output_offset(int row, int col, int M, int N) {
+  if constexpr (TRANSPOSE_OUTPUT)
+    return col * M + row;
+  return row * N + col;
+}
 
 // Must match SM90 BK so an aligned-K naive tree equals the SM90 tile tree.
 constexpr int K_TREE_LEAF = 32;
@@ -82,7 +104,7 @@ __device__ nv_bf16 k_tree_naive(const nv_bf16* __restrict__ A, const nv_bf16* __
 // construction: one thread = one output element, mid-split K tree.
 constexpr int NAIVE_TILE = 16;
 
-template <typename output_t>
+template <typename output_t, bool TRANSPOSE_OUTPUT>
 __global__ void det_gemm_naive(const nv_bf16* __restrict__ A,
                                const nv_bf16* __restrict__ B,
                                output_t* __restrict__ C,
@@ -90,16 +112,17 @@ __global__ void det_gemm_naive(const nv_bf16* __restrict__ A,
   const int row = blockIdx.y * NAIVE_TILE + threadIdx.y;
   const int col = blockIdx.x * NAIVE_TILE + threadIdx.x;
   if (row >= M || col >= N) return;
-  C[row * N + col] = cast_output<output_t>(
+  C[output_offset<TRANSPOSE_OUTPUT>(row, col, M, N)] = cast_output<output_t>(
       __bfloat162float(k_tree_naive(A, B, row, col, N, K, 0, K)));
 }
 
-template <typename output_t>
+template <typename output_t, bool TRANSPOSE_OUTPUT>
 void launch_naive(const nv_bf16* A, const nv_bf16* B, output_t* C,
                   int M, int N, int K, cudaStream_t stream) {
   dim3 block(NAIVE_TILE, NAIVE_TILE);
   dim3 grid(cdiv(N, NAIVE_TILE), cdiv(M, NAIVE_TILE));
-  det_gemm_naive<output_t><<<grid, block, 0, stream>>>(A, B, C, M, N, K);
+  det_gemm_naive<output_t, TRANSPOSE_OUTPUT><<<grid, block, 0, stream>>>(
+      A, B, C, M, N, K);
 }
 
 #if defined(RL_KERNEL_ENABLE_SM90)
@@ -115,8 +138,8 @@ constexpr int WG_THREADS = WARPS * 32;  // 128
 constexpr int STAGES = 2;
 
 constexpr int MMA_M = 16, MMA_N = 8, MMA_K = 16;
-constexpr int WARP_M = BM / WARPS;        // 16
-constexpr int M_TILES = WARP_M / MMA_M;   // 1
+constexpr int WARP_M = BM / WARPS;        // 32
+constexpr int M_TILES = WARP_M / MMA_M;   // 2
 constexpr int N_TILES = BN / MMA_N;       // 8
 constexpr int K_TILES = BK / MMA_K;       // 2
 constexpr int KK_GROUPS = BK / 32;        // 1
@@ -135,7 +158,7 @@ __device__ __forceinline__ void mma_m16n8k16(const uint32_t A[4], const uint32_t
                  "f"(D[0]), "f"(D[1]), "f"(D[2]), "f"(D[3]));
 }
 
-template <typename output_t>
+template <typename output_t, bool TRANSPOSE_OUTPUT>
 __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
                                      const __grid_constant__ CUtensorMap bt_tmap,
                                      output_t* __restrict__ C,
@@ -277,18 +300,22 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
     for (int n = 0; n < N_TILES; ++n) {
       const int col = col_base + n * MMA_N + (lane % 4) * 2;
       if (row < M && col + 1 < N) {
-        C[row * N + col + 0] = cast_output<output_t>(__bfloat162float(tree_v[mi][n][0]));
-        C[row * N + col + 1] = cast_output<output_t>(__bfloat162float(tree_v[mi][n][1]));
+        C[output_offset<TRANSPOSE_OUTPUT>(row, col + 0, M, N)] =
+            cast_output<output_t>(__bfloat162float(tree_v[mi][n][0]));
+        C[output_offset<TRANSPOSE_OUTPUT>(row, col + 1, M, N)] =
+            cast_output<output_t>(__bfloat162float(tree_v[mi][n][1]));
       }
       if (row + 8 < M && col + 1 < N) {
-        C[(row + 8) * N + col + 0] = cast_output<output_t>(__bfloat162float(tree_v[mi][n][2]));
-        C[(row + 8) * N + col + 1] = cast_output<output_t>(__bfloat162float(tree_v[mi][n][3]));
+        C[output_offset<TRANSPOSE_OUTPUT>(row + 8, col + 0, M, N)] =
+            cast_output<output_t>(__bfloat162float(tree_v[mi][n][2]));
+        C[output_offset<TRANSPOSE_OUTPUT>(row + 8, col + 1, M, N)] =
+            cast_output<output_t>(__bfloat162float(tree_v[mi][n][3]));
       }
     }
   }
 }
 
-template <typename output_t>
+template <typename output_t, bool TRANSPOSE_OUTPUT>
 bool launch_sm90(const nv_bf16* A, const nv_bf16* Bt, output_t* C,
                  int M, int N, int K, cudaStream_t stream) {
   if (M % BM != 0 || N % BN != 0 || K % BK != 0) return false;  // fall back
@@ -299,11 +326,12 @@ bool launch_sm90(const nv_bf16* A, const nv_bf16* Bt, output_t* C,
 
   const int smem = STAGES * (BM * BK + BN * BK) * sizeof(nv_bf16) + STAGES * 8;
   if (smem > 48 * 1024)
-    cudaFuncSetAttribute(det_gemm_sm90_kernel<output_t>,
+    cudaFuncSetAttribute(det_gemm_sm90_kernel<output_t, TRANSPOSE_OUTPUT>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
   dim3 grid(cdiv(N, BN), cdiv(M, BM));
-  det_gemm_sm90_kernel<output_t><<<grid, WG_THREADS, smem, stream>>>(a_tmap, bt_tmap, C, M, N, K);
+  det_gemm_sm90_kernel<output_t, TRANSPOSE_OUTPUT>
+      <<<grid, WG_THREADS, smem, stream>>>(a_tmap, bt_tmap, C, M, N, K);
   return true;
 }
 #endif  // RL_KERNEL_ENABLE_SM90
@@ -324,11 +352,15 @@ void check_in(const torch::Tensor& t, const char* n) {
   TORCH_CHECK(t.scalar_type() == torch::kBFloat16, n, " must be bf16");
 }
 
-torch::Tensor gemm_dispatch(const torch::Tensor& a, const torch::Tensor& b,
+torch::Tensor gemm_dispatch(const torch::Tensor& a, const torch::Tensor& rhs,
+                            RhsLayout rhs_layout = RhsLayout::kKN,
+                            OutputLayout output_layout = OutputLayout::kMN,
                             bool output_fp32 = false) {
-  const int M = a.size(0), K = a.size(1), N = b.size(1);
+  const int M = a.size(0), K = a.size(1);
+  const int N = rhs_layout == RhsLayout::kKN ? rhs.size(1) : rhs.size(0);
+  const bool transpose_output = output_layout == OutputLayout::kNM;
   auto options = a.options().dtype(output_fp32 ? torch::kFloat32 : torch::kBFloat16);
-  auto c = torch::empty({M, N}, options);
+  auto c = transpose_output ? torch::empty({N, M}, options) : torch::empty({M, N}, options);
   auto stream = at::cuda::getCurrentCUDAStream();
 
 #if defined(RL_KERNEL_ENABLE_SM90)
@@ -342,22 +374,56 @@ torch::Tensor gemm_dispatch(const torch::Tensor& a, const torch::Tensor& b,
     if (Mp != M) {
       a_use = torch::zeros({Mp, K}, a.options());
       a_use.narrow(0, 0, M).copy_(a);
+    } else if (reinterpret_cast<std::uintptr_t>(a_use.data_ptr()) % 16 != 0) {
+      // cuTensorMapEncodeTiled requires a 16-byte-aligned global base. A
+      // contiguous offset view is not guaranteed to satisfy that contract.
+      a_use = a.clone();
     }
-    torch::Tensor c_use = (Mp != M) ? torch::empty({Mp, N}, options) : c;
-    auto bt = b.t().contiguous();  // [N,K]
-    const bool launched = output_fp32
-        ? launch_sm90<float>(bf16(a_use), bf16(bt), c_use.data_ptr<float>(), Mp, N, K, stream)
-        : launch_sm90<nv_bf16>(bf16(a_use), bf16(bt), bf16o(c_use), Mp, N, K, stream);
+    torch::Tensor c_use = c;
+    if (Mp != M)
+      c_use = transpose_output ? torch::empty({N, Mp}, options)
+                               : torch::empty({Mp, N}, options);
+
+    // TMA consumes the physical [N,K] representation.  The explicit kNK
+    // contract lets callers provide that layout directly without a round-trip
+    // transpose through logical [K,N].
+    torch::Tensor bt = rhs_layout == RhsLayout::kNK ? rhs : rhs.t().contiguous();
+    if (reinterpret_cast<std::uintptr_t>(bt.data_ptr()) % 16 != 0)
+      bt = bt.clone();
+    bool launched = false;
+    if (output_fp32) {
+      launched = transpose_output
+          ? launch_sm90<float, true>(
+                bf16(a_use), bf16(bt), c_use.data_ptr<float>(), Mp, N, K, stream)
+          : launch_sm90<float, false>(
+                bf16(a_use), bf16(bt), c_use.data_ptr<float>(), Mp, N, K, stream);
+    } else {
+      launched = transpose_output
+          ? launch_sm90<nv_bf16, true>(bf16(a_use), bf16(bt), bf16o(c_use), Mp, N, K, stream)
+          : launch_sm90<nv_bf16, false>(bf16(a_use), bf16(bt), bf16o(c_use), Mp, N, K, stream);
+    }
     if (launched) {
-      if (Mp != M) c.copy_(c_use.narrow(0, 0, M));
+      if (Mp != M)
+        c.copy_(c_use.narrow(transpose_output ? 1 : 0, 0, M));
       return c;
     }
   }
 #endif
-  if (output_fp32)
-    launch_naive<float>(bf16(a), bf16(b), c.data_ptr<float>(), M, N, K, stream);
-  else
-    launch_naive<nv_bf16>(bf16(a), bf16(b), bf16o(c), M, N, K, stream);
+
+  // The scalar fallback keeps its original logical [K,N] operand traversal.
+  // Materialize only for the new physical-[N,K] contract.
+  torch::Tensor b = rhs_layout == RhsLayout::kKN ? rhs : rhs.t().contiguous();
+  if (output_fp32) {
+    if (transpose_output)
+      launch_naive<float, true>(bf16(a), bf16(b), c.data_ptr<float>(), M, N, K, stream);
+    else
+      launch_naive<float, false>(bf16(a), bf16(b), c.data_ptr<float>(), M, N, K, stream);
+  } else {
+    if (transpose_output)
+      launch_naive<nv_bf16, true>(bf16(a), bf16(b), bf16o(c), M, N, K, stream);
+    else
+      launch_naive<nv_bf16, false>(bf16(a), bf16(b), bf16o(c), M, N, K, stream);
+  }
   return c;
 }
 
@@ -371,6 +437,15 @@ torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b) {
   return gemm_dispatch(a, b);
 }
 
+torch::Tensor det_gemm_fwd_rhs_transposed(torch::Tensor a, torch::Tensor bt) {
+  check_in(a, "A"); check_in(bt, "Bt");
+  a = a.contiguous(); bt = bt.contiguous();
+  TORCH_CHECK(a.dim() == 2 && bt.dim() == 2,
+              "det_gemm_fwd_rhs_transposed: expect A[M,K] and Bt[N,K]");
+  TORCH_CHECK(bt.size(1) == a.size(1), "det_gemm_fwd_rhs_transposed: K mismatch");
+  return gemm_dispatch(a, bt, RhsLayout::kNK);
+}
+
 torch::Tensor det_gemm_fwd_fp32(torch::Tensor a, torch::Tensor b) {
   check_in(a, "A"); check_in(b, "B");
   a = a.contiguous(); b = b.contiguous();
@@ -382,16 +457,33 @@ torch::Tensor det_gemm_fwd_fp32(torch::Tensor a, torch::Tensor b) {
 
 torch::Tensor det_gemm_da(torch::Tensor dc, torch::Tensor b) {
   check_in(dc, "dC"); check_in(b, "B");
-  dc = dc.contiguous();
-  auto bt = b.t().contiguous();
-  TORCH_CHECK(bt.size(0) == dc.size(1), "det_gemm_da: N mismatch");
-  return gemm_dispatch(dc, bt);
+  dc = dc.contiguous(); b = b.contiguous();
+  TORCH_CHECK(dc.dim() == 2 && b.dim() == 2,
+              "det_gemm_da: expect dC[M,N] and B[K,N]");
+  TORCH_CHECK(b.size(1) == dc.size(1), "det_gemm_da: N mismatch");
+  // dA = dC @ B^T.  B already is the physical [K,N] transpose of that
+  // logical RHS, which is exactly the SM90 TMA layout.
+  return gemm_dispatch(dc, b, RhsLayout::kNK);
 }
 
 torch::Tensor det_gemm_db(torch::Tensor a, torch::Tensor dc) {
   check_in(a, "A"); check_in(dc, "dC");
   dc = dc.contiguous();
+  TORCH_CHECK(a.dim() == 2 && dc.dim() == 2,
+              "det_gemm_db: expect A[M,K] and dC[M,N]");
   auto at = a.t().contiguous();
   TORCH_CHECK(dc.size(0) == at.size(1), "det_gemm_db: M mismatch");
   return gemm_dispatch(at, dc);
+}
+
+torch::Tensor det_gemm_db_transposed(torch::Tensor a, torch::Tensor dc) {
+  check_in(a, "A"); check_in(dc, "dC");
+  dc = dc.contiguous();
+  TORCH_CHECK(a.dim() == 2 && dc.dim() == 2,
+              "det_gemm_db_transposed: expect A[M,K] and dC[M,N]");
+  auto at = a.t().contiguous();
+  TORCH_CHECK(dc.size(0) == at.size(1), "det_gemm_db_transposed: M mismatch");
+  // Preserve the exact A^T @ dC MMA/tree evaluation and change only the final
+  // address mapping so the canonical [N,K] weight-gradient is born contiguous.
+  return gemm_dispatch(at, dc, RhsLayout::kKN, OutputLayout::kNM);
 }

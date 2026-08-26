@@ -29,7 +29,8 @@ from rl_engine.kernels.ops.pytorch.ffn.ffn import (
 
 _REQUIRED_SYMBOLS = (
     "det_gemm_fwd",
-    "det_gemm_db",
+    "det_gemm_fwd_rhs_transposed",
+    "det_gemm_db_transposed",
     "swiglu_forward",
     "swiglu_backward",
 )
@@ -97,9 +98,13 @@ class _TorchKernelStub:
         self.calls.append("det_gemm_fwd")
         return a @ b
 
-    def det_gemm_db(self, a, grad_output):
-        self.calls.append("det_gemm_db")
-        return a.t().contiguous() @ grad_output
+    def det_gemm_fwd_rhs_transposed(self, a, bt):
+        self.calls.append("det_gemm_fwd_rhs_transposed")
+        return a @ bt.t()
+
+    def det_gemm_db_transposed(self, a, grad_output):
+        self.calls.append("det_gemm_db_transposed")
+        return grad_output.t() @ a
 
     def swiglu_forward(self, gate, up):
         self.calls.append("swiglu_forward")
@@ -836,9 +841,14 @@ def test_qwen_ffn_backward_matches_autograd_reference(monkeypatch):
     torch.testing.assert_close(actual, expected.detach())
     for actual_input, reference in zip(actual_inputs, ref_inputs, strict=True):
         torch.testing.assert_close(actual_input.grad, reference.grad)
+    for weight in actual_inputs[1:]:
+        assert weight.grad is not None
+        assert weight.grad.is_contiguous()
+        assert weight.grad.stride() == weight.stride()
 
-    assert stub.calls.count("det_gemm_fwd") == 6
-    assert stub.calls.count("det_gemm_db") == 3
+    assert stub.calls.count("det_gemm_fwd") == 3
+    assert stub.calls.count("det_gemm_fwd_rhs_transposed") == 3
+    assert stub.calls.count("det_gemm_db_transposed") == 3
     assert stub.calls.count("swiglu_forward") == 1
     assert stub.calls.count("swiglu_backward") == 1
 
@@ -874,7 +884,8 @@ def test_qwen_ffn_disable_split_k_false_uses_torch_matmul(monkeypatch):
         torch.testing.assert_close(actual_input.grad, reference.grad)
 
     assert stub.calls.count("det_gemm_fwd") == 0
-    assert stub.calls.count("det_gemm_db") == 0
+    assert stub.calls.count("det_gemm_fwd_rhs_transposed") == 0
+    assert stub.calls.count("det_gemm_db_transposed") == 0
     assert stub.calls.count("swiglu_forward") == 1
     assert stub.calls.count("swiglu_backward") == 1
 

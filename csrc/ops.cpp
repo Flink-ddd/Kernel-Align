@@ -12,7 +12,10 @@ torch::Tensor fused_logp_sm90_forward(torch::Tensor logits, torch::Tensor labels
 std::vector<torch::Tensor> fused_linear_logp_sm90_forward(torch::Tensor hidden,
                                                           torch::Tensor weight,
                                                           torch::Tensor target,
-                                                          torch::optional<torch::Tensor> bias);
+                                                          torch::optional<torch::Tensor> bias,
+                                                          torch::optional<torch::Tensor> temperature,
+                                                          bool return_logits,
+                                                          int64_t real_vocab_size);
 std::vector<torch::Tensor> batch_invariant_logp_sm90_forward(torch::Tensor logits,
                                                              torch::Tensor target,
                                                              int64_t ignore_index);
@@ -21,7 +24,9 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_global_target_forward(
     torch::Tensor weight,
     torch::Tensor target,
     torch::optional<torch::Tensor> bias,
-    int64_t vocab_start_index);
+    int64_t vocab_start_index,
+    torch::optional<torch::Tensor> temperature,
+    int64_t real_vocab_size);
 std::vector<torch::Tensor> fused_linear_logp_sm90_backward(torch::Tensor grad_logp,
                                                            torch::Tensor hidden,
                                                            torch::Tensor weight,
@@ -106,8 +111,10 @@ void deterministic_collective_all_gather(int64_t handle, torch::Tensor& output);
 
 // Batch-Invariant Deterministic GEMM Declarations
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
+torch::Tensor det_gemm_fwd_rhs_transposed(torch::Tensor a, torch::Tensor bt);
 torch::Tensor det_gemm_da(torch::Tensor dc, torch::Tensor b);
 torch::Tensor det_gemm_db(torch::Tensor a, torch::Tensor dc);
+torch::Tensor det_gemm_db_transposed(torch::Tensor a, torch::Tensor dc);
 // SiLU / SwiGLU Declarations (elementwise activation, general CUDA)
 torch::Tensor silu_forward_cuda(torch::Tensor x);
 torch::Tensor silu_backward_cuda(torch::Tensor dy, torch::Tensor x);
@@ -332,11 +339,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_SM90)
     m.def("fused_logp_sm90", &fused_logp_sm90_forward, "TMA-accelerated Online Softmax Fused LogP");
     m.def("fused_linear_logp_sm90", &fused_linear_logp_sm90_forward,
-          "TMA+WGMMA fused linear log-prob (hidden @ W^T -> selected-token logp), SM90");
+          "TMA+WGMMA fused linear log-prob (hidden @ W^T -> selected-token logp), SM90; "
+          "frozen reduction contract with optional temperature, logits, and real-vocab mask",
+          py::arg("hidden"), py::arg("weight"), py::arg("target"),
+          py::arg("bias") = py::none(), py::arg("temperature") = py::none(),
+          py::arg("return_logits") = false, py::arg("real_vocab_size") = -1);
     m.def("batch_invariant_logp_sm90", &batch_invariant_logp_sm90_forward,
           "TMA online-softmax batch-invariant selected-token log-prob from logits, SM90");
     m.def("fused_linear_logp_sm90_global_target", &fused_linear_logp_sm90_global_target_forward,
-          "TMA+WGMMA local-shard target-logit/lse for vocab-parallel linear log-prob, SM90");
+          "TMA+WGMMA local-shard target-logit/lse for vocab-parallel linear log-prob, SM90",
+          py::arg("hidden"), py::arg("weight"), py::arg("target"),
+          py::arg("bias") = py::none(), py::arg("vocab_start_index"),
+          py::arg("temperature") = py::none(), py::arg("real_vocab_size") = -1);
     m.def("fused_linear_logp_sm90_backward", &fused_linear_logp_sm90_backward,
           "CUDA fused backward for linear log-prob, SM90 backend");
     m.def("linear_logp_probs_bf16_forward", &linear_logp_probs_bf16_forward,
@@ -421,8 +435,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // registry Batch-Invariant Deterministic GEMM
     m.def("det_gemm_fwd", &det_gemm_fwd, "Batch-invariant deterministic GEMM forward (C=A@B)");
+    m.def(
+        "det_gemm_fwd_rhs_transposed",
+        &det_gemm_fwd_rhs_transposed,
+        "Batch-invariant deterministic GEMM with physical Bt[N,K] (C=A@Bt^T)");
     m.def("det_gemm_da", &det_gemm_da, "Batch-invariant deterministic GEMM backward dA (dC@B^T)");
     m.def("det_gemm_db", &det_gemm_db, "Batch-invariant deterministic GEMM backward dB (A^T@dC)");
+    m.def(
+        "det_gemm_db_transposed",
+        &det_gemm_db_transposed,
+        "Batch-invariant deterministic GEMM backward in canonical [N,K] layout");
     // registry RMSNorm
     m.def("rmsnorm_forward", &rmsnorm_forward, "Batch-invariant RMSNorm forward CUDA");
     m.def("rmsnorm_backward_dx", &rmsnorm_backward_dx, "Batch-invariant RMSNorm backward dx CUDA");

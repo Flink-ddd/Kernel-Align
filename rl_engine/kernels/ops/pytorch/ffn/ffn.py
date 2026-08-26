@@ -17,7 +17,8 @@ BACKEND_ID = "rlkernel.ffn.qwen3.deterministic.v1"
 
 _DET_GEMM_SYMBOLS = (
     "det_gemm_fwd",
-    "det_gemm_db",
+    "det_gemm_fwd_rhs_transposed",
+    "det_gemm_db_transposed",
 )
 _SWIGLU_SYMBOLS = (
     "swiglu_forward",
@@ -49,11 +50,30 @@ def _gemm_fwd(a: Tensor, b: Tensor, *, disable_split_k: bool) -> Tensor:
         return torch.matmul(a, b)
 
 
-def _gemm_db(a: Tensor, grad_output: Tensor, *, disable_split_k: bool) -> Tensor:
+def _gemm_fwd_rhs_transposed(
+    a: Tensor,
+    bt: Tensor,
+    *,
+    disable_split_k: bool,
+) -> Tensor:
     if disable_split_k:
-        return _C.det_gemm_db(a, grad_output)
+        return _C.det_gemm_fwd_rhs_transposed(a, bt)
     with torch.no_grad():
-        return torch.matmul(a.t().contiguous(), grad_output)
+        return torch.matmul(a, bt.t())
+
+
+def _gemm_db_transposed(
+    a: Tensor,
+    grad_output: Tensor,
+    *,
+    disable_split_k: bool,
+) -> Tensor:
+    if disable_split_k:
+        return _C.det_gemm_db_transposed(a, grad_output)
+    with torch.no_grad():
+        # dW is naturally [out,in]; let the production GEMM create that layout
+        # instead of materializing [in,out] and transposing the result.
+        return torch.matmul(grad_output.t(), a)
 
 
 def _require_parallel_group(group: Any, name: str):
@@ -204,19 +224,25 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         if sequence_parallel:
             rmsnorm_output_2d = _all_gather_tokens(rmsnorm_output_2d, tp_collective)
 
-        # The model stores projection weights as [out, in]; GEMM consumes [K, N].
-        gate = _gemm_fwd(
+        # The SM90 TMA kernel consumes physical B^T=[N,K]. Canonical model
+        # weights already have exactly that layout, so no prepared copy is
+        # needed and optimizer updates cannot leave a stale cache behind.
+        gate = _gemm_fwd_rhs_transposed(
             rmsnorm_output_2d,
-            gate_weight.t().contiguous(),
+            gate_weight,
             disable_split_k=disable_split_k,
         )
-        up = _gemm_fwd(
+        up = _gemm_fwd_rhs_transposed(
             rmsnorm_output_2d,
-            up_weight.t().contiguous(),
+            up_weight,
             disable_split_k=disable_split_k,
         )
         activated = _C.swiglu_forward(gate, up)
-        output = _gemm_fwd(activated, down_weight.t().contiguous(), disable_split_k=disable_split_k)
+        output = _gemm_fwd_rhs_transposed(
+            activated,
+            down_weight,
+            disable_split_k=disable_split_k,
+        )
 
         if sequence_parallel:
             output = _reduce_scatter_tokens(output, tp_collective)
@@ -257,20 +283,22 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         if ctx.sequence_parallel:
             grad_output = _all_gather_tokens(grad_output, tp_collective)
 
-        # Down weight gradients must see every CP token so gemm_db's K-tree
+        # Down weight gradients must see every CP token so the wgrad K-tree
         # matches CP=1. Local dW + AllReduce is a different parenthesization
         # whenever T is not a complete mid-split tree of 32-wide leaves.
         if cp_collective is not None:
             activated_full = _all_gather_tokens(activated, cp_collective)
             grad_output_full = _all_gather_tokens(grad_output, cp_collective)
-            grad_down_weight = (
-                _gemm_db(activated_full, grad_output_full, disable_split_k=disable_split_k)
-                .t()
-                .contiguous()
+            grad_down_weight = _gemm_db_transposed(
+                activated_full,
+                grad_output_full,
+                disable_split_k=disable_split_k,
             )
         else:
-            grad_down_weight = (
-                _gemm_db(activated, grad_output, disable_split_k=disable_split_k).t().contiguous()
+            grad_down_weight = _gemm_db_transposed(
+                activated,
+                grad_output,
+                disable_split_k=disable_split_k,
             )
 
         # Down input-gradient shards concatenate across TP; no TP reduction.
@@ -281,24 +309,26 @@ class _DeterministicFFNFunction(torch.autograd.Function):
             rmsnorm_full = _all_gather_tokens(rmsnorm_output, cp_collective)
             grad_gate_full = _all_gather_tokens(grad_gate, cp_collective)
             grad_up_full = _all_gather_tokens(grad_up, cp_collective)
-            grad_gate_weight = (
-                _gemm_db(rmsnorm_full, grad_gate_full, disable_split_k=disable_split_k)
-                .t()
-                .contiguous()
+            grad_gate_weight = _gemm_db_transposed(
+                rmsnorm_full,
+                grad_gate_full,
+                disable_split_k=disable_split_k,
             )
-            grad_up_weight = (
-                _gemm_db(rmsnorm_full, grad_up_full, disable_split_k=disable_split_k)
-                .t()
-                .contiguous()
+            grad_up_weight = _gemm_db_transposed(
+                rmsnorm_full,
+                grad_up_full,
+                disable_split_k=disable_split_k,
             )
         else:
-            grad_gate_weight = (
-                _gemm_db(rmsnorm_output, grad_gate, disable_split_k=disable_split_k)
-                .t()
-                .contiguous()
+            grad_gate_weight = _gemm_db_transposed(
+                rmsnorm_output,
+                grad_gate,
+                disable_split_k=disable_split_k,
             )
-            grad_up_weight = (
-                _gemm_db(rmsnorm_output, grad_up, disable_split_k=disable_split_k).t().contiguous()
+            grad_up_weight = _gemm_db_transposed(
+                rmsnorm_output,
+                grad_up,
+                disable_split_k=disable_split_k,
             )
 
         # Gate/Up input gradients reduce across TP, then add locally.
@@ -367,7 +397,7 @@ def qwen3_ffn(
         cp_group: Optional context-parallel process group. Each rank owns
             different token rows and the same local weight shards. Weight
             gradients AllGather tokens along CP and run the full-token
-            ``det_gemm_db`` so they match CP=1 bitwise.
+            ``det_gemm_db_transposed`` so they match CP=1 bitwise.
         sequence_parallel: Whether ``rmsnorm_output`` and the returned output
             are sharded on the flattened token dimension across ``tp_group``.
             Token gather/scatter use the deterministic AllGather and

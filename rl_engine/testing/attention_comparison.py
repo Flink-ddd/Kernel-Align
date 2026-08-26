@@ -22,6 +22,7 @@ from typing import Any, Literal
 
 import torch
 
+from rl_engine.kernels.attention_contract import SplitKVExecutionPlan, SplitKVMode, SplitKVSpec
 from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp
 from rl_engine.testing.reference_ops import selected_logprobs_reference
 
@@ -98,6 +99,7 @@ class DecodeKVCacheMetadata:
     q_rope_state: RoPEState = "post_rope"
     k_cache_rope_state: RoPEState = "post_rope"
     cp_block_owners: torch.Tensor | None = None
+    cp_world_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,9 @@ class DecodeAttentionInputs:
     lm_head_weight: torch.Tensor | None = None
     target_ids: torch.Tensor | None = None
     active_token_mask: torch.Tensor | None = None
+    k_new: torch.Tensor | None = None
+    v_new: torch.Tensor | None = None
+    split_kv: SplitKVSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -206,6 +211,7 @@ def compare_single_gpu_attention(
     query_chunk_size: int | None = None,
     kv_page_size: int | None = None,
     include_transformer_engine: bool = False,
+    strict_bitwise: bool = False,
 ) -> AttentionComparisonReport:
     """Compare full attention with chunked/paged single-GPU materializations.
 
@@ -215,11 +221,18 @@ def compare_single_gpu_attention(
     """
 
     _validate_comparison_inputs(inputs)
-    reference = run_full_attention(inputs)
-    candidates = [
-        run_chunked_query_attention(inputs, query_chunk_size=query_chunk_size),
-        run_paged_kv_attention(inputs, kv_page_size=kv_page_size, merge_backend="rl_kernel"),
-    ]
+    if strict_bitwise:
+        reference = run_strict_shared_core_attention(inputs)
+        candidates = [
+            run_strict_shared_core_chunked_attention(inputs, query_chunk_size=query_chunk_size),
+            run_strict_shared_core_paged_layout_attention(inputs, kv_page_size=kv_page_size),
+        ]
+    else:
+        reference = run_full_attention(inputs)
+        candidates = [
+            run_chunked_query_attention(inputs, query_chunk_size=query_chunk_size),
+            run_paged_kv_attention(inputs, kv_page_size=kv_page_size, merge_backend="rl_kernel"),
+        ]
     unavailable: list[str] = []
     if include_transformer_engine:
         try:
@@ -238,6 +251,120 @@ def compare_single_gpu_attention(
         reference_name=reference.name,
         drifts=drifts,
         unavailable=tuple(unavailable),
+    )
+
+
+def run_strict_shared_core_attention(inputs: AttentionComparisonInputs) -> AttentionPathResult:
+    """Run the canonical single-row arithmetic schedule for the full path."""
+
+    _validate_comparison_inputs(inputs)
+    out, lse = _strict_attention_with_lse(
+        inputs.q,
+        inputs.k,
+        inputs.v,
+        causal=inputs.causal,
+        scale=inputs.scale,
+        key_padding_mask=inputs.key_padding_mask,
+        q_start=0,
+        k_start=0,
+        total_query_len=inputs.q.size(2),
+        total_kv_len=inputs.k.size(2),
+        output_dtype=inputs.output_dtype,
+    )
+    return AttentionPathResult(
+        name="strict_shared_core_full_prefill",
+        out=out,
+        lse=lse,
+        provenance=_strict_shared_core_provenance(
+            inputs, materialization="full_logical_kv_shared_core"
+        ),
+    )
+
+
+def run_strict_shared_core_chunked_attention(
+    inputs: AttentionComparisonInputs,
+    *,
+    query_chunk_size: int | None,
+) -> AttentionPathResult:
+    """Replay query chunks through the same one-row schedule as full prefill."""
+
+    _validate_comparison_inputs(inputs)
+    chunk_size = (
+        inputs.q.size(2)
+        if query_chunk_size is None
+        else _positive_int(query_chunk_size, "query_chunk_size")
+    )
+    bounds = _chunk_bounds(inputs.q.size(2), chunk_size)
+    outs: list[torch.Tensor] = []
+    lses: list[torch.Tensor] = []
+    for q_start, q_end in bounds:
+        out, lse = _strict_attention_with_lse(
+            inputs.q[:, :, q_start:q_end, :],
+            inputs.k,
+            inputs.v,
+            causal=inputs.causal,
+            scale=inputs.scale,
+            key_padding_mask=inputs.key_padding_mask,
+            q_start=q_start,
+            k_start=0,
+            total_query_len=inputs.q.size(2),
+            total_kv_len=inputs.k.size(2),
+            output_dtype=inputs.output_dtype,
+        )
+        outs.append(out)
+        lses.append(lse)
+    return AttentionPathResult(
+        name="strict_shared_core_chunked_prefill",
+        out=torch.cat(outs, dim=2),
+        lse=torch.cat(lses, dim=2),
+        provenance={
+            **_strict_shared_core_provenance(inputs, materialization="query_chunks_shared_core"),
+            "query_chunk_size": chunk_size,
+            "chunk_bounds": [list(bound) for bound in bounds],
+        },
+    )
+
+
+def run_strict_shared_core_paged_layout_attention(
+    inputs: AttentionComparisonInputs,
+    *,
+    kv_page_size: int | None,
+) -> AttentionPathResult:
+    """Restore paged KV to logical order, then call the shared core once.
+
+    Strict mode deliberately does not create per-page partial states: page size
+    is a storage detail, while Split-KV is disabled in the arithmetic contract.
+    """
+
+    _validate_comparison_inputs(inputs)
+    page_size = (
+        inputs.k.size(2) if kv_page_size is None else _positive_int(kv_page_size, "kv_page_size")
+    )
+    pages = [(start, end) for start, end in _chunk_bounds(inputs.k.size(2), page_size)]
+    logical_k = torch.cat([inputs.k[:, :, start:end, :] for start, end in pages], dim=2)
+    logical_v = torch.cat([inputs.v[:, :, start:end, :] for start, end in pages], dim=2)
+    out, lse = _strict_attention_with_lse(
+        inputs.q,
+        logical_k,
+        logical_v,
+        causal=inputs.causal,
+        scale=inputs.scale,
+        key_padding_mask=inputs.key_padding_mask,
+        q_start=0,
+        k_start=0,
+        total_query_len=inputs.q.size(2),
+        total_kv_len=inputs.k.size(2),
+        output_dtype=inputs.output_dtype,
+    )
+    return AttentionPathResult(
+        name="strict_shared_core_paged_kv",
+        out=out,
+        lse=lse,
+        provenance={
+            **_strict_shared_core_provenance(inputs, materialization="paged_kv_layout_shared_core"),
+            "kv_page_size": page_size,
+            "kv_page_bounds": [list(bound) for bound in pages],
+        },
     )
 
 
@@ -450,7 +577,9 @@ def _run_decode_kv_replay(
     outs: list[torch.Tensor] = []
     lses: list[torch.Tensor] = []
     merge_orders: list[list[list[int]]] = []
+    actual_split_plans: list[list[dict[str, Any]]] = []
     cp_block_owners: list[list[int]] = []
+    split_kv = _resolved_decode_split_kv(inputs)
     for batch_index in range(inputs.q.size(0)):
         q, k, v, logical_positions = _decode_logical_qkv(inputs, batch_index)
         owners = _logical_block_owners(inputs, batch_index)
@@ -458,13 +587,14 @@ def _run_decode_kv_replay(
         batch_out: list[torch.Tensor] = []
         batch_lse: list[torch.Tensor] = []
         batch_orders: list[list[int]] = []
+        batch_split_plans: list[dict[str, Any]] = []
         for query_index in range(q.size(2)):
             query_position = int(inputs.metadata.cache_position[batch_index, query_index].item())
             states: list[_PartialAttentionState] = []
             order: list[int] = []
-            for block_index, (block_start, block_end) in enumerate(
-                _chunk_bounds(k.size(2), inputs.metadata.page_size)
-            ):
+            visible_count = int((logical_positions <= query_position).sum().item())
+            split_bounds = _decode_split_bounds(visible_count, split_kv)
+            for block_index, (block_start, block_end) in enumerate(split_bounds):
                 block_positions = logical_positions[block_start:block_end]
                 visible = block_positions <= query_position
                 if not bool(visible.any()):
@@ -499,12 +629,28 @@ def _run_decode_kv_replay(
             batch_out.append(out.to(inputs.output_dtype))
             batch_lse.append(lse)
             batch_orders.append(order)
+            plan = SplitKVExecutionPlan(
+                requested_mode=split_kv.mode,
+                requested_split_size=split_kv.fixed_split_size,
+                actual_mode=split_kv.mode,
+                actual_split_size=split_kv.fixed_split_size,
+                boundaries=tuple(split_bounds),
+                backend=f"{merge_backend}_decode_kv_replay",
+                source="reference_execution",
+            )
+            batch_split_plans.append(plan.to_dict())
         merge_orders.append(batch_orders)
+        actual_split_plans.append(batch_split_plans)
         outs.append(torch.cat(batch_out, dim=2))
         lses.append(torch.cat(batch_lse, dim=2))
 
     provenance: dict[str, Any] = {
         "attention_mode": "decode",
+        "decode_semantics": (
+            "past_kv_plus_new_kv_append" if inputs.k_new is not None else "cache_replay"
+        ),
+        "past_kv_lengths": inputs.metadata.kv_seq_lens.tolist(),
+        "new_kv_length": (0 if inputs.k_new is None else inputs.k_new.size(2)),
         "materialization": "paged_kv_replay",
         "execution_scope": "single_device_logical_reference",
         "runtime_verified": False,
@@ -530,6 +676,10 @@ def _run_decode_kv_replay(
         "q_rope_output_dtype": str(_decode_q_rope_output_dtype(inputs)).replace("torch.", ""),
         "k_cache_rope_output_dtype": str(_decode_k_rope_output_dtype(inputs)).replace("torch.", ""),
         "cp_block_owners": cp_block_owners,
+        "cp_world_size": inputs.metadata.cp_world_size,
+        "requested_split_kv_policy": split_kv.mode.value,
+        "requested_split_kv_size": split_kv.fixed_split_size,
+        "actual_split_kv_plans": actual_split_plans,
         "merge_order": "global_block_index",
         "logical_merge_orders": merge_orders,
         "merge_backend": merge_backend,
@@ -571,6 +721,13 @@ def _run_decode_kv_replay(
     }
     if merge_backend == "transformer_engine":
         provenance.update(_te_context_parallel_provenance())
+        provenance.update(
+            {
+                "actual_backend": "te_context_parallel_merge_helpers",
+                "communication_backend": "none",
+                "production_ready": False,
+            }
+        )
     return AttentionPathResult(
         name=f"{merge_backend}_decode_kv_replay",
         out=torch.cat(outs, dim=0),
@@ -603,6 +760,7 @@ def run_full_attention(inputs: AttentionComparisonInputs) -> AttentionPathResult
             "attention_mode": "prefill",
             "materialization": "full_sequence",
             "lse_domain": "attention",
+            **_single_gpu_reference_provenance(),
         },
     )
 
@@ -710,6 +868,7 @@ def run_chunked_query_attention(
             "query_chunk_size": chunk_size,
             "chunk_bounds": [list(bound) for bound in chunk_bounds],
             "lse_domain": "attention",
+            **_single_gpu_reference_provenance(),
         },
     )
 
@@ -772,9 +931,17 @@ def run_paged_kv_attention(
         "lse_exported": True,
         "accum_dtype": "fp32",
         "downcast_at": "final_write",
+        **_single_gpu_reference_provenance(),
     }
     if merge_backend == "transformer_engine":
         provenance.update(_te_context_parallel_provenance())
+        provenance.update(
+            {
+                "actual_backend": "te_context_parallel_merge_helpers",
+                "communication_backend": "none",
+                "production_ready": False,
+            }
+        )
     return AttentionPathResult(
         name=f"{merge_backend}_paged_kv",
         out=out.to(inputs.output_dtype),
@@ -976,6 +1143,23 @@ def _decode_logical_qkv(
         k = rope.forward_fp32(k, key_positions, theta=inputs.rope_theta).to(
             _decode_k_rope_output_dtype(inputs)
         )
+    if inputs.k_new is not None:
+        assert inputs.v_new is not None
+        k_new = inputs.k_new[batch_index : batch_index + 1]
+        if metadata.k_cache_rope_state == "pre_rope":
+            k_new = rope.forward_fp32(
+                k_new,
+                metadata.query_position_ids[batch_index : batch_index + 1],
+                theta=inputs.rope_theta,
+            ).to(_decode_k_rope_output_dtype(inputs))
+        k = torch.cat((k, k_new), dim=2)
+        v = torch.cat((v, inputs.v_new[batch_index : batch_index + 1]), dim=2)
+        logical_position_tensor = torch.cat(
+            (
+                logical_position_tensor,
+                metadata.query_position_ids[batch_index].long(),
+            )
+        )
     return q, k, v, logical_position_tensor
 
 
@@ -1060,6 +1244,65 @@ def _rope_attention_provenance(
         "rope_output_dtype": str(_rope_output_dtype(inputs)).replace("torch.", ""),
         "fusion_boundary": fusion_boundary,
         "lse_domain": "attention",
+        "preprocess_backends": {
+            "rope": "rlkernel.pytorch.rope_reference",
+            "qk_rmsnorm": "not_executed_projected_qk_input",
+        },
+        **_single_gpu_reference_provenance(),
+    }
+
+
+def _single_gpu_reference_provenance() -> dict[str, Any]:
+    return {
+        "execution_scope": "single_device_correctness_reference",
+        "runtime_verified": False,
+        "actual_backend": "rlkernel.pytorch.attention_reference",
+        "communication_backend": "none",
+        "production_ready": False,
+        "preprocess_policy": "reference_only_not_production",
+        "native_backend_executed": False,
+        "preprocess_fallback": True,
+        "preprocess_fallback_reason": (
+            "single-GPU attribution harness intentionally uses the PyTorch deterministic reference"
+        ),
+        "qkv_input_boundary": "projected_qkv",
+        "qkv_projection_executed": False,
+        "output_projection_executed": False,
+        "communication": "none",
+    }
+
+
+def _strict_shared_core_provenance(
+    inputs: AttentionComparisonInputs,
+    *,
+    materialization: str,
+) -> dict[str, Any]:
+    return {
+        "execution_scope": "single_device_strict_shared_core",
+        "runtime_verified": False,
+        "actual_backend": "rlkernel.pytorch.strict_attention_reference",
+        "communication_backend": "none",
+        "production_ready": False,
+        "strict_core_id": "rlkernel.attention.deterministic_core.v1",
+        "strict_schedule": "single_batch_single_query_global_kv_blocks",
+        "strict_mode": True,
+        "native_backend_executed": False,
+        "native_attention_arithmetic": False,
+        "fallback": False,
+        "fallback_reason": None,
+        "materialization": materialization,
+        "attention_mode": "prefill",
+        "qkv_input_boundary": "projected_qkv",
+        "qkv_projection_executed": False,
+        "output_projection_executed": False,
+        "communication": "none",
+        "split_kv_policy": "disabled",
+        "merge_order": "global_block_index",
+        "accum_dtype": "fp32",
+        "downcast_at": "final_write",
+        "lse_domain": "attention",
+        "lse_exported": True,
+        "dtype": str(inputs.q.dtype).replace("torch.", ""),
     }
 
 
@@ -1091,6 +1334,80 @@ def _strict_decode_attention_with_lse(
     )
     weights = torch.where(row_sum > 0, exp_scores / row_sum, torch.zeros_like(exp_scores))
     return torch.matmul(weights, vf).to(output_dtype), lse.squeeze(-1)
+
+
+def _strict_attention_with_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    causal: bool,
+    scale: float | None,
+    key_padding_mask: torch.Tensor | None,
+    q_start: int,
+    k_start: int,
+    total_query_len: int,
+    total_kv_len: int,
+    output_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the fixed one-batch/one-query arithmetic schedule locally.
+
+    PR2 must remain independently runnable before PR3 is merged, so this small
+    reference intentionally mirrors the PR3 schedule instead of importing its
+    implementation.  The contract is the same: no Split-KV, FP32 intermediates,
+    logical position offsets, and one reduction per query row.
+    """
+
+    if q.shape[0] != k.shape[0] or k.shape[:1] != v.shape[:1] or k.shape[2:] != v.shape[2:]:
+        raise ValueError("strict Attention q/k/v batch and KV shapes must match")
+    hq, hkv = q.size(1), k.size(1)
+    if hq % hkv:
+        raise ValueError("strict Attention requires GQA-compatible head counts")
+    scale_value = 1.0 / math.sqrt(q.size(-1)) if scale is None else float(scale)
+    output_rows: list[torch.Tensor] = []
+    lse_rows: list[torch.Tensor] = []
+    for batch_index in range(q.size(0)):
+        q_rows: list[torch.Tensor] = []
+        lse_batch: list[torch.Tensor] = []
+        k_batch = k[batch_index : batch_index + 1].float()
+        v_batch = v[batch_index : batch_index + 1].float()
+        if hq != hkv:
+            k_batch = k_batch.repeat_interleave(hq // hkv, dim=1)
+            v_batch = v_batch.repeat_interleave(hq // hkv, dim=1)
+        for query_index in range(q.size(2)):
+            q_row = q[batch_index : batch_index + 1, :, query_index : query_index + 1, :].float()
+            scores = torch.matmul(q_row, k_batch.transpose(-1, -2)) * scale_value
+            if causal:
+                query_position = total_kv_len - total_query_len + q_start + query_index
+                key_positions = torch.arange(k.size(2), device=q.device, dtype=torch.long) + k_start
+                scores = scores.masked_fill(
+                    key_positions.view(1, 1, 1, -1) > query_position,
+                    float("-inf"),
+                )
+            if key_padding_mask is not None:
+                scores = scores.masked_fill(
+                    ~key_padding_mask[batch_index : batch_index + 1].view(1, 1, 1, -1),
+                    float("-inf"),
+                )
+            row_max = scores.amax(dim=-1, keepdim=True)
+            finite = torch.isfinite(row_max)
+            exp_scores = torch.where(
+                finite,
+                torch.exp(scores - row_max),
+                torch.zeros_like(scores),
+            )
+            row_sum = exp_scores.sum(dim=-1, keepdim=True)
+            lse = torch.where(
+                row_sum > 0,
+                row_max + torch.log(row_sum),
+                torch.full_like(row_sum, float("-inf")),
+            )
+            weights = torch.where(row_sum > 0, exp_scores / row_sum, torch.zeros_like(exp_scores))
+            q_rows.append(torch.matmul(weights, v_batch).to(output_dtype))
+            lse_batch.append(lse.squeeze(-1))
+        output_rows.append(torch.cat(q_rows, dim=2))
+        lse_rows.append(torch.cat(lse_batch, dim=2))
+    return torch.cat(output_rows, dim=0), torch.cat(lse_rows, dim=0)
 
 
 def _attention_with_lse(
@@ -1530,6 +1847,9 @@ def _validate_decode_inputs(inputs: DecodeAttentionInputs) -> None:
     if metadata.cp_block_owners is not None:
         if metadata.cp_block_owners.shape != metadata.block_table.shape:
             raise ValueError("cp_block_owners must have the same shape as block_table")
+        cp_world_size = _positive_int(metadata.cp_world_size, "cp_world_size")
+        if bool((metadata.cp_block_owners >= cp_world_size).any()):
+            raise ValueError("cp_block_owners must be smaller than cp_world_size")
     if not torch.equal(metadata.cache_position, metadata.query_position_ids):
         raise ValueError("cache_position and query_position_ids must identify the same positions")
     if metadata.q_rope_state not in {"pre_rope", "post_rope"}:
@@ -1578,6 +1898,22 @@ def _validate_decode_inputs(inputs: DecodeAttentionInputs) -> None:
     ):
         if dtype is not None and not dtype.is_floating_point:
             raise ValueError(f"{name} must be a floating-point torch.dtype")
+    if (inputs.k_new is None) != (inputs.v_new is None):
+        raise ValueError("k_new and v_new must be provided together")
+    append_mode = inputs.k_new is not None
+    if append_mode:
+        assert inputs.k_new is not None and inputs.v_new is not None
+        if inputs.k_new.shape != inputs.v_new.shape:
+            raise ValueError("k_new and v_new must have matching shapes")
+        expected_new_shape = (batch, inputs.k_cache.size(1), sq, head_dim)
+        if inputs.k_new.shape != expected_new_shape:
+            raise ValueError("k_new and v_new must have shape [B, Hkv, Sq, D]")
+        if inputs.k_new.device != inputs.q.device or inputs.v_new.device != inputs.q.device:
+            raise ValueError("k_new and v_new must be on the same device as q")
+    if inputs.split_kv is not None and not isinstance(inputs.split_kv, SplitKVSpec):
+        raise ValueError("split_kv must be a SplitKVSpec when provided")
+    if inputs.split_kv is not None and inputs.split_kv.mode is SplitKVMode.AUTO:
+        raise ValueError("decode replay requires disabled or fixed Split-KV, not auto")
     if (
         metadata.q_rope_state == "post_rope"
         and inputs.q_rope_output_dtype is not None
@@ -1642,13 +1978,36 @@ def _validate_decode_inputs(inputs: DecodeAttentionInputs) -> None:
                 "block_table/global_token_positions must reconstruct logical positions "
                 "in strictly increasing global order"
             )
+        position_offset = int(global_positions[0].item())
         key_positions = metadata.key_position_ids[batch_index, slot_index]
         if not torch.equal(key_positions, global_positions):
             raise ValueError("key_position_ids must match cached global token positions")
         cache_positions = metadata.cache_position[batch_index]
-        query_is_cached = (cache_positions[:, None] == global_positions[None, :]).any(dim=1)
-        if not bool(query_is_cached.all()):
-            raise ValueError("cache_position must refer to a token present in the KV cache")
+        if append_mode:
+            expected_positions = torch.arange(
+                position_offset,
+                position_offset + sequence_length,
+                device=inputs.q.device,
+                dtype=global_positions.dtype,
+            )
+            if not torch.equal(global_positions, expected_positions):
+                raise ValueError(
+                    "append mode requires cached global positions to form one contiguous range"
+                )
+            expected_new_positions = torch.arange(
+                position_offset + sequence_length,
+                position_offset + sequence_length + sq,
+                device=inputs.q.device,
+                dtype=cache_positions.dtype,
+            )
+            if not torch.equal(cache_positions, expected_new_positions):
+                raise ValueError(
+                    "append cache_position must identify the contiguous new-token suffix"
+                )
+        else:
+            query_is_cached = (cache_positions[:, None] == global_positions[None, :]).any(dim=1)
+            if not bool(query_is_cached.all()):
+                raise ValueError("cache_position must refer to a token present in the KV cache")
         if sq > 1 and bool((cache_positions[1:] <= cache_positions[:-1]).any()):
             raise ValueError("few-query cache_position values must be strictly increasing")
 
@@ -1675,8 +2034,12 @@ def _validate_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
 
 
 def _validate_partial_states(states: list[_PartialAttentionState]) -> None:
+    if not states:
+        raise ValueError("at least one partial attention state is required")
     first = states[0]
-    if first.block_start < 0 or first.block_end <= first.block_start:
+    if first.block_start != 0:
+        raise ValueError("partial state coverage must start at logical KV token 0")
+    if first.block_end <= first.block_start:
         raise ValueError("partial state ranges must satisfy 0 <= block_start < block_end")
     previous_end = first.block_end
     for state in states[1:]:
@@ -1711,6 +2074,23 @@ def _chunk_bounds(length: int, chunk_size: int) -> list[tuple[int, int]]:
     return bounds
 
 
+def _resolved_decode_split_kv(inputs: DecodeAttentionInputs) -> SplitKVSpec:
+    # Existing replay behavior used one partial state per logical cache page.
+    # Keep that as the explicit default while allowing disabled/fixed sweeps on
+    # the same physical page layout.
+    return inputs.split_kv or SplitKVSpec.fixed(inputs.metadata.page_size)
+
+
+def _decode_split_bounds(length: int, split_kv: SplitKVSpec) -> list[tuple[int, int]]:
+    if split_kv.mode is SplitKVMode.AUTO:
+        raise ValueError("decode replay cannot materialize an unknown auto Split-KV plan")
+    chunk_size = length
+    if split_kv.mode is SplitKVMode.FIXED:
+        assert split_kv.fixed_split_size is not None
+        chunk_size = split_kv.fixed_split_size
+    return _chunk_bounds(length, chunk_size)
+
+
 def _positive_int(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
@@ -1737,7 +2117,11 @@ __all__ = [
     "run_full_attention",
     "run_decode_full_prefill_reference",
     "run_decode_kv_replay",
+    "run_decode_strict_shared_core",
     "run_paged_kv_attention",
+    "run_strict_shared_core_attention",
+    "run_strict_shared_core_chunked_attention",
+    "run_strict_shared_core_paged_layout_attention",
     "run_unfused_rope_attention",
     "transformer_engine_context_parallel_available",
 ]

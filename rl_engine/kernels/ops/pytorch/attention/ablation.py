@@ -20,8 +20,6 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping, cast
 
 import torch
-from torch import Tensor
-
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_CORE_ID,
     STRICT_ATTENTION_SCHEDULE_ID,
@@ -30,6 +28,7 @@ from rl_engine.kernels.attention_contract import (
     AttentionDType,
     SplitKVMode,
 )
+from torch import Tensor
 
 BACKEND_ID = "rlkernel.attention.deterministic.v1"
 REFERENCE_BACKEND_ID = "rlkernel.attention.reference.v1"
@@ -121,7 +120,7 @@ class AttentionAblationResult:
             "out_shape": list(self.out.shape),
             "out_dtype": str(self.out.dtype).replace("torch.", ""),
             "lse_shape": None if self.lse is None else list(self.lse.shape),
-            "lse_dtype": None if self.lse is None else str(self.lse.dtype).replace("torch.", ""),
+            "lse_dtype": (None if self.lse is None else str(self.lse.dtype).replace("torch.", "")),
             "gradients": {
                 "dq": self.dq is not None,
                 "dk": self.dk is not None,
@@ -163,6 +162,26 @@ class AttentionAblationOp:
         # fallback to the PyTorch reference when AG/RS is required.
         self.cp_backend = cp_backend
         self.communication_backend = communication_backend.strip()
+        self._cuda_runtime_group: Any = None
+        self._cuda_runtime_bound = False
+
+    def bind_cuda_runtime(self, *, process_group: Any = None) -> Any:
+        """Bind the shared production CUDA core/transport once per process."""
+
+        if self._cuda_runtime_bound:
+            if process_group is not self._cuda_runtime_group:
+                raise AttentionContractError(
+                    "Attention CUDA runtime is already bound to another process group"
+                )
+            return self.core
+        from rl_engine.kernels.ops.cuda.attention.strict_runtime import StrictCUDAAttentionRuntime
+
+        runtime = StrictCUDAAttentionRuntime(process_group=process_group)
+        self.core = runtime
+        self.cp_backend = runtime
+        self._cuda_runtime_group = process_group
+        self._cuda_runtime_bound = True
+        return runtime
 
     def __call__(
         self,
@@ -277,6 +296,7 @@ class AttentionAblationOp:
                 )
 
         call_kwargs = dict(kwargs)
+        call_kwargs.setdefault("contract", contract)
         call_kwargs.setdefault("causal", contract.causal)
         call_kwargs.setdefault("scale", 1.0 / math.sqrt(contract.head_dim))
         call_kwargs.setdefault("cp_world_size", contract.sharding.cp_world_size)
@@ -305,13 +325,15 @@ class AttentionAblationOp:
             "strict_schedule": cfg.strict_schedule if cfg.deterministic else None,
             "core_id": cfg.strict_core_id if cfg.deterministic else selected_id,
             "backend_deterministic": cfg.deterministic,
-            "native_attention_arithmetic": False if cfg.deterministic else selected_id == "native",
+            "native_attention_arithmetic": (
+                False if cfg.deterministic else selected_id == "native"
+            ),
             "communication_backend": cfg.communication_backend,
             "communication_executed": bool(getattr(selected, "communication_executed", False)),
             "split_kv": contract.split_kv.to_dict(),
             "actual_split_kv": _actual_split_provenance(
                 contract,
-                total_kv_tokens=k.size(2),
+                total_kv_tokens=k.size(2) * contract.sharding.cp_world_size,
                 backend=selected_id,
             ),
             "reduction": _reduction_provenance(contract),

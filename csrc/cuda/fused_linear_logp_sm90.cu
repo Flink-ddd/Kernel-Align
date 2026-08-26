@@ -27,6 +27,26 @@ constexpr int WARPS = 4;      // one warpgroup
 constexpr int WG_THREADS = WARPS * 32; // 128
 constexpr int STAGES = 2;     // double-buffering
 
+// ---------------------------------------------------------------------------
+// Bitwise reduction contract (bit-relevant constants; changes require a
+// contract-version bump):
+//   * VOCAB tile width .......... BN  (64)   - which columns share a tile
+//   * K slab width .............. BK  (32)   - GEMM accumulation order
+//   * vocab split count ......... N_SPLIT_CONTRACT (64), a function of V only
+//   * in-tile sum ............... adjacent-pairwise balanced binary tree over
+//                                 BN registers (one add per level)
+//   * cross-tile / cross-split .. ascending-index sequential scalar chains
+//   * row max ................... successive fmaxf (order-free)
+//   * transcendentals ........... expf / logf (IEEE), never __expf
+//   * padding lanes ............. -inf to max, exp() -> exact 0 to sum
+//   * temperature ............... scales stats and selected logit in the
+//                                 epilogue, never the stored logits
+//   * final clamp ............... logp = min(zt - lse, 0)
+// Launch axes that only move work along M (row blocks, warps, stages) are
+// bit-neutral and may be tuned freely.
+// ---------------------------------------------------------------------------
+constexpr int N_SPLIT_CONTRACT = 64;
+
 constexpr int MMA_M = 16;
 constexpr int MMA_N = 8;
 constexpr int MMA_K = 16;
@@ -83,11 +103,13 @@ __global__ void fused_linear_logp_sm90_kernel(const __grid_constant__ CUtensorMa
                                               const __grid_constant__ CUtensorMap w_tmap,
                                               const int *__restrict__ target,
                                               const float *__restrict__ bias, // may be null
+                                              const float *__restrict__ temperature, // may be null
+                                              float *__restrict__ logits_out,  // may be null
                                               float *__restrict__ part_max,   // [n_split, N]
                                               float *__restrict__ part_sum,   // [n_split, N]
                                               float *__restrict__ part_zt,    // [n_split, N]
                                               int N, int D, int V, int n_split,
-                                              int vocab_start_index) {
+                                              int vocab_start_index, int real_vocab_end) {
     const int tid = threadIdx.x;
     const int warp = tid / 32;
     const int lane = tid % 32;
@@ -234,36 +256,58 @@ __global__ void fused_linear_logp_sm90_kernel(const __grid_constant__ CUtensorMa
         }
         __syncthreads();
 
-        // Online softmax: threads stride over rows, each folding this tile's BN
-        // columns into the running (max, sum) and capturing the target logit.
+        // Online softmax under the frozen reduction contract: threads stride
+        // over rows; each folds this tile's BN columns with an in-register
+        // adjacent-pairwise tree, then merges tiles with the pinned ascending
+        // sequential chain. Temperature scales the stats and the selected
+        // logit; the stored logits (when requested) stay unscaled.
         for (int r = tid; r < num_rows; r += WG_THREADS) {
             const int tgt = target[row_base + r];
-            float tmax = -CUDART_INF_F;
+            const float inv_t =
+                (temperature != nullptr) ? 1.0f / temperature[row_base + r] : 1.0f;
+            float x[BN];
+#pragma unroll
             for (int c = 0; c < BN; ++c) {
                 const int col = col_base + c;
-                if (col >= V)
-                    break;
-                float val = sLogits[r * BN + c];
-                if (bias != nullptr)
-                    val += bias[col];
-                tmax = fmaxf(tmax, val);
+                float val = -CUDART_INF_F;  // padded lane: -inf max, exp() -> 0
+                if (col < V && col < real_vocab_end) {
+                    val = sLogits[r * BN + c];
+                    if (bias != nullptr)
+                        val += bias[col];
+                    if (logits_out != nullptr)
+                        logits_out[(size_t)(row_base + r) * V + col] = val;
+                } else if (logits_out != nullptr && col < V) {
+                    logits_out[(size_t)(row_base + r) * V + col] = -CUDART_INF_F;
+                }
+                if (temperature != nullptr)
+                    val *= inv_t;
                 if (vocab_start_index + col == tgt)
                     sZt[r] = val;
+                x[c] = val;
+            }
+            float tmax = -CUDART_INF_F;
+#pragma unroll
+            for (int c = 0; c < BN; ++c) {
+                tmax = fmaxf(tmax, x[c]);
             }
             float tsum = 0.0f;
-            for (int c = 0; c < BN; ++c) {
-                const int col = col_base + c;
-                if (col >= V)
-                    break;
-                float val = sLogits[r * BN + c];
-                if (bias != nullptr)
-                    val += bias[col];
-                tsum += __expf(val - tmax);
+            if (tmax != -CUDART_INF_F) {  // all-padded tile contributes exact 0
+#pragma unroll
+                for (int c = 0; c < BN; ++c)
+                    x[c] = expf(x[c] - tmax);
+#pragma unroll
+                for (int stride = BN / 2; stride >= 1; stride >>= 1)
+#pragma unroll
+                    for (int c = 0; c < stride; ++c)
+                        x[c] += x[c + stride];
+                tsum = x[0];
             }
-            float old_max = sMax[r];
-            float new_max = fmaxf(old_max, tmax);
-            sSum[r] = sSum[r] * __expf(old_max - new_max) + tsum * __expf(tmax - new_max);
-            sMax[r] = new_max;
+            const float old_max = sMax[r];
+            const float new_max = fmaxf(old_max, tmax);
+            if (new_max != -CUDART_INF_F) {  // avoid (-inf) - (-inf) = NaN
+                sSum[r] = sSum[r] * expf(old_max - new_max) + tsum * expf(tmax - new_max);
+                sMax[r] = new_max;
+            }
         }
         __syncthreads();
     }
@@ -436,7 +480,9 @@ __global__ void fused_linear_logp_logits_tile_bf16_mma_kernel(
 
 // Merge per-split partials: M = max_s m_s, S = sum_s s_s*exp(m_s - M),
 // zt = sum_s zt_s (exactly one split holds the target column), then
-// logp = zt - (M + log S). One thread per token row.
+// logp = min(zt - (M + log S), 0). One thread per token row.
+// The split fold is the pinned ascending-index sequential chain; the split
+// count itself is a contract constant (function of V only, never of batch).
 __global__ void fused_linear_logp_sm90_combine_kernel(const float *__restrict__ part_max,
                                                       const float *__restrict__ part_sum,
                                                       const float *__restrict__ part_zt,
@@ -454,13 +500,13 @@ __global__ void fused_linear_logp_sm90_combine_kernel(const float *__restrict__ 
 
     float S = 0.0f;
     float zt = 0.0f;
-    for (int s = 0; s < n_split; ++s) {
+    for (int s = 0; s < n_split; ++s) {  // ascending-index sequential chain
         const int idx = s * N + r;
-        S += part_sum[idx] * __expf(part_max[idx] - M);
+        S += part_sum[idx] * expf(part_max[idx] - M);
         zt += part_zt[idx];
     }
     const float lse = M + logf(S);
-    out_value[r] = return_target_logit ? zt : zt - lse;
+    out_value[r] = return_target_logit ? zt : fminf(zt - lse, 0.0f);
     out_lse[r] = lse;
 }
 
@@ -1772,7 +1818,8 @@ torch::Tensor linear_logp_logits_bf16_to_dlogits(torch::Tensor logits,
 
 std::vector<torch::Tensor> fused_linear_logp_sm90_forward_impl(
     torch::Tensor hidden, torch::Tensor weight, torch::Tensor target,
-    torch::optional<torch::Tensor> bias, int64_t vocab_start_index, bool return_target_logit) {
+    torch::optional<torch::Tensor> bias, int64_t vocab_start_index, bool return_target_logit,
+    torch::optional<torch::Tensor> temperature, bool return_logits, int64_t real_vocab_size) {
     TORCH_CHECK(hidden.is_cuda() && weight.is_cuda(), "hidden and weight must be CUDA tensors");
     TORCH_CHECK(weight.device() == hidden.device(),
                 "lm_head_weight must be on the same device as hidden");
@@ -1791,10 +1838,41 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_forward_impl(
                     "bias must be on the same device as hidden");
         TORCH_CHECK(bias->numel() == V, "bias must have V=", V, " elements, got ", bias->numel());
     }
+    const float *temp_ptr = nullptr;
+    torch::Tensor temp_c;
+    if (temperature.has_value()) {
+        TORCH_CHECK(temperature->device() == hidden.device(),
+                    "temperature must be on the same device as hidden");
+        TORCH_CHECK(temperature->scalar_type() == at::kFloat,
+                    "temperature must be float32");
+        TORCH_CHECK(temperature->numel() == N,
+                    "temperature must have one value per token: expected ", N,
+                    ", got ", temperature->numel());
+        temp_c = temperature->contiguous();
+        temp_ptr = temp_c.data_ptr<float>();
+        const float tmin = temp_c.min().item<float>();
+        TORCH_CHECK(tmin > 0.0f, "temperature must be strictly positive, got min ", tmin);
+    }
 
     auto opts_f = hidden.options().dtype(torch::kFloat);
     auto out_value = torch::empty({N}, opts_f);
     auto lse = torch::empty({N}, opts_f);
+    torch::Tensor logits;
+    float *logits_ptr = nullptr;
+    if (return_logits) {
+        logits = torch::empty({N, V}, opts_f);
+        logits_ptr = logits.data_ptr<float>();
+    }
+    // Real-vocab masking normalizes the padded Megatron domain (152064) and
+    // the unpadded serving domain (151936) onto one contract: lanes at or
+    // beyond the real vocab contribute exactly -inf to the max and 0 to the
+    // sumexp on every rank. ``real_vocab_size < 0`` disables masking (V is
+    // all real).
+    const int real_vocab_end =
+        real_vocab_size < 0
+            ? V
+            : static_cast<int>(
+                  std::min<int64_t>(std::max<int64_t>(real_vocab_size - vocab_start_index, 0), V));
 
     // TMA descriptors: box [rows=BM/BN, cols=BK], unswizzled (see helper above).
     CUtensorMap h_tmap, w_tmap;
@@ -1818,11 +1896,11 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_forward_impl(
     const int total_vtiles = (V + BN - 1) / BN;
     auto target_i = target.to(torch::kInt32).contiguous();
 
-    // Split the vocab loop across CTAs so the grid fills the GPU: aim for a few
-    // CTAs per SM, capped by the number of vocab tiles available to split.
-    int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-    int target_ctas = sm_count * 4;
-    int n_split = std::max(1, std::min(target_ctas / std::max(row_blocks, 1), total_vtiles));
+    // [contract] The vocab-split count is a function of V only: the combine
+    // tree must not change with batch shape, occupancy, or SM count. Filling
+    // the GPU for large batches is recovered by launching more row blocks (a
+    // bit-neutral axis), never by changing n_split.
+    int n_split = std::max(1, std::min(N_SPLIT_CONTRACT, total_vtiles));
 
     auto part_max = torch::empty({n_split, N}, opts_f);
     auto part_sum = torch::empty({n_split, N}, opts_f);
@@ -1835,9 +1913,9 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_forward_impl(
 
     dim3 grid(row_blocks, n_split);
     fused_linear_logp_sm90_kernel<<<grid, WG_THREADS, smem>>>(
-        h_tmap, w_tmap, target_i.data_ptr<int>(), bias_ptr, part_max.data_ptr<float>(),
-        part_sum.data_ptr<float>(), part_zt.data_ptr<float>(), N, D, V, n_split,
-        static_cast<int>(vocab_start_index));
+        h_tmap, w_tmap, target_i.data_ptr<int>(), bias_ptr, temp_ptr, logits_ptr,
+        part_max.data_ptr<float>(), part_sum.data_ptr<float>(), part_zt.data_ptr<float>(), N, D,
+        V, n_split, static_cast<int>(vocab_start_index), real_vocab_end);
 
     const int combine_threads = 256;
     const int combine_blocks = (N + combine_threads - 1) / combine_threads;
@@ -1845,6 +1923,8 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_forward_impl(
         part_max.data_ptr<float>(), part_sum.data_ptr<float>(), part_zt.data_ptr<float>(),
         out_value.data_ptr<float>(), lse.data_ptr<float>(), N, n_split, return_target_logit);
 
+    if (return_logits)
+        return {out_value, lse, logits};
     return {out_value, lse};
 }
 
@@ -1854,8 +1934,12 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_forward_impl(
 std::vector<torch::Tensor> fused_linear_logp_sm90_forward(torch::Tensor hidden,
                                                           torch::Tensor weight,
                                                           torch::Tensor target,
-                                                          torch::optional<torch::Tensor> bias) {
-    return fused_linear_logp_sm90_forward_impl(hidden, weight, target, bias, 0, false);
+                                                          torch::optional<torch::Tensor> bias,
+                                                          torch::optional<torch::Tensor> temperature,
+                                                          bool return_logits,
+                                                          int64_t real_vocab_size) {
+    return fused_linear_logp_sm90_forward_impl(hidden, weight, target, bias, 0, false,
+                                                temperature, return_logits, real_vocab_size);
 }
 
 // Vocab-parallel local-shard forward. Target ids stay in global-vocab
@@ -1863,9 +1947,11 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_forward(torch::Tensor hidden,
 // Returns (local_target_logit [N] f32, local_lse [N] f32).
 std::vector<torch::Tensor> fused_linear_logp_sm90_global_target_forward(
     torch::Tensor hidden, torch::Tensor weight, torch::Tensor target,
-    torch::optional<torch::Tensor> bias, int64_t vocab_start_index) {
+    torch::optional<torch::Tensor> bias, int64_t vocab_start_index,
+    torch::optional<torch::Tensor> temperature, int64_t real_vocab_size) {
     return fused_linear_logp_sm90_forward_impl(
-        hidden, weight, target, bias, vocab_start_index, true);
+        hidden, weight, target, bias, vocab_start_index, true, temperature, false,
+        real_vocab_size);
 }
 
 // Backward fast path: compute local dlogits in one CUDA kernel, then use GEMMs
