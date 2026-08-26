@@ -16,6 +16,7 @@ from rl_engine.kernels.ops.cuda.matmul import deterministic_gemm
 
 try:
     from rl_engine.kernels.ops.triton.matmul import deterministic_gemm_triton
+    from rl_engine.kernels.ops.triton.matmul.det_gemm import _triton_tree_gemm
 
     _HAS_TRITON = True
 except ImportError:
@@ -41,6 +42,17 @@ if _HAS_TRITON:
 
 def _rand(*shape):
     return torch.randn(*shape, device=DEV, dtype=torch.bfloat16)
+
+
+def _assert_same_raw_bytes(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    assert actual.shape == expected.shape
+    assert actual.dtype == expected.dtype == torch.bfloat16
+    assert actual.is_contiguous()
+    assert expected.is_contiguous()
+    assert torch.equal(
+        actual.reshape(-1).view(torch.uint8),
+        expected.reshape(-1).view(torch.uint8),
+    )
 
 
 _K_TREE_LEAF = 32
@@ -261,3 +273,75 @@ def test_triton_tree_matches_python_reference_backward_bitwise():
     )
     for expected_grad, triton_input in zip(expected, triton_inputs, strict=True):
         assert torch.equal(expected_grad, triton_input.grad)
+
+
+@pytest.mark.skipif(not _HAS_TRITON, reason="Triton is unavailable")
+@pytest.mark.parametrize(
+    "shape",
+    (
+        (1, 1, 3),
+        (3, 31, 5),
+        (17, 32, 33),
+        (33, 33, 17),
+        (65, 65, 31),
+    ),
+)
+def test_triton_tree_transposed_out_matches_legacy_root_copy_raw_bytes(shape):
+    """Root placement may transpose addresses, but never the BF16 values."""
+
+    torch.manual_seed(49)
+    m_size, k_size, n_size = shape
+    a = _rand(m_size, k_size)
+    b = _rand(k_size, n_size)
+
+    legacy = _triton_tree_gemm(a, b).t().contiguous()
+    output_buffer = torch.empty(
+        (n_size, m_size),
+        dtype=torch.bfloat16,
+        device=a.device,
+    )
+    version_before = output_buffer._version
+    transposed = _triton_tree_gemm(
+        a,
+        b,
+        transpose_output=True,
+        out=output_buffer,
+    )
+
+    assert transposed is output_buffer
+    assert output_buffer._version == version_before + 1
+    assert transposed.stride() == (m_size, 1)
+    _assert_same_raw_bytes(transposed, legacy)
+
+
+@pytest.mark.skipif(not _HAS_TRITON, reason="Triton is unavailable")
+def test_triton_wgrad_reads_positive_stride_transpose_view_raw_bytes():
+    """The copy-free a.T wgrad path must preserve the legacy GEMM bit graph."""
+
+    torch.manual_seed(50)
+    token_count, input_size, output_size = 33, 65, 17
+    activations = _rand(token_count, input_size)
+    grad_output = _rand(token_count, output_size)
+    activation_t = activations.t()
+    assert not activation_t.is_contiguous()
+    assert all(stride > 0 for stride in activation_t.stride())
+
+    legacy = _triton_tree_gemm(
+        activation_t.contiguous(),
+        grad_output,
+    ).t().contiguous()
+    output_buffer = torch.empty(
+        (output_size, input_size),
+        dtype=torch.bfloat16,
+        device=activations.device,
+    )
+    direct = _triton_tree_gemm(
+        activation_t,
+        grad_output,
+        transpose_output=True,
+        out=output_buffer,
+        preserve_a_strides=True,
+    )
+
+    assert direct is output_buffer
+    _assert_same_raw_bytes(direct, legacy)

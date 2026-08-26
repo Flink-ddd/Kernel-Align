@@ -233,6 +233,36 @@ if _TRITON_AVAILABLE:
         tl.store(output_ptr + offsets, values, mask=mask)
 
     @triton.jit
+    def _copy_tree_root_transposed_kernel(
+        workspace_ptr,
+        output_ptr,
+        root,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        offsets_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+        elements = M * N
+        mask = (offsets_m[:, None] < M) & (offsets_n[None, :] < N)
+        values = tl.load(
+            workspace_ptr
+            + root * elements
+            + offsets_m[:, None] * N
+            + offsets_n[None, :],
+            mask=mask,
+        )
+        # Store the already-rounded BF16 root directly in [N, M] layout.
+        # This is a pure address permutation: the canonical GEMM leaves, tree,
+        # operand order, and every rounding boundary remain unchanged.
+        tl.store(
+            output_ptr + offsets_n[:, None] * M + offsets_m[None, :],
+            tl.trans(values),
+            mask=tl.trans(mask),
+        )
+
+    @triton.jit
     def _det_gemm_fp32_kernel(
         a_ptr,
         b_ptr,
@@ -305,7 +335,14 @@ def _triton_gemm_fp32(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return c
 
 
-def _triton_tree_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def _triton_tree_gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    transpose_output: bool = False,
+    out: torch.Tensor | None = None,
+    preserve_a_strides: bool = False,
+) -> torch.Tensor:
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is unavailable")
     if a.dim() != 2 or b.dim() != 2:
@@ -317,10 +354,34 @@ def _triton_tree_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if not a.is_cuda or not b.is_cuda or a.device != b.device:
         raise RuntimeError("Triton tree GEMM inputs must share one CUDA/ROCm device")
 
-    a = a.contiguous()
+    # The leaf kernel accepts positive arbitrary strides. Wgrad uses this to
+    # consume an activation transpose view without materializing another copy.
+    # Other callers retain the established contiguous-input behavior.
+    if not preserve_a_strides:
+        a = a.contiguous()
     b = b.contiguous()
     m_size, k_size = a.shape
     n_size = b.size(1)
+    result_shape = (n_size, m_size) if transpose_output else (m_size, n_size)
+    if out is None:
+        result = torch.empty(result_shape, dtype=torch.bfloat16, device=a.device)
+    else:
+        if tuple(out.shape) != result_shape:
+            raise ValueError(
+                f"Triton tree GEMM output must have shape {result_shape}, "
+                f"got {tuple(out.shape)}"
+            )
+        if out.dtype != torch.bfloat16:
+            raise TypeError(f"Triton tree GEMM output must be BF16, got {out.dtype}")
+        if out.device != a.device:
+            raise RuntimeError(
+                f"Triton tree GEMM output must be on {a.device}, got {out.device}"
+            )
+        if not out.is_contiguous():
+            raise ValueError("Triton tree GEMM output buffer must be contiguous")
+        if out.requires_grad:
+            raise ValueError("Triton tree GEMM output buffer must not require gradients")
+        result = out
     plan = _device_tree_plan(k_size, a.device)
     workspace = torch.empty(
         (plan.host.node_count, m_size, n_size),
@@ -367,15 +428,34 @@ def _triton_tree_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             BLOCK=reduction_block,
         )
 
-    result = torch.empty((m_size, n_size), dtype=torch.bfloat16, device=a.device)
     copy_block = 256
-    _copy_tree_root_kernel[(triton.cdiv(result.numel(), copy_block),)](
-        workspace,
-        result,
-        plan.host.root,
-        result.numel(),
-        BLOCK=copy_block,
-    )
+    if transpose_output:
+        transpose_block = 32
+        transpose_grid = (
+            triton.cdiv(m_size, transpose_block),
+            triton.cdiv(n_size, transpose_block),
+        )
+        _copy_tree_root_transposed_kernel[transpose_grid](
+            workspace,
+            result,
+            plan.host.root,
+            M=m_size,
+            N=n_size,
+            BLOCK_M=transpose_block,
+            BLOCK_N=transpose_block,
+        )
+    else:
+        _copy_tree_root_kernel[(triton.cdiv(result.numel(), copy_block),)](
+            workspace,
+            result,
+            plan.host.root,
+            result.numel(),
+            BLOCK=copy_block,
+        )
+    if out is not None:
+        # Triton mutates caller-owned storage outside PyTorch's dispatcher.
+        # Keep saved-tensor and cache version checks semantically correct.
+        torch.autograd.graph.increment_version(result)
     return result
 
 

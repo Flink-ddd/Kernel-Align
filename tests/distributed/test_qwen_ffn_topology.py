@@ -24,6 +24,7 @@ import rl_engine.kernels.ops.triton.ffn.ffn as ffn_module
 from rl_engine.kernels.ops.triton.ffn import (
     QWEN3_8B_HIDDEN_SIZE,
     QWEN3_8B_INTERMEDIATE_SIZE,
+    pack_qwen3_ffn_forward_weights,
     qwen3_ffn,
 )
 _IS_ROCM = getattr(torch.version, "hip", None) is not None
@@ -226,17 +227,21 @@ def _run_topology(
         up[feature_start:feature_end].contiguous(),
         down[:, feature_start:feature_end].contiguous(),
     )
+    inference_forward_weights = pack_qwen3_ffn_forward_weights(*shard[1:])
 
     with torch.no_grad():
         inference = qwen3_ffn(
             *shard,
+            forward_weights=inference_forward_weights,
             tp_group=tp_group,
             cp_group=cp_group,
             sequence_parallel=sequence_parallel,
         )
     inputs = [value.detach().clone().requires_grad_(True) for value in shard]
+    training_forward_weights = pack_qwen3_ffn_forward_weights(*inputs[1:])
     training = qwen3_ffn(
         *inputs,
+        forward_weights=training_forward_weights,
         tp_group=tp_group,
         cp_group=cp_group,
         sequence_parallel=sequence_parallel,
