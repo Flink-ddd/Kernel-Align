@@ -76,6 +76,10 @@ jobs:
         run: |
           python -m pytest tests/test_kv_cache_attention.py -v -k "not large and not gpu"
 
+      - name: Run Mismatch Framework Tests (CPU-safe)
+        run: |
+          python -m pytest tests/test_mismatch_framework.py tests/test_mismatch_logprob_adapter.py -v
+
   docs:
     runs-on: ubuntu-latest
     steps:
