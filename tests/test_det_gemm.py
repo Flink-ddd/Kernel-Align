@@ -38,6 +38,24 @@ def _rand(*shape):
     return torch.randn(*shape, device=DEV, dtype=torch.bfloat16)
 
 
+# Matches det_gemm_kernel.cu: mid-split K-tree, FP32 leaf width 32, BF16 internal adds.
+_K_TREE_LEAF = 32
+
+
+def _k_tree_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    a = a.detach().contiguous()
+    b = b.detach().contiguous()
+    k = a.shape[1]
+
+    def rec(lo: int, hi: int) -> torch.Tensor:
+        if hi - lo <= _K_TREE_LEAF:
+            return (a[:, lo:hi].float() @ b[lo:hi, :].float()).to(dtype=torch.bfloat16)
+        mid = lo + (hi - lo) // 2
+        return rec(lo, mid) + rec(mid, hi)
+
+    return rec(0, k)
+
+
 @pytest.mark.parametrize("name,gemm", _BACKENDS)
 def test_forward_batch_invariance(name, gemm):
     # A row's output must not change when other rows join the batch.
@@ -81,7 +99,10 @@ def test_forward_correctness(name, gemm):
     M, K, N = 128, 2048, 2048
     a, b = _rand(M, K), _rand(K, N)
     out = gemm(a, b).float()
-    ref = a.float() @ b.float()
+    if name == "cuda":
+        ref = _k_tree_gemm(a, b).float()
+    else:
+        ref = a.float() @ b.float()
     contract = load_contract()
     thresholds = contract["accuracy"]["default"]["reduction"]["bfloat16"]
     torch.testing.assert_close(out, ref, atol=thresholds["atol"], rtol=thresholds["rtol"])
@@ -111,6 +132,18 @@ def test_backward_correctness(name, gemm):
     b = _rand(K, N).requires_grad_(True)
     g = _rand(M, N)
     gemm(a, b).backward(g)
+    if name == "cuda":
+        da = _k_tree_gemm(g, b.t().contiguous())
+        db = _k_tree_gemm(a.detach().t().contiguous(), g)
+        contract = load_contract()
+        thresholds = contract["accuracy"]["default"]["reduction"]["bfloat16"]
+        torch.testing.assert_close(
+            a.grad.float(), da.float(), atol=thresholds["atol"], rtol=thresholds["rtol"]
+        )
+        torch.testing.assert_close(
+            b.grad.float(), db.float(), atol=thresholds["atol"], rtol=thresholds["rtol"]
+        )
+        return
     af = a.detach().float().requires_grad_(True)
     bf = b.detach().float().requires_grad_(True)
     (af @ bf).backward(g.float())

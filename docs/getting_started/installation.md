@@ -14,15 +14,15 @@ git clone https://github.com/RL-Align/RL-Kernel.git
 cd RL-Kernel
 # Optional: pin the compile target. If unset, the build targets your GPU's arch.
 # export TORCH_CUDA_ARCH_LIST="9.0+PTX"   # e.g. Hopper; or "8.6+PTX", "12.0+PTX"
-pip install --no-build-isolation -e .
+RL_KERNEL_REQUIRE_EXT=1 python -m pip install --no-build-isolation -e .
 ```
 
-Without `--no-build-isolation`, PyTorch is invisible to the isolated build
-environment, the extension is silently skipped, and the library falls back to the
-slower pure-PyTorch kernels. Confirm the compiled extension is present with:
+`RL_KERNEL_REQUIRE_EXT=1` makes the build fail if `_C` cannot be compiled. Without
+`--no-build-isolation`, PyTorch is invisible to the isolated build environment.
+Confirm the compiled extension is present with:
 
 ```bash
-python -c "from rl_engine import _C; print('compiled extension OK')"
+python -c "import rl_engine._C as _C; assert hasattr(_C, 'fused_logp'); print(_C.__file__)"
 ```
 
 A CPU-only install (plain `pip install -e .` on a machine with no GPU) remains
@@ -34,15 +34,15 @@ The extras add optional dependencies on top of the compiled package, so they use
 the same `--no-build-isolation` flag as the source build above.
 
 ```bash
-pip install --no-build-isolation -e ".[cuda]"
+RL_KERNEL_REQUIRE_EXT=1 python -m pip install --no-build-isolation -e ".[cuda]"
 ```
 
 ```bash
-pip install --no-build-isolation -e ".[rocm]"
+RL_KERNEL_REQUIRE_EXT=1 python -m pip install --no-build-isolation -e ".[rocm]"
 ```
 
 ```bash
-pip install --no-build-isolation -e ".[vllm]"
+python -m pip install --no-build-isolation -e ".[vllm]"
 ```
 
 Install the vLLM extra only on rollout or benchmark environments that need the

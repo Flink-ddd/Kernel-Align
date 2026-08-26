@@ -5,6 +5,17 @@
 #include <limits>
 #include <torch/extension.h>
 
+constexpr int kFusedLogpLogicalWarpSize = 32;
+
+template <typename T>
+__device__ __forceinline__ T fused_logp_shfl_down_32(T value, unsigned int delta) {
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+    return __shfl_down(value, delta, kFusedLogpLogicalWarpSize);
+#else
+    return __shfl_down_sync(0xffffffffu, value, delta, kFusedLogpLogicalWarpSize);
+#endif
+}
+
 template <typename scalar_t>
 __device__ __forceinline__ scalar_t blockReduceMax(scalar_t val) {
     static __shared__ float shared[32];
@@ -14,7 +25,7 @@ __device__ __forceinline__ scalar_t blockReduceMax(scalar_t val) {
     float f_val = static_cast<float>(val);
 
     for (int offset = 16; offset > 0; offset /= 2)
-        f_val = max(f_val, __shfl_down_sync(0xffffffff, f_val, offset));
+        f_val = max(f_val, fused_logp_shfl_down_32(f_val, offset));
 
     if (lane == 0) shared[wid] = f_val;
     __syncthreads();
@@ -22,7 +33,7 @@ __device__ __forceinline__ scalar_t blockReduceMax(scalar_t val) {
     f_val = (threadIdx.x < blockDim.x / 32) ? shared[lane] : -1e20f;
     if (wid == 0) {
         for (int offset = 16; offset > 0; offset /= 2)
-            f_val = max(f_val, __shfl_down_sync(0xffffffff, f_val, offset));
+            f_val = max(f_val, fused_logp_shfl_down_32(f_val, offset));
     }
     return static_cast<scalar_t>(f_val);
 }
@@ -36,7 +47,7 @@ __device__ __forceinline__ scalar_t blockReduceSum(scalar_t val) {
     float f_val = static_cast<float>(val);
 
     for (int offset = 16; offset > 0; offset /= 2)
-        f_val += __shfl_down_sync(0xffffffff, f_val, offset);
+        f_val += fused_logp_shfl_down_32(f_val, offset);
 
     if (lane == 0) shared[wid] = f_val;
     __syncthreads();
@@ -44,7 +55,7 @@ __device__ __forceinline__ scalar_t blockReduceSum(scalar_t val) {
     f_val = (threadIdx.x < blockDim.x / 32) ? shared[lane] : 0.0f;
     if (wid == 0) {
         for (int offset = 16; offset > 0; offset /= 2)
-            f_val += __shfl_down_sync(0xffffffff, f_val, offset);
+            f_val += fused_logp_shfl_down_32(f_val, offset);
     }
     return static_cast<scalar_t>(f_val);
 }
@@ -82,8 +93,8 @@ __device__ __forceinline__ LogSumExpState blockReduceLogSumExp(LogSumExpState st
 
     for (int offset = 16; offset > 0; offset /= 2) {
         LogSumExpState other{
-            __shfl_down_sync(0xffffffff, state.max_val, offset),
-            __shfl_down_sync(0xffffffff, state.sum_exp, offset)};
+            fused_logp_shfl_down_32(state.max_val, offset),
+            fused_logp_shfl_down_32(state.sum_exp, offset)};
         state = merge_logsumexp_state(state, other);
     }
 
@@ -100,8 +111,8 @@ __device__ __forceinline__ LogSumExpState blockReduceLogSumExp(LogSumExpState st
     if (wid == 0) {
         for (int offset = 16; offset > 0; offset /= 2) {
             LogSumExpState other{
-                __shfl_down_sync(0xffffffff, state.max_val, offset),
-                __shfl_down_sync(0xffffffff, state.sum_exp, offset)};
+                fused_logp_shfl_down_32(state.max_val, offset),
+                fused_logp_shfl_down_32(state.sum_exp, offset)};
             state = merge_logsumexp_state(state, other);
         }
     }

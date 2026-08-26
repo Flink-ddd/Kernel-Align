@@ -96,6 +96,22 @@ OP_SPECS = {
             ),
         },
     ),
+    "cp_attention": OperatorSpec(
+        name="cp_attention",
+        op_class="attention",
+        gold_path=(
+            "rl_engine.kernels.ops.pytorch.attention.cp_attention."
+            "DeterministicCPAttentionReferenceOp"
+        ),
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": (
+                "rl_engine.kernels.ops.pytorch.attention.cp_attention."
+                "DeterministicCPAttentionReferenceOp"
+            ),
+        },
+        grad_input_names=("q", "k", "v"),
+    ),
     "logp": OperatorSpec(
         name="logp",
         op_class="logprob",

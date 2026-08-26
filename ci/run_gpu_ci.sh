@@ -197,12 +197,17 @@ TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu124}"
 # --no-build-isolation: torch must be visible to setup.py, else the extension is silently skipped.
 # --no-deps: keep the pinned torch; do not let the editable install re-resolve it.
 "$PY" -m pip install --no-build-isolation --no-deps -e .
-"$PY" -m pip install --no-cache-dir numpy tabulate accelerate "transformers==5.13.1" pytest triton
+"$PY" -m pip install --no-cache-dir numpy tabulate accelerate "transformers==5.13.1" pytest triton "flashinfer-python>=0.6.0,<0.7"
 nvidia-smi
 # Fail fast if _C did not build or cannot launch, instead of silently using native fallbacks.
 "$PY" scripts/ci_smoke.py
 # Enforce _C in the pytest suite too (test_extension_smoke.py skips unless this is set).
 export RL_KERNEL_REQUIRE_EXT=1
+"$PY" -m pytest tests/test_flashinfer_pr7_attention.py -q
+"$PY" scripts/ws2_pr7_flashinfer_attention_check.py --no-dry-run --device cuda --mode decode --split-kv-policy disabled --output artifacts/pr7-decode-disabled.json
+"$PY" scripts/ws2_pr7_flashinfer_attention_check.py --no-dry-run --device cuda --mode decode --split-kv-policy fixed --fixed-split-size 4 --output artifacts/pr7-decode-fixed.json
+"$PY" scripts/ws2_pr7_flashinfer_attention_check.py --no-dry-run --device cuda --mode prefill --query-len 4 --split-kv-policy disabled --output artifacts/pr7-prefill-disabled.json
+"$PY" scripts/ws2_pr7_flashinfer_attention_check.py --no-dry-run --device cuda --mode prefill --query-len 4 --split-kv-policy fixed --fixed-split-size 4 --output artifacts/pr7-prefill-fixed.json
 export WS1_C8_JSON=/tmp/ws1-c8-ci.json
 export WS1_WEIGHTS_PATH="'"${WS1_WEIGHTS_PATH:-}"'"
 if [ "$WS1_TEST_SUITE" = "ws1-chain" ]; then

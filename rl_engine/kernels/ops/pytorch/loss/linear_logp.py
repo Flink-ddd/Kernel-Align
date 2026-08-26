@@ -288,8 +288,25 @@ def _merge_tp_local_logp(
         dist.all_gather(chunks, local_stats, group=tp_group)
         gathered = torch.stack(chunks, dim=0)
 
-    global_lse = torch.logsumexp(gathered[:, 0, :], dim=0)
-    target_logit = gathered[:, 1, :].sum(dim=0)
+    # [contract] Explicit rank-ordered reduction trees. ``torch.logsumexp`` and
+    # ``Tensor.sum`` own their internal reduction order, which is not part of
+    # any contract; the merge order is pinned here instead:
+    #   * global max: successive maxima in ascending rank order (order-free),
+    #   * rescaled sumexp: ascending-rank sequential chain,
+    #   * target logit: ascending-rank sequential chain (exactly one rank
+    #     owns a nonzero owner value, so the chain is exact).
+    local_lse = gathered[:, 0, :]
+    local_zt = gathered[:, 1, :]
+    global_max = local_lse[0].clone()
+    for rank in range(1, world_size):
+        global_max = torch.maximum(global_max, local_lse[rank])
+    sumexp = torch.exp(local_lse[0] - global_max)
+    for rank in range(1, world_size):
+        sumexp = sumexp + torch.exp(local_lse[rank] - global_max)
+    global_lse = global_max + torch.log(sumexp)
+    target_logit = local_zt[0].clone()
+    for rank in range(1, world_size):
+        target_logit = target_logit + local_zt[rank]
     return target_logit - global_lse, global_lse
 
 

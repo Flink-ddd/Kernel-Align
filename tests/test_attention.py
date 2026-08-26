@@ -443,6 +443,18 @@ def test_registry_dispatches_native_attention_op():
     assert isinstance(op, (NativeAttentionOp, DeterministicAttentionOp))
 
 
+def test_deterministic_attention_op_exposes_shared_strict_identity():
+    from rl_engine.kernels.attention_contract import (
+        STRICT_ATTENTION_CORE_ID,
+        STRICT_ATTENTION_SCHEDULE_ID,
+    )
+    from rl_engine.kernels.ops.cuda.attention.deterministic_attn import DeterministicAttentionOp
+
+    assert DeterministicAttentionOp.core_id == STRICT_ATTENTION_CORE_ID
+    assert DeterministicAttentionOp.strict_schedule == STRICT_ATTENTION_SCHEDULE_ID
+    assert DeterministicAttentionOp.backend_id == "rlkernel.cuda.deterministic_attention"
+
+
 # --------------------------------------------------------------------------- #
 # Qwen3-8B LARGE real-scale GPU smoke test
 # --------------------------------------------------------------------------- #
