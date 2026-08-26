@@ -13,6 +13,11 @@ import torch
 from rl_engine.kernels.gtest.tolerance import load_contract
 from rl_engine.kernels.ops.base import _C
 from rl_engine.kernels.ops.cuda.matmul import deterministic_gemm
+from rl_engine.kernels.ops.cuda.matmul.det_gemm import (
+    DetGemmOp,
+    det_gemm_backend,
+    det_gemm_backend_id,
+)
 
 try:
     from rl_engine.kernels.ops.triton.matmul import deterministic_gemm_triton
@@ -37,6 +42,80 @@ if _HAS_TRITON:
 
 def _rand(*shape):
     return torch.randn(*shape, device=DEV, dtype=torch.bfloat16)
+
+
+def test_strict_backend_selection_is_explicit(monkeypatch):
+    monkeypatch.setenv("RL_KERNEL_DET_GEMM_BACKEND", "cublaslt")
+    assert det_gemm_backend() == "cublaslt_nosplitk"
+    assert det_gemm_backend_id() == "rlkernel.det_gemm.cublaslt_nosplitk.v1"
+
+    monkeypatch.setenv("RL_KERNEL_DET_GEMM_BACKEND", "unknown")
+    with pytest.raises(RuntimeError, match="RL_KERNEL_DET_GEMM_BACKEND"):
+        det_gemm_backend()
+
+
+def test_aligned_runtime_selects_cublaslt_by_default(monkeypatch):
+    monkeypatch.delenv("RL_KERNEL_DET_GEMM_BACKEND", raising=False)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    monkeypatch.setenv("CUBLASLT_WORKSPACE_SIZE", "1")
+
+    assert det_gemm_backend() == "cublaslt_nosplitk"
+
+
+def test_explicit_sm90_backend_overrides_aligned_default(monkeypatch):
+    monkeypatch.setenv("RL_KERNEL_DET_GEMM_BACKEND", "sm90")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    monkeypatch.setenv("CUBLASLT_WORKSPACE_SIZE", "1")
+
+    assert det_gemm_backend() == "sm90"
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="cuBLASLt no-split-K contract is validated on SM90",
+)
+def test_cublaslt_nosplitk_target_shape_is_batch_invariant(monkeypatch):
+    import rl_engine.kernels.ops.cuda.matmul.det_gemm as det_gemm_module
+
+    monkeypatch.setenv("RL_KERNEL_DET_GEMM_BACKEND", "cublaslt_nosplitk")
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    monkeypatch.setenv("CUBLASLT_WORKSPACE_SIZE", "1")
+    monkeypatch.setattr(det_gemm_module, "_CUBLASLT_CONFIGURED", False)
+
+    torch.manual_seed(24)
+    rows = _rand(256, 4096)
+    weight = _rand(3072, 4096)
+    op = DetGemmOp()
+    reference = op.linear(rows, weight)[0]
+
+    for row_count in (1, 2, 16, 128):
+        assert torch.equal(op.linear(rows[:row_count], weight)[0], reference)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="cuBLASLt no-split-K contract is validated on SM90",
+)
+def test_cublaslt_nosplitk_compiles_fullgraph(monkeypatch):
+    import rl_engine.kernels.ops.cuda.matmul.det_gemm as det_gemm_module
+
+    monkeypatch.setenv("RL_KERNEL_DET_GEMM_BACKEND", "cublaslt_nosplitk")
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    monkeypatch.setenv("CUBLASLT_WORKSPACE_SIZE", "1")
+    monkeypatch.setattr(det_gemm_module, "_CUBLASLT_CONFIGURED", False)
+
+    op = DetGemmOp()
+    a = _rand(2, 256)
+    weight = _rand(192, 256)
+
+    def linear(value, linear_weight):
+        return op.linear(value, linear_weight)
+
+    expected = linear(a, weight)
+    actual = torch.compile(linear, backend="eager", fullgraph=True)(a, weight)
+    assert torch.equal(actual, expected)
 
 
 # Matches det_gemm_kernel.cu: mid-split K-tree, FP32 leaf width 32, BF16 internal adds.
@@ -144,6 +223,62 @@ def test_forward_batch_invariance(name, gemm):
     assert torch.equal(out1[0], outN[0]), f"{name}: forward batch-invariance broken"
 
 
+def test_native_weight_linear_matches_gemm_bitwise_for_ragged_m():
+    torch.manual_seed(8)
+    weight = _rand(3072, 4096)
+    rows = _rand(129, 4096)
+    op = DetGemmOp()
+    for row_count in (1, 8, 16, 17, 127, 128, 129):
+        actual = op.linear(rows[:row_count], weight)
+        expected = deterministic_gemm(rows[:row_count], weight.t().contiguous())
+        assert torch.equal(
+            actual, expected
+        ), f"native-weight mismatch for M={row_count}"
+
+
+def test_decode_tile_boundary_preserves_batch_invariance():
+    torch.manual_seed(11)
+    weight = _rand(3072, 4096)
+    rows = _rand(17, 4096)
+    op = DetGemmOp()
+
+    decode = op.linear(rows[:16], weight)
+    general = op.linear(rows, weight)
+
+    assert torch.equal(decode, general[:16])
+
+
+def test_native_weight_linear_backward_matches_gemm_bitwise():
+    torch.manual_seed(9)
+    a_native = _rand(128, 256).requires_grad_(True)
+    weight_native = _rand(192, 256).requires_grad_(True)
+    a_reference = a_native.detach().clone().requires_grad_(True)
+    weight_reference = weight_native.detach().clone().requires_grad_(True)
+    grad = _rand(128, 192)
+
+    DetGemmOp().linear(a_native, weight_native).backward(grad)
+    deterministic_gemm(a_reference, weight_reference.t().contiguous()).backward(grad)
+
+    assert torch.equal(a_native.grad, a_reference.grad)
+    assert torch.equal(weight_native.grad, weight_reference.grad)
+
+
+def test_native_weight_linear_compiles_fullgraph_bitwise():
+    torch.manual_seed(10)
+    a = _rand(17, 256)
+    weight = _rand(192, 256)
+    op = DetGemmOp()
+
+    def linear(value, linear_weight):
+        return op.linear(value, linear_weight)
+
+    expected = linear(a, weight)
+    compiled = torch.compile(linear, backend="eager", fullgraph=True)
+    actual = compiled(a, weight)
+
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize("name,gemm", _BACKENDS)
 def test_forward_chunked_prefill(name, gemm):
     # Splitting M then concatenating must match the full GEMM bitwise.
@@ -179,7 +314,9 @@ def test_forward_correctness(name, gemm):
         ref = a.float() @ b.float()
     contract = load_contract()
     thresholds = contract["accuracy"]["default"]["reduction"]["bfloat16"]
-    torch.testing.assert_close(out, ref, atol=thresholds["atol"], rtol=thresholds["rtol"])
+    torch.testing.assert_close(
+        out, ref, atol=thresholds["atol"], rtol=thresholds["rtol"]
+    )
 
 
 @pytest.mark.parametrize("name,gemm", _BACKENDS)
@@ -195,7 +332,9 @@ def test_backward_batch_invariance(name, gemm):
     big[0] = row.detach()[0]
     big.requires_grad_(True)
     gemm(big, b).sum().backward()
-    assert torch.equal(g1[0], big.grad[0]), f"{name}: backward dA batch-invariance broken"
+    assert torch.equal(
+        g1[0], big.grad[0]
+    ), f"{name}: backward dA batch-invariance broken"
 
 
 @pytest.mark.parametrize("name,gemm", _BACKENDS)

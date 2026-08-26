@@ -6,7 +6,11 @@ import torch
 import torch.nn.functional as F
 
 from rl_engine.kernels.ops.cuda.norm.rmsnorm import RMSNormCudaOp, rmsnorm_cuda
-from rl_engine.kernels.ops.pytorch.norm.rms_norm import NativeRMSNormOp
+from rl_engine.kernels.ops.pytorch.norm.rms_norm import (
+    NativeRMSNormOp,
+    strict_add_rms_norm,
+    strict_rms_norm,
+)
 from rl_engine.kernels.ops.triton.rmsnorm_triton import rmsnorm_triton
 
 try:
@@ -16,13 +20,34 @@ try:
         hasattr(_C, name)
         for name in ("rmsnorm_forward", "rmsnorm_backward_dx", "rmsnorm_backward_dw")
     )
-except ImportError:  # pragma: no cover - import can fail when the extension is not built.
+except (
+    ImportError
+):  # pragma: no cover - import can fail when the extension is not built.
     _HAS_CUDA_RMSNORM = False
 
 # Qwen3-8B normalized dims this op must cover.
 _HIDDEN = 4096  # input / post-attention norm
 _HEAD_DIM = 128  # QK-Norm (per-head RMSNorm on Q and K)
 _EPS = 1e-6
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_strict_rms_norm_is_bitwise_under_inductor():
+    x = torch.randn((17, 128), device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+    weight = torch.randn((128,), device="cuda", dtype=torch.bfloat16)
+
+    expected = strict_rms_norm(x, weight, eps=_EPS)
+    expected_fused = strict_add_rms_norm(x, residual, weight, eps=_EPS)
+    compiled_norm = torch.compile(strict_rms_norm, fullgraph=True)
+    compiled_fused = torch.compile(strict_add_rms_norm, fullgraph=True)
+
+    actual = compiled_norm(x, weight, eps=_EPS)
+    actual_fused = compiled_fused(x, residual, weight, eps=_EPS)
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_fused[0], expected_fused[0])
+    assert torch.equal(actual_fused[1], expected_fused[1])
 
 
 # Shared helpers
@@ -73,8 +98,12 @@ def _build_padded_layout(x_real, dy_real, total_rows, real_positions):
     assert len(real_positions) == real_rows
     assert total_rows >= real_rows
 
-    x_pad = torch.randn((total_rows, hidden), device=device, dtype=torch.float32).to(dtype)
-    dy_pad = torch.randn((total_rows, hidden), device=device, dtype=torch.float32).to(dtype)
+    x_pad = torch.randn((total_rows, hidden), device=device, dtype=torch.float32).to(
+        dtype
+    )
+    dy_pad = torch.randn((total_rows, hidden), device=device, dtype=torch.float32).to(
+        dtype
+    )
     mask = torch.zeros((total_rows,), device=device, dtype=torch.bool)
 
     for src_t, dst_t in enumerate(real_positions):
@@ -98,7 +127,9 @@ requires_cuda_rmsnorm = pytest.mark.skipif(
     reason="CUDA RMSNorm extension is not available",
 )
 
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is required"
+)
 
 
 # 1. Primary correctness check vs PyTorch's own F.rms_norm. This is a *truly*
@@ -250,8 +281,12 @@ def test_registry_dispatches_rms_norm():
 @requires_cuda
 @pytest.mark.parametrize("impl", ["triton", "cuda"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("rows, hidden", [(1, 128), (8, 768), (32, 2048), (128, _HIDDEN)])
-def test_cuda_triton_rms_norm_matches_native_forward_and_backward(impl, dtype, rows, hidden):
+@pytest.mark.parametrize(
+    "rows, hidden", [(1, 128), (8, 768), (32, 2048), (128, _HIDDEN)]
+)
+def test_cuda_triton_rms_norm_matches_native_forward_and_backward(
+    impl, dtype, rows, hidden
+):
     if impl == "cuda" and not _HAS_CUDA_RMSNORM:
         pytest.skip("CUDA RMSNorm extension is not available")
 
@@ -278,8 +313,12 @@ def test_cuda_triton_rms_norm_matches_native_forward_and_backward(impl, dtype, r
 
     atol, rtol = _dtype_tolerance(dtype)
     dw_scale = max(1.0, rows**0.5 / 4.0)
-    torch.testing.assert_close(y_gpu.detach().cpu().float(), y_ref.detach(), atol=atol, rtol=rtol)
-    torch.testing.assert_close(x_gpu.grad.detach().cpu().float(), x_ref.grad, atol=atol, rtol=rtol)
+    torch.testing.assert_close(
+        y_gpu.detach().cpu().float(), y_ref.detach(), atol=atol, rtol=rtol
+    )
+    torch.testing.assert_close(
+        x_gpu.grad.detach().cpu().float(), x_ref.grad, atol=atol, rtol=rtol
+    )
     torch.testing.assert_close(
         w_gpu.grad.detach().cpu().float(),
         w_ref.grad,
@@ -332,7 +371,9 @@ def test_triton_rms_norm_long_context_dw_reduction():
     y_gpu.backward(dy_gpu)
 
     assert w_gpu.grad.dtype == w_gpu.dtype
-    torch.testing.assert_close(y_gpu.detach().cpu().float(), y_ref.detach(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        y_gpu.detach().cpu().float(), y_ref.detach(), atol=2e-2, rtol=2e-2
+    )
     torch.testing.assert_close(
         w_gpu.grad.detach().cpu().float(),
         w_ref.grad,

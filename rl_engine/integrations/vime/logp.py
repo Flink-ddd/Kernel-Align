@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+
 from rl_engine.integrations.ablation import Implementation, operator_ablation_case
 from rl_engine.kernels.logprob_contract import (
     LogprobContract,
@@ -31,7 +32,6 @@ from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import (
     BACKEND_ID,
     DEFAULT_NUM_VOCAB_TILES,
 )
-from rl_engine.kernels.registry import kernel_registry
 
 
 class SelectedLogprobProviderUnavailable(RuntimeError):
@@ -56,6 +56,12 @@ class ProviderResult:
 
 
 _DEFAULT_STRICT_LINEAR_LOGP: Any | None = None
+
+
+def _kernel_registry() -> Any:
+    from rl_engine.kernels.registry import kernel_registry
+
+    return kernel_registry
 
 
 def _default_strict_linear_logp() -> Any:
@@ -247,7 +253,7 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> ProviderResult:
             # explicit TP vocab reduction for the full-vocabulary entropy
             # requested by Vime's policy loss.
             entropy_contract, entropy_tiles = _contract_for_request(request)
-            entropy_dispatch = kernel_registry.get_logprob_op(
+            entropy_dispatch = _kernel_registry().get_logprob_op(
                 entropy_contract, requested_backend=BACKEND_ID
             )
             if (
@@ -314,7 +320,7 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> ProviderResult:
         )
 
     contract, num_vocab_tiles = _contract_for_request(request)
-    dispatch = kernel_registry.get_logprob_op(contract, requested_backend=BACKEND_ID)
+    dispatch = _kernel_registry().get_logprob_op(contract, requested_backend=BACKEND_ID)
     if dispatch.provenance["actual_backend"] != BACKEND_ID or dispatch.provenance["fallback"]:
         raise RuntimeError("explicit WS2 backend dispatch changed during materialization")
     if getattr(request, "with_entropy", False):
@@ -378,10 +384,13 @@ def provider(request: Any) -> ProviderResult:
 
     # PR230's P/R axis is selected independently for training and rollout.
     # The Megatron provider is only the training boundary, so a production
-    # training side must bypass the RL-Kernel integration entirely.
+    # training side must request Vime's native implementation. Returning an
+    # RL-Kernel result here would make P/P and P/R silently execute R/* logp.
     case = operator_ablation_case("logp", os.getenv("RL_KERNEL_LOGP_CASE", "P/P"))
     if case.training is Implementation.PRODUCTION:
-        return _provider_impl(request)
+        raise SelectedLogprobProviderUnavailable(
+            "production Megatron logp selected; use Vime's native implementation"
+        )
 
     from rl_engine.integrations.state import get_active_integration
 

@@ -8,6 +8,8 @@ from typing import Any, Optional
 
 import torch
 
+from rl_engine.distributed.collectives import collective_for_group
+
 # Backward token-chunk target: process at most this many ``[chunk, V]`` logit
 # elements per cuBLAS step so peak backward memory stays ~``chunk*V`` instead of
 # ``N*V``.
@@ -176,6 +178,37 @@ def _validate_tp_vocab_partition_cached(
     return int(covered)
 
 
+def _validate_even_tp_vocab_partition_local(
+    *,
+    tp_group: Any,
+    vocab_start_index: int,
+    local_vocab_size: int,
+    global_vocab_size: Optional[int],
+) -> int:
+    """Validate the strict equal-shard contract without a data-plane collective."""
+
+    dist = _require_distributed_initialized()
+    rank = dist.get_rank(group=tp_group)
+    world_size = dist.get_world_size(group=tp_group)
+    expected_global_size = local_vocab_size * world_size
+    expected_start = rank * local_vocab_size
+    if local_vocab_size <= 0:
+        raise ValueError("strict TP linear_logp requires a non-empty vocab shard.")
+    if vocab_start_index != expected_start:
+        raise ValueError(
+            "strict TP linear_logp requires equal rank-ordered vocab shards: "
+            f"rank={rank} expected vocab_start_index={expected_start}, "
+            f"got {vocab_start_index}."
+        )
+    if global_vocab_size is not None and int(global_vocab_size) != expected_global_size:
+        raise ValueError(
+            "strict TP linear_logp global_vocab_size must equal "
+            f"local_vocab_size * world_size={expected_global_size}, "
+            f"got {global_vocab_size}."
+        )
+    return expected_global_size
+
+
 def _validate_global_targets(
     target_1d: torch.Tensor,
     global_vocab_size: int,
@@ -209,6 +242,18 @@ def _validate_global_targets(
             f"got [{t_min}, {t_max}]. Mask or filter padding / ignore-index values "
             "(e.g. -100) before this op."
         )
+
+
+def _assert_global_targets_async(
+    target_1d: torch.Tensor,
+    global_vocab_size: int,
+) -> None:
+    """Range-check targets without synchronizing the CUDA hot path."""
+    torch._assert_async(
+        ((target_1d >= 0) & (target_1d < global_vocab_size)).all(),
+        f"target_ids out of range: expected [0, {global_vocab_size - 1}]. "
+        "Mask or filter padding / ignore-index values (e.g. -100) before this op.",
+    )
 
 
 def _chunked_local_linear_logp_stats(
@@ -276,17 +321,30 @@ def _merge_tp_local_logp(
         return local_target_logit - global_lse, global_lse
 
     local_stats = torch.stack((local_lse, local_target_logit), dim=0).contiguous()
-    gathered = torch.empty(
-        (world_size, *local_stats.shape),
-        device=local_stats.device,
-        dtype=local_stats.dtype,
-    )
-    try:
-        dist.all_gather_into_tensor(gathered, local_stats, group=tp_group)
-    except (AttributeError, RuntimeError):
-        chunks = [torch.empty_like(local_stats) for _ in range(world_size)]
-        dist.all_gather(chunks, local_stats, group=tp_group)
-        gathered = torch.stack(chunks, dim=0)
+    if local_stats.is_cuda:
+        collective = collective_for_group(
+            tp_group,
+            min_size_bytes=local_stats.numel() * local_stats.element_size(),
+            device=local_stats.device,
+        )
+        if collective is None:
+            raise RuntimeError("tensor-parallel linear_logp requires an RL-Kernel collective")
+        gathered = collective.all_gather(
+            local_stats,
+            validate_signature=False,
+        ).reshape(world_size, *local_stats.shape)
+    else:
+        gathered = torch.empty(
+            (world_size, *local_stats.shape),
+            device=local_stats.device,
+            dtype=local_stats.dtype,
+        )
+        try:
+            dist.all_gather_into_tensor(gathered, local_stats, group=tp_group)
+        except (AttributeError, RuntimeError):
+            chunks = [torch.empty_like(local_stats) for _ in range(world_size)]
+            dist.all_gather(chunks, local_stats, group=tp_group)
+            gathered = torch.stack(chunks, dim=0)
 
     # [contract] Explicit rank-ordered reduction trees. ``torch.logsumexp`` and
     # ``Tensor.sum`` own their internal reduction order, which is not part of
@@ -310,6 +368,25 @@ def _merge_tp_local_logp(
     return target_logit - global_lse, global_lse
 
 
+def _deterministic_tp_all_reduce_(tensor: torch.Tensor, tp_group: Any) -> torch.Tensor:
+    if not tensor.is_cuda:
+        dist = _require_distributed_initialized()
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=tp_group)
+        return tensor
+    collective = collective_for_group(
+        tp_group,
+        min_size_bytes=tensor.numel() * tensor.element_size(),
+        device=tensor.device,
+    )
+    if collective is None:
+        raise RuntimeError("tensor-parallel linear_logp requires an RL-Kernel collective")
+    return collective.all_reduce(
+        tensor.contiguous(),
+        out=tensor,
+        validate_signature=False,
+    )
+
+
 def tensor_parallel_linear_logp_backward(
     grad_logp: torch.Tensor,
     hidden_2d: torch.Tensor,
@@ -330,7 +407,6 @@ def tensor_parallel_linear_logp_backward(
     compute_grad_bias: bool = True,
     chunk_elems: int = BWD_CHUNK_ELEMS,
 ):
-    dist = _require_distributed_initialized()
     n, d = hidden_2d.shape
     local_vocab = weight.shape[0]
     dt = weight.dtype
@@ -384,7 +460,7 @@ def tensor_parallel_linear_logp_backward(
 
     grad_hidden = None
     if grad_h is not None:
-        dist.all_reduce(grad_h, op=dist.ReduceOp.SUM, group=tp_group)
+        _deterministic_tp_all_reduce_(grad_h, tp_group)
         grad_hidden = grad_h.to(hidden_dtype).reshape((*tuple(lead_shape), d))
     grad_weight = grad_w.to(weight_dtype) if grad_w is not None else None
     grad_bias = grad_b.to(bias_dtype) if grad_b is not None else None

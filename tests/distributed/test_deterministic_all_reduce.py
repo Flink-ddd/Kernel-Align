@@ -13,6 +13,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from rl_engine.distributed import DeterministicCollective
+from rl_engine.distributed.collectives import deterministic_all_reduce_inplace
 
 _MAX_WORLD_SIZE = 8
 _TP_SIZES = (1, 2, 4, 8)
@@ -58,7 +59,9 @@ def _worker(rank: int, port: int) -> None:
         timeout=timedelta(minutes=5),
     )
     try:
-        groups = {tp_size: dist.new_group(ranks=list(range(tp_size))) for tp_size in _TP_SIZES}
+        groups = {
+            tp_size: dist.new_group(ranks=list(range(tp_size))) for tp_size in _TP_SIZES
+        }
         for tp_size, group in groups.items():
             if rank < tp_size:
                 with DeterministicCollective(
@@ -78,14 +81,19 @@ def _worker(rank: int, port: int) -> None:
                             generator=generator,
                         ).to(device=device, dtype=dtype)
                         leaves = list(leaves_tensor.unbind())
-                        input = _fixed_tree_reference(leaves[start : start + leaves_per_rank])
+                        input = _fixed_tree_reference(
+                            leaves[start : start + leaves_per_rank]
+                        )
                         expected = _fixed_tree_reference(leaves)
 
                         output = collective.all_reduce(input)
                         assert torch.equal(output, expected)
 
                         peer_outputs = _all_gather_tensors(output, group, tp_size)
-                        assert all(torch.equal(peer_output, output) for peer_output in peer_outputs)
+                        assert all(
+                            torch.equal(peer_output, output)
+                            for peer_output in peer_outputs
+                        )
 
                         baseline = output.clone()
                         for _ in range(3):
@@ -96,6 +104,46 @@ def _worker(rank: int, port: int) -> None:
                         returned = collective.all_reduce(inplace, out=inplace)
                         assert returned is inplace
                         assert torch.equal(inplace, expected)
+
+                        if tp_size == 2 and dtype is torch.bfloat16:
+                            compiled_input = input.clone()
+                            compiled = torch.compile(
+                                deterministic_all_reduce_inplace,
+                                backend="eager",
+                                fullgraph=True,
+                            )
+                            compiled_output = compiled(
+                                compiled_input,
+                                collective_handle=int(collective._handle),
+                            )
+                            assert compiled_output is compiled_input
+                            assert torch.equal(compiled_output, expected)
+
+                            graph_base = (
+                                torch.arange(257, device=device, dtype=torch.float32)
+                                .div_(64)
+                                .to(torch.bfloat16)
+                            )
+                            graph_input = graph_base + group_rank
+                            graph = torch.cuda.CUDAGraph()
+                            dist.barrier(group=group)
+                            torch.cuda.synchronize(device)
+                            with torch.cuda.graph(graph):
+                                deterministic_all_reduce_inplace(
+                                    graph_input,
+                                    collective_handle=int(collective._handle),
+                                )
+                            for replay in range(3):
+                                graph_input.copy_(graph_base + group_rank + replay)
+                                graph.replay()
+                                torch.cuda.synchronize(device)
+                                expected_graph = _fixed_tree_reference(
+                                    [
+                                        graph_base + peer_rank + replay
+                                        for peer_rank in range(tp_size)
+                                    ]
+                                )
+                                assert torch.equal(graph_input, expected_graph)
             dist.barrier()
     finally:
         dist.destroy_process_group()

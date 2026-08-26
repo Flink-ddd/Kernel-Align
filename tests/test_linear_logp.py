@@ -126,6 +126,133 @@ def _tp_linear_logp_gloo_worker(rank, world_size, init_method, result_queue):
             torch.distributed.destroy_process_group()
 
 
+def _tp_linear_logp_rl_collective_worker(rank, world_size, init_method, result_queue):
+    collective_module = None
+    try:
+        import torch.distributed as dist
+
+        from rl_engine.distributed import collectives as collective_module
+        from rl_engine.kernels.ops.pytorch.loss.linear_logp import (
+            _deterministic_tp_all_reduce_,
+            _merge_tp_local_logp,
+        )
+        from rl_engine.kernels.ops.base import _C
+        from rl_engine.kernels.ops.cuda.loss.linear_logp import (
+            sm90_deterministic_linear_logp_tp,
+            sm90_deterministic_logp_from_local_logits_tp,
+        )
+
+        torch.cuda.set_device(rank)
+        dist.init_process_group(
+            backend="nccl",
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size,
+        )
+        device = torch.device("cuda", rank)
+        peer_lse = torch.tensor(
+            [[1.25, -2.0, 3.0], [0.5, -1.0, 2.5]],
+            device=device,
+            dtype=torch.float32,
+        )
+        peer_target = torch.tensor(
+            [[5.0, 0.0, 7.0], [0.0, 6.0, 0.0]],
+            device=device,
+            dtype=torch.float32,
+        )
+        local_lse = peer_lse[rank].contiguous()
+        local_target = peer_target[rank].contiguous()
+
+        # The first call performs the one-time CUDA IPC handle exchange.
+        _merge_tp_local_logp(local_lse, local_target, tp_group=dist.group.WORLD)
+
+        forbidden_names = (
+            "all_gather",
+            "all_gather_into_tensor",
+            "all_gather_object",
+            "all_reduce",
+        )
+        saved = {name: getattr(dist, name) for name in forbidden_names}
+
+        def forbidden(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError("steady-state CUDA linear_logp used torch.distributed data plane")
+
+        for name in forbidden_names:
+            setattr(dist, name, forbidden)
+        try:
+            logp, lse = _merge_tp_local_logp(
+                local_lse,
+                local_target,
+                tp_group=dist.group.WORLD,
+            )
+            reduce_input = (
+                torch.tensor([1.0, -2.0], device=device)
+                if rank == 0
+                else torch.tensor([3.0, 4.0], device=device)
+            )
+            reduced = _deterministic_tp_all_reduce_(reduce_input, dist.group.WORLD)
+            hidden = (
+                torch.arange(3 * 32, device=device, dtype=torch.float32)
+                .reshape(3, 32)
+                .div_(128)
+                .to(torch.bfloat16)
+            )
+            weight = (
+                torch.arange(64 * 32, device=device, dtype=torch.float32)
+                .reshape(64, 32)
+                .add_(rank * 64 * 32)
+                .div_(4096)
+                .to(torch.bfloat16)
+            )
+            target = torch.tensor([0, 64, 127], device=device)
+            recomputed, _ = sm90_deterministic_linear_logp_tp(
+                hidden,
+                weight,
+                target,
+                vocab_start_index=rank * 64,
+                global_vocab_size=128,
+                real_vocab_size=128,
+                tp_group=dist.group.WORLD,
+            )
+            local_logits = _C.det_gemm_fwd_weight(hidden, weight)
+            reused, _ = sm90_deterministic_logp_from_local_logits_tp(
+                local_logits,
+                target,
+                vocab_start_index=rank * 64,
+                global_vocab_size=128,
+                real_vocab_size=128,
+                tp_group=dist.group.WORLD,
+            )
+        finally:
+            for name, function in saved.items():
+                setattr(dist, name, function)
+
+        global_max = torch.maximum(peer_lse[0], peer_lse[1])
+        expected_lse = global_max + torch.log(
+            torch.exp(peer_lse[0] - global_max) + torch.exp(peer_lse[1] - global_max)
+        )
+        expected_logp = peer_target[0] + peer_target[1] - expected_lse
+        assert torch.equal(lse, expected_lse)
+        assert torch.equal(logp, expected_logp)
+        assert torch.equal(reduced, torch.tensor([4.0, 2.0], device=device))
+        assert torch.equal(reused, recomputed)
+        result_queue.put({"ok": True, "rank": rank})
+    except Exception:  # pragma: no cover - forwarded to parent process
+        result_queue.put({"ok": False, "rank": rank, "traceback": traceback.format_exc()})
+        raise
+    finally:
+        if collective_module is not None:
+            try:
+                for collective in list(collective_module._COLLECTIVES.values()):
+                    collective.close()
+                collective_module._COLLECTIVES.clear()
+            except Exception:
+                pass
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
 # SM90 forward needs bf16 and a hidden dim that is a multiple of the kernel's K
 # slice (32); N / V are deliberately left unaligned to the 64-wide tiles.
 _SM90_N = 96
@@ -477,6 +604,47 @@ def test_native_tensor_parallel_matches_full_reference_cpu_gloo_4_ranks():
         assert result["hidden_grad"] < 1e-5
         assert result["weight_grad"] < 1e-5
         assert result["bias_grad"] < 1e-5
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="RL-Kernel TP linear_logp collective test requires two CUDA devices.",
+)
+def test_tp_linear_logp_uses_rl_collectives_without_torch_distributed_steady_state():
+    ctx = mp.get_context("spawn")
+    world_size = 2
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_method = (Path(tmpdir) / "nccl_init").as_uri()
+        result_queue = ctx.Queue()
+        processes = [
+            ctx.Process(
+                target=_tp_linear_logp_rl_collective_worker,
+                args=(rank, world_size, init_method, result_queue),
+            )
+            for rank in range(world_size)
+        ]
+        for process in processes:
+            process.start()
+
+        results = []
+        try:
+            for _ in processes:
+                results.append(result_queue.get(timeout=90))
+        except queue.Empty:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+            pytest.fail("timed out waiting for RL-Kernel TP linear_logp workers")
+        finally:
+            for process in processes:
+                process.join(timeout=10)
+                if process.is_alive():
+                    process.terminate()
+
+    for result in sorted(results, key=lambda item: item["rank"]):
+        assert result["ok"], result.get("traceback")
+    for process in processes:
+        assert process.exitcode == 0
 
 
 @requires_triton_cuda
@@ -1256,6 +1424,165 @@ def test_sm90_backward_prefers_fused_extension_when_available(monkeypatch):
     assert grad_hidden is None
     assert torch.equal(grad_weight, torch.ones_like(weight))
     assert torch.equal(grad_bias, torch.ones_like(bias))
+
+
+def test_strict_tp_hot_path_avoids_validation_collectives_and_weight_transpose(
+    monkeypatch,
+):
+    from rl_engine.kernels.ops.cuda.loss import linear_logp as cuda_linear_logp
+
+    calls = {}
+
+    class FakeC:
+        @staticmethod
+        def det_gemm_fwd_weight(hidden, weight):
+            calls["gemm_weight"] = weight
+            return hidden.new_zeros((hidden.size(0), weight.size(0)))
+
+        @staticmethod
+        def linear_logp_local_bf16_forward(logits, target, vocab_start):
+            del vocab_start
+            return (
+                torch.zeros_like(target, dtype=torch.float32),
+                torch.zeros_like(target, dtype=torch.float32),
+            )
+
+        @staticmethod
+        def linear_logp_logits_bf16_to_dlogits(*args):
+            del args
+
+    hidden = torch.randn(2, 8, dtype=torch.bfloat16)
+    weight = torch.randn(4, 8, dtype=torch.bfloat16)
+    target = torch.tensor([1, 5], dtype=torch.long)
+
+    monkeypatch.delenv("RL_KERNEL_LINEAR_LOGP_VALIDATE_TP_TARGETS", raising=False)
+    monkeypatch.delenv("VIME_RL_KERNEL_VALIDATE_TP_TARGETS", raising=False)
+    monkeypatch.setattr(cuda_linear_logp, "_EXT_AVAILABLE", True)
+    monkeypatch.setattr(cuda_linear_logp, "_C", FakeC)
+    monkeypatch.setattr(
+        cuda_linear_logp,
+        "_validate_tp_vocab_partition_cached",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("strict TP must not call synchronized partition validation")
+        ),
+    )
+    monkeypatch.setattr(
+        cuda_linear_logp,
+        "_validate_even_tp_vocab_partition_local",
+        lambda **kwargs: kwargs["global_vocab_size"],
+    )
+    monkeypatch.setattr(
+        cuda_linear_logp,
+        "_require_distributed_initialized",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("default strict TP validation must not issue all_reduce")
+        ),
+    )
+    monkeypatch.setattr(
+        cuda_linear_logp,
+        "_merge_tp_local_logp",
+        lambda local_lse, local_target, **kwargs: (
+            local_target - local_lse,
+            local_lse,
+        ),
+    )
+
+    logp, lse, *_ = cuda_linear_logp._strict_tp_run(
+        hidden,
+        weight,
+        None,
+        target,
+        vocab_start=0,
+        global_vocab=8,
+        real_vocab=8,
+        temperature=None,
+        tp_group=object(),
+    )
+
+    assert logp.shape == target.shape
+    assert lse.shape == target.shape
+    assert calls["gemm_weight"].data_ptr() == weight.data_ptr()
+
+
+def test_strict_tp_synchronized_validation_is_opt_in(monkeypatch):
+    from rl_engine.kernels.ops.cuda.loss import linear_logp as cuda_linear_logp
+
+    calls = {"target_validation": 0, "all_reduce": 0}
+
+    class FakeC:
+        @staticmethod
+        def det_gemm_fwd_weight(hidden, weight):
+            return hidden.new_zeros((hidden.size(0), weight.size(0)))
+
+        @staticmethod
+        def linear_logp_local_bf16_forward(logits, target, vocab_start):
+            del logits, vocab_start
+            return (
+                torch.zeros_like(target, dtype=torch.float32),
+                torch.zeros_like(target, dtype=torch.float32),
+            )
+
+        @staticmethod
+        def linear_logp_logits_bf16_to_dlogits(*args):
+            del args
+
+    class FakeDist:
+        class ReduceOp:
+            SUM = object()
+
+        @staticmethod
+        def all_reduce(tensor, **kwargs):
+            del tensor, kwargs
+            calls["all_reduce"] += 1
+
+    monkeypatch.setenv("RL_KERNEL_LINEAR_LOGP_VALIDATE_TP_TARGETS", "1")
+    monkeypatch.setattr(cuda_linear_logp, "_EXT_AVAILABLE", True)
+    monkeypatch.setattr(cuda_linear_logp, "_C", FakeC)
+    monkeypatch.setattr(
+        cuda_linear_logp,
+        "_validate_tp_vocab_partition_cached",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("strict TP must not call synchronized partition validation")
+        ),
+    )
+    monkeypatch.setattr(
+        cuda_linear_logp,
+        "_validate_even_tp_vocab_partition_local",
+        lambda **kwargs: kwargs["global_vocab_size"],
+    )
+    monkeypatch.setattr(
+        cuda_linear_logp,
+        "_validate_global_targets",
+        lambda *args, **kwargs: calls.__setitem__(
+            "target_validation", calls["target_validation"] + 1
+        ),
+    )
+    monkeypatch.setattr(cuda_linear_logp, "_require_distributed_initialized", FakeDist)
+    monkeypatch.setattr(
+        cuda_linear_logp,
+        "_merge_tp_local_logp",
+        lambda local_lse, local_target, **kwargs: (
+            local_target - local_lse,
+            local_lse,
+        ),
+    )
+
+    hidden = torch.randn(2, 8, dtype=torch.bfloat16)
+    weight = torch.randn(4, 8, dtype=torch.bfloat16)
+    target = torch.tensor([1, 2], dtype=torch.long)
+    cuda_linear_logp._strict_tp_run(
+        hidden,
+        weight,
+        None,
+        target,
+        vocab_start=0,
+        global_vocab=8,
+        real_vocab=8,
+        temperature=None,
+        tp_group=object(),
+    )
+
+    assert calls == {"target_validation": 1, "all_reduce": 1}
 
 
 def test_registry_dispatch_matches_native():

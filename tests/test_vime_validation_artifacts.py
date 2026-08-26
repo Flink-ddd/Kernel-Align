@@ -75,3 +75,45 @@ def test_vime_artifacts_reject_triton_even_when_values_match(tmp_path):
 
     assert report["passed"] is False
     assert "vllm/rollout attention used Triton" in report["readbacks"]["errors"]
+
+
+def test_vime_artifacts_accept_successful_zero_threshold_runtime_assertion(tmp_path):
+    readbacks = tmp_path / "readbacks"
+    train_data = tmp_path / "train-data"
+    readbacks.mkdir()
+    train_data.mkdir()
+    _write_readback(readbacks, "megatron", "training")
+    _write_readback(readbacks, "vllm", "rollout")
+    rollout = [torch.tensor([-1.25]), torch.tensor([-2.5, -3.0])]
+    torch.save({"rollout_data": {"rollout_log_probs": rollout}}, train_data / "0.pt")
+
+    report = validate_artifacts(
+        readbacks,
+        train_data,
+        runtime_ci_zero_threshold_passed=True,
+    )
+
+    assert report["passed"] is True
+    assert report["train_rollout_logp"]["comparison_mode"] == "runtime_ci_zero_threshold"
+    assert report["train_rollout_logp"]["runtime_asserted_sample_count"] == 2
+    assert report["train_rollout_logp"]["element_count"] == 3
+
+
+def test_vime_artifacts_reject_missing_training_values_without_runtime_assertion(tmp_path):
+    readbacks = tmp_path / "readbacks"
+    train_data = tmp_path / "train-data"
+    readbacks.mkdir()
+    train_data.mkdir()
+    _write_readback(readbacks, "megatron", "training")
+    _write_readback(readbacks, "vllm", "rollout")
+    torch.save(
+        {"rollout_data": {"rollout_log_probs": [torch.tensor([-1.25])]}},
+        train_data / "0.pt",
+    )
+
+    report = validate_artifacts(readbacks, train_data)
+
+    assert report["passed"] is False
+    assert "no successful zero-threshold runtime CI assertion" in " ".join(
+        report["train_rollout_logp"]["errors"]
+    )

@@ -109,9 +109,13 @@ void deterministic_collective_all_gather(int64_t handle, torch::Tensor& output);
 
 // Batch-Invariant Deterministic GEMM Declarations
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
+torch::Tensor det_gemm_fwd_weight(torch::Tensor a, torch::Tensor weight);
 torch::Tensor det_gemm_fwd_rhs_transposed(torch::Tensor a, torch::Tensor bt);
+bool det_gemm_sm90_compiled();
 torch::Tensor det_gemm_da(torch::Tensor dc, torch::Tensor b);
 torch::Tensor det_gemm_db(torch::Tensor a, torch::Tensor dc);
+torch::Tensor det_gemm_da_weight(torch::Tensor dc, torch::Tensor weight);
+torch::Tensor det_gemm_dw(torch::Tensor a, torch::Tensor dc);
 torch::Tensor det_gemm_db_transposed(torch::Tensor a, torch::Tensor dc);
 // SiLU / SwiGLU Declarations (elementwise activation, general CUDA)
 torch::Tensor silu_forward_cuda(torch::Tensor x);
@@ -121,6 +125,10 @@ std::vector<torch::Tensor> swiglu_backward_cuda(
     torch::Tensor dy,
     torch::Tensor gate,
     torch::Tensor up);
+torch::Tensor swiglu_packed_forward_cuda(torch::Tensor gate_up);
+std::vector<torch::Tensor> swiglu_packed_backward_cuda(
+    torch::Tensor dy,
+    torch::Tensor gate_up);
 
 // RMSNorm Declarations & Wrappers
 
@@ -251,6 +259,16 @@ std::vector<torch::Tensor> swiglu_backward(
     torch::Tensor gate,
     torch::Tensor up) {
   return swiglu_backward_cuda(dy, gate, up);
+}
+
+torch::Tensor swiglu_packed_forward(torch::Tensor gate_up) {
+  return swiglu_packed_forward_cuda(gate_up);
+}
+
+std::vector<torch::Tensor> swiglu_packed_backward(
+    torch::Tensor dy,
+    torch::Tensor gate_up) {
+  return swiglu_packed_backward_cuda(dy, gate_up);
 }
 
 // Deterministic standard-softmax attention (issue #147)
@@ -422,16 +440,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // registry Batch-Invariant Deterministic GEMM
     m.def("det_gemm_fwd", &det_gemm_fwd, "Batch-invariant deterministic GEMM forward (C=A@B)");
-    m.def(
-        "det_gemm_fwd_rhs_transposed",
-        &det_gemm_fwd_rhs_transposed,
-        "Batch-invariant deterministic GEMM with physical Bt[N,K] (C=A@Bt^T)");
+    m.def("det_gemm_fwd_weight", &det_gemm_fwd_weight,
+          "Batch-invariant deterministic linear forward (C=A@weight^T)");
+    m.def("det_gemm_fwd_rhs_transposed", &det_gemm_fwd_rhs_transposed,
+          "Batch-invariant deterministic GEMM with physical Bt[N,K] (C=A@Bt^T)");
+    m.def("det_gemm_sm90_compiled", &det_gemm_sm90_compiled,
+          "Whether deterministic GEMM was built with its SM90 path");
     m.def("det_gemm_da", &det_gemm_da, "Batch-invariant deterministic GEMM backward dA (dC@B^T)");
     m.def("det_gemm_db", &det_gemm_db, "Batch-invariant deterministic GEMM backward dB (A^T@dC)");
-    m.def(
-        "det_gemm_db_transposed",
-        &det_gemm_db_transposed,
-        "Batch-invariant deterministic GEMM backward in canonical [N,K] layout");
+    m.def("det_gemm_da_weight", &det_gemm_da_weight,
+          "Batch-invariant deterministic linear backward dA (dC@weight)");
+    m.def("det_gemm_dw", &det_gemm_dw,
+          "Batch-invariant deterministic linear backward dWeight (dC^T@A)");
+    m.def("det_gemm_db_transposed", &det_gemm_db_transposed,
+          "Batch-invariant deterministic GEMM backward in canonical [N,K] layout");
     // registry RMSNorm
     m.def("rmsnorm_forward", &rmsnorm_forward, "Batch-invariant RMSNorm forward CUDA");
     m.def("rmsnorm_backward_dx", &rmsnorm_backward_dx, "Batch-invariant RMSNorm backward dx CUDA");
@@ -442,6 +464,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("silu_backward", &silu_backward, "Batch-invariant SiLU backward CUDA");
     m.def("swiglu_forward", &swiglu_forward, "Batch-invariant SwiGLU forward CUDA");
     m.def("swiglu_backward", &swiglu_backward, "Batch-invariant SwiGLU backward CUDA");
+    m.def("swiglu_packed_forward", &swiglu_packed_forward,
+          "Batch-invariant SwiGLU forward for [rows, 2 * intermediate]");
+    m.def("swiglu_packed_backward", &swiglu_packed_backward,
+          "Batch-invariant SwiGLU backward for [rows, 2 * intermediate]");
 
     // Deterministic standard-softmax attention (issue #147)
     m.def(

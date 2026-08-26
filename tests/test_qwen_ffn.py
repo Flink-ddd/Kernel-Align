@@ -24,15 +24,19 @@ from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 from rl_engine.kernels.ops.pytorch.ffn.ffn import (
     QWEN3_8B_HIDDEN_SIZE,
     QWEN3_8B_INTERMEDIATE_SIZE,
+    Qwen3FFNOp,
     qwen3_ffn,
+    qwen3_ffn_packed_inference,
 )
 
 _REQUIRED_SYMBOLS = (
-    "det_gemm_fwd",
-    "det_gemm_fwd_rhs_transposed",
-    "det_gemm_db_transposed",
+    "det_gemm_fwd_weight",
+    "det_gemm_da_weight",
+    "det_gemm_dw",
     "swiglu_forward",
     "swiglu_backward",
+    "swiglu_packed_forward",
+    "swiglu_packed_backward",
 )
 _HIDDEN = 64
 _INTERMEDIATE = 512
@@ -42,20 +46,29 @@ _TOKEN_BOUNDARY_COUNTS = (8, 31, 32, 33, 64, 96, 128)
 _WORLD2_CONFIGS = (
     ("tp2_sp", 2, 1, True, _TOPOLOGY_TOKENS),
     ("cp2", 1, 2, False, _TOPOLOGY_TOKENS),
-    *((f"cp2_T{token_count}", 1, 2, False, token_count) for token_count in _CP_TOKEN_COUNTS),
+    *(
+        (f"cp2_T{token_count}", 1, 2, False, token_count)
+        for token_count in _CP_TOKEN_COUNTS
+    ),
 )
 _WORLD4_CONFIGS = (
     ("tp4", 4, 1, False, _TOPOLOGY_TOKENS),
     ("cp4", 1, 4, False, _TOPOLOGY_TOKENS),
     ("tp2_cp2", 2, 2, False, _TOPOLOGY_TOKENS),
     ("tp2_cp2_sp", 2, 2, True, _TOPOLOGY_TOKENS),
-    *((f"cp4_T{token_count}", 1, 4, False, token_count) for token_count in _CP_TOKEN_COUNTS),
+    *(
+        (f"cp4_T{token_count}", 1, 4, False, token_count)
+        for token_count in _CP_TOKEN_COUNTS
+    ),
 )
 _WORLD8_WORLD_GROUP_CONFIGS = (
     ("tp8", 8, 1, False, _TOPOLOGY_TOKENS),
     ("tp8_sp", 8, 1, True, _TOPOLOGY_TOKENS),
     ("cp8", 1, 8, False, _TOPOLOGY_TOKENS),
-    *((f"cp8_T{token_count}", 1, 8, False, token_count) for token_count in _CP_TOKEN_COUNTS),
+    *(
+        (f"cp8_T{token_count}", 1, 8, False, token_count)
+        for token_count in _CP_TOKEN_COUNTS
+    ),
 )
 _WORLD8_TP2_CP4_CONFIGS = (("tp2_cp4", 2, 4, False, _TOPOLOGY_TOKENS),)
 _WORLD8_TP4_CP2_CONFIGS = (
@@ -70,7 +83,9 @@ def _has_sm90_ffn_devices(count: int) -> bool:
         and torch.distributed.is_available()
         and torch.distributed.is_nccl_available()
         and torch.cuda.device_count() >= count
-        and all(torch.cuda.get_device_capability(index)[0] == 9 for index in range(count))
+        and all(
+            torch.cuda.get_device_capability(index)[0] == 9 for index in range(count)
+        )
         and all(hasattr(_C, name) for name in _REQUIRED_SYMBOLS)
     )
 
@@ -94,17 +109,17 @@ class _TorchKernelStub:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def det_gemm_fwd(self, a, b):
-        self.calls.append("det_gemm_fwd")
-        return a @ b
+    def det_gemm_fwd_weight(self, a, weight):
+        self.calls.append("det_gemm_fwd_weight")
+        return a @ weight.t()
 
-    def det_gemm_fwd_rhs_transposed(self, a, bt):
-        self.calls.append("det_gemm_fwd_rhs_transposed")
-        return a @ bt.t()
+    def det_gemm_da_weight(self, grad_output, weight):
+        self.calls.append("det_gemm_da_weight")
+        return grad_output @ weight
 
-    def det_gemm_db_transposed(self, a, grad_output):
-        self.calls.append("det_gemm_db_transposed")
-        return grad_output.t() @ a
+    def det_gemm_dw(self, a, grad_output):
+        self.calls.append("det_gemm_dw")
+        return grad_output.t().contiguous() @ a
 
     def swiglu_forward(self, gate, up):
         self.calls.append("swiglu_forward")
@@ -112,6 +127,19 @@ class _TorchKernelStub:
 
     def swiglu_backward(self, grad_output, gate, up):
         self.calls.append("swiglu_backward")
+        sigmoid = torch.sigmoid(gate)
+        grad_gate = grad_output * up * sigmoid * (1.0 + gate * (1.0 - sigmoid))
+        grad_up = grad_output * gate * sigmoid
+        return grad_gate, grad_up
+
+    def swiglu_packed_forward(self, gate_up):
+        self.calls.append("swiglu_packed_forward")
+        gate, up = gate_up.chunk(2, dim=-1)
+        return gate * torch.sigmoid(gate) * up
+
+    def swiglu_packed_backward(self, grad_output, gate_up):
+        self.calls.append("swiglu_packed_backward")
+        gate, up = gate_up.chunk(2, dim=-1)
         sigmoid = torch.sigmoid(gate)
         grad_gate = grad_output * up * sigmoid * (1.0 + gate * (1.0 - sigmoid))
         grad_up = grad_output * gate * sigmoid
@@ -160,9 +188,13 @@ def _shard_ranges(
     return token_start, token_end, feat_start, feat_end
 
 
-def _spawn_nccl_workers(worker, world_size: int, worker_args=(), *, timeout: int = 180) -> None:
+def _spawn_nccl_workers(
+    worker, world_size: int, worker_args=(), *, timeout: int = 180
+) -> None:
     if not _has_sm90_ffn_devices(world_size):
-        pytest.skip(f"requires {world_size} SM90 GPUs, NCCL, and the GEMM/SwiGLU extension")
+        pytest.skip(
+            f"requires {world_size} SM90 GPUs, NCCL, and the GEMM/SwiGLU extension"
+        )
 
     ctx = mp.get_context("spawn")
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -343,7 +375,9 @@ def _distributed_ffn_backward_nccl_worker(
         ), "FFN input gradient changed with the local token batch size"
         result_queue.put({"ok": True, "rank": rank})
     except Exception:  # pragma: no cover - forwarded to the parent process.
-        result_queue.put({"ok": False, "rank": rank, "traceback": traceback.format_exc()})
+        result_queue.put(
+            {"ok": False, "rank": rank, "traceback": traceback.format_exc()}
+        )
         raise
     finally:
         _close_ffn_collectives()
@@ -351,7 +385,9 @@ def _distributed_ffn_backward_nccl_worker(
             torch.distributed.destroy_process_group()
 
 
-def _tp1_vs_tpn_train_infer_worker(rank, world_size, init_method, result_queue, expect_match):
+def _tp1_vs_tpn_train_infer_worker(
+    rank, world_size, init_method, result_queue, expect_match
+):
     try:
         import torch.distributed as dist
 
@@ -364,7 +400,9 @@ def _tp1_vs_tpn_train_infer_worker(rank, world_size, init_method, result_queue, 
         )
         device = torch.device("cuda", rank)
         token_count, hidden_size, intermediate_size = 16, 64, 256
-        hidden = _randn((token_count, hidden_size), seed=50, device=device, dtype=torch.bfloat16)
+        hidden = _randn(
+            (token_count, hidden_size), seed=50, device=device, dtype=torch.bfloat16
+        )
         gate_weight = _randn(
             (intermediate_size, hidden_size),
             seed=51,
@@ -396,7 +434,9 @@ def _tp1_vs_tpn_train_infer_worker(rank, world_size, init_method, result_queue, 
         ]
         train_tp1 = qwen3_ffn(*tp1_inputs)
         train_tp1.backward(grad_output)
-        assert torch.equal(infer_tp1, train_tp1.detach()), "TP=1 train/infer forward mismatch"
+        assert torch.equal(
+            infer_tp1, train_tp1.detach()
+        ), "TP=1 train/infer forward mismatch"
 
         local_i = intermediate_size // world_size
         feat_start = rank * local_i
@@ -425,9 +465,15 @@ def _tp1_vs_tpn_train_infer_worker(rank, world_size, init_method, result_queue, 
             assert train_match, f"TP=1 vs TP={world_size} train forward mismatch"
             assert hidden_match, f"TP=1 vs TP={world_size} hidden grad mismatch"
         else:
-            assert not infer_match, f"TP=1 vs TP={world_size} infer forward unexpectedly matched"
-            assert not train_match, f"TP=1 vs TP={world_size} train forward unexpectedly matched"
-            assert not hidden_match, f"TP=1 vs TP={world_size} hidden grad unexpectedly matched"
+            assert (
+                not infer_match
+            ), f"TP=1 vs TP={world_size} infer forward unexpectedly matched"
+            assert (
+                not train_match
+            ), f"TP=1 vs TP={world_size} train forward unexpectedly matched"
+            assert (
+                not hidden_match
+            ), f"TP=1 vs TP={world_size} hidden grad unexpectedly matched"
 
         assert torch.equal(
             tp1_inputs[1].grad[feat_start:feat_end], tpn_inputs[1].grad
@@ -441,7 +487,9 @@ def _tp1_vs_tpn_train_infer_worker(rank, world_size, init_method, result_queue, 
 
         result_queue.put({"ok": True, "rank": rank})
     except Exception:  # pragma: no cover - forwarded to the parent process.
-        result_queue.put({"ok": False, "rank": rank, "traceback": traceback.format_exc()})
+        result_queue.put(
+            {"ok": False, "rank": rank, "traceback": traceback.format_exc()}
+        )
         raise
     finally:
         _close_ffn_collectives()
@@ -450,10 +498,16 @@ def _tp1_vs_tpn_train_infer_worker(rank, world_size, init_method, result_queue, 
 
 
 def _make_topology_inputs(token_count, device):
-    hidden = _randn((token_count, _HIDDEN), seed=60, device=device, dtype=torch.bfloat16)
-    gate = _randn((_INTERMEDIATE, _HIDDEN), seed=61, device=device, dtype=torch.bfloat16)
+    hidden = _randn(
+        (token_count, _HIDDEN), seed=60, device=device, dtype=torch.bfloat16
+    )
+    gate = _randn(
+        (_INTERMEDIATE, _HIDDEN), seed=61, device=device, dtype=torch.bfloat16
+    )
     up = _randn((_INTERMEDIATE, _HIDDEN), seed=62, device=device, dtype=torch.bfloat16)
-    down = _randn((_HIDDEN, _INTERMEDIATE), seed=63, device=device, dtype=torch.bfloat16)
+    down = _randn(
+        (_HIDDEN, _INTERMEDIATE), seed=63, device=device, dtype=torch.bfloat16
+    )
     grad = _randn((token_count, _HIDDEN), seed=64, device=device, dtype=torch.bfloat16)
     return hidden, gate, up, down, grad
 
@@ -461,7 +515,10 @@ def _make_topology_inputs(token_count, device):
 def _canonical(hidden, gate, up, down, grad):
     with torch.no_grad():
         infer = qwen3_ffn(hidden, gate, up, down)
-    inputs = [value.detach().clone().requires_grad_(True) for value in (hidden, gate, up, down)]
+    inputs = [
+        value.detach().clone().requires_grad_(True)
+        for value in (hidden, gate, up, down)
+    ]
     train = qwen3_ffn(*inputs)
     train.backward(grad)
     return infer, train, inputs
@@ -584,7 +641,9 @@ def _topology_worker(rank, world_size, init_method, result_queue, configs):
             if token_count not in canonical:
                 tensors = _make_topology_inputs(token_count, device)
                 canonical[token_count] = (*tensors, *_canonical(*tensors))
-            hidden, gate, up, down, grad, infer_ref, train_ref, ref_inputs = canonical[token_count]
+            hidden, gate, up, down, grad, infer_ref, train_ref, ref_inputs = canonical[
+                token_count
+            ]
             _run_topology_config(
                 rank,
                 dist,
@@ -604,7 +663,9 @@ def _topology_worker(rank, world_size, init_method, result_queue, configs):
             )
         result_queue.put({"ok": True, "rank": rank})
     except Exception:  # pragma: no cover - forwarded to the parent process.
-        result_queue.put({"ok": False, "rank": rank, "traceback": traceback.format_exc()})
+        result_queue.put(
+            {"ok": False, "rank": rank, "traceback": traceback.format_exc()}
+        )
         raise
     finally:
         _close_ffn_collectives()
@@ -612,11 +673,21 @@ def _topology_worker(rank, world_size, init_method, result_queue, configs):
             torch.distributed.destroy_process_group()
 
 
-def _ffn_tensors(token_count, device, seed, *, hidden=_HIDDEN, intermediate=_INTERMEDIATE):
-    rmsnorm = _randn((token_count, hidden), seed=seed, device=device, dtype=torch.bfloat16)
-    gate = _randn((intermediate, hidden), seed=seed + 1, device=device, dtype=torch.bfloat16)
-    up = _randn((intermediate, hidden), seed=seed + 2, device=device, dtype=torch.bfloat16)
-    down = _randn((hidden, intermediate), seed=seed + 3, device=device, dtype=torch.bfloat16)
+def _ffn_tensors(
+    token_count, device, seed, *, hidden=_HIDDEN, intermediate=_INTERMEDIATE
+):
+    rmsnorm = _randn(
+        (token_count, hidden), seed=seed, device=device, dtype=torch.bfloat16
+    )
+    gate = _randn(
+        (intermediate, hidden), seed=seed + 1, device=device, dtype=torch.bfloat16
+    )
+    up = _randn(
+        (intermediate, hidden), seed=seed + 2, device=device, dtype=torch.bfloat16
+    )
+    down = _randn(
+        (hidden, intermediate), seed=seed + 3, device=device, dtype=torch.bfloat16
+    )
     return rmsnorm, gate, up, down
 
 
@@ -676,7 +747,9 @@ def _cache_worker(rank, world_size, init_method, result_queue):
         _close_ffn_collectives()
         result_queue.put({"ok": True, "rank": rank})
     except Exception:  # pragma: no cover - forwarded to the parent process.
-        result_queue.put({"ok": False, "rank": rank, "traceback": traceback.format_exc()})
+        result_queue.put(
+            {"ok": False, "rank": rank, "traceback": traceback.format_exc()}
+        )
         raise
     finally:
         _close_ffn_collectives()
@@ -723,7 +796,9 @@ def _uneven_sp_worker(rank, world_size, init_method, result_queue):
                 raise
             result_queue.put({"ok": True, "rank": rank})
     except Exception:  # pragma: no cover - forwarded to the parent process.
-        result_queue.put({"ok": False, "rank": rank, "traceback": traceback.format_exc()})
+        result_queue.put(
+            {"ok": False, "rank": rank, "traceback": traceback.format_exc()}
+        )
         raise
     finally:
         _close_ffn_collectives()
@@ -732,7 +807,9 @@ def _uneven_sp_worker(rank, world_size, init_method, result_queue):
 
 
 def _qwen3_8b_weights(device):
-    hidden = _randn((8, QWEN3_8B_HIDDEN_SIZE), seed=90, device=device, dtype=torch.bfloat16)
+    hidden = _randn(
+        (8, QWEN3_8B_HIDDEN_SIZE), seed=90, device=device, dtype=torch.bfloat16
+    )
     gate = _randn(
         (QWEN3_8B_INTERMEDIATE_SIZE, QWEN3_8B_HIDDEN_SIZE),
         seed=91,
@@ -751,7 +828,9 @@ def _qwen3_8b_weights(device):
         device=device,
         dtype=torch.bfloat16,
     )
-    grad = _randn((8, QWEN3_8B_HIDDEN_SIZE), seed=94, device=device, dtype=torch.bfloat16)
+    grad = _randn(
+        (8, QWEN3_8B_HIDDEN_SIZE), seed=94, device=device, dtype=torch.bfloat16
+    )
     return hidden, gate, up, down, grad
 
 
@@ -771,7 +850,8 @@ def _qwen3_8b_tp2_worker(rank, world_size, init_method, result_queue):
         with torch.no_grad():
             infer_tp1 = qwen3_ffn(hidden, gate, up, down)
         tp1_inputs = [
-            value.detach().clone().requires_grad_(True) for value in (hidden, gate, up, down)
+            value.detach().clone().requires_grad_(True)
+            for value in (hidden, gate, up, down)
         ]
         train_tp1 = qwen3_ffn(*tp1_inputs)
         train_tp1.backward(grad)
@@ -796,15 +876,78 @@ def _qwen3_8b_tp2_worker(rank, world_size, init_method, result_queue):
         assert torch.equal(tp1_inputs[0].grad, tp2_inputs[0].grad)
         assert torch.equal(tp1_inputs[1].grad[feat_start:feat_end], tp2_inputs[1].grad)
         assert torch.equal(tp1_inputs[2].grad[feat_start:feat_end], tp2_inputs[2].grad)
-        assert torch.equal(tp1_inputs[3].grad[:, feat_start:feat_end], tp2_inputs[3].grad)
+        assert torch.equal(
+            tp1_inputs[3].grad[:, feat_start:feat_end], tp2_inputs[3].grad
+        )
         result_queue.put({"ok": True, "rank": rank})
     except Exception:  # pragma: no cover - forwarded to the parent process.
-        result_queue.put({"ok": False, "rank": rank, "traceback": traceback.format_exc()})
+        result_queue.put(
+            {"ok": False, "rank": rank, "traceback": traceback.format_exc()}
+        )
         raise
     finally:
         _close_ffn_collectives()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
+
+
+def _compiled_packed_tp2_worker(rank, world_size, init_method, result_queue):
+    try:
+        import torch.distributed as dist
+
+        torch.cuda.set_device(rank)
+        dist.init_process_group(
+            backend="nccl",
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size,
+        )
+        device = torch.device("cuda", rank)
+        hidden = _randn((17, 64), seed=141, device=device, dtype=torch.bfloat16)
+        fused = _randn((256, 64), seed=142 + rank, device=device, dtype=torch.bfloat16)
+        down = _randn((64, 128), seed=144 + rank, device=device, dtype=torch.bfloat16)
+        gate, up = fused.chunk(2, dim=0)
+        operator = Qwen3FFNOp()
+
+        with torch.no_grad():
+            expected = operator(
+                hidden,
+                gate,
+                up,
+                down,
+                fused_gate_up_weight=fused,
+                tp_group=dist.group.WORLD,
+                deterministic=True,
+            )
+            collective_handle, tp_world_size = operator.prepare_packed_inference(
+                fused,
+                down,
+                tp_group=dist.group.WORLD,
+            )
+            compiled = torch.compile(qwen3_ffn_packed_inference, fullgraph=True)
+            actual = compiled(
+                hidden,
+                fused,
+                down,
+                collective_handle=collective_handle,
+                tp_world_size=tp_world_size,
+            )
+
+        assert torch.equal(actual, expected)
+        result_queue.put({"ok": True, "rank": rank})
+    except Exception:  # pragma: no cover - forwarded to the parent process.
+        result_queue.put(
+            {"ok": False, "rank": rank, "traceback": traceback.format_exc()}
+        )
+        raise
+    finally:
+        _close_ffn_collectives()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
+def test_qwen_ffn_compiled_packed_tp2_matches_eager_strict():
+    _spawn_nccl_workers(_compiled_packed_tp2_worker, 2)
 
 
 def test_qwen_ffn_qwen3_8b_dimensions_are_pinned():
@@ -841,16 +984,57 @@ def test_qwen_ffn_backward_matches_autograd_reference(monkeypatch):
     torch.testing.assert_close(actual, expected.detach())
     for actual_input, reference in zip(actual_inputs, ref_inputs, strict=True):
         torch.testing.assert_close(actual_input.grad, reference.grad)
-    for weight in actual_inputs[1:]:
-        assert weight.grad is not None
-        assert weight.grad.is_contiguous()
-        assert weight.grad.stride() == weight.stride()
 
-    assert stub.calls.count("det_gemm_fwd") == 3
-    assert stub.calls.count("det_gemm_fwd_rhs_transposed") == 3
-    assert stub.calls.count("det_gemm_db_transposed") == 3
+    assert stub.calls.count("det_gemm_fwd_weight") == 3
+    assert stub.calls.count("det_gemm_da_weight") == 3
+    assert stub.calls.count("det_gemm_dw") == 3
     assert stub.calls.count("swiglu_forward") == 1
     assert stub.calls.count("swiglu_backward") == 1
+
+
+def test_qwen_ffn_packed_gate_up_matches_separate_backward(monkeypatch):
+    stub = _TorchKernelStub()
+    monkeypatch.setattr(ffn_module, "_C", stub)
+    monkeypatch.setattr(ffn_module, "_EXT_AVAILABLE", True)
+    monkeypatch.setattr(ffn_module, "_validate_ffn_inputs", lambda *args: None)
+
+    hidden = _randn((2, 3, 8), seed=10)
+    fused = torch.cat(
+        (_randn((12, 8), seed=11), _randn((12, 8), seed=12)),
+        dim=0,
+    )
+    down = _randn((8, 12), seed=13)
+    grad_output = _randn(hidden.shape, seed=14)
+
+    ref_hidden = hidden.detach().clone().requires_grad_(True)
+    ref_fused = fused.detach().clone().requires_grad_(True)
+    ref_gate, ref_up = ref_fused.chunk(2, dim=0)
+    ref_down = down.detach().clone().requires_grad_(True)
+    expected, _, _, _ = _reference(ref_hidden, ref_gate, ref_up, ref_down)
+    expected.backward(grad_output)
+
+    actual_hidden = hidden.detach().clone().requires_grad_(True)
+    actual_fused = fused.detach().clone().requires_grad_(True)
+    actual_gate, actual_up = actual_fused.chunk(2, dim=0)
+    actual_down = down.detach().clone().requires_grad_(True)
+    actual = qwen3_ffn(
+        actual_hidden,
+        actual_gate,
+        actual_up,
+        actual_down,
+        fused_gate_up_weight=actual_fused,
+    )
+    actual.backward(grad_output)
+
+    torch.testing.assert_close(actual, expected.detach())
+    torch.testing.assert_close(actual_hidden.grad, ref_hidden.grad)
+    torch.testing.assert_close(actual_fused.grad, ref_fused.grad)
+    torch.testing.assert_close(actual_down.grad, ref_down.grad)
+    assert stub.calls.count("det_gemm_fwd_weight") == 2
+    assert stub.calls.count("swiglu_packed_forward") == 1
+    assert stub.calls.count("swiglu_packed_backward") == 1
+    assert stub.calls.count("swiglu_forward") == 0
+    assert stub.calls.count("swiglu_backward") == 0
 
 
 def test_qwen_ffn_disable_split_k_false_uses_torch_matmul(monkeypatch):
@@ -883,9 +1067,9 @@ def test_qwen_ffn_disable_split_k_false_uses_torch_matmul(monkeypatch):
     for actual_input, reference in zip(actual_inputs, ref_inputs, strict=True):
         torch.testing.assert_close(actual_input.grad, reference.grad)
 
-    assert stub.calls.count("det_gemm_fwd") == 0
-    assert stub.calls.count("det_gemm_fwd_rhs_transposed") == 0
-    assert stub.calls.count("det_gemm_db_transposed") == 0
+    assert stub.calls.count("det_gemm_fwd_weight") == 0
+    assert stub.calls.count("det_gemm_da_weight") == 0
+    assert stub.calls.count("det_gemm_dw") == 0
     assert stub.calls.count("swiglu_forward") == 1
     assert stub.calls.count("swiglu_backward") == 1
 
@@ -893,7 +1077,9 @@ def test_qwen_ffn_disable_split_k_false_uses_torch_matmul(monkeypatch):
 def test_qwen_ffn_deterministic_false_uses_production_gemm(monkeypatch):
     modes = []
     monkeypatch.setattr(ffn_module, "_validate_ffn_inputs", lambda *args: None)
-    monkeypatch.setattr(ffn_module, "_require_ffn_kernels", lambda **kwargs: modes.append(kwargs))
+    monkeypatch.setattr(
+        ffn_module, "_require_ffn_kernels", lambda **kwargs: modes.append(kwargs)
+    )
     monkeypatch.setattr(
         ffn_module._DeterministicFFNFunction,
         "apply",
@@ -902,7 +1088,7 @@ def test_qwen_ffn_deterministic_false_uses_production_gemm(monkeypatch):
 
     tensors = [torch.empty(1)] * 4
     assert qwen3_ffn(*tensors, deterministic=False) is False
-    assert modes == [{"disable_split_k": False}]
+    assert modes == [{"disable_split_k": False, "packed_gate_up": False}]
 
 
 def test_qwen_ffn_rejects_conflicting_backend_switches():
@@ -1016,13 +1202,79 @@ def test_qwen_ffn_cuda_train_and_infer_forward_are_bitwise_identical():
 
 
 @requires_cuda_ffn
+def test_qwen_ffn_packed_gate_up_is_bitwise_identical():
+    hidden = _randn((17, 64), seed=40, device="cuda", dtype=torch.bfloat16)
+    fused = torch.cat(
+        (
+            _randn((128, 64), seed=41, device="cuda", dtype=torch.bfloat16),
+            _randn((128, 64), seed=42, device="cuda", dtype=torch.bfloat16),
+        ),
+        dim=0,
+    )
+    down = _randn((64, 128), seed=43, device="cuda", dtype=torch.bfloat16)
+    grad = _randn(hidden.shape, seed=44, device="cuda", dtype=torch.bfloat16)
+
+    separate_hidden = hidden.detach().clone().requires_grad_(True)
+    separate_gate = fused[:128].detach().clone().requires_grad_(True)
+    separate_up = fused[128:].detach().clone().requires_grad_(True)
+    separate_down = down.detach().clone().requires_grad_(True)
+    separate = qwen3_ffn(
+        separate_hidden,
+        separate_gate,
+        separate_up,
+        separate_down,
+    )
+    separate.backward(grad)
+
+    packed_hidden = hidden.detach().clone().requires_grad_(True)
+    packed_fused = fused.detach().clone().requires_grad_(True)
+    packed_gate, packed_up = packed_fused.chunk(2, dim=0)
+    packed_down = down.detach().clone().requires_grad_(True)
+    packed = qwen3_ffn(
+        packed_hidden,
+        packed_gate,
+        packed_up,
+        packed_down,
+        fused_gate_up_weight=packed_fused,
+    )
+    packed.backward(grad)
+
+    assert torch.equal(packed, separate)
+    assert torch.equal(packed_hidden.grad, separate_hidden.grad)
+    assert torch.equal(
+        packed_fused.grad,
+        torch.cat((separate_gate.grad, separate_up.grad), dim=0),
+    )
+    assert torch.equal(packed_down.grad, separate_down.grad)
+
+
+@requires_cuda_ffn
+def test_qwen_ffn_packed_inference_compiles_fullgraph_bitwise():
+    hidden = _randn((17, 64), seed=45, device="cuda", dtype=torch.bfloat16)
+    fused = _randn((256, 64), seed=46, device="cuda", dtype=torch.bfloat16)
+    down = _randn((64, 128), seed=47, device="cuda", dtype=torch.bfloat16)
+
+    expected = qwen3_ffn_packed_inference(hidden, fused, down)
+    compiled = torch.compile(
+        qwen3_ffn_packed_inference,
+        backend="eager",
+        fullgraph=True,
+    )
+    actual = compiled(hidden, fused, down)
+
+    assert torch.equal(actual, expected)
+
+
+@requires_cuda_ffn
 @pytest.mark.parametrize("token_count", _TOKEN_BOUNDARY_COUNTS)
 def test_qwen_ffn_output_and_hidden_grad_are_batch_invariant(token_count):
     device = torch.device("cuda", 0)
     gate = _randn((256, _HIDDEN), seed=70, device=device, dtype=torch.bfloat16)
     up = _randn((256, _HIDDEN), seed=71, device=device, dtype=torch.bfloat16)
     down = _randn((_HIDDEN, 256), seed=72, device=device, dtype=torch.bfloat16)
-    hidden = _randn((token_count, _HIDDEN), seed=73, device=device, dtype=torch.bfloat16)
+    hidden = _randn(
+        (token_count, _HIDDEN), seed=73, device=device, dtype=torch.bfloat16
+    )
     grad = _randn((token_count, _HIDDEN), seed=74, device=device, dtype=torch.bfloat16)
 
     full_hidden = hidden.detach().clone().requires_grad_(True)
@@ -1063,12 +1315,16 @@ def test_qwen_ffn_qwen3_8b_shapes_run_and_are_batch_invariant():
 def test_qwen_ffn_sequence_parallel_requires_tensor_parallel_group():
     device = torch.device("cuda", 0)
     hidden, gate, up, down = _ffn_tensors(8, device, seed=120, intermediate=128)
-    with pytest.raises(ValueError, match="sequence_parallel requires a tensor-parallel group"):
+    with pytest.raises(
+        ValueError, match="sequence_parallel requires a tensor-parallel group"
+    ):
         qwen3_ffn(hidden, gate, up, down, sequence_parallel=True)
 
 
 def test_qwen_ffn_tp_correctness_and_batch_invariance():
-    _spawn_nccl_workers(_distributed_ffn_backward_nccl_worker, 2, (1, False), timeout=90)
+    _spawn_nccl_workers(
+        _distributed_ffn_backward_nccl_worker, 2, (1, False), timeout=90
+    )
 
 
 def test_qwen_ffn_tp_sp_correctness_and_batch_invariance():
@@ -1076,7 +1332,9 @@ def test_qwen_ffn_tp_sp_correctness_and_batch_invariance():
 
 
 def test_qwen_ffn_tp_cp_correctness_and_batch_invariance():
-    _spawn_nccl_workers(_distributed_ffn_backward_nccl_worker, 4, (2, False), timeout=90)
+    _spawn_nccl_workers(
+        _distributed_ffn_backward_nccl_worker, 4, (2, False), timeout=90
+    )
 
 
 def test_qwen_ffn_tp_cp_sp_correctness_and_batch_invariance():
@@ -1100,7 +1358,9 @@ def test_qwen_ffn_world4_tp_cp_sp_match_tp1_cp1_bitwise():
 
 
 def test_qwen_ffn_world8_tp8_and_cp8_match_tp1_cp1_bitwise():
-    _spawn_nccl_workers(_topology_worker, 8, (_WORLD8_WORLD_GROUP_CONFIGS,), timeout=120)
+    _spawn_nccl_workers(
+        _topology_worker, 8, (_WORLD8_WORLD_GROUP_CONFIGS,), timeout=120
+    )
 
 
 def test_qwen_ffn_world8_tp2_cp4_match_tp1_cp1_bitwise():

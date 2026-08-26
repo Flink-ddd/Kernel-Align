@@ -13,6 +13,11 @@ import torch
 from rl_engine.integrations.vime.logp import SelectedLogprobProviderUnavailable, provider
 
 
+@pytest.fixture(autouse=True)
+def _select_rlkernel_training_logp(monkeypatch):
+    monkeypatch.setenv("RL_KERNEL_LOGP_CASE", "R/R")
+
+
 def _request(*, cp_rank: int = 0, with_entropy: bool = False, keep_mask=None):
     logits = torch.tensor(
         [[0.25, -0.5, 1.0, 0.1, -0.3, 0.6, -0.7, 0.4] for _ in range(3)],
@@ -91,3 +96,10 @@ def test_provider_rejects_local_vocab_metadata_that_cannot_describe_tp_ownership
 
     with pytest.raises(SelectedLogprobProviderUnavailable, match="cover padded_vocab_size"):
         provider(request)
+
+
+def test_provider_production_training_case_requests_vime_native_fallback(monkeypatch):
+    monkeypatch.setenv("RL_KERNEL_LOGP_CASE", "P/R")
+
+    with pytest.raises(SelectedLogprobProviderUnavailable, match="Vime's native"):
+        provider(_request())

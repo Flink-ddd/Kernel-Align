@@ -13,10 +13,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -24,13 +27,76 @@ namespace {
 constexpr int kMaxDeterministicWorldSize = 8;
 constexpr int kThreads = 256;
 constexpr int kMaxBlocks = 4096;
+constexpr int64_t kSequenceHeaderBytes = 2 * sizeof(uint64_t);
 
 struct PeerPointers {
   const void* values[kMaxDeterministicWorldSize];
+  const uint64_t* stage_sequences[kMaxDeterministicWorldSize];
+  const uint64_t* done_sequences[kMaxDeterministicWorldSize];
 };
 
 bool is_supported_world_size(int64_t world_size) {
   return world_size == 1 || world_size == 2 || world_size == 4 || world_size == 8;
+}
+
+__device__ __forceinline__ uint64_t load_acquire_system(
+    const uint64_t* address) {
+  uint64_t value;
+  asm volatile(
+      "ld.acquire.sys.global.u64 %0, [%1];"
+      : "=l"(value)
+      : "l"(address)
+      : "memory");
+  return value;
+}
+
+__device__ __forceinline__ void store_release_system(
+    uint64_t* address,
+    uint64_t value) {
+  asm volatile(
+      "st.release.sys.global.u64 [%0], %1;"
+      :
+      : "l"(address), "l"(value)
+      : "memory");
+}
+
+__global__ void wait_for_previous_done_kernel(
+    PeerPointers peers,
+    int world_size,
+    const uint64_t* local_stage_sequence) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  const uint64_t sequence = load_acquire_system(local_stage_sequence);
+  for (int peer = 0; peer < world_size; ++peer) {
+    while (load_acquire_system(peers.done_sequences[peer]) < sequence) {
+      __nanosleep(64);
+    }
+  }
+}
+
+__global__ void publish_next_stage_sequence_kernel(uint64_t* stage_sequence) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  const uint64_t current = load_acquire_system(stage_sequence);
+  store_release_system(stage_sequence, current + 1);
+}
+
+__global__ void wait_for_staged_peers_kernel(
+    PeerPointers peers,
+    int world_size,
+    const uint64_t* local_stage_sequence) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  const uint64_t sequence = load_acquire_system(local_stage_sequence);
+  for (int peer = 0; peer < world_size; ++peer) {
+    while (load_acquire_system(peers.stage_sequences[peer]) < sequence) {
+      __nanosleep(64);
+    }
+  }
+}
+
+__global__ void publish_done_sequence_kernel(
+    uint64_t* done_sequence,
+    const uint64_t* stage_sequence) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  store_release_system(done_sequence, load_acquire_system(stage_sequence));
 }
 
 template <typename T>
@@ -208,13 +274,16 @@ class DeterministicCollectiveState {
       : rank_(rank),
         world_size_(handles.size()),
         device_index_(staging.get_device()),
-        capacity_bytes_(staging.numel() * staging.element_size()) {
+        capacity_bytes_(
+            staging.numel() * staging.element_size() - kSequenceHeaderBytes) {
     TORCH_CHECK(staging.is_cuda(), "collective staging buffer must be CUDA");
     TORCH_CHECK(staging.is_contiguous(), "collective staging buffer must be contiguous");
     TORCH_CHECK(
         staging.scalar_type() == torch::kUInt8,
         "collective staging buffer must have dtype torch.uint8");
-    TORCH_CHECK(capacity_bytes_ > 0, "collective staging capacity must be positive");
+    TORCH_CHECK(
+        capacity_bytes_ > 0,
+        "collective staging must reserve sequence metadata and positive payload capacity");
     TORCH_CHECK(
         is_supported_world_size(world_size_),
         "deterministic collectives require world size 1, 2, 4, or 8; got ",
@@ -228,8 +297,10 @@ class DeterministicCollectiveState {
         world_size_,
         ")");
 
-    for (auto& peer : peers_.values) {
-      peer = nullptr;
+    for (int peer = 0; peer < kMaxDeterministicWorldSize; ++peer) {
+      peers_.values[peer] = nullptr;
+      peers_.stage_sequences[peer] = nullptr;
+      peers_.done_sequences[peer] = nullptr;
     }
     imported_bases_.fill(nullptr);
     try {
@@ -240,29 +311,39 @@ class DeterministicCollectiveState {
             peer);
         TORCH_CHECK(offsets[peer] >= 0, "negative CUDA IPC offset for rank ", peer);
 
+        void* allocation = nullptr;
         if (peer == rank_) {
-          peers_.values[peer] = staging.data_ptr();
-          continue;
-        }
+          allocation = staging.data_ptr();
+        } else {
+          cudaIpcMemHandle_t handle{};
+          auto* raw_handle = reinterpret_cast<uint8_t*>(&handle);
+          for (size_t byte = 0; byte < sizeof(handle); ++byte) {
+            TORCH_CHECK(
+                handles[peer][byte] >= 0 && handles[peer][byte] <= 255,
+                "invalid CUDA IPC handle byte for rank ",
+                peer);
+            raw_handle[byte] = static_cast<uint8_t>(handles[peer][byte]);
+          }
 
-        cudaIpcMemHandle_t handle{};
-        auto* raw_handle = reinterpret_cast<uint8_t*>(&handle);
-        for (size_t byte = 0; byte < sizeof(handle); ++byte) {
-          TORCH_CHECK(
-              handles[peer][byte] >= 0 && handles[peer][byte] <= 255,
-              "invalid CUDA IPC handle byte for rank ",
-              peer);
-          raw_handle[byte] = static_cast<uint8_t>(handles[peer][byte]);
+          void* base = nullptr;
+          AT_CUDA_CHECK(cudaIpcOpenMemHandle(
+              &base,
+              handle,
+              cudaIpcMemLazyEnablePeerAccess));
+          imported_bases_[peer] = base;
+          allocation = static_cast<char*>(base) + offsets[peer];
         }
-
-        void* base = nullptr;
-        AT_CUDA_CHECK(cudaIpcOpenMemHandle(
-            &base,
-            handle,
-            cudaIpcMemLazyEnablePeerAccess));
-        imported_bases_[peer] = base;
-        peers_.values[peer] = static_cast<const char*>(base) + offsets[peer];
+        auto* bytes = static_cast<uint8_t*>(allocation);
+        peers_.stage_sequences[peer] =
+            reinterpret_cast<const uint64_t*>(bytes);
+        peers_.done_sequences[peer] =
+            reinterpret_cast<const uint64_t*>(bytes + sizeof(uint64_t));
+        peers_.values[peer] = bytes + kSequenceHeaderBytes;
       }
+      auto* local_bytes = static_cast<uint8_t*>(staging.data_ptr());
+      local_stage_sequence_ = reinterpret_cast<uint64_t*>(local_bytes);
+      local_done_sequence_ =
+          reinterpret_cast<uint64_t*>(local_bytes + sizeof(uint64_t));
     } catch (...) {
       close_imports();
       throw;
@@ -291,6 +372,9 @@ class DeterministicCollectiveState {
         input_bytes,
         " bytes but staging capacity is ",
         capacity_bytes_);
+    wait_for_previous_done_kernel<<<1, 1, 0, stream>>>(
+        peers_, world_size_, local_stage_sequence_);
+    AT_CUDA_CHECK(cudaGetLastError());
     if (input_bytes > 0) {
       AT_CUDA_CHECK(cudaMemcpyAsync(
           const_cast<void*>(peers_.values[rank_]),
@@ -299,12 +383,15 @@ class DeterministicCollectiveState {
           cudaMemcpyDeviceToDevice,
           stream));
     }
+    publish_next_stage_sequence_kernel<<<1, 1, 0, stream>>>(
+        local_stage_sequence_);
+    AT_CUDA_CHECK(cudaGetLastError());
     staged_bytes_ = input_bytes;
     staged_scalar_type_ = input.scalar_type();
     has_staged_input_ = true;
   }
 
-  void all_reduce(torch::Tensor& output, cudaStream_t stream) const {
+  void all_reduce(torch::Tensor& output, cudaStream_t stream) {
     check_tensor(output, "output");
     TORCH_CHECK(has_staged_input_, "stage() must be called before all_reduce()");
     TORCH_CHECK(
@@ -314,8 +401,10 @@ class DeterministicCollectiveState {
         output.numel() * output.element_size() == staged_bytes_,
         "all-reduce output size must match the staged input size");
 
+    wait_for_staged_peers(stream);
     const int64_t element_count = output.numel();
     if (element_count == 0) {
+      publish_done(stream);
       return;
     }
     const int blocks = static_cast<int>(std::min<int64_t>(
@@ -359,9 +448,10 @@ class DeterministicCollectiveState {
             output.scalar_type());
     }
     AT_CUDA_CHECK(cudaGetLastError());
+    publish_done(stream);
   }
 
-  void reduce_scatter(torch::Tensor& output, cudaStream_t stream) const {
+  void reduce_scatter(torch::Tensor& output, cudaStream_t stream) {
     check_tensor(output, "output");
     TORCH_CHECK(has_staged_input_, "stage() must be called before reduce_scatter()");
     TORCH_CHECK(
@@ -371,8 +461,10 @@ class DeterministicCollectiveState {
         output.numel() * output.element_size() * world_size_ == staged_bytes_,
         "reduce-scatter output must contain one world-size fraction of the staged input");
 
+    wait_for_staged_peers(stream);
     const int64_t output_element_count = output.numel();
     if (output_element_count == 0) {
+      publish_done(stream);
       return;
     }
     const int blocks = static_cast<int>(std::min<int64_t>(
@@ -419,9 +511,10 @@ class DeterministicCollectiveState {
             output.scalar_type());
     }
     AT_CUDA_CHECK(cudaGetLastError());
+    publish_done(stream);
   }
 
-  void all_gather(torch::Tensor& output, cudaStream_t stream) const {
+  void all_gather(torch::Tensor& output, cudaStream_t stream) {
     check_tensor(output, "output");
     TORCH_CHECK(has_staged_input_, "stage() must be called before all_gather()");
     TORCH_CHECK(
@@ -432,8 +525,10 @@ class DeterministicCollectiveState {
             staged_bytes_ * world_size_,
         "all-gather output must contain one staged input per rank");
 
+    wait_for_staged_peers(stream);
     const int64_t output_bytes = output.numel() * output.element_size();
     if (output_bytes == 0) {
+      publish_done(stream);
       return;
     }
     const int blocks = static_cast<int>(std::min<int64_t>(
@@ -445,9 +540,23 @@ class DeterministicCollectiveState {
         staged_bytes_,
         world_size_);
     AT_CUDA_CHECK(cudaGetLastError());
+    publish_done(stream);
   }
 
  private:
+  void wait_for_staged_peers(cudaStream_t stream) const {
+    wait_for_staged_peers_kernel<<<1, 1, 0, stream>>>(
+        peers_, world_size_, local_stage_sequence_);
+    AT_CUDA_CHECK(cudaGetLastError());
+  }
+
+  void publish_done(cudaStream_t stream) {
+    publish_done_sequence_kernel<<<1, 1, 0, stream>>>(
+        local_done_sequence_, local_stage_sequence_);
+    AT_CUDA_CHECK(cudaGetLastError());
+    has_staged_input_ = false;
+  }
+
   void check_tensor(const torch::Tensor& tensor, const char* name) const {
     TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
@@ -476,13 +585,27 @@ class DeterministicCollectiveState {
   int64_t staged_bytes_{0};
   at::ScalarType staged_scalar_type_{at::ScalarType::Undefined};
   bool has_staged_input_{false};
+  uint64_t* local_stage_sequence_{nullptr};
+  uint64_t* local_done_sequence_{nullptr};
   PeerPointers peers_{};
   std::array<void*, kMaxDeterministicWorldSize> imported_bases_{};
 };
 
-DeterministicCollectiveState* state_from_handle(int64_t handle) {
+std::atomic<int64_t> next_collective_handle{1};
+std::mutex collective_states_mutex;
+std::unordered_map<int64_t, std::shared_ptr<DeterministicCollectiveState>>
+    collective_states;
+
+std::shared_ptr<DeterministicCollectiveState> state_from_handle(int64_t handle) {
   TORCH_CHECK(handle != 0, "deterministic collective handle is closed");
-  return reinterpret_cast<DeterministicCollectiveState*>(handle);
+  std::lock_guard<std::mutex> lock(collective_states_mutex);
+  const auto it = collective_states.find(handle);
+  TORCH_CHECK(
+      it != collective_states.end(),
+      "deterministic collective handle ",
+      handle,
+      " is unknown or already closed");
+  return it->second;
 }
 
 }  // namespace
@@ -535,16 +658,35 @@ int64_t deterministic_collective_create(
     const std::vector<int64_t>& offsets,
     int64_t rank) {
   const c10::cuda::CUDAGuard device_guard(staging.device());
-  auto state = std::make_unique<DeterministicCollectiveState>(
+  auto state = std::make_shared<DeterministicCollectiveState>(
       staging,
       handles,
       offsets,
       rank);
-  return reinterpret_cast<int64_t>(state.release());
+  const int64_t handle = next_collective_handle.fetch_add(
+      1, std::memory_order_relaxed);
+  TORCH_CHECK(handle > 0, "deterministic collective handle space exhausted");
+  {
+    std::lock_guard<std::mutex> lock(collective_states_mutex);
+    const bool inserted = collective_states.emplace(handle, state).second;
+    TORCH_CHECK(inserted, "duplicate deterministic collective handle ", handle);
+  }
+  return handle;
 }
 
 void deterministic_collective_destroy(int64_t handle) {
-  delete state_from_handle(handle);
+  std::shared_ptr<DeterministicCollectiveState> state;
+  {
+    std::lock_guard<std::mutex> lock(collective_states_mutex);
+    const auto it = collective_states.find(handle);
+    TORCH_CHECK(
+        it != collective_states.end(),
+        "deterministic collective handle ",
+        handle,
+        " is unknown or already closed");
+    state = std::move(it->second);
+    collective_states.erase(it);
+  }
 }
 
 void deterministic_collective_stage(int64_t handle, torch::Tensor& input) {

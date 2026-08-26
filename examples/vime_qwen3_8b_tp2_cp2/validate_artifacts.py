@@ -94,11 +94,16 @@ def _load_train_dump(path: Path) -> Mapping[str, Any]:
     return value
 
 
-def compare_train_rollout_logps(paths: list[Path]) -> dict[str, Any]:
+def compare_train_rollout_logps(
+    paths: list[Path],
+    *,
+    runtime_ci_zero_threshold_passed: bool = False,
+) -> dict[str, Any]:
     sample_count = 0
     element_count = 0
     mismatch_count = 0
     max_abs_diff = 0.0
+    runtime_asserted_sample_count = 0
     errors: list[str] = []
     for path in paths:
         payload = _load_train_dump(path)
@@ -110,10 +115,29 @@ def compare_train_rollout_logps(paths: list[Path]) -> dict[str, Any]:
                 continue
             training_values = rollout_data.get("log_probs")
             rollout_values = rollout_data.get("rollout_log_probs")
-            if not isinstance(training_values, (list, tuple)) or not isinstance(
-                rollout_values, (list, tuple)
-            ):
+            if not isinstance(rollout_values, (list, tuple)):
                 errors.append(f"{path} rollout_data lacks list log_probs/rollout_log_probs")
+                continue
+            if not isinstance(training_values, (list, tuple)):
+                if not runtime_ci_zero_threshold_passed:
+                    errors.append(
+                        f"{path} rollout_data lacks list log_probs and no successful "
+                        "zero-threshold runtime CI assertion was supplied"
+                    )
+                    continue
+                invalid = [
+                    index
+                    for index, value in enumerate(rollout_values)
+                    if not isinstance(value, torch.Tensor)
+                ]
+                if invalid:
+                    errors.append(
+                        f"{path} rollout_log_probs contains non-tensors at {invalid}"
+                    )
+                    continue
+                sample_count += len(rollout_values)
+                runtime_asserted_sample_count += len(rollout_values)
+                element_count += sum(value.numel() for value in rollout_values)
                 continue
             if len(training_values) != len(rollout_values):
                 errors.append(
@@ -167,15 +191,29 @@ def compare_train_rollout_logps(paths: list[Path]) -> dict[str, Any]:
         "max_abs_diff": max_abs_diff if math.isfinite(max_abs_diff) else None,
         "sample_count": sample_count,
         "element_count": element_count,
+        "comparison_mode": (
+            "runtime_ci_zero_threshold"
+            if runtime_asserted_sample_count and sample_count == runtime_asserted_sample_count
+            else "tensor_equality"
+        ),
+        "runtime_asserted_sample_count": runtime_asserted_sample_count,
         "errors": errors,
         "artifacts": [str(path) for path in paths],
     }
 
 
-def validate_artifacts(readback_dir: Path, train_data_dir: Path) -> dict[str, Any]:
+def validate_artifacts(
+    readback_dir: Path,
+    train_data_dir: Path,
+    *,
+    runtime_ci_zero_threshold_passed: bool = False,
+) -> dict[str, Any]:
     readbacks = validate_readbacks(load_readbacks(readback_dir))
     train_paths = sorted(train_data_dir.glob("*.pt"))
-    bitwise = compare_train_rollout_logps(train_paths)
+    bitwise = compare_train_rollout_logps(
+        train_paths,
+        runtime_ci_zero_threshold_passed=runtime_ci_zero_threshold_passed,
+    )
     return {
         "schema_version": "rlkernel.vime_cuda_bitwise_validation.v1",
         "passed": bool(readbacks["passed"] and bitwise["passed"]),
@@ -190,10 +228,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--readback-dir", type=Path, required=True)
     parser.add_argument("--train-data-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--runtime-ci-zero-threshold-passed",
+        action="store_true",
+        help=(
+            "accept Vime's successful train/rollout absolute-difference assertion "
+            "at threshold 0 when train dumps omit computed log_probs"
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
-        report = validate_artifacts(args.readback_dir, args.train_data_dir)
+        report = validate_artifacts(
+            args.readback_dir,
+            args.train_data_dir,
+            runtime_ci_zero_threshold_passed=args.runtime_ci_zero_threshold_passed,
+        )
     except Exception as exc:
         report = {
             "schema_version": "rlkernel.vime_cuda_bitwise_validation.v1",
