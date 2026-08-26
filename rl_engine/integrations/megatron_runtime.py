@@ -282,7 +282,9 @@ def install_megatron_integration(
             "ffn",
             ",".join(f"{cls.__module__}.{cls.__name__}.forward" for cls in resolved_ffn),
         )
-    integration.record_installed_hook("logp", "rl_engine.integrations.vime.logp.provider")
+    integration.record_installed_hook(
+        "logp", "rl_engine.integrations.vime.linear_logp.provider"
+    )
     return integration
 
 

@@ -16,7 +16,13 @@ from threading import Lock
 from typing import Any
 
 import torch
+
 from rl_engine.integrations.ablation import Implementation, IntegrationPlan
+from rl_engine.runtime_mode import (
+    rl_kernel_mode,
+    rl_kernel_mode_policy,
+    route_report_enabled,
+)
 
 
 @dataclass(frozen=True)
@@ -152,6 +158,7 @@ class FrameworkOperatorIntegration:
         provenance = dict(raw_provenance) if isinstance(raw_provenance, Mapping) else {}
         actual_backend = _actual_backend(provenance) or backend_id
         fallback = _contains_fallback(provenance)
+        runtime_mode = rl_kernel_mode()
         should_report = False
         route_changed = False
         route_fingerprint = (
@@ -177,7 +184,7 @@ class FrameworkOperatorIntegration:
             )
             if normalized not in self._reported_routes:
                 self._reported_routes.add(normalized)
-                should_report = _route_report_enabled()
+                should_report = route_report_enabled()
             if self._persisted_route_fingerprints.get(normalized) != route_fingerprint:
                 self._persisted_route_fingerprints[normalized] = route_fingerprint
                 route_changed = True
@@ -186,16 +193,19 @@ class FrameworkOperatorIntegration:
         if should_report:
             print(
                 "[RL-Kernel][route] "
-                f"framework={self.framework} target={self.target} module={normalized} "
+                f"mode={runtime_mode.value} framework={self.framework} "
+                f"target={self.target} module={normalized} "
+                f"{_interface_route_fields(provenance)}"
                 f"requested={implementation.value} actual={actual_backend} "
                 f"fallback={str(fallback).lower()}",
                 flush=True,
             )
         if implementation is Implementation.RL_KERNEL and fallback:
             self.record_fallback(normalized, f"operator provenance selected {actual_backend}")
-            raise RuntimeError(
-                f"{self.framework} {normalized} strict RL-Kernel route reported fallback"
-            )
+            if rl_kernel_mode_policy(runtime_mode).fail_on_fallback:
+                raise RuntimeError(
+                    f"{self.framework} {normalized} strict RL-Kernel route reported fallback"
+                )
 
     def readback(self) -> dict[str, Any]:
         with self._lock:
@@ -314,21 +324,15 @@ def _actual_backend(value: Any) -> str | None:
     return None
 
 
-def _route_report_enabled() -> bool:
-    enabled = os.getenv("RL_KERNEL_ROUTE_REPORT", "1").strip().lower()
-    if enabled in {"0", "false", "no", "off"}:
-        return False
-    all_ranks = os.getenv("RL_KERNEL_ROUTE_REPORT_ALL_RANKS", "0").strip().lower()
-    if all_ranks in {"1", "true", "yes", "on"}:
-        return True
-    for name in ("RANK", "LOCAL_RANK"):
-        value = os.getenv(name, "").strip()
-        if value:
-            try:
-                return int(value) == 0
-            except ValueError:
-                continue
-    return True
+def _interface_route_fields(provenance: Mapping[str, Any]) -> str:
+    interface = provenance.get("interface")
+    operator = provenance.get("operator")
+    fields = []
+    if isinstance(interface, str) and interface.strip():
+        fields.append(f"interface={interface.strip()}")
+    if isinstance(operator, str) and operator.strip():
+        fields.append(f"operator={operator.strip()}")
+    return "" if not fields else " ".join(fields) + " "
 
 
 def _runtime_platform(value: Any) -> str | None:

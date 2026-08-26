@@ -10,7 +10,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from rl_engine.integrations.vime.logp import SelectedLogprobProviderUnavailable, provider
+from rl_engine.integrations.vime.linear_logp import (
+    SelectedLogprobProviderUnavailable,
+    provider,
+)
+
+
+def test_legacy_provider_path_is_an_alias():
+    from rl_engine.integrations.vime.logp import provider as legacy_provider
+
+    assert legacy_provider is provider
 
 
 @pytest.fixture(autouse=True)

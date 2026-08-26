@@ -61,10 +61,10 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("rollout.top_p must remain 1.0 for the strict provider contract")
     if provider.get("mode") != "strict":
         raise ValueError("selected_logprob_provider.mode must be strict")
-    if provider.get("path") != "rl_engine.integrations.vime.logp.provider":
+    if provider.get("path") != "rl_engine.integrations.vime.linear_logp.provider":
         raise ValueError("example must use the RL-Kernel Vime provider")
-    if provider.get("backend_id") != "pytorch-vocab-parallel-logp-ws2":
-        raise ValueError("example must pin the WS2 vocab-parallel backend")
+    if provider.get("backend_id") != "rlkernel.linear_logp.bitwise.v1":
+        raise ValueError("example must pin the strict bitwise linear_logp backend")
 
 
 def load_runtime_evidence(path: Path | None) -> dict[str, Any] | None:

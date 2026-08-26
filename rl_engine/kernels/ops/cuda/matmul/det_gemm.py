@@ -9,17 +9,20 @@ backend selection never falls back silently. Tensor-parallel GEMM is WS2.
 """
 import os
 from collections.abc import Callable
+from threading import Lock
 
 import torch
 
 from rl_engine.kernels.ops.backward_runtime import record_backward
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
-from rl_engine.utils.logger import logger
+from rl_engine.runtime_mode import rl_kernel_mode, route_report_enabled
 
 _BACKEND_ENV = "RL_KERNEL_DET_GEMM_BACKEND"
 _SM90_BACKEND = "sm90"
 _CUBLASLT_BACKEND = "cublaslt_nosplitk"
 _CUBLASLT_CONFIGURED = False
+_ROUTE_REPORTED = False
+_ROUTE_REPORT_LOCK = Lock()
 
 
 def det_gemm_backend() -> str:
@@ -57,6 +60,22 @@ def det_gemm_backend_id() -> str:
     return "rlkernel.det_gemm.sm90.v1"
 
 
+def _report_strict_route_once() -> None:
+    global _ROUTE_REPORTED
+    if not route_report_enabled():
+        return
+    with _ROUTE_REPORT_LOCK:
+        if _ROUTE_REPORTED:
+            return
+        _ROUTE_REPORTED = True
+    print(
+        f"[RL-Kernel][route] mode={rl_kernel_mode().value} module=gemm "
+        "requested=strict "
+        f"actual={det_gemm_backend_id()} fallback=false",
+        flush=True,
+    )
+
+
 def _configure_cublaslt_nosplitk(a: torch.Tensor | None = None) -> None:
     """Validate the Hopper batch-invariant cuBLASLt contract once per process."""
 
@@ -85,7 +104,6 @@ def _configure_cublaslt_nosplitk(a: torch.Tensor | None = None) -> None:
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.preferred_blas_library("cublaslt")
     _CUBLASLT_CONFIGURED = True
-    logger.info("Using RL-Kernel strict cuBLASLt no-split-K GEMM backend.")
 
 
 def det_gemm_linear(
@@ -98,7 +116,9 @@ def det_gemm_linear(
 
     if det_gemm_backend() == _CUBLASLT_BACKEND:
         _configure_cublaslt_nosplitk(a)
+        _report_strict_route_once()
         return torch.mm(a, weight.t())
+    _report_strict_route_once()
     if native_op is not None:
         return native_op(a, weight)
     return _det_gemm_fwd_weight(a, weight)
@@ -216,32 +236,28 @@ class DetGemmOp:
         backend = det_gemm_backend()
         if backend == _CUBLASLT_BACKEND:
             _configure_cublaslt_nosplitk()
-        if _EXT_AVAILABLE and hasattr(_C, "det_gemm_fwd"):
-            if backend == _SM90_BACKEND and os.getenv(
-                "RL_KERNEL_DET_GEMM_SM90_ONLY", ""
-            ).strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            } and not (
-                hasattr(_C, "det_gemm_sm90_compiled") and _C.det_gemm_sm90_compiled()
-            ):
-                raise RuntimeError(
-                    "RL_KERNEL_DET_GEMM_SM90_ONLY=1 requires an extension built with "
-                    "KERNEL_ALIGN_DET_GEMM_SM90=1"
-                )
-            self.op = _C.det_gemm_fwd
-            self.has_hardware_op = True
-            logger.info(
-                "Successfully linked RL-Kernel det_gemm backend %s.",
-                det_gemm_backend_id(),
+        if not (_EXT_AVAILABLE and hasattr(_C, "det_gemm_fwd")):
+            raise RuntimeError(
+                "strict RL-Kernel GEMM requires the compiled CUDA extension; "
+                "refusing non-strict fallback"
             )
-        else:
-            logger.warning(
-                "RL-Kernel _C.det_gemm_fwd unavailable; DetGemmOp requires the "
-                "compiled CUDA extension and has no batch-invariant fallback."
+        if backend == _SM90_BACKEND and os.getenv(
+            "RL_KERNEL_DET_GEMM_SM90_ONLY", ""
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        } and not (
+            hasattr(_C, "det_gemm_sm90_compiled") and _C.det_gemm_sm90_compiled()
+        ):
+            raise RuntimeError(
+                "RL_KERNEL_DET_GEMM_SM90_ONLY=1 requires an extension built with "
+                "KERNEL_ALIGN_DET_GEMM_SM90=1; refusing non-strict fallback"
             )
+        self.op = _C.det_gemm_fwd
+        self.has_hardware_op = True
+        _report_strict_route_once()
 
     def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         assert a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16, "BF16 only"

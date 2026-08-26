@@ -8,7 +8,9 @@ The example is deliberately strict:
 
 - Megatron training uses `TP=2`, `CP=2`, `PP=1`, and four actor ranks.
 - vLLM rollout uses processed logprobs and `top_p=1.0`.
-- Vime must load `rl_engine.integrations.vime.logp.provider` in `strict` mode.
+- Vime must load `rl_engine.integrations.vime.linear_logp.provider` in `strict`
+  mode. The former `rl_engine.integrations.vime.logp.provider` path remains a
+  compatibility alias.
 - A native fallback or a missing provider marker is not reported as a pass.
 - Attention and FFN are not declared consistent from configuration alone. They
   require executed Megatron and vLLM readbacks, so the report marks them
@@ -18,6 +20,30 @@ The example is deliberately strict:
 
 The Vime companion must be installed or checked out separately. This example
 does not modify `vllm-project/vime`.
+
+## User modes
+
+`RL_KERNEL_MODE` is the user-facing switch. The fair runner maps each mode to
+one complete train/rollout route rather than asking users to compose module
+cases manually:
+
+| Mode | Route | Fallback policy | Intended use |
+| --- | --- | --- | --- |
+| `strict` | R/R | fail closed | production bitwise consistency |
+| `audit` | R/R | record every fallback without a strict pass claim | diagnosis and route evidence |
+| `auto` | P/P through installed adapters | observable | compatibility checks |
+| `off` | native P/P, no provider or plugin injection | native by definition | clean baseline |
+
+The recommended post-training comparison is `off` versus `strict`. Both use
+the same aligned framework flags by default, so the measured delta is the
+RL-Kernel backend cost rather than an unrelated determinism configuration.
+The older `pp`, `pp-aligned`, `rr`, and `rr-aligned` names remain accepted.
+
+```bash
+examples/vime_qwen3_8b_tp2_cp2/run_fair_perf_case.sh off
+examples/vime_qwen3_8b_tp2_cp2/run_fair_perf_case.sh strict
+examples/vime_qwen3_8b_tp2_cp2/run_fair_perf_case.sh audit
+```
 
 The executable entry point is the Vime script
 `scripts/run-qwen3-8B-rlkernel-tp2-cp2.sh`. Its default topology is an

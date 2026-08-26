@@ -1,13 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODE="${1:-}"
-case "${MODE}" in
-  pp|pp-aligned|rr|rr-aligned) ;;
+REQUESTED_MODE="${1:-}"
+case "${REQUESTED_MODE}" in
+  strict|audit|auto|off|pp|pp-aligned|rr|rr-aligned) ;;
   *)
-    echo "usage: $0 {pp|pp-aligned|rr|rr-aligned}" >&2
+    echo "usage: $0 {strict|audit|auto|off|pp|pp-aligned|rr|rr-aligned}" >&2
     exit 2
     ;;
+esac
+
+MODE="${REQUESTED_MODE}"
+case_id=R/R
+aligned=1
+provider_mode=strict
+case "${REQUESTED_MODE}" in
+  strict) MODE=strict ;;
+  audit) MODE=audit ;;
+  auto) MODE=auto; case_id=P/P; provider_mode=auto ;;
+  off) MODE=off; case_id=P/P; provider_mode=auto ;;
+  rr-aligned) MODE=strict ;;
+  rr) MODE=strict; aligned=0 ;;
+  pp-aligned) MODE=off; case_id=P/P; provider_mode=auto ;;
+  pp) MODE=off; case_id=P/P; provider_mode=auto; aligned=0 ;;
 esac
 
 VIME_ROOT="${VIME_ROOT:-/home/ellm/ljj/vime-debug-main}"
@@ -18,7 +33,7 @@ TE_SITE="${TE_SITE:-/home/ellm/ljj/.te-2.11.0-site-packages}"
 CUDA_PYTHON_SITE="${CUDA_PYTHON_SITE:-/home/ellm/ljj/.cuda-python-12.8-site-packages}"
 CUDA12_COMPAT_LIB="${CUDA12_COMPAT_LIB:-/home/ellm/ljj/.cuda12-compat-lib}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-RUN_ID="${RUN_ID:-fair-${MODE}-${STAMP}}"
+RUN_ID="${RUN_ID:-fair-${REQUESTED_MODE}-${STAMP}}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-${VIME_ROOT}/outputs/rlkernel/${RUN_ID}}"
 TRACE_MODE="${TRACE_MODE:-0}"
 
@@ -26,29 +41,30 @@ NVIDIA_LIBS="$(find "$(dirname "$(dirname "${PYTHON_BIN}")")/lib/python3.11/site
 export PYTHONPATH="${CUDA_PYTHON_SITE}:${TE_SITE}:${PYTHONPATH:-}"
 export LD_LIBRARY_PATH="${CUDA12_COMPAT_LIB}:${TE_SITE}/transformer_engine/wheel_lib${NVIDIA_LIBS:+:${NVIDIA_LIBS}}:${LD_LIBRARY_PATH:-}"
 
-case_id=R/R
-[[ "${MODE}" == pp* ]] && case_id=P/P
-aligned=0
-[[ "${MODE}" == *-aligned ]] && aligned=1
 cp_comm_type=all_gather
 ci_test=1
 validate_artifacts="${VALIDATE_ARTIFACTS:-1}"
-if [[ "${MODE}" == pp* ]]; then
+if [[ "${case_id}" == P/P ]]; then
   cp_comm_type=p2p
   ci_test=0
   validate_artifacts=0
 fi
+if [[ "${MODE}" == audit ]]; then
+  validate_artifacts=0
+fi
 launcher="${VIME_ROOT}/scripts/codex-debug-qwen3-8B-production-pp-tp2-cp2.sh"
-run_python="${PYTHON_BIN}"
-aligned_env=()
+run_python="${RL_KERNEL_ROOT}/examples/vime_qwen3_8b_tp2_cp2/aligned_python_entrypoint.sh"
+[[ -x "${run_python}" ]] || {
+  echo "RL-Kernel Python entrypoint is not executable: ${run_python}" >&2
+  exit 3
+}
+adapter_env=(
+  RL_KERNEL_REAL_PYTHON="${PYTHON_BIN}"
+  RL_KERNEL_MODE="${MODE}"
+  RL_KERNEL_ALIGNED="${aligned}"
+)
 if [[ "${aligned}" == 1 ]]; then
-  run_python="${RL_KERNEL_ROOT}/examples/vime_qwen3_8b_tp2_cp2/aligned_python_entrypoint.sh"
-  [[ -x "${run_python}" ]] || {
-    echo "Aligned Python entrypoint is not executable: ${run_python}" >&2
-    exit 3
-  }
-  aligned_env=(
-    RL_KERNEL_REAL_PYTHON="${PYTHON_BIN}"
+  adapter_env+=(
     VLLM_BATCH_INVARIANT=1
     NCCL_ALGO=Ring
     NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
@@ -56,19 +72,24 @@ if [[ "${aligned}" == 1 ]]; then
     CUBLASLT_WORKSPACE_SIZE=1
   )
 fi
+if [[ "${MODE}" == audit ]]; then
+  adapter_env+=(RL_KERNEL_ROUTE_REPORT_ALL_RANKS=1)
+fi
 
 mkdir -p "${ARTIFACT_DIR}"
-run_case=(env "${aligned_env[@]}" \
+run_case=(env "${adapter_env[@]}" \
+  RL_KERNEL_MODE="${MODE}" \
   RL_KERNEL_ROOT="${RL_KERNEL_ROOT}" \
   PYTHON_BIN="${run_python}" \
   RAY_BIN="${RAY_BIN}" \
   RL_KERNEL_RUN_ID="${RUN_ID}" \
   RL_KERNEL_ARTIFACT_DIR="${ARTIFACT_DIR}" \
-  RAY_TEMP_DIR="/tmp/rlk-fair-${MODE}" \
+  RAY_TEMP_DIR="/tmp/rlk-fair-${REQUESTED_MODE}" \
   VIME_CKPT="${ARTIFACT_DIR}/unused-checkpoint" \
   RL_KERNEL_ATTENTION_CASE="${case_id}" \
   RL_KERNEL_FFN_CASE="${case_id}" \
   RL_KERNEL_LOGP_CASE="${case_id}" \
+  SELECTED_LOGPROB_PROVIDER_MODE="${provider_mode}" \
   TRANSFORMER_IMPL=transformer_engine \
   ATTENTION_BACKEND="${ATTENTION_BACKEND:-auto}" \
   VLLM_ENFORCE_EAGER=0 \
@@ -100,7 +121,7 @@ elif [[ "${TRACE_MODE}" == 1 ]]; then
     exit 3
   }
   trace_base="${ARTIFACT_DIR}/trace/full-stack"
-  session="rlkfair${MODE//-/}$$"
+  session="rlkfair${REQUESTED_MODE//-/}$$"
   launch_pid=""
   cleanup_trace() {
     nsys stop --session="${session}" >/dev/null 2>&1 || true
@@ -153,5 +174,5 @@ if [[ "${validate_artifacts}" == 1 ]]; then
     >>"${ARTIFACT_DIR}/run.log"
 fi
 
-printf 'MODE=%s\nRUN_ID=%s\nARTIFACT_DIR=%s\n' \
-  "${MODE}" "${RUN_ID}" "${ARTIFACT_DIR}"
+printf 'MODE=%s\nREQUESTED_MODE=%s\nRUN_ID=%s\nARTIFACT_DIR=%s\n' \
+  "${MODE}" "${REQUESTED_MODE}" "${RUN_ID}" "${ARTIFACT_DIR}"

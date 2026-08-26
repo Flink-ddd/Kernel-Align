@@ -519,6 +519,7 @@ def test_vllm_ffn_compiled_path_uses_prebound_collective(monkeypatch):
         "runtime_platform": "cuda",
         "actual_backend": "rlkernel.cuda.det_gemm_swiglu",
         "gemm_backend": "rlkernel.det_gemm.sm90.v1",
+        "fallback": False,
         "gate_up_projection": "packed_single_launch",
         "triton_used": False,
     }
@@ -1540,6 +1541,7 @@ def test_compiled_custom_op_execution_is_valid_route_evidence():
 
 def test_route_report_is_emitted_once(capsys, monkeypatch):
     monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("RL_KERNEL_MODE", "strict")
     plan = IntegrationPlan.from_case_ids(attention="R/R")
     integration = FrameworkOperatorIntegration(
         framework="megatron",
@@ -1549,6 +1551,8 @@ def test_route_report_is_emitted_once(capsys, monkeypatch):
             "attention": _ReadbackOperator(
                 {
                     "runtime_platform": "cuda",
+                    "interface": "megatron.attention.forward",
+                    "operator": "rlkernel.cuda.fa4",
                     "actual_backend": "rlkernel.cuda.fa4",
                     "fallback": False,
                 }
@@ -1561,13 +1565,16 @@ def test_route_report_is_emitted_once(capsys, monkeypatch):
 
     lines = [line for line in capsys.readouterr().out.splitlines() if "[route]" in line]
     assert lines == [
-        "[RL-Kernel][route] framework=megatron target=training module=attention "
+        "[RL-Kernel][route] mode=strict framework=megatron target=training "
+        "module=attention interface=megatron.attention.forward "
+        "operator=rlkernel.cuda.fa4 "
         "requested=rl_kernel actual=rlkernel.cuda.fa4 fallback=false"
     ]
 
 
 def test_strict_route_fails_when_provenance_reports_fallback(monkeypatch):
     monkeypatch.setenv("RL_KERNEL_ROUTE_REPORT", "0")
+    monkeypatch.setenv("RL_KERNEL_MODE", "strict")
     plan = IntegrationPlan.from_case_ids(ffn="R/R")
     integration = FrameworkOperatorIntegration(
         framework="vllm",
@@ -1586,3 +1593,31 @@ def test_strict_route_fails_when_provenance_reports_fallback(monkeypatch):
 
     with pytest.raises(RuntimeError, match="strict RL-Kernel route reported fallback"):
         integration.execute("ffn", lambda value: value, "x")
+
+
+def test_audit_route_records_fallback_without_hiding_it(monkeypatch):
+    monkeypatch.setenv("RL_KERNEL_ROUTE_REPORT", "0")
+    monkeypatch.setenv("RL_KERNEL_MODE", "audit")
+    plan = IntegrationPlan.from_case_ids(ffn="R/R")
+    integration = FrameworkOperatorIntegration(
+        framework="vllm",
+        target="rollout",
+        plan=plan,
+        rl_kernel_operators={
+            "ffn": _ReadbackOperator(
+                {
+                    "runtime_platform": "cuda",
+                    "actual_backend": "vllm.native.silu_and_mul",
+                    "fallback": True,
+                }
+            )
+        },
+    )
+
+    assert integration.execute("ffn", lambda value: value, "x") == "x"
+    assert integration.readback()["fallbacks"] == [
+        {
+            "module": "ffn",
+            "reason": "operator provenance selected vllm.native.silu_and_mul",
+        }
+    ]

@@ -15,9 +15,9 @@
     "logprobs_mode": "processed_logprobs"
   },
   "selected_logprob_provider": {
-    "path": "rl_engine.integrations.vime.logp.provider",
+    "path": "rl_engine.integrations.vime.linear_logp.provider",
     "mode": "strict",
-    "backend_id": "pytorch-vocab-parallel-logp-ws2",
+    "backend_id": "rlkernel.linear_logp.bitwise.v1",
     "real_vocab_size": 151936,
     "padded_vocab_size": 152064,
     "num_vocab_tiles": 64

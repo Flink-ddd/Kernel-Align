@@ -50,6 +50,7 @@ from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import (
     DEFAULT_NUM_VOCAB_TILES,
 )
 from rl_engine.kernels.semantic_registry import OperatorRequirements
+from rl_engine.runtime_mode import strict_contract_enabled
 
 ATTENTION_BACKEND_ID = "rlkernel.attention.deterministic.v1"
 FFN_BACKEND_ID = "rlkernel.ffn.qwen3.deterministic.v1"
@@ -457,6 +458,9 @@ class MegatronAttentionOperator:
     @property
     def provenance(self) -> Mapping[str, Any]:
         return {
+            "interface": "megatron.attention.forward",
+            "operator": self.backend_id,
+            "fallback": False,
             "semantic_instance": self._handle.provenance,
             "execution": dict(self._last_provenance),
         }
@@ -680,6 +684,9 @@ class MegatronFFNOperator:
     @property
     def provenance(self) -> Mapping[str, Any]:
         return {
+            "interface": "megatron.mlp.forward",
+            "operator": self.backend_id,
+            "fallback": False,
             "semantic_instance": self._handle.provenance,
             "execution": dict(self._last_provenance),
         }
@@ -751,6 +758,7 @@ class MegatronFFNOperator:
             "runtime_platform": "cuda",
             "actual_backend": "rlkernel.cuda.det_gemm_swiglu",
             "gemm_backend": det_gemm_backend_id(),
+            "fallback": False,
             "gate_up_projection": "separate_strict_launches",
             "triton_used": False,
         }
@@ -825,6 +833,9 @@ class VllmAttentionOperator:
     @property
     def provenance(self) -> Mapping[str, Any]:
         return {
+            "interface": "vllm.attention.forward",
+            "operator": self.backend_id,
+            "fallback": False,
             "semantic_instance": self._handle.provenance,
             "execution": dict(self._last_provenance),
         }
@@ -1079,6 +1090,9 @@ class VllmFFNOperator:
     @property
     def provenance(self) -> Mapping[str, Any]:
         return {
+            "interface": "vllm.qwen3.mlp.forward",
+            "operator": self.backend_id,
+            "fallback": False,
             "semantic_instance": self._handle.provenance,
             "execution": dict(self._last_provenance),
         }
@@ -1116,6 +1130,7 @@ class VllmFFNOperator:
             "runtime_platform": "cuda",
             "actual_backend": "rlkernel.cuda.det_gemm_swiglu",
             "gemm_backend": det_gemm_backend_id(),
+            "fallback": False,
             "gate_up_projection": "packed_single_launch",
             "triton_used": False,
         }
@@ -1194,18 +1209,17 @@ class MegatronLogpOperator:
     def __call__(self, request: Any) -> Any:
         logits = getattr(request, "logits", None)
         hidden = getattr(request, "hidden", None)
-        strict = os.getenv("VIME_RL_KERNEL_STRICT", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        strict = strict_contract_enabled()
         if isinstance(hidden, torch.Tensor):
             if self._linear_logp is None:
                 raise RuntimeError("Megatron linear_logp route is not installed")
             _require_nvidia_cuda(hidden, "linear_logp")
             result = self._provider(request, linear_logp=self._linear_logp)
             self._last_provenance = {
+                "interface": "vime.selected_logprob_provider",
+                "operator": self.backend_id,
+                "actual_backend": self.backend_id,
+                "fallback": False,
                 "runtime_platform": "cuda",
                 "triton_used": False,
                 "provider": dict(getattr(result, "provenance", {})),
@@ -1222,6 +1236,10 @@ class MegatronLogpOperator:
         _require_nvidia_cuda(logits, "Logp")
         result = self._provider(request)
         self._last_provenance = {
+            "interface": "vime.selected_logprob_provider",
+            "operator": self.backend_id,
+            "actual_backend": self.backend_id,
+            "fallback": False,
             "runtime_platform": "cuda",
             "triton_used": False,
             "provider": dict(getattr(result, "provenance", {})),
@@ -1356,6 +1374,10 @@ class VllmLogpOperator:
         values = torch.where(matches, selected.unsqueeze(1), values)
         self._last_provenance = {
             **dict(provenance),
+            "interface": "vllm.sampler.selected_logprob",
+            "operator": self.backend_id,
+            "actual_backend": self.backend_id,
+            "fallback": False,
             "sampled_token_ids": _tensor_metadata(token_ids),
             "logprobs_shape": list(values.shape),
             "logprob_token_ids_shape": list(ids.shape),

@@ -32,6 +32,7 @@ from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import (
     BACKEND_ID,
     DEFAULT_NUM_VOCAB_TILES,
 )
+from rl_engine.runtime_mode import strict_contract_enabled
 
 
 class SelectedLogprobProviderUnavailable(RuntimeError):
@@ -216,7 +217,7 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> ProviderResult:
     distribution semantics.
     """
 
-    strict = os.getenv("VIME_RL_KERNEL_STRICT", "").strip().lower() in {"1", "true", "yes", "on"}
+    strict = strict_contract_enabled()
     if strict and not isinstance(getattr(request, "hidden", None), torch.Tensor):
         raise RuntimeError(
             "strict Vime linear_logp request is missing hidden/LM-head structural inputs"
