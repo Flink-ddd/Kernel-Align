@@ -16,6 +16,7 @@ the earlier fixed-order, no-split-K contract and do not use BF16 tree nodes.
 
 from __future__ import annotations
 
+import functools
 import threading
 from dataclasses import dataclass
 
@@ -36,6 +37,92 @@ from rl_engine.utils.logger import logger
 _BLOCK_M, _BLOCK_N, _BLOCK_K = 64, 64, 32
 _TREE_PLANS: dict[tuple[int, int], "_DeviceTreePlan"] = {}
 _TREE_PLAN_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class _TreeLeafConfig:
+    block_m: int
+    block_n: int
+    num_warps: int
+    n_fastest: bool
+
+
+_DEFAULT_TREE_LEAF_CONFIG = _TreeLeafConfig(_BLOCK_M, _BLOCK_N, 4, False)
+
+# Offline-swept on ROCm gfx942 with Triton 3.7. These entries deliberately
+# cover only the Qwen3-8B TP1 logical shapes and stride modes used by the FFN.
+# Other architectures and shapes retain the established 64x64 specialization.
+_GFX942_QWEN_FORWARD_LEAF_CONFIGS = {
+    1: _TreeLeafConfig(1, 128, 1, True),
+    8: _TreeLeafConfig(8, 128, 2, True),
+    32: _TreeLeafConfig(32, 128, 4, True),
+}
+_GFX942_QWEN_WGRAD_LEAF_CONFIGS = {
+    1: _TreeLeafConfig(128, 64, 2, True),
+    8: _TreeLeafConfig(128, 64, 2, True),
+    32: _TreeLeafConfig(64, 64, 2, True),
+}
+_QWEN_FORWARD_GEMM_SHAPES = {(4096, 12288), (12288, 4096)}
+_QWEN_WGRAD_OUTPUT_SHAPES = {(4096, 12288), (12288, 4096)}
+
+
+def _gfx942_qwen_tree_leaf_config(
+    m_size: int,
+    k_size: int,
+    n_size: int,
+    *,
+    transpose_output: bool,
+    preserve_a_strides: bool,
+) -> _TreeLeafConfig:
+    if (
+        not transpose_output
+        and not preserve_a_strides
+        and (k_size, n_size) in _QWEN_FORWARD_GEMM_SHAPES
+    ):
+        return _GFX942_QWEN_FORWARD_LEAF_CONFIGS.get(
+            m_size,
+            _DEFAULT_TREE_LEAF_CONFIG,
+        )
+    if (
+        transpose_output
+        and preserve_a_strides
+        and (m_size, n_size) in _QWEN_WGRAD_OUTPUT_SHAPES
+    ):
+        return _GFX942_QWEN_WGRAD_LEAF_CONFIGS.get(
+            k_size,
+            _DEFAULT_TREE_LEAF_CONFIG,
+        )
+    return _DEFAULT_TREE_LEAF_CONFIG
+
+
+@functools.lru_cache(maxsize=None)
+def _device_arch(device_index: int) -> str:
+    if getattr(torch.version, "hip", None) is None:
+        return ""
+    properties = torch.cuda.get_device_properties(device_index)
+    return str(getattr(properties, "gcnArchName", "")).partition(":")[0]
+
+
+@functools.lru_cache(maxsize=None)
+def _tree_leaf_config(
+    device: torch.device,
+    m_size: int,
+    k_size: int,
+    n_size: int,
+    *,
+    transpose_output: bool,
+    preserve_a_strides: bool,
+) -> _TreeLeafConfig:
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    if _device_arch(device_index) != "gfx942":
+        return _DEFAULT_TREE_LEAF_CONFIG
+    return _gfx942_qwen_tree_leaf_config(
+        m_size,
+        k_size,
+        n_size,
+        transpose_output=transpose_output,
+        preserve_a_strides=preserve_a_strides,
+    )
 
 
 @dataclass(frozen=True)
@@ -149,10 +236,16 @@ if _TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        N_FASTEST: tl.constexpr,
     ):
-        leaf = tl.program_id(0)
-        pid_m = tl.program_id(1)
-        pid_n = tl.program_id(2)
+        if N_FASTEST:
+            pid_n = tl.program_id(0)
+            pid_m = tl.program_id(1)
+            leaf = tl.program_id(2)
+        else:
+            leaf = tl.program_id(0)
+            pid_m = tl.program_id(1)
+            pid_n = tl.program_id(2)
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         leaf_start = tl.load(leaf_starts_ptr + leaf)
@@ -388,10 +481,20 @@ def _triton_tree_gemm(
         dtype=torch.bfloat16,
         device=a.device,
     )
+    leaf_config = _tree_leaf_config(
+        a.device,
+        m_size,
+        k_size,
+        n_size,
+        transpose_output=transpose_output,
+        preserve_a_strides=preserve_a_strides,
+    )
+    tiles_m = triton.cdiv(m_size, leaf_config.block_m)
+    tiles_n = triton.cdiv(n_size, leaf_config.block_n)
     leaf_grid = (
-        len(plan.host.leaf_nodes),
-        triton.cdiv(m_size, _BLOCK_M),
-        triton.cdiv(n_size, _BLOCK_N),
+        (tiles_n, tiles_m, len(plan.host.leaf_nodes))
+        if leaf_config.n_fastest
+        else (len(plan.host.leaf_nodes), tiles_m, tiles_n)
     )
     _det_gemm_tree_leaf_kernel[leaf_grid](
         a,
@@ -407,9 +510,11 @@ def _triton_tree_gemm(
         stride_ak=a.stride(1),
         stride_bk=b.stride(0),
         stride_bn=b.stride(1),
-        BLOCK_M=_BLOCK_M,
-        BLOCK_N=_BLOCK_N,
+        BLOCK_M=leaf_config.block_m,
+        BLOCK_N=leaf_config.block_n,
         BLOCK_K=_BLOCK_K,
+        N_FASTEST=leaf_config.n_fastest,
+        num_warps=leaf_config.num_warps,
     )
     reduction_block = 256
     for operations, (lower, upper, output) in zip(

@@ -15,8 +15,18 @@ from rl_engine.kernels.gtest.tolerance import load_contract
 from rl_engine.kernels.ops.cuda.matmul import deterministic_gemm
 
 try:
+    import triton
+
     from rl_engine.kernels.ops.triton.matmul import deterministic_gemm_triton
-    from rl_engine.kernels.ops.triton.matmul.det_gemm import _triton_tree_gemm
+    from rl_engine.kernels.ops.triton.matmul.det_gemm import (
+        _DEFAULT_TREE_LEAF_CONFIG,
+        _GFX942_QWEN_FORWARD_LEAF_CONFIGS,
+        _GFX942_QWEN_WGRAD_LEAF_CONFIGS,
+        _det_gemm_tree_leaf_kernel,
+        _device_tree_plan,
+        _gfx942_qwen_tree_leaf_config,
+        _triton_tree_gemm,
+    )
 
     _HAS_TRITON = True
 except ImportError:
@@ -28,6 +38,9 @@ IS_ROCM = getattr(torch.version, "hip", None) is not None
 HAS_SUPPORTED_GPU = torch.cuda.is_available() and (
     IS_ROCM or torch.cuda.get_device_capability()[0] >= 8
 )
+IS_GFX942 = IS_ROCM and torch.cuda.is_available() and str(
+    getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+).startswith("gfx942")
 
 pytestmark = pytest.mark.skipif(
     not HAS_SUPPORTED_GPU,
@@ -55,6 +68,80 @@ def _assert_same_raw_bytes(actual: torch.Tensor, expected: torch.Tensor) -> None
     )
 
 
+def _leaf_workspace(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    config,
+) -> torch.Tensor:
+    m_size, k_size = a.shape
+    n_size = b.size(1)
+    plan = _device_tree_plan(k_size, a.device)
+    workspace = torch.empty(
+        (plan.host.node_count, m_size, n_size),
+        dtype=torch.bfloat16,
+        device=a.device,
+    )
+    tiles_m = triton.cdiv(m_size, config.block_m)
+    tiles_n = triton.cdiv(n_size, config.block_n)
+    grid = (
+        (tiles_n, tiles_m, len(plan.host.leaf_nodes))
+        if config.n_fastest
+        else (len(plan.host.leaf_nodes), tiles_m, tiles_n)
+    )
+    _det_gemm_tree_leaf_kernel[grid](
+        a,
+        b,
+        workspace,
+        plan.leaf_starts,
+        plan.leaf_lengths,
+        plan.leaf_nodes,
+        M=m_size,
+        N=n_size,
+        K=k_size,
+        stride_am=a.stride(0),
+        stride_ak=a.stride(1),
+        stride_bk=b.stride(0),
+        stride_bn=b.stride(1),
+        BLOCK_M=config.block_m,
+        BLOCK_N=config.block_n,
+        BLOCK_K=_K_TREE_LEAF,
+        N_FASTEST=config.n_fastest,
+        num_warps=config.num_warps,
+    )
+    return workspace.index_select(0, plan.leaf_nodes.to(torch.int64))
+
+
+def _special_bf16(shape: tuple[int, ...], *, offset: int = 0) -> torch.Tensor:
+    bits = torch.tensor(
+        (
+            0x0000,
+            0x8000,
+            0x0001,
+            0x8001,
+            0x007F,
+            0x807F,
+            0x0080,
+            0x8080,
+            0x3F80,
+            0xBF80,
+            0x7F7F,
+            0xFF7F,
+            0x7F80,
+            0xFF80,
+            0x7F81,
+            0x7FC1,
+            0xFF81,
+            0xFFFF,
+        ),
+        dtype=torch.uint16,
+    )
+    elements = 1
+    for size in shape:
+        elements *= size
+    indices = (torch.arange(elements, dtype=torch.int64) + offset) % bits.numel()
+    return bits[indices].view(torch.bfloat16).reshape(shape).to(DEV)
+
+
 _K_TREE_LEAF = 32
 
 
@@ -80,13 +167,94 @@ def _balanced_tree_sum(parts: list[torch.Tensor]) -> torch.Tensor:
     return level[0]
 
 
+@pytest.mark.skipif(not _HAS_TRITON, reason="Triton is unavailable")
+@pytest.mark.parametrize(
+    ("shape", "transpose_output", "preserve_a_strides", "expected"),
+    (
+        ((1, 4096, 12288), False, False, (1, 128, 1, True)),
+        ((8, 4096, 12288), False, False, (8, 128, 2, True)),
+        ((32, 12288, 4096), False, False, (32, 128, 4, True)),
+        ((4096, 1, 12288), True, True, (128, 64, 2, True)),
+        ((12288, 8, 4096), True, True, (128, 64, 2, True)),
+        ((4096, 32, 12288), True, True, (64, 64, 2, True)),
+        ((16, 4096, 12288), False, False, (64, 64, 4, False)),
+        ((32, 4096, 4096), False, False, (64, 64, 4, False)),
+        ((4096, 16, 12288), True, True, (64, 64, 4, False)),
+        ((4096, 8, 12288), True, False, (64, 64, 4, False)),
+    ),
+)
+def test_gfx942_qwen_leaf_config_table_is_exact(
+    shape,
+    transpose_output,
+    preserve_a_strides,
+    expected,
+):
+    config = _gfx942_qwen_tree_leaf_config(
+        *shape,
+        transpose_output=transpose_output,
+        preserve_a_strides=preserve_a_strides,
+    )
+    assert (
+        config.block_m,
+        config.block_n,
+        config.num_warps,
+        config.n_fastest,
+    ) == expected
+
+
+@pytest.mark.skipif(
+    not (_HAS_TRITON and IS_GFX942),
+    reason="leaf specialization raw-byte tests require ROCm gfx942",
+)
+@pytest.mark.parametrize("k_size", (1, 8, 31, 32, 33, 65, 4096, 12288))
+def test_gfx942_leaf_configs_preserve_special_value_workspace_raw_bytes(k_size):
+    a = _special_bf16((3, k_size))
+    b = _special_bf16((k_size, 17), offset=7)
+    expected = _leaf_workspace(a, b, _DEFAULT_TREE_LEAF_CONFIG)
+    configs = tuple(
+        dict.fromkeys(
+            (
+                *_GFX942_QWEN_FORWARD_LEAF_CONFIGS.values(),
+                *_GFX942_QWEN_WGRAD_LEAF_CONFIGS.values(),
+            )
+        )
+    )
+
+    for config in configs:
+        _assert_same_raw_bytes(_leaf_workspace(a, b, config), expected)
+
+
+@pytest.mark.skipif(
+    not (_HAS_TRITON and IS_GFX942),
+    reason="leaf specialization raw-byte tests require ROCm gfx942",
+)
+def test_gfx942_leaf_configs_preserve_transposed_a_workspace_raw_bytes():
+    source = _special_bf16((65, 3))
+    a = source.t()
+    b = _special_bf16((65, 17), offset=11)
+    assert not a.is_contiguous()
+    assert all(stride > 0 for stride in a.stride())
+    expected = _leaf_workspace(a, b, _DEFAULT_TREE_LEAF_CONFIG)
+    configs = tuple(
+        dict.fromkeys(
+            (
+                *_GFX942_QWEN_FORWARD_LEAF_CONFIGS.values(),
+                *_GFX942_QWEN_WGRAD_LEAF_CONFIGS.values(),
+            )
+        )
+    )
+
+    for config in configs:
+        _assert_same_raw_bytes(_leaf_workspace(a, b, config), expected)
+
+
 @pytest.mark.parametrize("tp_size", (2, 4, 8))
 @pytest.mark.skipif(not _HAS_TRITON, reason="Triton is unavailable")
 def test_forward_matches_balanced_contiguous_k_shards_bitwise(tp_size):
     """The GEMM K-tree and the TP collective rank tree must be the same graph."""
 
     torch.manual_seed(8)
-    # Qwen3-8B's down projection uses K=12288.  Its 384 32-wide leaves also
+    # Qwen3-8B's down projection uses K=12288. Its 512 24-wide leaves also
     # exercise the non-power-of-two midpoint tree used by the SM90 kernel.
     m, k, n = 4, 12288, 64
     a, b = _rand(m, k), _rand(k, n)

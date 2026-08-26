@@ -31,7 +31,11 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
 
 import rl_engine.kernels.ops.triton.ffn.ffn as ffn_module
-from rl_engine.kernels.ops.triton.ffn import qwen3_ffn
+from rl_engine.kernels.ops.triton.ffn import (
+    pack_qwen3_ffn_forward_weights,
+    qwen3_ffn,
+)
+
 _DISTRIBUTED_CONFIGS: dict[int, tuple[tuple[str, int, int, bool], ...]] = {
     2: (("tp2", 2, 1, False), ("tp2_sp", 2, 1, True)),
     4: (
@@ -45,6 +49,7 @@ _DISTRIBUTED_CONFIGS: dict[int, tuple[tuple[str, int, int, bool], ...]] = {
         ("tp4_cp2_sp", 4, 2, True),
     ),
 }
+_TP1_FORWARD_CACHE_BYTES = 3 * 4096 * 12288 * torch.bfloat16.itemsize
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -179,6 +184,11 @@ def _single_gpu_benchmarks(
     gate_weight = _randn((12288, 4096), seed=3000, device=device)
     up_weight = _randn((12288, 4096), seed=3001, device=device)
     down_weight = _randn((4096, 12288), seed=3002, device=device)
+    forward_weights = pack_qwen3_ffn_forward_weights(
+        gate_weight,
+        up_weight,
+        down_weight,
+    )
     official = _official_qwen3_mlp(gate_weight, up_weight, down_weight)
     for index, tokens in enumerate((1, 8, 32)):
         hidden = _randn((tokens, 4096), seed=3010 + index * 2, device=device)
@@ -195,7 +205,11 @@ def _single_gpu_benchmarks(
         )
         triton_timing = _summary_ms(
             _gpu_event_samples(
-                lambda: qwen3_ffn(hidden, *weights),
+                lambda: qwen3_ffn(
+                    hidden,
+                    *weights,
+                    forward_weights=forward_weights,
+                ),
                 warmup=warmup,
                 samples=samples,
             )
@@ -208,6 +222,7 @@ def _single_gpu_benchmarks(
                 "hidden": 4096,
                 "intermediate": 12288,
                 "dtype": "bfloat16",
+                "weight_layout": "packed_forward_cache",
                 "official_tp1": official_timing,
                 "triton": triton_timing,
                 "latency_ratio_vs_official_tp1": (
@@ -221,6 +236,19 @@ def _single_gpu_benchmarks(
             value.detach().clone().requires_grad_(True)
             for value in (hidden, *weights)
         ]
+        triton_forward_weights = pack_qwen3_ffn_forward_weights(
+            *triton_inputs[1:]
+        )
+
+        def triton_training_step() -> torch.Tensor:
+            return _training_step(
+                lambda *values: qwen3_ffn(
+                    *values,
+                    forward_weights=triton_forward_weights,
+                ),
+                triton_inputs,
+                grad_output,
+            )
 
         def official_training_step() -> torch.Tensor:
             official.zero_grad(set_to_none=True)
@@ -238,7 +266,7 @@ def _single_gpu_benchmarks(
         )
         triton_train_timing = _summary_ms(
             _gpu_event_samples(
-                lambda: _training_step(qwen3_ffn, triton_inputs, grad_output),
+                triton_training_step,
                 warmup=max(1, warmup // 2),
                 samples=training_samples,
             )
@@ -251,6 +279,7 @@ def _single_gpu_benchmarks(
                 "hidden": 4096,
                 "intermediate": 12288,
                 "dtype": "bfloat16",
+                "weight_layout": "packed_forward_cache",
                 "official_tp1": official_train_timing,
                 "triton": triton_train_timing,
                 "latency_ratio_vs_official_tp1": (
@@ -259,11 +288,17 @@ def _single_gpu_benchmarks(
                 ),
             }
         )
-        del hidden, grad_output, official_hidden, triton_inputs
+        del (
+            hidden,
+            grad_output,
+            official_hidden,
+            triton_inputs,
+            triton_forward_weights,
+        )
         torch.cuda.empty_cache()
 
     # This is intentionally separate from the determinism and speed results.
-    del official, gate_weight, up_weight, down_weight
+    del official, forward_weights, gate_weight, up_weight, down_weight
     torch.cuda.empty_cache()
     tokens = 8
     fp32_hidden = _randn(
@@ -449,12 +484,26 @@ def _distributed_ffn_benchmark(
 
     # Exactness reference: the same deterministic Triton implementation at TP=1.
     full_values = (hidden_full, gate_full, up_full, down_full)
+    tp1_forward_weights = pack_qwen3_ffn_forward_weights(*full_values[1:])
     with torch.no_grad():
-        tp1_forward = qwen3_ffn(*full_values).detach().clone()
-    tp1_inputs = [value.detach().clone().requires_grad_(True) for value in full_values]
-    tp1_train = _training_step(qwen3_ffn, tp1_inputs, grad_output_full).detach().clone()
+        tp1_forward = qwen3_ffn(
+            *full_values,
+            forward_weights=tp1_forward_weights,
+        ).detach().clone()
+    tp1_inputs = [
+        value.detach().clone().requires_grad_(True) for value in full_values
+    ]
+    tp1_training_weights = pack_qwen3_ffn_forward_weights(*tp1_inputs[1:])
+    tp1_train = _training_step(
+        lambda *values: qwen3_ffn(
+            *values,
+            forward_weights=tp1_training_weights,
+        ),
+        tp1_inputs,
+        grad_output_full,
+    ).detach().clone()
     tp1_grads = [value.grad.detach().clone() for value in tp1_inputs]
-    del tp1_inputs
+    del tp1_inputs, tp1_forward_weights, tp1_training_weights
     torch.cuda.empty_cache()
 
     meshes: dict[tuple[int, int], tuple[list[Any], list[Any]]] = {}
@@ -483,11 +532,13 @@ def _distributed_ffn_benchmark(
             up_full[feature_start:feature_end].contiguous(),
             down_full[:, feature_start:feature_end].contiguous(),
         )
+        shard_forward_weights = pack_qwen3_ffn_forward_weights(*shard[1:])
         local_grad_output = grad_output_full[token_start:token_end].contiguous()
 
         def triton_forward():
             return qwen3_ffn(
                 *shard,
+                forward_weights=shard_forward_weights,
                 tp_group=tp_group,
                 cp_group=cp_group,
                 sequence_parallel=sequence_parallel,
@@ -506,14 +557,21 @@ def _distributed_ffn_benchmark(
             dist.group.WORLD,
         )
 
-        triton_inputs = [value.detach().clone().requires_grad_(True) for value in shard]
-        repeat_inputs = [value.detach().clone().requires_grad_(True) for value in shard]
+        triton_inputs = [
+            value.detach().clone().requires_grad_(True) for value in shard
+        ]
+        repeat_inputs = [
+            value.detach().clone().requires_grad_(True) for value in shard
+        ]
+        triton_forward_weights = pack_qwen3_ffn_forward_weights(*triton_inputs[1:])
+        repeat_forward_weights = pack_qwen3_ffn_forward_weights(*repeat_inputs[1:])
 
-        def triton_training_step(inputs):
+        def triton_training_step(inputs, packed_weights):
             for value in inputs:
                 value.grad = None
             output = qwen3_ffn(
                 *inputs,
+                forward_weights=packed_weights,
                 tp_group=tp_group,
                 cp_group=cp_group,
                 sequence_parallel=sequence_parallel,
@@ -521,13 +579,22 @@ def _distributed_ffn_benchmark(
             output.backward(local_grad_output)
             return output
 
-        triton_train = triton_training_step(triton_inputs).detach().clone()
+        triton_train = triton_training_step(
+            triton_inputs,
+            triton_forward_weights,
+        ).detach().clone()
         triton_grads = [value.grad.detach().clone() for value in triton_inputs]
-        repeat_train = triton_training_step(repeat_inputs).detach().clone()
+        repeat_train = triton_training_step(
+            repeat_inputs,
+            repeat_forward_weights,
+        ).detach().clone()
         repeat_grads = [value.grad.detach().clone() for value in repeat_inputs]
         triton_train_summary = _slowest_rank_summary(
             _distributed_wall_samples(
-                lambda: triton_training_step(triton_inputs),
+                lambda: triton_training_step(
+                    triton_inputs,
+                    triton_forward_weights,
+                ),
                 group=dist.group.WORLD,
                 warmup=max(1, warmup // 2),
                 samples=training_samples,
@@ -576,6 +643,7 @@ def _distributed_ffn_benchmark(
                 "tokens": token_count,
                 "hidden": hidden_size,
                 "intermediate": intermediate_size,
+                "weight_layout": "packed_forward_cache",
             }
             results.extend(
                 (
@@ -629,7 +697,14 @@ def _distributed_ffn_benchmark(
                     },
                 )
             )
-        del shard, triton_inputs, repeat_inputs
+        del (
+            shard,
+            shard_forward_weights,
+            triton_inputs,
+            triton_forward_weights,
+            repeat_inputs,
+            repeat_forward_weights,
+        )
         torch.cuda.empty_cache()
         dist.barrier()
 
@@ -860,6 +935,12 @@ def _write_report(
             "- The official performance baseline is upstream Transformers "
             "`Qwen3MLP` with unsharded weights and input (TP=1). Each distributed "
             "rank runs that TP=1 reference and the slowest rank/sample is reported.",
+            "- Deterministic Triton timings use the explicit prepacked forward-weight "
+            "cache. Packing happens once outside the timed region; canonical source "
+            "weights remain the autograd and optimizer source of truth.",
+            f"- The TP=1 cache adds {_TP1_FORWARD_CACHE_BYTES / 2**20:.0f} MiB; "
+            "each TP rank holds that amount divided by TP size. Refresh cost is "
+            "excluded because the benchmark measures the steady-state FFN call.",
             "- The distributed exactness baseline is the PR's deterministic Triton "
             "FFN at TP=1. Local outputs, dHidden, and sharded dWeights are compared "
             "against their exact TP=1 slices.",
@@ -888,10 +969,10 @@ def _write_report(
             "dHidden, and dWeights.",
             f"- Repeat mismatch: **{total_repeat_mismatch}**; training/inference "
             f"forward mismatch: **{total_train_infer_mismatch}**.",
-            f"- Single-GPU deterministic Triton latency is "
+            f"- Single-GPU deterministic Triton packed-cache latency is "
             f"**{min(single_ratios):.2f}-{max(single_ratios):.2f}x** the official "
             "Qwen3MLP TP=1 latency across M=1/8/32 and forward/training.",
-            f"- Distributed deterministic Triton latency is "
+            f"- Distributed deterministic Triton packed-cache latency is "
             f"**{min(distributed_ratios):.2f}-{max(distributed_ratios):.2f}x** the "
             "official Qwen3MLP TP=1 latency across tested parallel layouts.",
             f"- The separate official-Qwen3MLP FP16 versus FP32 observation has "
@@ -904,7 +985,7 @@ def _write_report(
             "reported here.",
             "",
             "| Shape / direction | Official Qwen3MLP TP=1 (ms) | Deterministic "
-            "Triton (ms) | Triton / official TP=1 |",
+            "Triton, packed (ms) | Triton / official TP=1 |",
             "|---|---:|---:|---:|",
         )
     )
@@ -925,7 +1006,8 @@ def _write_report(
             "this comparison.",
             "",
             "| Parallel layout | Direction | Official Qwen3MLP TP=1 (ms) | "
-            "Deterministic distributed Triton (ms) | Triton / official TP=1 |",
+            "Deterministic distributed Triton, packed (ms) | Triton / official "
+            "TP=1 |",
             "|---|---|---:|---:|---:|",
         )
     )
@@ -1076,11 +1158,12 @@ def _write_report(
             "",
             "## Figures",
             "",
-            "![Single-GPU CUDA, Triton, and CPU latency](single_gpu_overhead.png)",
+            "![Single-GPU CUDA, packed Triton, and CPU latency]"
+            "(single_gpu_overhead.png)",
             "",
             "![Topology mismatch versus Triton TP=1](collective_overhead.png)",
             "",
-            "![Distributed H100 CUDA and MI300X Triton latency]"
+            "![Distributed H100 CUDA and MI300X packed Triton latency]"
             "(distributed_ffn_overhead.png)",
             "",
         )
@@ -1138,7 +1221,7 @@ def _write_figures(
             positions + width / 2,
             triton_values,
             width,
-            label="Deterministic Triton FFN",
+            label="Deterministic Triton FFN (packed)",
             color="#7c3aed",
         )
         for bars, values in (
@@ -1176,7 +1259,11 @@ def _write_figures(
             ("H100 Triton replay", "triton_h100_ms", "#06b6d4"),
             ("H100 deterministic CUDA", "cuda_h100_ms", "#dc2626"),
             ("MI300X official TP=1", "official_mi300x_ms", "#86efac"),
-            ("MI300X deterministic Triton", "triton_mi300x_ms", "#7c3aed"),
+            (
+                "MI300X deterministic Triton (packed)",
+                "triton_mi300x_ms",
+                "#7c3aed",
+            ),
         )
         width = 0.13
         for axis, direction, direction_label in (
@@ -1302,7 +1389,11 @@ def _write_figures(
     if comparison_payload is None:
         distributed_series = (
             ("Official Qwen3MLP TP=1", "official_mi300x_ms", "#2563eb"),
-            ("Deterministic distributed Triton", "triton_mi300x_ms", "#7c3aed"),
+            (
+                "Deterministic distributed Triton (packed)",
+                "triton_mi300x_ms",
+                "#7c3aed",
+            ),
         )
         width = 0.37
     else:
@@ -1314,7 +1405,11 @@ def _write_figures(
             ("H100 official TP=1", "official_h100_ms", "#60a5fa"),
             ("H100 deterministic CUDA", "cuda_h100_ms", "#dc2626"),
             ("MI300X official TP=1", "official_mi300x_ms", "#86efac"),
-            ("MI300X deterministic Triton", "triton_mi300x_ms", "#7c3aed"),
+            (
+                "MI300X deterministic Triton (packed)",
+                "triton_mi300x_ms",
+                "#7c3aed",
+            ),
         )
         width = 0.19
     for axis, direction, direction_label in (
@@ -1445,6 +1540,8 @@ def main() -> None:
             "samples": args.samples,
             "training_samples": args.training_samples,
             "operator_only": True,
+            "triton_weight_layout": "packed_forward_cache_outside_timed_region",
+            "tp1_forward_cache_bytes": _TP1_FORWARD_CACHE_BYTES,
         },
         "single_gpu": _single_gpu_benchmarks(
             warmup=args.warmup,
