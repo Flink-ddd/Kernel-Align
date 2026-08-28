@@ -8,8 +8,8 @@ from typing import Any
 import pytest
 import torch
 
-import rl_engine.distributed.collectives as cuda_collectives
-import rl_engine.distributed.transport_collectives as transport_collectives
+import rl_engine.distributed as distributed
+import rl_engine.distributed.collectives as collectives
 from rl_engine.distributed import (
     RCCLDeterministicCollective,
     TorchDistributedDeterministicCollective,
@@ -92,6 +92,18 @@ class _FakeDistributed:
             destination.copy_(peer.reshape(-1))
 
 
+def test_public_exports_use_canonical_collectives_module() -> None:
+    assert distributed.DeterministicCollective is collectives.DeterministicCollective
+    assert distributed.RCCLDeterministicCollective is collectives.RCCLDeterministicCollective
+    assert (
+        distributed.TorchDistributedDeterministicCollective
+        is collectives.TorchDistributedDeterministicCollective
+    )
+    assert (
+        distributed.create_deterministic_collective is collectives.create_deterministic_collective
+    )
+
+
 def _make_collective(
     monkeypatch: pytest.MonkeyPatch,
     peer_inputs: list[torch.Tensor],
@@ -109,7 +121,7 @@ def _make_collective(
         peer_signatures=peer_signatures,
         peer_capacities=peer_capacities,
     )
-    monkeypatch.setattr(transport_collectives, "dist", fake_dist)
+    monkeypatch.setattr(collectives, "dist", fake_dist)
     collective = TorchDistributedDeterministicCollective(
         group=object(),
         device="cpu",
@@ -312,14 +324,14 @@ def test_unsupported_world_size_is_rejected(
     world_size: int,
 ) -> None:
     fake_dist = _FakeDistributed([torch.ones(1)] * world_size)
-    monkeypatch.setattr(transport_collectives, "dist", fake_dist)
+    monkeypatch.setattr(collectives, "dist", fake_dist)
 
     with pytest.raises(ValueError, match="world_size in"):
         TorchDistributedDeterministicCollective(group=object(), device="cpu")
 
 
 def test_rccl_class_requires_rocm_build(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(transport_collectives.torch.version, "hip", None, raising=False)
+    monkeypatch.setattr(collectives.torch.version, "hip", None, raising=False)
 
     with pytest.raises(RuntimeError, match="ROCm PyTorch build"):
         RCCLDeterministicCollective(group=object(), device="cuda:0")
@@ -327,10 +339,10 @@ def test_rccl_class_requires_rocm_build(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_rccl_class_requires_nccl_process_group(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_dist = _FakeDistributed([torch.ones(1)], backend="gloo")
-    monkeypatch.setattr(transport_collectives, "dist", fake_dist)
-    monkeypatch.setattr(transport_collectives.torch.version, "hip", "6.3", raising=False)
-    monkeypatch.setattr(transport_collectives.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(transport_collectives.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(collectives, "dist", fake_dist)
+    monkeypatch.setattr(collectives.torch.version, "hip", "6.3", raising=False)
+    monkeypatch.setattr(collectives.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(collectives.torch.cuda, "current_device", lambda: 0)
 
     with pytest.raises(RuntimeError, match="NCCL process-group API"):
         RCCLDeterministicCollective(group=object(), device="cuda:0")
@@ -339,8 +351,8 @@ def test_rccl_class_requires_nccl_process_group(monkeypatch: pytest.MonkeyPatch)
 def test_rccl_class_rejects_cpu_before_process_group_exchange(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(transport_collectives.torch.version, "hip", "6.3", raising=False)
-    monkeypatch.setattr(transport_collectives.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(collectives.torch.version, "hip", "6.3", raising=False)
+    monkeypatch.setattr(collectives.torch.cuda, "is_available", lambda: True)
 
     with pytest.raises(ValueError, match="ROCm device"):
         RCCLDeterministicCollective(group=object(), device="cpu")
@@ -354,11 +366,11 @@ def test_factory_dispatches_rocm_to_rccl(monkeypatch: pytest.MonkeyPatch) -> Non
         calls.append(kwargs)
         return sentinel
 
-    monkeypatch.setattr(transport_collectives.torch.version, "hip", "6.3", raising=False)
-    monkeypatch.setattr(transport_collectives, "RCCLDeterministicCollective", fake_rccl)
+    monkeypatch.setattr(collectives.torch.version, "hip", "6.3", raising=False)
+    monkeypatch.setattr(collectives, "RCCLDeterministicCollective", fake_rccl)
 
     group = object()
-    result = transport_collectives.create_deterministic_collective(
+    result = collectives.create_deterministic_collective(
         group=group,
         device="cuda:3",
         max_size_bytes=1234,
@@ -376,11 +388,11 @@ def test_factory_preserves_existing_cuda_collective(monkeypatch: pytest.MonkeyPa
         calls.append(kwargs)
         return sentinel
 
-    monkeypatch.setattr(transport_collectives.torch.version, "hip", None, raising=False)
-    monkeypatch.setattr(cuda_collectives, "DeterministicCollective", fake_cuda)
+    monkeypatch.setattr(collectives.torch.version, "hip", None, raising=False)
+    monkeypatch.setattr(collectives, "DeterministicCollective", fake_cuda)
 
     group = object()
-    result = transport_collectives.create_deterministic_collective(
+    result = collectives.create_deterministic_collective(
         group=group,
         device="cuda:1",
         max_size_bytes=4321,

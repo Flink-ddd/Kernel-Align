@@ -95,7 +95,7 @@ torch::Tensor deterministic_logp_forward_indexed_fp32(torch::Tensor logits, torc
 
 #if !defined(USE_ROCM) && !defined(KERNEL_ALIGN_WITH_ROCM)
 // Single-node TP=8 deterministic CUDA IPC collectives. ROCm uses the
-// rank-ordered RCCL transport in rl_engine.distributed.transport_collectives.
+// rank-ordered RCCL transport in rl_engine.distributed.collectives.
 std::tuple<std::vector<int64_t>, int64_t> deterministic_collective_ipc_meta(
     torch::Tensor& tensor);
 int64_t deterministic_collective_create(
