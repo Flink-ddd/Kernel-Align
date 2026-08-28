@@ -8,21 +8,13 @@ def batch_invariant_logp_ascend(
     target: torch.Tensor,
     ignore_index: int,
 ) -> list[torch.Tensor]: ...
-
-
 def deterministic_collective_create(
     staging: torch.Tensor,
     world_size: int,
     rank: int,
 ) -> int: ...
-
-
 def deterministic_collective_destroy(handle: int) -> None: ...
-
-
 def deterministic_collective_stage(handle: int, input: torch.Tensor) -> None: ...
-
-
 def deterministic_collective_reduce(
     handle: int,
     gathered: torch.Tensor,

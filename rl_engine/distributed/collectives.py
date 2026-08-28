@@ -98,9 +98,7 @@ class DeterministicCollective:
             normalized_device = torch.device("npu", torch.npu.current_device())
             if device is not None:
                 normalized_device = (
-                    torch.device("npu", device)
-                    if isinstance(device, int)
-                    else torch.device(device)
+                    torch.device("npu", device) if isinstance(device, int) else torch.device(device)
                 )
                 if normalized_device.type != "npu":
                     raise ValueError(
@@ -117,9 +115,7 @@ class DeterministicCollective:
             self.device = normalized_device
             self._create_npu_state()
         else:
-            raise RuntimeError(
-                "deterministic collectives require CUDA or Ascend NPU devices"
-            )
+            raise RuntimeError("deterministic collectives require CUDA or Ascend NPU devices")
 
         self._synchronize_ranks()
 
@@ -349,10 +345,7 @@ class DeterministicCollective:
 
     def _staged_view(self, input: torch.Tensor) -> torch.Tensor:
         """The staged input as a typed view of the staging buffer."""
-        return (
-            self._staging.narrow(0, 0, input.numel() * input.element_size())
-            .view(input.dtype)
-        )
+        return self._staging.narrow(0, 0, input.numel() * input.element_size()).view(input.dtype)
 
     def _run_reduction(
         self,
