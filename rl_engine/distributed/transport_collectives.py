@@ -74,6 +74,12 @@ class TorchDistributedDeterministicCollective:
         # One dtype-agnostic byte workspace is grown on demand and reused by
         # reduction collectives. AllGather writes directly into its output.
         self._workspace: torch.Tensor | None = None
+        # A Python-object collective is useful for catching a mismatched new
+        # signature, but running one on every hot-path call dominates small
+        # message latency. Validate each local signature once and then rely on
+        # the standard collective contract that ranks call operations in the
+        # same order.
+        self._validated_signatures: set[tuple[Any, ...]] = set()
         self._validate_matching_capacity()
 
     @staticmethod
@@ -200,6 +206,7 @@ class TorchDistributedDeterministicCollective:
 
         with self._lock:
             self._workspace = None
+            self._validated_signatures.clear()
             self._closed = True
 
     def __enter__(self) -> TorchDistributedDeterministicCollective:
@@ -271,12 +278,15 @@ class TorchDistributedDeterministicCollective:
         if self.world_size == 1:
             return
         signature = (op_name, tuple(input.shape), str(input.dtype), input.numel())
+        if signature in self._validated_signatures:
+            return
         signatures: list[tuple[Any, ...] | None] = [None] * self.world_size
         dist.all_gather_object(signatures, signature, group=self.group)
         if any(peer_signature != signature for peer_signature in signatures):
             raise ValueError(
                 f"all ranks must call {op_name} with matching shapes and dtypes; got {signatures}"
             )
+        self._validated_signatures.add(signature)
 
     def _validate_matching_capacity(self) -> None:
         if self.world_size == 1:
@@ -336,15 +346,21 @@ class TorchDistributedDeterministicCollective:
 
     @staticmethod
     def _balanced_tree_sum(rank_inputs: torch.Tensor) -> torch.Tensor:
-        level = list(rank_inputs.unbind(0))
-        if len(level) not in _SUPPORTED_WORLD_SIZES:
+        world_size = rank_inputs.size(0)
+        if world_size not in _SUPPORTED_WORLD_SIZES:
             raise ValueError(
                 "balanced reduction requires rank inputs for world_size in "
-                f"{_SUPPORTED_WORLD_SIZES}, got {len(level)}"
+                f"{_SUPPORTED_WORLD_SIZES}, got {world_size}"
             )
-        while len(level) > 1:
-            level = [torch.add(level[index], level[index + 1]) for index in range(0, len(level), 2)]
-        return level[0]
+        # ``rank_inputs`` is the private transport workspace for reductions,
+        # so fixed-tree nodes can be accumulated in place. This preserves the
+        # exact pairings while avoiding one temporary allocation per tree node.
+        stride = 1
+        while stride < world_size:
+            for index in range(0, world_size, 2 * stride):
+                rank_inputs[index].add_(rank_inputs[index + stride])
+            stride *= 2
+        return rank_inputs[0]
 
 
 class RCCLDeterministicCollective(TorchDistributedDeterministicCollective):

@@ -35,6 +35,7 @@ class _FakeDistributed:
         self.peer_capacities = peer_capacities
         self.into_tensor_calls = 0
         self.list_transport_calls = 0
+        self.object_gather_calls = 0
         self.last_transport_output: torch.Tensor | None = None
 
     @property
@@ -59,6 +60,7 @@ class _FakeDistributed:
         return self.backend
 
     def all_gather_object(self, output: list[Any], value: Any, *, group: Any) -> None:
+        self.object_gather_calls += 1
         if isinstance(value, int):
             values = self.peer_capacities or [value] * len(self.peer_inputs)
         else:
@@ -214,6 +216,19 @@ def test_reduction_workspace_grows_once_and_is_reused(
     collective.close()
     assert collective._workspace is None
     assert collective.workspace_size_bytes == 0
+
+
+def test_matching_signature_is_validated_once_per_hot_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peers = [torch.full((2, 3), rank + 1, dtype=torch.float32) for rank in range(2)]
+    collective, fake_dist = _make_collective(monkeypatch, peers, backend="nccl")
+    constructor_object_gathers = fake_dist.object_gather_calls
+
+    collective.all_reduce(peers[0])
+    collective.all_reduce(peers[0])
+
+    assert fake_dist.object_gather_calls == constructor_object_gathers + 1
 
 
 def test_reduce_scatter_reduces_then_selects_local_leading_shard(

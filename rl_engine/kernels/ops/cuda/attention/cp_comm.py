@@ -684,8 +684,11 @@ class _RCCLRankOrderedTransport:
         for source in range(self.world_size):
             source_begin = source * full.size(0) + begin
             level.append(gathered[source_begin : source_begin + rows_per_rank])
-        while len(level) > 1:
-            level = [torch.add(level[index], level[index + 1]) for index in range(0, len(level), 2)]
+        stride = 1
+        while stride < self.world_size:
+            for index in range(0, self.world_size, 2 * stride):
+                level[index].add_(level[index + stride])
+            stride *= 2
         return level[0]
 
 
