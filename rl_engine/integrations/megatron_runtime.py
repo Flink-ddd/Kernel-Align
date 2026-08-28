@@ -9,6 +9,8 @@ import importlib
 from collections.abc import Iterable
 from typing import Any
 
+import torch
+
 from rl_engine.integrations.ablation import Implementation, IntegrationPlan
 from rl_engine.integrations.framework_operators import (
     MegatronAttentionOperator,
@@ -18,9 +20,11 @@ from rl_engine.integrations.framework_operators import (
 from rl_engine.integrations.linear_logp import LinearLogpWrapper
 from rl_engine.integrations.megatron import MegatronIntegration
 from rl_engine.integrations.state import get_active_integration, set_active_integration
-from rl_engine.integrations.vime.logp import _provider_impl
+from rl_engine.integrations.vime.linear_logp_provider import _provider_impl
 
 _PATCH_MARKER = "__rl_kernel_original_forward__"
+_STRICT_ATTENTION_PATCH_MARKER = "__rl_kernel_original_strict_attention_init__"
+_STRICT_ATTENTION_PROJECTION_MARKER = "__rl_kernel_strict_attention_projection__"
 
 
 def _optional_class(path: str) -> type[Any] | None:
@@ -72,6 +76,81 @@ def _patch_forward(
     cls.forward = wrapped
 
 
+def _patch_strict_attention_projections(
+    *,
+    self_attention_cls: type[Any] | None = None,
+    column_linear_cls: type[Any] | None = None,
+    row_linear_cls: type[Any] | None = None,
+    det_gemm: Any | None = None,
+) -> None:
+    """Use the shared deterministic GEMM for Megatron Attention projections."""
+
+    if self_attention_cls is None or column_linear_cls is None or row_linear_cls is None:
+        from megatron.core.tensor_parallel.layers import (
+            ColumnParallelLinear,
+            RowParallelLinear,
+        )
+        from megatron.core.transformer.attention import SelfAttention
+
+        self_attention_cls = SelfAttention
+        column_linear_cls = ColumnParallelLinear
+        row_linear_cls = RowParallelLinear
+    if hasattr(self_attention_cls, _STRICT_ATTENTION_PATCH_MARKER):
+        return
+    if det_gemm is None:
+        from rl_engine.kernels.ops.cuda.matmul.det_gemm import DetGemmOp
+
+        det_gemm = DetGemmOp()
+
+    attention_init = self_attention_cls.__init__
+    column_forward_impl = column_linear_cls._forward_impl
+    row_forward_impl = row_linear_cls._forward_impl
+
+    def deterministic_projection(
+        input_value: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        input_2d = input_value.reshape(-1, input_value.shape[-1])
+        output_2d = det_gemm(input_2d, weight.t().contiguous())
+        output = output_2d.reshape(*input_value.shape[:-1], weight.shape[0])
+        return output if bias is None else output + bias
+
+    def attention_init_wrapped(instance: Any, *args: Any, **kwargs: Any) -> None:
+        attention_init(instance, *args, **kwargs)
+        setattr(instance.linear_qkv, _STRICT_ATTENTION_PROJECTION_MARKER, "qkv")
+        setattr(instance.linear_proj, _STRICT_ATTENTION_PROJECTION_MARKER, "o_proj")
+        # copy_to_tensor_model_parallel_region already owns this TP dgrad reduction.
+        instance.linear_qkv.allreduce_dgrad = False
+
+    def column_forward_impl_wrapped(
+        instance: Any,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        if hasattr(instance, _STRICT_ATTENTION_PROJECTION_MARKER):
+            return deterministic_projection(input, weight, kwargs.get("bias"))
+        return column_forward_impl(instance, input, weight, *args, **kwargs)
+
+    def row_forward_impl_wrapped(
+        instance: Any,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        if hasattr(instance, _STRICT_ATTENTION_PROJECTION_MARKER):
+            return deterministic_projection(input, weight, kwargs.get("bias"))
+        return row_forward_impl(instance, input, weight, *args, **kwargs)
+
+    setattr(self_attention_cls, _STRICT_ATTENTION_PATCH_MARKER, attention_init)
+    self_attention_cls.__init__ = attention_init_wrapped
+    column_linear_cls._forward_impl = column_forward_impl_wrapped
+    row_linear_cls._forward_impl = row_forward_impl_wrapped
+
+
 def install_megatron_integration(
     plan: IntegrationPlan,
     *,
@@ -112,6 +191,8 @@ def install_megatron_integration(
         raise RuntimeError("R/R Megatron FFN selected but no supported class was found")
 
     set_active_integration("megatron", integration)
+    if plan.implementation_for("attention", "training") is Implementation.RL_KERNEL:
+        _patch_strict_attention_projections()
     for cls in resolved_attention:
         _patch_forward(cls, integration=integration, module="attention")
     if resolved_attention:
@@ -126,7 +207,7 @@ def install_megatron_integration(
             "ffn",
             ",".join(f"{cls.__module__}.{cls.__name__}.forward" for cls in resolved_ffn),
         )
-    integration.record_installed_hook("logp", "rl_engine.integrations.vime.logp.provider")
+    integration.record_installed_hook("logp", "rl_engine.integrations.vime.linear_logp_provider.provider")
     return integration
 
 

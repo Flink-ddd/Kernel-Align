@@ -24,6 +24,8 @@ from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
 from rl_engine.utils.logger import logger
 
 _FA4_API_SOURCE = "flash_attn.cute.interface"
+_FA4_COMPAT_API_SOURCE = "vllm.vllm_flash_attn.cute.interface"
+_FA4_API_SOURCES = (_FA4_API_SOURCE, _FA4_COMPAT_API_SOURCE)
 _FA4_REQUIRED_PARAMETERS = frozenset(
     {"softmax_scale", "causal", "num_splits", "pack_gqa", "deterministic", "return_lse"}
 )
@@ -33,19 +35,28 @@ class StrictFlashAttentionUnavailable(RuntimeError):
     """Raised when the exact FlashAttention production contract is unavailable."""
 
 
-def _load_fa4_cute_op() -> tuple[Callable[..., Any], str]:
-    try:
-        module = importlib.import_module(_FA4_API_SOURCE)
-        op = getattr(module, "flash_attn_func")
-    except (AttributeError, ImportError, OSError, RuntimeError) as exc:
-        raise StrictFlashAttentionUnavailable(
-            "strict CUDA Attention requires flash_attn.cute.interface.flash_attn_func"
-        ) from exc
-    try:
-        package_version = importlib.metadata.version("flash-attn")
-    except importlib.metadata.PackageNotFoundError:
-        package_version = "unknown"
-    return op, package_version
+def _load_fa4_cute_op() -> tuple[Callable[..., Any], str, str]:
+    errors: list[str] = []
+    for api_source in _FA4_API_SOURCES:
+        try:
+            module = importlib.import_module(api_source)
+            op = getattr(module, "flash_attn_func")
+        except (AttributeError, ImportError, OSError, RuntimeError) as exc:
+            errors.append(f"{api_source}: {exc}")
+            continue
+
+        package_name = "vllm" if api_source == _FA4_COMPAT_API_SOURCE else "flash-attn"
+        try:
+            package_version = importlib.metadata.version(package_name)
+        except importlib.metadata.PackageNotFoundError:
+            package_version = "unknown"
+        return op, package_version, api_source
+
+    raise StrictFlashAttentionUnavailable(
+        "strict CUDA Attention requires a FlashAttention CuTe API; tried "
+        + ", ".join(_FA4_API_SOURCES)
+        + (f" ({'; '.join(errors)})" if errors else "")
+    )
 
 
 class StrictFlashAttention4Core:
@@ -78,13 +89,15 @@ class StrictFlashAttention4Core:
         if requested.mode is not SplitKVMode.DISABLED:
             raise ValueError("strict FA4 Attention requires Split-KV to be disabled")
         if _op is None:
-            op, package_version = _load_fa4_cute_op()
+            op, package_version, api_source = _load_fa4_cute_op()
         else:
             op = _op
             package_version = "test-double" if _package_version is None else _package_version
+            api_source = _FA4_API_SOURCE
         self._validate_api(op)
         self.split_kv = requested
         self.package_version = package_version
+        self.api_source = api_source
         self._op = op
 
     @staticmethod
@@ -138,14 +151,57 @@ class StrictFlashAttention4Core:
         q_fa = q.transpose(1, 2).contiguous()
         k_fa = k.transpose(1, 2).contiguous()
         v_fa = v.transpose(1, 2).contiguous()
-        result = self._op(
+        result = self.forward_bshd_with_lse(
             q_fa,
             k_fa,
             v_fa,
+            causal=causal,
+            scale=scale,
+            key_padding_mask=key_padding_mask,
+            query_position_ids=query_position_ids,
+            key_position_ids=key_position_ids,
+            output_dtype=resolved_dtype,
+        )
+        return DeterministicAttentionCoreResult(
+            out=result.out.transpose(1, 2).contiguous(),
+            lse=result.lse,
+            provenance=result.provenance,
+        )
+
+    def forward_bshd_with_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        causal: bool = True,
+        scale: float | None = None,
+        key_padding_mask: torch.Tensor | None = None,
+        query_position_ids: torch.Tensor | None = None,
+        key_position_ids: torch.Tensor | None = None,
+        output_dtype: torch.dtype | None = None,
+    ) -> DeterministicAttentionCoreResult:
+        """Run strict FA4 on tensors already laid out as [B, S, H, D]."""
+        self._validate_bshd_inputs(q, k, v, key_padding_mask)
+        RLKernelDeterministicAttentionCore._validate_positions(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            causal=causal,
+            query_position_ids=query_position_ids,
+            key_position_ids=key_position_ids,
+        )
+        resolved_dtype = q.dtype if output_dtype is None else output_dtype
+        if resolved_dtype != q.dtype:
+            raise ValueError("strict Attention output_dtype must match the Q/K/V input dtype")
+
+        result = self._op(
+            q,
+            k,
+            v,
             softmax_scale=scale,
             causal=causal,
             num_splits=self.num_splits,
-            pack_gqa=q.size(1) > k.size(1),
+            pack_gqa=q.size(2) > k.size(2),
             deterministic=self.deterministic_backward,
             return_lse=True,
         )
@@ -156,9 +212,9 @@ class StrictFlashAttention4Core:
         out_fa, lse = result
         if not isinstance(out_fa, torch.Tensor) or not isinstance(lse, torch.Tensor):
             raise StrictFlashAttentionUnavailable("FlashAttention CuTe returned non-tensor output")
-        expected_out_shape = q_fa.shape
-        expected_lse_shape = (q.size(0), q.size(1), q.size(2))
-        if tuple(out_fa.shape) != tuple(expected_out_shape):
+        expected_out_shape = q.shape
+        expected_lse_shape = (q.size(0), q.size(2), q.size(1))
+        if tuple(out_fa.shape) != expected_out_shape:
             raise StrictFlashAttentionUnavailable(
                 f"FlashAttention output must have shape {tuple(expected_out_shape)}"
             )
@@ -175,9 +231,8 @@ class StrictFlashAttention4Core:
                 "FlashAttention attention-domain LSE must be FP32"
             )
 
-        out = out_fa.transpose(1, 2).contiguous()
         return DeterministicAttentionCoreResult(
-            out=out,
+            out=out_fa,
             lse=lse.contiguous(),
             provenance={
                 "strict_core_id": self.core_id,
@@ -188,7 +243,7 @@ class StrictFlashAttention4Core:
                 "num_splits": self.num_splits,
                 "deterministic_backward": self.deterministic_backward,
                 "dropout_p": 0.0,
-                "split_kv": self.split_kv.resolve(k.size(2), backend=self.backend_id).to_dict(),
+                "split_kv": self.split_kv.resolve(k.size(1), backend=self.backend_id).to_dict(),
                 "merge_order": self.merge_order,
                 "accum_dtype": self.accum_dtype,
                 "downcast_at": self.downcast_at,
@@ -199,6 +254,36 @@ class StrictFlashAttention4Core:
                 "reference_only": self.reference_only,
             },
         )
+
+    @staticmethod
+    def _validate_bshd_inputs(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        key_padding_mask: torch.Tensor | None,
+    ) -> None:
+        if key_padding_mask is not None:
+            raise ValueError(
+                "strict FA4 core does not accept padding masks; materialize each logical row"
+            )
+        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+            raise ValueError("q/k/v must be 4-D [B, S, H, D]")
+        if q.size(0) != 1:
+            raise ValueError("strict FA4 core executes one logical batch row at a time")
+        if k.size(0) != 1 or v.size(0) != 1:
+            raise ValueError("q/k/v batch sizes must match")
+        if k.shape != v.shape or q.size(3) != k.size(3):
+            raise ValueError("k/v shapes and q/k/v head dimensions must match")
+        if q.size(2) % k.size(2) != 0:
+            raise ValueError("Q heads must be divisible by KV heads for GQA")
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("strict FA4 core supports FP16/BF16 only")
+        if k.dtype != q.dtype or v.dtype != q.dtype:
+            raise ValueError("q/k/v must share one dtype")
+        if not (q.is_cuda and k.is_cuda and v.is_cuda):
+            raise ValueError("strict FA4 core requires CUDA tensors")
+        if not (q.device == k.device == v.device):
+            raise ValueError("q/k/v must be on one CUDA device")
 
     @staticmethod
     def _validate_inputs(
@@ -273,7 +358,10 @@ class FlashAttentionOp:
             k: (batch, seqlen, nheads_k, headdim)
             v: (batch, seqlen, nheads_k, headdim)
         """
-        assert q.dtype in [torch.float16, torch.bfloat16], "FlashAttention requires FP16 or BF16"
+        assert q.dtype in [
+            torch.float16,
+            torch.bfloat16,
+        ], "FlashAttention requires FP16 or BF16"
         assert q.is_cuda and k.is_cuda and v.is_cuda, "Inputs must be on CUDA device"
 
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()

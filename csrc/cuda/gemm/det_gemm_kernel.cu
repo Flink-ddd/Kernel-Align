@@ -71,22 +71,6 @@ __device__ __forceinline__ nv_bf16 bf16_add(nv_bf16 a, nv_bf16 b) {
   return __float2bfloat16(__bfloat162float(a) + __bfloat162float(b));
 }
 
-// True iff [lo, hi) is a node of the mid-split tree over [0, n).
-__device__ __forceinline__ bool is_mid_split_node(int lo, int hi, int n) {
-  int a = 0, b = n;
-  while (b - a > 1) {
-    if (a == lo && b == hi) return true;
-    const int m = a + (b - a) / 2;
-    if (hi <= m)
-      b = m;
-    else if (lo >= m)
-      a = m;
-    else
-      return false;
-  }
-  return a == lo && b == hi;
-}
-
 __device__ nv_bf16 k_tree_naive(const nv_bf16* __restrict__ A, const nv_bf16* __restrict__ B,
                                 int row, int col, int N, int K, int lo, int hi) {
   if (hi - lo <= K_TREE_LEAF) {
@@ -114,6 +98,92 @@ __global__ void det_gemm_naive(const nv_bf16* __restrict__ A,
   if (row >= M || col >= N) return;
   C[output_offset<TRANSPOSE_OUTPUT>(row, col, M, N)] = cast_output<output_t>(
       __bfloat162float(k_tree_naive(A, B, row, col, N, K, 0, K)));
+}
+
+// Weight gradients in the FFN are an outer-product GEMM when the token batch
+// is small: dW = dY^T @ X.  The regular scalar fallback assigns one 16x16
+// block to each output tile.  For Qwen3's [out,in] projections that creates
+// roughly 200k blocks at M=1/8 and repeatedly reloads the same token rows.
+// This path keeps the exact scalar accumulation order (tokens are visited in
+// ascending order and the result is rounded once to BF16), but stages one
+// token tile and computes a 128x128 output tile with 256 threads.  It also
+// consumes X in its native [tokens,in] layout, so no X.T.contiguous() helper
+// allocation is needed.
+constexpr int SMALL_K_TILE = K_TREE_LEAF;
+constexpr int SMALL_M_TILE = 128;
+constexpr int SMALL_N_TILE = 128;
+constexpr int SMALL_THREADS = 256;
+
+template <typename output_t>
+__global__ void det_gemm_db_small_k(const nv_bf16* __restrict__ X,
+                                    const nv_bf16* __restrict__ dY,
+                                    output_t* __restrict__ dW,
+                                    int tokens,
+                                    int in_features,
+                                    int out_features) {
+  // Give this dynamic shared-memory symbol a kernel-specific name.  CUDA
+  // 12.4 diagnoses same-TU extern __shared__ declarations with different
+  // element types as incompatible, even though they belong to different
+  // kernels.
+  extern __shared__ __align__(1024) nv_bf16 small_k_smem[];
+  nv_bf16* sX = small_k_smem;
+  nv_bf16* sY = sX + SMALL_K_TILE * SMALL_N_TILE;
+
+  const int tid = threadIdx.x;
+  const int in_base = blockIdx.x * SMALL_N_TILE;
+  const int out_base = blockIdx.y * SMALL_M_TILE;
+
+  // The shared tile is padded to 32 tokens. Zero padding makes the launch
+  // shape independent of the token count while the loop below still visits
+  // exactly the original [0,tokens) reduction range.
+  for (int index = tid; index < SMALL_K_TILE * SMALL_N_TILE; index += blockDim.x) {
+    const int token = index / SMALL_N_TILE;
+    const int feature = index % SMALL_N_TILE;
+    const int global_feature = in_base + feature;
+    sX[index] = (token < tokens && global_feature < in_features)
+                    ? X[token * in_features + global_feature]
+                    : __float2bfloat16(0.0f);
+  }
+  for (int index = tid; index < SMALL_K_TILE * SMALL_M_TILE; index += blockDim.x) {
+    const int token = index / SMALL_M_TILE;
+    const int output = index % SMALL_M_TILE;
+    const int global_output = out_base + output;
+    sY[index] = (token < tokens && global_output < out_features)
+                    ? dY[token * out_features + global_output]
+                    : __float2bfloat16(0.0f);
+  }
+  __syncthreads();
+
+  // dW is physically [out_features,in_features]. Each thread computes eight
+  // elements; neighboring threads therefore issue contiguous stores.
+  for (int index = tid; index < SMALL_M_TILE * SMALL_N_TILE; index += blockDim.x) {
+    const int output = index / SMALL_N_TILE;
+    const int feature = index % SMALL_N_TILE;
+    const int global_output = out_base + output;
+    const int global_feature = in_base + feature;
+    if (global_output >= out_features || global_feature >= in_features) continue;
+
+    float acc = 0.0f;
+    for (int token = 0; token < tokens; ++token)
+      acc += __bfloat162float(sX[token * SMALL_N_TILE + feature]) *
+             __bfloat162float(sY[token * SMALL_M_TILE + output]);
+    dW[global_output * in_features + global_feature] = cast_output<output_t>(acc);
+  }
+}
+
+template <typename output_t>
+void launch_db_small_k(const nv_bf16* X,
+                       const nv_bf16* dY,
+                       output_t* dW,
+                       int tokens,
+                       int in_features,
+                       int out_features,
+                       cudaStream_t stream) {
+  dim3 block(SMALL_THREADS);
+  dim3 grid(cdiv(in_features, SMALL_N_TILE), cdiv(out_features, SMALL_M_TILE));
+  constexpr int smem_elements = SMALL_K_TILE * (SMALL_N_TILE + SMALL_M_TILE);
+  det_gemm_db_small_k<output_t><<<grid, block, smem_elements * sizeof(nv_bf16), stream>>>(
+      X, dY, dW, tokens, in_features, out_features);
 }
 
 template <typename output_t, bool TRANSPOSE_OUTPUT>
@@ -145,6 +215,21 @@ constexpr int K_TILES = BK / MMA_K;       // 2
 constexpr int KK_GROUPS = BK / 32;        // 1
 constexpr int TREE_DEPTH = 16;
 
+__device__ __forceinline__ int mid_tree_merge_count(int leaf, int n) {
+  int lo = 0, hi = n, count = 0;
+  while (hi - lo > 1) {
+    const int mid = lo + (hi - lo) / 2;
+    if (leaf < mid) {
+      hi = mid;
+      count = 0;
+    } else {
+      lo = mid;
+      ++count;
+    }
+  }
+  return count;
+}
+
 __device__ __forceinline__ void ldmatrix_x4(uint32_t regs[4], uint32_t addr) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                : "=r"(regs[0]), "=r"(regs[1]), "=r"(regs[2]), "=r"(regs[3])
@@ -170,8 +255,8 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
   const int col_base = blockIdx.x * BN;
   const int kd = K / BK;
 
-  extern __shared__ __align__(1024) char smem[];
-  nv_bf16* sA = reinterpret_cast<nv_bf16*>(smem);
+  extern __shared__ __align__(1024) char sm90_smem[];
+  nv_bf16* sA = reinterpret_cast<nv_bf16*>(sm90_smem);
   nv_bf16* sB = reinterpret_cast<nv_bf16*>(sA + STAGES * BM * BK);
   int* mbar_base = reinterpret_cast<int*>(sB + STAGES * BN * BK);
 
@@ -204,9 +289,8 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
   for (int s = 0; s < STAGES; ++s) phase[s] = 0;
 
   float tile_acc[M_TILES][N_TILES][4];
-  nv_bf16 tree_v[M_TILES][N_TILES][4];
-  nv_bf16 tree_stk[TREE_DEPTH][M_TILES][N_TILES][4];
-  int tree_lo[TREE_DEPTH], tree_hi[TREE_DEPTH];
+  __nv_bfloat162 tree_v[M_TILES][N_TILES][2];
+  __nv_bfloat162 tree_stk[TREE_DEPTH][M_TILES][N_TILES][2];
   int sp = 0;
 
   if (tid == 0)
@@ -217,7 +301,7 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
   for (int k = 0; k < kd; ++k) {       // fixed ascending tile order, NO split-K
     const int buf = k % STAGES;
     if (tid == 0 && k + (STAGES - 1) < kd) issue_load(k + (STAGES - 1));
-    det_gemm::mbar_wait(mbar[buf], phase[buf]);
+    if (tid == 0) det_gemm::mbar_wait(mbar[buf], phase[buf]);
     phase[buf] ^= 1;
     __syncthreads();
 
@@ -266,29 +350,28 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
 #pragma unroll
       for (int n = 0; n < N_TILES; ++n)
 #pragma unroll
-        for (int i = 0; i < 4; ++i) tree_v[mi][n][i] = __float2bfloat16(tile_acc[mi][n][i]);
+        for (int i = 0; i < 2; ++i)
+          tree_v[mi][n][i] = __floats2bfloat162_rn(tile_acc[mi][n][2 * i + 0],
+                                                    tile_acc[mi][n][2 * i + 1]);
 
-    int lo = k, hi = k + 1;
-    while (sp > 0 && tree_hi[sp - 1] == lo && is_mid_split_node(tree_lo[sp - 1], hi, kd)) {
+    const int merge_count = mid_tree_merge_count(k, kd);
+    for (int merge = 0; merge < merge_count; ++merge) {
 #pragma unroll
       for (int mi = 0; mi < M_TILES; ++mi)
 #pragma unroll
         for (int n = 0; n < N_TILES; ++n)
 #pragma unroll
-          for (int i = 0; i < 4; ++i)
-            tree_v[mi][n][i] = bf16_add(tree_stk[sp - 1][mi][n][i], tree_v[mi][n][i]);
-      lo = tree_lo[sp - 1];
+          for (int i = 0; i < 2; ++i)
+            tree_v[mi][n][i] = __hadd2(tree_stk[sp - 1][mi][n][i], tree_v[mi][n][i]);
       --sp;
     }
-    if (hi < kd) {
+    if (k + 1 < kd) {
 #pragma unroll
       for (int mi = 0; mi < M_TILES; ++mi)
 #pragma unroll
         for (int n = 0; n < N_TILES; ++n)
 #pragma unroll
-          for (int i = 0; i < 4; ++i) tree_stk[sp][mi][n][i] = tree_v[mi][n][i];
-      tree_lo[sp] = lo;
-      tree_hi[sp] = hi;
+          for (int i = 0; i < 2; ++i) tree_stk[sp][mi][n][i] = tree_v[mi][n][i];
       ++sp;
     }
   }
@@ -301,15 +384,15 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
       const int col = col_base + n * MMA_N + (lane % 4) * 2;
       if (row < M && col + 1 < N) {
         C[output_offset<TRANSPOSE_OUTPUT>(row, col + 0, M, N)] =
-            cast_output<output_t>(__bfloat162float(tree_v[mi][n][0]));
+            cast_output<output_t>(__low2float(tree_v[mi][n][0]));
         C[output_offset<TRANSPOSE_OUTPUT>(row, col + 1, M, N)] =
-            cast_output<output_t>(__bfloat162float(tree_v[mi][n][1]));
+            cast_output<output_t>(__high2float(tree_v[mi][n][0]));
       }
       if (row + 8 < M && col + 1 < N) {
         C[output_offset<TRANSPOSE_OUTPUT>(row + 8, col + 0, M, N)] =
-            cast_output<output_t>(__bfloat162float(tree_v[mi][n][2]));
+            cast_output<output_t>(__low2float(tree_v[mi][n][1]));
         C[output_offset<TRANSPOSE_OUTPUT>(row + 8, col + 1, M, N)] =
-            cast_output<output_t>(__bfloat162float(tree_v[mi][n][3]));
+            cast_output<output_t>(__high2float(tree_v[mi][n][1]));
       }
     }
   }
@@ -478,11 +561,29 @@ torch::Tensor det_gemm_db(torch::Tensor a, torch::Tensor dc) {
 
 torch::Tensor det_gemm_db_transposed(torch::Tensor a, torch::Tensor dc) {
   check_in(a, "A"); check_in(dc, "dC");
-  dc = dc.contiguous();
   TORCH_CHECK(a.dim() == 2 && dc.dim() == 2,
               "det_gemm_db_transposed: expect A[M,K] and dC[M,N]");
+  const int tokens = a.size(0);
+  const int in_features = a.size(1);
+  const int out_features = dc.size(1);
+  TORCH_CHECK(dc.size(0) == tokens, "det_gemm_db_transposed: M mismatch");
+
+  // The normal SM90 path expects A^T to be physically contiguous. For short
+  // token batches, materializing that transpose and launching the 16x16
+  // scalar fallback dominates the actual outer-product work. The tiled path
+  // reads A directly and preserves the same ascending-token reduction order.
+  if (tokens > 0 && tokens < SMALL_K_TILE) {
+    a = a.contiguous();
+    dc = dc.contiguous();
+    auto output = torch::empty({out_features, in_features}, a.options());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    launch_db_small_k<nv_bf16>(
+        bf16(a), bf16(dc), bf16o(output), tokens, in_features, out_features, stream);
+    return output;
+  }
+
+  dc = dc.contiguous();
   auto at = a.t().contiguous();
-  TORCH_CHECK(dc.size(0) == at.size(1), "det_gemm_db_transposed: M mismatch");
   // Preserve the exact A^T @ dC MMA/tree evaluation and change only the final
   // address mapping so the canonical [N,K] weight-gradient is born contiguous.
   return gemm_dispatch(at, dc, RhsLayout::kKN, OutputLayout::kNM);

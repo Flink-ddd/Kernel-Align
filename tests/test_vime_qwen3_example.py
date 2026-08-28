@@ -22,7 +22,7 @@ def test_qwen3_example_config_is_strict_and_explicit():
     validate_config(config)
     assert config["training"]["tensor_model_parallel_size"] == 2
     assert config["training"]["context_parallel_size"] == 2
-    assert config["selected_logprob_provider"]["mode"] == "strict"
+    assert config["linear_logp_provider"]["mode"] == "strict"
 
 
 def test_qwen3_example_report_does_not_claim_unread_back_attention_or_ffn(tmp_path):
@@ -34,7 +34,7 @@ def test_qwen3_example_report_does_not_claim_unread_back_attention_or_ffn(tmp_pa
         command=["bash", "run.sh"],
         status="passed",
         returncode=0,
-        log_text="Selected-logprob provider active: backend_id=pytorch-vocab-parallel-logp-ws2",
+        log_text="linear_logp provider active: backend_id=pytorch-vocab-parallel-logp-ws2",
         log_path=tmp_path / "run.log",
     )
     assert report["status"] == "passed"
@@ -117,7 +117,7 @@ def test_qwen3_example_accepts_only_exact_zero_runtime_evidence(tmp_path):
         command=["bash", "run.sh"],
         status="passed",
         returncode=0,
-        log_text="Selected-logprob provider active: backend_id=pytorch-vocab-parallel-logp-ws2",
+        log_text="linear_logp provider active: backend_id=pytorch-vocab-parallel-logp-ws2",
         log_path=None,
         runtime_evidence=evidence,
     )
@@ -135,6 +135,6 @@ def test_qwen3_example_rejects_nonzero_runtime_evidence():
 @pytest.mark.parametrize("bad_path", ["", "other.provider"])
 def test_qwen3_example_rejects_non_rlkernel_provider(bad_path):
     config = load_config(CONFIG)
-    config["selected_logprob_provider"]["path"] = bad_path
+    config["linear_logp_provider"]["path"] = bad_path
     with pytest.raises(ValueError, match="RL-Kernel Vime provider"):
         validate_config(config)

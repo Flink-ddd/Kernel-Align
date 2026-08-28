@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Runtime selected-logprob provider for Vime's Megatron backend.
+"""Runtime ``linear_logp`` provider for Vime's Megatron backend.
 
-The adapter intentionally accepts and returns structural objects: RL-Kernel
-never imports Vime.  Vime remains responsible for constructing locally owned
-CP token rows and response masks; this provider owns only the TP-vocabulary
-reduction.  CP rank and layout are recorded and validated as row ownership
-metadata, never passed to the numerical merge.
+The adapter accepts only structural objects. RL-Kernel never imports Vime;
+Vime owns token-row construction and loss composition, while this provider
+owns the numerical backend, TP reduction, and provenance.
 """
 
 from __future__ import annotations
@@ -18,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+
 from rl_engine.integrations.ablation import Implementation, operator_ablation_case
 from rl_engine.kernels.logprob_contract import (
     LogprobContract,
@@ -34,21 +33,17 @@ from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import (
 from rl_engine.kernels.registry import kernel_registry
 
 
-class SelectedLogprobProviderUnavailable(RuntimeError):
-    """Request Vime's native provider fallback in ``auto`` mode.
+class LinearLogpProviderUnavailable(RuntimeError):
+    """Request Vime's native provider fallback in ``auto`` mode."""
 
-    Vime recognizes the marker instead of importing this class, which keeps
-    the dependency direction from Vime to RL-Kernel at runtime only.
-    """
-
-    selected_logprob_provider_unavailable = True
+    linear_logp_provider_unavailable = True
 
 
 @dataclass(frozen=True)
-class ProviderResult:
-    """Structural result understood by the Vime provider boundary."""
+class LinearLogpResult:
+    """Structural result understood by Vime's provider boundary."""
 
-    selected_logprobs: torch.Tensor
+    logp: torch.Tensor
     entropy: torch.Tensor | None
     backend_id: str
     contract_id: str
@@ -69,7 +64,7 @@ def _default_strict_linear_logp() -> Any:
 
 def _as_positive_int(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise SelectedLogprobProviderUnavailable(
+        raise LinearLogpProviderUnavailable(
             f"{name} must be a positive integer; got {value!r}"
         )
     return value
@@ -77,17 +72,17 @@ def _as_positive_int(value: Any, name: str) -> int:
 
 def _metadata(request: Any) -> Mapping[str, Any]:
     value = getattr(request, "metadata", None)
+    if value is None:
+        return {}
     if not isinstance(value, Mapping):
-        raise SelectedLogprobProviderUnavailable(
-            "request.metadata must provide vocab-parallel metadata"
-        )
+        raise LinearLogpProviderUnavailable("request.metadata must be a mapping")
     return value
 
 
 def _request_tensor(request: Any, name: str) -> torch.Tensor:
     value = getattr(request, name, None)
     if not isinstance(value, torch.Tensor):
-        raise SelectedLogprobProviderUnavailable(f"request.{name} must be a torch.Tensor")
+        raise LinearLogpProviderUnavailable(f"request.{name} must be a torch.Tensor")
     return value
 
 
@@ -103,20 +98,60 @@ def _tp_coordinates(tp_group: Any) -> tuple[int, int]:
 
 
 def _tile_count(metadata: Mapping[str, Any], padded_vocab_size: int) -> int:
-    configured = metadata.get("num_vocab_tiles", os.getenv("RL_KERNEL_LOGPROB_NUM_VOCAB_TILES"))
+    configured = metadata.get(
+        "num_vocab_tiles", os.getenv("RL_KERNEL_LOGPROB_NUM_VOCAB_TILES")
+    )
     if configured is None or configured == "":
         configured = DEFAULT_NUM_VOCAB_TILES
     try:
         tiles = int(configured)
     except (TypeError, ValueError) as exc:
-        raise SelectedLogprobProviderUnavailable(
+        raise LinearLogpProviderUnavailable(
             f"num_vocab_tiles must be an integer; got {configured!r}"
         ) from exc
     if tiles <= 0 or padded_vocab_size % tiles:
-        raise SelectedLogprobProviderUnavailable(
+        raise LinearLogpProviderUnavailable(
             f"num_vocab_tiles={tiles} must divide padded_vocab_size={padded_vocab_size}"
         )
     return tiles
+
+
+def _vocab_partition(
+    request: Any, logits: torch.Tensor, tp_rank: int, tp_world_size: int
+) -> tuple[int, int, int, int]:
+    metadata = _metadata(request)
+    context = getattr(request, "context", None)
+    partition = getattr(context, "vocab_partition", None)
+    if partition is not None:
+        local_start = getattr(partition, "local_start", None)
+        local_size = getattr(partition, "local_size", None)
+        real_vocab_size = getattr(partition, "real_size", None)
+        padded_vocab_size = getattr(partition, "padded_size", None)
+    else:
+        local_start = tp_rank * logits.shape[1]
+        local_size = logits.shape[1]
+        real_vocab_size = metadata.get("real_vocab_size")
+        padded_vocab_size = metadata.get("padded_vocab_size")
+
+    local_start = 0 if local_start is None else local_start
+    local_size = logits.shape[1] if local_size is None else local_size
+    real_vocab_size = _as_positive_int(real_vocab_size, "real_vocab_size")
+    padded_vocab_size = _as_positive_int(padded_vocab_size, "padded_vocab_size")
+    if local_start != tp_rank * logits.shape[1] or local_size != logits.shape[1]:
+        raise LinearLogpProviderUnavailable(
+            "linear_logp vocabulary partition must be rank-contiguous and match local logits: "
+            f"start={local_start}, local={local_size}, rank={tp_rank}, width={logits.shape[1]}"
+        )
+    if logits.shape[1] * tp_world_size != padded_vocab_size:
+        raise LinearLogpProviderUnavailable(
+            "local vocab width and TP group do not cover padded_vocab_size exactly: "
+            f"{logits.shape[1]} * {tp_world_size} != {padded_vocab_size}"
+        )
+    if real_vocab_size > padded_vocab_size:
+        raise LinearLogpProviderUnavailable(
+            "real_vocab_size must not exceed padded_vocab_size"
+        )
+    return local_start, logits.shape[1], real_vocab_size, padded_vocab_size
 
 
 def _contract_for_request(request: Any) -> tuple[LogprobContract, int]:
@@ -124,61 +159,56 @@ def _contract_for_request(request: Any) -> tuple[LogprobContract, int]:
     targets = _request_tensor(request, "target_ids")
     metadata = _metadata(request)
     if logits.ndim != 2 or targets.shape != (logits.shape[0],):
-        raise SelectedLogprobProviderUnavailable(
+        raise LinearLogpProviderUnavailable(
             "request must contain local [T, V] logits and aligned [T] targets"
         )
     if logits.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        raise SelectedLogprobProviderUnavailable(f"unsupported logit dtype {logits.dtype}")
+        raise LinearLogpProviderUnavailable(f"unsupported logit dtype {logits.dtype}")
     if targets.device != logits.device:
-        raise SelectedLogprobProviderUnavailable("target_ids must share the local logits device")
+        raise LinearLogpProviderUnavailable(
+            "target_ids must share the local logits device"
+        )
 
-    cp = getattr(request, "context_parallel", None)
-    cp_world_size = _as_positive_int(getattr(cp, "world_size", None), "context_parallel.world_size")
-    cp_rank = getattr(cp, "rank", None)
+    layout = getattr(request, "token_layout", None)
+    cp_world_size = _as_positive_int(
+        getattr(layout, "world_size", None), "token_layout.world_size"
+    )
+    cp_rank = getattr(layout, "rank", None)
     if (
         isinstance(cp_rank, bool)
         or not isinstance(cp_rank, int)
         or not 0 <= cp_rank < cp_world_size
     ):
-        raise SelectedLogprobProviderUnavailable(
-            f"context_parallel.rank={cp_rank!r} is invalid for CP={cp_world_size}"
+        raise LinearLogpProviderUnavailable(
+            f"token_layout.rank={cp_rank!r} is invalid for CP={cp_world_size}"
         )
-    if getattr(cp, "layout", None) not in (
+    if getattr(layout, "layout", None) not in (
         {"single"} if cp_world_size == 1 else {"zigzag", "allgather"}
     ):
-        raise SelectedLogprobProviderUnavailable(
-            "context_parallel layout does not describe local CP token ownership"
+        raise LinearLogpProviderUnavailable(
+            "token_layout does not describe local token ownership"
         )
 
-    tp_rank, tp_world_size = _tp_coordinates(getattr(request, "tensor_parallel_group", None))
+    tp_rank, tp_world_size = _tp_coordinates(
+        getattr(request, "tensor_parallel_group", None)
+    )
     declared_tp_rank = metadata.get("tp_rank")
     declared_tp_world_size = metadata.get("tp_world_size")
     if declared_tp_rank is not None and declared_tp_rank != tp_rank:
-        raise SelectedLogprobProviderUnavailable(
+        raise LinearLogpProviderUnavailable(
             f"metadata tp_rank={declared_tp_rank} disagrees with TP group rank={tp_rank}"
         )
     if declared_tp_world_size is not None and declared_tp_world_size != tp_world_size:
-        raise SelectedLogprobProviderUnavailable(
-            f"metadata tp_world_size={declared_tp_world_size} disagrees with "
-            f"TP group size={tp_world_size}"
+        raise LinearLogpProviderUnavailable(
+            f"metadata tp_world_size={declared_tp_world_size} disagrees with TP group size={tp_world_size}"
         )
 
-    real_vocab_size = _as_positive_int(metadata.get("real_vocab_size"), "real_vocab_size")
-    padded_vocab_size = _as_positive_int(metadata.get("padded_vocab_size"), "padded_vocab_size")
-    if logits.shape[1] * tp_world_size != padded_vocab_size:
-        raise SelectedLogprobProviderUnavailable(
-            "local vocab width and TP group do not cover padded_vocab_size exactly: "
-            f"{logits.shape[1]} * {tp_world_size} != {padded_vocab_size}"
-        )
-    if real_vocab_size > padded_vocab_size:
-        raise SelectedLogprobProviderUnavailable(
-            "real_vocab_size must not exceed padded_vocab_size"
-        )
-
-    bounds = tuple(
-        (rank * logits.shape[1], (rank + 1) * logits.shape[1]) for rank in range(tp_world_size)
+    local_start, local_size, real_vocab_size, padded_vocab_size = _vocab_partition(
+        request, logits, tp_rank, tp_world_size
     )
-    active_mask = (True,) * logits.shape[0]
+    bounds = tuple(
+        (rank * local_size, (rank + 1) * local_size) for rank in range(tp_world_size)
+    )
     contract = LogprobContract(
         role=LogprobRole.TRAIN,
         dtype={
@@ -186,7 +216,9 @@ def _contract_for_request(request: Any) -> tuple[LogprobContract, int]:
             torch.float16: LogprobDType.FP16,
             torch.float32: LogprobDType.FP32,
         }[logits.dtype],
-        mask=MaskSpec(num_tokens=logits.shape[0], active_mask=active_mask),
+        mask=MaskSpec(
+            num_tokens=logits.shape[0], active_mask=(True,) * logits.shape[0]
+        ),
         sharding=ShardingSpec(
             tp_rank=tp_rank,
             tp_world_size=tp_world_size,
@@ -201,51 +233,50 @@ def _contract_for_request(request: Any) -> tuple[LogprobContract, int]:
     return contract, _tile_count(metadata, padded_vocab_size)
 
 
-def _provider_impl(request: Any, *, linear_logp: Any = None) -> ProviderResult:
-    """Compute Vime selected logprobs on the explicit WS2 TP/CP contract.
+def _provider_impl(request: Any, *, linear_logp: Any = None) -> LinearLogpResult:
+    """Compute Vime log-probabilities on the explicit TP/CP contract."""
 
-    Top-p replay is deliberately unavailable until it has a separately
-    validated fixed-order mask contract.  In Vime ``auto`` mode this signals
-    native execution; in ``strict`` mode it fails instead of changing sampled
-    distribution semantics.
-    """
-
-    strict = os.getenv("VIME_RL_KERNEL_STRICT", "").strip().lower() in {"1", "true", "yes", "on"}
-    if strict and not isinstance(getattr(request, "hidden", None), torch.Tensor):
+    strict = os.getenv("VIME_RL_KERNEL_STRICT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    context = getattr(request, "context", None)
+    hidden = getattr(context, "hidden", None)
+    projection = getattr(context, "projection", None)
+    partition = getattr(context, "vocab_partition", None)
+    if strict and not isinstance(hidden, torch.Tensor):
         raise RuntimeError(
-            "strict Vime linear_logp request is missing hidden/LM-head structural inputs"
+            "strict Vime linear_logp request is missing structural context"
         )
     if strict and getattr(request, "log_prob_keep_mask", None) is not None:
-        raise RuntimeError("strict Vime linear_logp does not support top-p replay in this contract")
-    if (
-        linear_logp is None
-        and strict
-        and isinstance(getattr(request, "hidden", None), torch.Tensor)
-    ):
+        raise RuntimeError(
+            "strict Vime linear_logp does not support top-p replay in this contract"
+        )
+    if linear_logp is None and strict and isinstance(hidden, torch.Tensor):
         linear_logp = _default_strict_linear_logp()
-    if linear_logp is not None and isinstance(getattr(request, "hidden", None), torch.Tensor):
-        hidden = request.hidden
-        weight = getattr(request, "lm_head_weight", None)
-        if not isinstance(weight, torch.Tensor):
-            raise RuntimeError("linear_logp request must expose lm_head_weight")
-        selected = linear_logp(
+    if linear_logp is not None and isinstance(hidden, torch.Tensor):
+        if projection is None or not isinstance(
+            getattr(projection, "weight", None), torch.Tensor
+        ):
+            raise RuntimeError("linear_logp context must expose projection.weight")
+        if partition is None:
+            raise RuntimeError("linear_logp context must expose vocab_partition")
+        logp = linear_logp(
             hidden,
-            weight,
+            projection.weight,
             request.target_ids,
-            getattr(request, "lm_head_bias", None),
+            getattr(projection, "bias", None),
             tp_group=getattr(request, "tensor_parallel_group", None),
-            vocab_start_index=int(getattr(request, "vocab_start_index", 0)),
-            global_vocab_size=getattr(request, "global_vocab_size", None),
-            real_vocab_size=getattr(request, "metadata", {}).get("real_vocab_size"),
+            vocab_start_index=int(partition.local_start),
+            global_vocab_size=int(partition.padded_size),
+            real_vocab_size=int(partition.real_size),
             temperature=getattr(request, "temperature", None),
         )
         entropy = None
         entropy_provenance: dict[str, Any] = {}
         if getattr(request, "with_entropy", False):
-            # Entropy is a separate loss metric from selected logprob. Keep
-            # the strict selected path on linear_logp, while using the
-            # explicit TP vocab reduction for the full-vocabulary entropy
-            # requested by Vime's policy loss.
             entropy_contract, entropy_tiles = _contract_for_request(request)
             entropy_dispatch = kernel_registry.get_logprob_op(
                 entropy_contract, requested_backend=BACKEND_ID
@@ -272,36 +303,34 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> ProviderResult:
                 "logits_materialized": True,
             }
         provenance = dict(getattr(linear_logp, "provenance", {}))
-        provenance.update(
-            {
-                "execution": {
-                    "role": "vime_training_linear_logprob",
-                    "strict_backend": True,
-                    "top_p_replay": False,
-                    "cp_is_merge_axis": False,
-                    "logits_materialized": bool(getattr(request, "with_entropy", False)),
-                    "entropy": entropy_provenance,
-                },
-                "request": {
-                    "hidden_shape": list(hidden.shape),
-                    "hidden_dtype": str(hidden.dtype).replace("torch.", ""),
-                    "target_shape": list(request.target_ids.shape),
-                    "tp_world_size": int(getattr(request, "metadata", {}).get("tp_world_size", 1)),
-                    "tp_rank": int(getattr(request, "metadata", {}).get("tp_rank", 0)),
-                    "cp_world_size": int(getattr(request, "context_parallel", None).world_size),
-                    "cp_rank": int(getattr(request, "context_parallel", None).rank),
-                },
-            }
-        )
+        provenance["execution"] = {
+            "role": "vime_training_linear_logp",
+            "strict_backend": True,
+            "top_p_replay": False,
+            "cp_is_merge_axis": False,
+            "logits_materialized": bool(getattr(request, "with_entropy", False)),
+            "entropy": entropy_provenance,
+        }
+        provenance["request"] = {
+            "hidden_shape": list(hidden.shape),
+            "hidden_dtype": str(hidden.dtype).replace("torch.", ""),
+            "target_shape": list(request.target_ids.shape),
+            "tp_world_size": int(
+                getattr(request, "metadata", {}).get("tp_world_size", 1)
+            ),
+            "tp_rank": int(getattr(request, "metadata", {}).get("tp_rank", 0)),
+            "cp_world_size": int(getattr(request, "token_layout").world_size),
+            "cp_rank": int(getattr(request, "token_layout").rank),
+        }
         backend_id = str(provenance.get("actual_backend", linear_logp.backend_id))
         contract_id = (
             "linear_logp:"
             f"tp={getattr(request, 'metadata', {}).get('tp_world_size', 1)}:"
-            f"cp={getattr(request, 'context_parallel', None).world_size}:"
-            f"vocab={getattr(request, 'global_vocab_size', None)}"
+            f"cp={getattr(request, 'token_layout').world_size}:"
+            f"vocab={partition.padded_size}"
         )
-        return ProviderResult(
-            selected_logprobs=selected.reshape(-1, 1),
+        return LinearLogpResult(
+            logp=logp.reshape(-1, 1),
             entropy=entropy,
             backend_id=backend_id,
             contract_id=contract_id,
@@ -309,16 +338,21 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> ProviderResult:
         )
 
     if getattr(request, "log_prob_keep_mask", None) is not None:
-        raise SelectedLogprobProviderUnavailable(
-            "RL-Kernel WS2 logprob does not yet materialize Vime top-p replay masks"
+        raise LinearLogpProviderUnavailable(
+            "RL-Kernel logp does not yet materialize Vime top-p replay masks"
         )
 
     contract, num_vocab_tiles = _contract_for_request(request)
     dispatch = kernel_registry.get_logprob_op(contract, requested_backend=BACKEND_ID)
-    if dispatch.provenance["actual_backend"] != BACKEND_ID or dispatch.provenance["fallback"]:
-        raise RuntimeError("explicit WS2 backend dispatch changed during materialization")
+    if (
+        dispatch.provenance["actual_backend"] != BACKEND_ID
+        or dispatch.provenance["fallback"]
+    ):
+        raise RuntimeError(
+            "explicit WS2 backend dispatch changed during materialization"
+        )
     if getattr(request, "with_entropy", False):
-        selected_logp, _lse, entropy = dispatch.op.apply_with_entropy(
+        logp, _lse, entropy = dispatch.op.apply_with_entropy(
             request.logits,
             request.target_ids,
             contract=contract,
@@ -327,7 +361,7 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> ProviderResult:
             with_entropy_grad=bool(getattr(request, "with_entropy_grad", False)),
         )
     else:
-        selected_logp, _lse = dispatch.op(
+        logp, _lse = dispatch.op(
             request.logits,
             request.target_ids,
             contract=contract,
@@ -349,20 +383,20 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> ProviderResult:
         "cp_world_size": contract.sharding.cp_world_size,
     }
     provenance["execution"] = {
-        "role": "vime_training_selected_logprob",
+        "role": "vime_training_linear_logp",
         "strict_backend": True,
         "top_p_replay": False,
     }
-    provenance["cp_row_ownership"] = {
-        "cp_rank": contract.sharding.cp_rank,
-        "cp_world_size": contract.sharding.cp_world_size,
-        "layout": request.context_parallel.layout,
+    provenance["token_row_ownership"] = {
+        "rank": contract.sharding.cp_rank,
+        "world_size": contract.sharding.cp_world_size,
+        "layout": request.token_layout.layout,
         "local_token_rows": int(request.logits.shape[0]),
-        "cp_is_merge_axis": False,
+        "is_merge_axis": False,
     }
     provenance["num_vocab_tiles"] = num_vocab_tiles
-    return ProviderResult(
-        selected_logprobs=selected_logp.unsqueeze(-1),
+    return LinearLogpResult(
+        logp=logp.unsqueeze(-1),
         entropy=entropy,
         backend_id=dispatch.capability.backend_id,
         contract_id=contract.cross_rank_fingerprint(),
@@ -373,12 +407,9 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> ProviderResult:
 _provider_impl.backend_id = BACKEND_ID  # type: ignore[attr-defined]
 
 
-def provider(request: Any) -> ProviderResult:
+def provider(request: Any) -> LinearLogpResult:
     """Route Vime training logp through the active Megatron integration."""
 
-    # PR230's P/R axis is selected independently for training and rollout.
-    # The Megatron provider is only the training boundary, so a production
-    # training side must bypass the RL-Kernel integration entirely.
     case = operator_ablation_case("logp", os.getenv("RL_KERNEL_LOGP_CASE", "P/P"))
     if case.training is Implementation.PRODUCTION:
         return _provider_impl(request)
@@ -389,7 +420,7 @@ def provider(request: Any) -> ProviderResult:
     if integration is None:
         return _provider_impl(request)
 
-    def native_unavailable(_request: Any) -> ProviderResult:
+    def native_unavailable(_request: Any) -> LinearLogpResult:
         raise RuntimeError(
             "the structural provider was invoked for a production Megatron logp route"
         )
@@ -397,4 +428,4 @@ def provider(request: Any) -> ProviderResult:
     return integration.execute("logp", native_unavailable, request)
 
 
-__all__ = ["ProviderResult", "SelectedLogprobProviderUnavailable", "provider"]
+__all__ = ["LinearLogpResult", "LinearLogpProviderUnavailable", "provider"]

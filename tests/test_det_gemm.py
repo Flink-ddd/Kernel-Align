@@ -97,6 +97,8 @@ def test_rhs_transposed_materializes_unaligned_contiguous_view_for_tma():
 @pytest.mark.parametrize(
     "shape",
     [
+        (1, 128, 128),  # short-K tiled backward path
+        (8, 128, 128),  # short-K tiled backward path
         (128, 128, 128),  # aligned SM90 path
         (128, 96, 64),  # SM90 logical-M padding and dim-1 crop
         (31, 70, 65),  # scalar fallback

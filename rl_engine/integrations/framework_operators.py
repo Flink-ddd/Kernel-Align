@@ -16,8 +16,12 @@ from threading import Lock
 from typing import Any, Mapping, cast
 
 import torch
+
 from rl_engine.alignment.cross_config.operators import OperatorBridge, OperatorOverride
-from rl_engine.integrations.linear_logp import LinearLogpWrapper, take_rollout_linear_logp_context
+from rl_engine.integrations.linear_logp import (
+    LinearLogpWrapper,
+    take_rollout_linear_logp_context,
+)
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_FA4_SCHEDULE_ID,
     STRICT_ATTENTION_PRODUCTION_CORE_ID,
@@ -28,13 +32,22 @@ from rl_engine.kernels.attention_contract import (
 )
 from rl_engine.kernels.attention_contract import ReductionSpec as AttentionReductionSpec
 from rl_engine.kernels.attention_contract import ShardingSpec as AttentionShardingSpec
-from rl_engine.kernels.attention_contract import SplitKVSpec
-from rl_engine.kernels.logprob_contract import LogprobContract, LogprobDType, LogprobRole, MaskSpec
+from rl_engine.kernels.attention_contract import (
+    SplitKVSpec,
+)
+from rl_engine.kernels.logprob_contract import (
+    LogprobContract,
+    LogprobDType,
+    LogprobRole,
+    MaskSpec,
+)
 from rl_engine.kernels.logprob_contract import ReductionSpec as LogprobReductionSpec
 from rl_engine.kernels.logprob_contract import ShardingSpec as LogprobShardingSpec
 from rl_engine.kernels.ops.pytorch.attention.ablation import AttentionAblationConfig
 from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import BACKEND_ID as LOGP_BACKEND_ID
-from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import DEFAULT_NUM_VOCAB_TILES
+from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import (
+    DEFAULT_NUM_VOCAB_TILES,
+)
 from rl_engine.kernels.registry import kernel_registry
 from rl_engine.kernels.semantic_registry import OperatorRequirements
 
@@ -934,7 +947,8 @@ class MegatronLogpOperator:
 
     def __call__(self, request: Any) -> Any:
         logits = getattr(request, "logits", None)
-        hidden = getattr(request, "hidden", None)
+        context = getattr(request, "context", None)
+        hidden = getattr(context, "hidden", None)
         strict = os.getenv("VIME_RL_KERNEL_STRICT", "").strip().lower() in {
             "1",
             "true",
@@ -1087,7 +1101,10 @@ class VllmLogpOperator:
         native_selected = values[
             torch.arange(values.size(0), device=values.device), columns
         ].clone()
-        values[torch.arange(values.size(0), device=values.device), columns] = selected
+        # vLLM prepends the sampled token and then appends top-k tokens. When
+        # the sample is also in top-k, its API conversion keeps the last
+        # duplicate, so every matching column must carry the strict value.
+        values = torch.where(matches, selected.unsqueeze(1), values)
         self._last_provenance = {
             **dict(provenance),
             "sampled_token_ids": _tensor_debug_stats(token_ids),

@@ -1,14 +1,14 @@
 # Vime Qwen3-8B TP=2 CP=2 validation
 
 This example is the recommended reproducible entry point for the Vime-side
-selected-logprob integration. It keeps framework glue in Vime and keeps the
+linear_logp integration. It keeps framework glue in Vime and keeps the
 numerical provider, contract, provenance, and report in RL-Kernel.
 
 The example is deliberately strict:
 
 - Megatron training uses `TP=2`, `CP=2`, `PP=1`, and four actor ranks.
 - vLLM rollout uses processed logprobs and `top_p=1.0`.
-- Vime must load `rl_engine.integrations.vime.logp.provider` in `strict` mode.
+- Vime must load `rl_engine.integrations.vime.linear_logp_provider.provider` in `strict` mode.
 - A native fallback or a missing provider marker is not reported as a pass.
 - Attention and FFN are not declared consistent from configuration alone. They
   require executed Megatron and vLLM readbacks, so the report marks them
