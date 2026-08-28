@@ -137,6 +137,25 @@ def _close_ffn_collectives() -> None:
     ffn_module._COLLECTIVES.clear()
 
 
+def test_ffn_collective_creation_uses_platform_factory(monkeypatch):
+    import rl_engine.distributed as distributed
+
+    sentinel = object()
+    calls = []
+
+    def fake_factory(**kwargs):
+        calls.append(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(distributed, "create_deterministic_collective", fake_factory)
+    group = object()
+
+    result = ffn_module._create_collective(group=group, max_size_bytes=1234)
+
+    assert result is sentinel
+    assert calls == [{"group": group, "max_size_bytes": 1234}]
+
+
 def _shard_ranges(
     rank: int,
     *,

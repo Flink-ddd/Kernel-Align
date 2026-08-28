@@ -139,9 +139,11 @@ def get_extensions():
             "csrc/cuda/rmsnorm.cu",
             "csrc/cuda/activation.cu",
             "csrc/cuda/attention/deterministic_attention.cu",
-            "csrc/cuda/distributed/deterministic_collective.cu",
         ]
         if not is_rocm:
+            # The CUDA collective owns CUDA IPC handles and driver API calls;
+            # ROCm uses the Python RCCL transport implementation instead.
+            cuda_sources.append("csrc/cuda/distributed/deterministic_collective.cu")
             # This source contains NVIDIA PTX (cp.async, ldmatrix, and mma.sync).
             # The ROCm dispatcher falls back to PyTorch SDPA for this operator.
             cuda_sources.append("csrc/cuda/attention/prefix_shared_attention.cu")
@@ -211,9 +213,10 @@ def get_extensions():
             nvcc_flags.append("-allow-unsupported-compiler")
             nvcc_flags.append("-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH")
 
-        cxx_flags = ["-O3", "-std=c++17", "-DKERNEL_ALIGN_WITH_CUDA"]
+        platform_define = "-DKERNEL_ALIGN_WITH_ROCM" if is_rocm else "-DKERNEL_ALIGN_WITH_CUDA"
+        cxx_flags = ["-O3", "-std=c++17", platform_define]
         extra_link_args = list(torch_rpath)
-        if os.name != "nt":
+        if os.name != "nt" and not is_rocm:
             # CUDA IPC metadata queries use the driver API (cuPointerGetAttribute).
             extra_link_args.append("-lcuda")
 

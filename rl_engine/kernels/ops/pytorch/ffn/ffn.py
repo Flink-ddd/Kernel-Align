@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Bias-free gated FFN assembled from deterministic CUDA kernels."""
+"""Bias-free gated FFN assembled from deterministic GPU kernels."""
 
 from __future__ import annotations
 
@@ -35,9 +35,9 @@ def _require_ffn_kernels(*, disable_split_k: bool) -> None:
     if not _EXT_AVAILABLE or _C is None or missing:
         suffix = f" Missing symbols: {', '.join(missing)}." if missing else ""
         needed = (
-            "compiled deterministic GEMM and SwiGLU CUDA kernels"
+            "compiled deterministic GEMM and SwiGLU GPU kernels"
             if disable_split_k
-            else "compiled SwiGLU CUDA kernels"
+            else "compiled SwiGLU GPU kernels"
         )
         raise RuntimeError(f"qwen3_ffn requires the {needed}.{suffix}")
 
@@ -135,7 +135,8 @@ def _validate_ffn_inputs(
         if tensor.dtype != torch.bfloat16:
             raise TypeError(f"{name} must have dtype bfloat16, got {tensor.dtype}.")
         if not tensor.is_cuda:
-            raise RuntimeError(f"{name} must be on a CUDA device, got '{tensor.device}'.")
+            # PyTorch exposes AMD GPU tensors through the torch.cuda API too.
+            raise RuntimeError(f"{name} must be on a CUDA/ROCm GPU device, got '{tensor.device}'.")
         if tensor.device != rmsnorm_output.device:
             raise RuntimeError(
                 f"all FFN inputs must be on {rmsnorm_output.device}, "
@@ -143,13 +144,34 @@ def _validate_ffn_inputs(
             )
 
 
+def _create_collective(*, group: Any, max_size_bytes: int):
+    """Create the platform-specific collective lazily.
+
+    NVIDIA keeps the existing CUDA IPC implementation.  ROCm selects the
+    RCCL transport-only implementation, which performs the floating-point
+    reduction in the shared deterministic local tree.  Keeping this boundary
+    small also makes the backend choice explicit and easy to inject in tests.
+    """
+
+    try:
+        from rl_engine.distributed import create_deterministic_collective
+    except ImportError as exc:
+        raise RuntimeError(
+            "parallel qwen3_ffn requires the platform deterministic collective "
+            "factory; single-device qwen3_ffn remains available"
+        ) from exc
+
+    return create_deterministic_collective(
+        group=group,
+        max_size_bytes=max_size_bytes,
+    )
+
+
 def _collective_for_group(group: Any, *, min_size_bytes: int):
     if group is None:
         return None
 
     import torch.distributed as dist
-
-    from rl_engine.distributed import DeterministicCollective
 
     rank = dist.get_rank(group=group)
     world_size = dist.get_world_size(group=group)
@@ -161,7 +183,7 @@ def _collective_for_group(group: Any, *, min_size_bytes: int):
     if cached is not None:
         cached.close()
 
-    collective = DeterministicCollective(
+    collective = _create_collective(
         group=group,
         max_size_bytes=max(_COLLECTIVE_MIN_CAPACITY_BYTES, min_size_bytes),
     )
@@ -393,7 +415,8 @@ def qwen3_ffn(
             ``[H, I_local]``.
         tp_group: Optional tensor-parallel process group. Gate and Up are
             column-parallel; Down is row-parallel. Reductions use the
-            deterministic fixed-tree collectives rather than NCCL.
+            platform deterministic fixed-tree collectives. On ROCm, RCCL only
+            transports rank inputs and the reduction tree executes locally.
         cp_group: Optional context-parallel process group. Each rank owns
             different token rows and the same local weight shards. Weight
             gradients AllGather tokens along CP and run the full-token

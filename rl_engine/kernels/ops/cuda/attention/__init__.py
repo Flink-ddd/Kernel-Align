@@ -27,6 +27,7 @@ try:
         CPCommunicationStatus,
         CUDAAGRSAttentionCPCommunication,
         P2PNCCLAttentionCPCommunication,
+        RCCLAGRSAttentionCPCommunication,
         sort_attention_cp_partial_states,
     )
 except ModuleNotFoundError as exc:
@@ -46,6 +47,7 @@ else:
         "CPCommunicationStatus",
         "CUDAAGRSAttentionCPCommunication",
         "P2PNCCLAttentionCPCommunication",
+        "RCCLAGRSAttentionCPCommunication",
         "sort_attention_cp_partial_states",
     ]
 
