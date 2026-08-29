@@ -24,8 +24,8 @@
 - Measured paths:
   - `sdpa`: `torch.nn.functional.scaled_dot_product_attention`. **Speed baseline only** — as in PR #325, no accuracy comparison is mixed into the speed table.
   - `strict-aiter`: `StrictRocmAiterCKAttentionCore` called **once for all heads**. This is the core, not the production schedule: the Vime provider launches it once per (batch row, KV group). See the per-KV-group schedule table for that cost.
-  - `reference-hip`: `_C.deterministic_attention_forward/backward`, the materializing FP32 reference core hipified from the shared `.cu`.
-  - `triton-bitwise`: `TritonDeterministicAttentionOp`, whose contract is bit-identity with `reference-hip`.
+  - `reference-native`: `_C.deterministic_attention_forward/backward`, the materializing FP32 reference core hipified from the shared `.cu`.
+  - `triton-bitwise`: `TritonDeterministicAttentionOp`, whose contract is bit-identity with `reference-native`.
 - Timing: CUDA events, median and p95. Peak memory is the per-call increase in `torch.cuda.max_memory_allocated` above what was live before the call.
 - Accuracy is against an FP64 oracle over the same BF16/FP16-rounded inputs. Repeat = two identical calls are bitwise equal; batch-invariant = a row computed alone is bitwise equal to the same row inside a batch.
 - 5 warmups, 20 measured forward samples, 10 measured forward+backward samples. Raw medians, p95, min and max are in `results.json`.
@@ -66,19 +66,19 @@ Acceptance is 0 mismatched elements. This is the contract the Triton core exists
 |---:|---|---:|---:|---:|---:|---:|---:|:---:|
 | 512 | sdpa | 0.0782 | 0.0820 | 1.00x | 12.1 | 8.195e-03 | n/a | yes |
 | 512 | strict-aiter | 0.2428 | 0.2560 | 3.11x | 14.1 | 2.468e-02 | 8.359e-07 | yes |
-| 512 | reference-hip | 0.9659 | 1.0030 | 12.36x | 36.1 | 7.741e-03 | 8.111e-07 | yes |
+| 512 | reference-native | 0.9659 | 1.0030 | 12.36x | 36.1 | 7.741e-03 | 8.111e-07 | yes |
 | 512 | triton-bitwise | 1.3816 | 1.3923 | 17.68x | 36.1 | 7.741e-03 | 8.111e-07 | yes |
 | 1024 | sdpa | 0.1319 | 0.1430 | 1.00x | 24.1 | 1.027e-02 | n/a | yes |
 | 1024 | strict-aiter | 0.2468 | 0.2578 | 1.87x | 28.1 | 2.609e-02 | 1.213e-06 | yes |
-| 1024 | reference-hip | 3.1389 | 3.1914 | 23.79x | 136.1 | 7.810e-03 | 8.732e-07 | yes |
+| 1024 | reference-native | 3.1389 | 3.1914 | 23.79x | 136.1 | 7.810e-03 | 8.732e-07 | yes |
 | 1024 | triton-bitwise | 4.8240 | 4.8720 | 36.56x | 136.1 | 7.810e-03 | 8.732e-07 | yes |
 | 2048 | sdpa | 0.2887 | 0.2975 | 1.00x | 48.3 | 7.994e-03 | n/a | yes |
 | 2048 | strict-aiter | 0.2962 | 0.3394 | 1.03x | 56.3 | 2.027e-02 | 2.288e-06 | yes |
-| 2048 | reference-hip | 12.8467 | 12.9922 | 44.50x | 528.2 | 7.804e-03 | 1.142e-06 | yes |
+| 2048 | reference-native | 12.8467 | 12.9922 | 44.50x | 528.2 | 7.804e-03 | 1.142e-06 | yes |
 | 2048 | triton-bitwise | 19.4226 | 19.5024 | 67.28x | 528.3 | 7.804e-03 | 1.142e-06 | yes |
 | 4096 | sdpa | 0.6936 | 0.7149 | 1.00x | 96.5 | 9.604e-03 | n/a | yes |
 | 4096 | strict-aiter | 0.5644 | 0.6076 | 0.81x | 112.5 | 2.138e-02 | 3.967e-06 | yes |
-| 4096 | reference-hip | 49.3624 | 49.5342 | 71.17x | 2080.5 | 7.808e-03 | 1.381e-06 | yes |
+| 4096 | reference-native | 49.3624 | 49.5342 | 71.17x | 2080.5 | 7.808e-03 | 1.381e-06 | yes |
 | 4096 | triton-bitwise | 86.0655 | 86.5760 | 124.08x | 2080.5 | 7.808e-03 | 1.381e-06 | yes |
 
 ### Forward+backward
@@ -87,19 +87,19 @@ Acceptance is 0 mismatched elements. This is the contract the Triton core exists
 |---:|---|---:|---:|---:|---:|
 | 512 | sdpa | 0.3228 | 0.3510 | 1.00x | 32.2 |
 | 512 | strict-aiter | 0.6039 | 0.6560 | 1.87x | 288.2 |
-| 512 | reference-hip | 2.9714 | 2.9876 | 9.21x | 78.1 |
+| 512 | reference-native | 2.9714 | 2.9876 | 9.21x | 78.1 |
 | 512 | triton-bitwise | 4.8578 | 4.9374 | 15.05x | 78.1 |
 | 1024 | sdpa | 0.4319 | 0.5795 | 1.00x | 64.3 |
 | 1024 | strict-aiter | 0.9293 | 0.9651 | 2.15x | 1088.4 |
-| 1024 | reference-hip | 12.2009 | 12.2835 | 28.25x | 284.3 |
+| 1024 | reference-native | 12.2009 | 12.2835 | 28.25x | 284.3 |
 | 1024 | triton-bitwise | 20.1771 | 20.3071 | 46.71x | 284.3 |
 | 2048 | sdpa | 1.0735 | 1.1114 | 1.00x | 128.8 |
 | 2048 | strict-aiter | 1.9019 | 1.9802 | 1.77x | 4224.8 |
-| 2048 | reference-hip | 47.8741 | 48.1225 | 44.60x | 1080.5 |
+| 2048 | reference-native | 47.8741 | 48.1225 | 44.60x | 1080.5 |
 | 2048 | triton-bitwise | 76.7414 | 76.9707 | 71.49x | 1080.5 |
 | 4096 | sdpa | 3.2464 | 3.3146 | 1.00x | 257.5 |
 | 4096 | strict-aiter | 5.7304 | 5.7861 | 1.77x | 16641.5 |
-| 4096 | reference-hip | 173.3365 | 173.5448 | 53.39x | 4209.0 |
+| 4096 | reference-native | 173.3365 | 173.5448 | 53.39x | 4209.0 |
 | 4096 | triton-bitwise | 304.1032 | 304.4993 | 93.67x | 4209.0 |
 
 ## Single-device Attention (fp16)
@@ -110,19 +110,19 @@ Acceptance is 0 mismatched elements. This is the contract the Triton core exists
 |---:|---|---:|---:|---:|---:|---:|---:|:---:|
 | 512 | sdpa | 0.0700 | 0.0735 | 1.00x | 12.1 | 1.042e-03 | n/a | yes |
 | 512 | strict-aiter | 0.2472 | 0.3623 | 3.53x | 14.1 | 2.046e-03 | 8.756e-07 | yes |
-| 512 | reference-hip | 0.9588 | 1.0180 | 13.70x | 36.1 | 9.702e-04 | 8.340e-07 | yes |
+| 512 | reference-native | 0.9588 | 1.0180 | 13.70x | 36.1 | 9.702e-04 | 8.340e-07 | yes |
 | 512 | triton-bitwise | 1.3660 | 1.3787 | 19.52x | 36.1 | 9.702e-04 | 8.340e-07 | yes |
 | 1024 | sdpa | 0.1286 | 0.1435 | 1.00x | 24.1 | 1.053e-03 | n/a | yes |
 | 1024 | strict-aiter | 0.2423 | 0.2602 | 1.88x | 28.1 | 2.299e-03 | 1.250e-06 | yes |
-| 1024 | reference-hip | 3.0663 | 3.1218 | 23.84x | 136.1 | 9.757e-04 | 1.011e-06 | yes |
+| 1024 | reference-native | 3.0663 | 3.1218 | 23.84x | 136.1 | 9.757e-04 | 1.011e-06 | yes |
 | 1024 | triton-bitwise | 4.7733 | 4.8062 | 37.11x | 136.1 | 9.757e-04 | 1.011e-06 | yes |
 | 2048 | sdpa | 0.2866 | 0.2997 | 1.00x | 48.3 | 9.099e-04 | n/a | yes |
 | 2048 | strict-aiter | 0.2942 | 0.3034 | 1.03x | 56.3 | 2.053e-03 | 2.540e-06 | yes |
-| 2048 | reference-hip | 12.5348 | 12.7376 | 43.73x | 528.2 | 9.099e-04 | 1.103e-06 | yes |
+| 2048 | reference-native | 12.5348 | 12.7376 | 43.73x | 528.2 | 9.099e-04 | 1.103e-06 | yes |
 | 2048 | triton-bitwise | 19.1882 | 19.2599 | 66.94x | 528.3 | 9.099e-04 | 1.103e-06 | yes |
 | 4096 | sdpa | 1.0565 | 1.0855 | 1.00x | 96.5 | 9.905e-04 | n/a | yes |
 | 4096 | strict-aiter | 0.5813 | 0.6200 | 0.55x | 112.5 | 1.953e-03 | 3.805e-06 | yes |
-| 4096 | reference-hip | 48.3115 | 48.4132 | 45.73x | 2080.5 | 9.681e-04 | 1.511e-06 | yes |
+| 4096 | reference-native | 48.3115 | 48.4132 | 45.73x | 2080.5 | 9.681e-04 | 1.511e-06 | yes |
 | 4096 | triton-bitwise | 84.9071 | 85.0736 | 80.36x | 2080.5 | 9.681e-04 | 1.511e-06 | yes |
 
 ### Forward+backward
@@ -131,19 +131,19 @@ Acceptance is 0 mismatched elements. This is the contract the Triton core exists
 |---:|---|---:|---:|---:|---:|
 | 512 | sdpa | 0.3177 | 0.3328 | 1.00x | 32.2 |
 | 512 | strict-aiter | 1.0677 | 1.1007 | 3.36x | 288.2 |
-| 512 | reference-hip | 3.0363 | 3.0744 | 9.56x | 78.1 |
+| 512 | reference-native | 3.0363 | 3.0744 | 9.56x | 78.1 |
 | 512 | triton-bitwise | 4.7821 | 4.8698 | 15.05x | 78.1 |
 | 1024 | sdpa | 0.4399 | 0.5001 | 1.00x | 64.4 |
 | 1024 | strict-aiter | 0.8350 | 0.9122 | 1.90x | 1088.4 |
-| 1024 | reference-hip | 12.0068 | 12.0713 | 27.29x | 284.3 |
+| 1024 | reference-native | 12.0068 | 12.0713 | 27.29x | 284.3 |
 | 1024 | triton-bitwise | 19.3157 | 19.4640 | 43.91x | 284.3 |
 | 2048 | sdpa | 1.1766 | 1.2269 | 1.00x | 128.5 |
 | 2048 | strict-aiter | 1.9060 | 2.0250 | 1.62x | 4224.8 |
-| 2048 | reference-hip | 47.5117 | 47.7373 | 40.38x | 1080.5 |
+| 2048 | reference-native | 47.5117 | 47.7373 | 40.38x | 1080.5 |
 | 2048 | triton-bitwise | 75.7950 | 76.0022 | 64.42x | 1080.5 |
 | 4096 | sdpa | 4.0247 | 4.0579 | 1.00x | 257.0 |
 | 4096 | strict-aiter | 5.8475 | 5.8916 | 1.45x | 16641.5 |
-| 4096 | reference-hip | 171.5617 | 171.7337 | 42.63x | 4209.0 |
+| 4096 | reference-native | 171.5617 | 171.7337 | 42.63x | 4209.0 |
 | 4096 | triton-bitwise | 300.1215 | 301.8339 | 74.57x | 4209.0 |
 
 ## Production core versus the reference core
@@ -169,20 +169,20 @@ A row computed alone must be bitwise equal to the same row inside a batch. The s
 |---:|---|:---:|---:|---|
 | 512 | sdpa | yes | 0 | measured |
 | 512 | strict-aiter | yes | 0 | core executes one logical batch row per launch |
-| 512 | reference-hip | yes | 0 | measured |
 | 512 | triton-bitwise | yes | 0 | measured |
+| 512 | reference-native | yes | 0 | measured |
 | 1024 | sdpa | yes | 0 | measured |
 | 1024 | strict-aiter | yes | 0 | core executes one logical batch row per launch |
-| 1024 | reference-hip | yes | 0 | measured |
 | 1024 | triton-bitwise | yes | 0 | measured |
+| 1024 | reference-native | yes | 0 | measured |
 | 2048 | sdpa | yes | 0 | measured |
 | 2048 | strict-aiter | yes | 0 | core executes one logical batch row per launch |
-| 2048 | reference-hip | yes | 0 | measured |
 | 2048 | triton-bitwise | yes | 0 | measured |
+| 2048 | reference-native | yes | 0 | measured |
 | 4096 | sdpa | yes | 0 | measured |
 | 4096 | strict-aiter | yes | 0 | core executes one logical batch row per launch |
-| 4096 | reference-hip | yes | 0 | measured |
 | 4096 | triton-bitwise | yes | 0 | measured |
+| 4096 | reference-native | yes | 0 | measured |
 
 ## TP-degree invariance of the strict ROCm core
 
@@ -241,7 +241,7 @@ Schedule: all-gather Q/K/V and the position ids over the CP group, run the stric
 
 ## Figures
 
-`reference-hip` and `triton-bitwise` allocate exactly the same buffers, so their memory curves coincide and the later-drawn series hides the earlier one.
+`reference-native` and `triton-bitwise` allocate exactly the same buffers, so their memory curves coincide and the later-drawn series hides the earlier one.
 
 ![Single-device latency and memory grid](single_gpu_grid.png)
 

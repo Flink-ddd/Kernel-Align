@@ -90,31 +90,6 @@
             },
             "train_peak_mib": 288.18896484375
           },
-          "reference-hip": {
-            "forward": {
-              "median_ms": 0.9658550024032593,
-              "p95_ms": 1.0030183851718903,
-              "min_ms": 0.9305430054664612,
-              "max_ms": 1.0328550338745117
-            },
-            "forward_peak_mib": 36.0625,
-            "out_vs_fp64": {
-              "max_abs": 0.0077411426297544494,
-              "relative_l2": 0.0015903199116563222
-            },
-            "lse_vs_fp64": {
-              "max_abs": 8.111189337967062e-07,
-              "relative_l2": 4.340800016528509e-08
-            },
-            "repeat_bitwise": true,
-            "train_fwd_bwd": {
-              "median_ms": 2.971434473991394,
-              "p95_ms": 2.9875863194465637,
-              "min_ms": 2.9168529510498047,
-              "max_ms": 2.990001916885376
-            },
-            "train_peak_mib": 78.1259765625
-          },
           "triton-bitwise": {
             "forward": {
               "median_ms": 1.38155198097229,
@@ -139,6 +114,31 @@
               "max_ms": 4.9755120277404785
             },
             "train_peak_mib": 78.1259765625
+          },
+          "reference-native": {
+            "forward": {
+              "median_ms": 0.9658550024032593,
+              "p95_ms": 1.0030183851718903,
+              "min_ms": 0.9305430054664612,
+              "max_ms": 1.0328550338745117
+            },
+            "forward_peak_mib": 36.0625,
+            "out_vs_fp64": {
+              "max_abs": 0.0077411426297544494,
+              "relative_l2": 0.0015903199116563222
+            },
+            "lse_vs_fp64": {
+              "max_abs": 8.111189337967062e-07,
+              "relative_l2": 4.340800016528509e-08
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 2.971434473991394,
+              "p95_ms": 2.9875863194465637,
+              "min_ms": 2.9168529510498047,
+              "max_ms": 2.990001916885376
+            },
+            "train_peak_mib": 78.1259765625
           }
         },
         "triton_vs_reference": {
@@ -156,7 +156,8 @@
             "max_abs": 9.5367431640625e-07,
             "relative_l2": 4.7804698254096993e-08
           },
-          "out_mismatched": 1710619
+          "out_mismatched": 1710619,
+          "production_path": "strict-aiter"
         }
       },
       {
@@ -213,31 +214,6 @@
             },
             "train_peak_mib": 1088.37646484375
           },
-          "reference-hip": {
-            "forward": {
-              "median_ms": 3.1389429569244385,
-              "p95_ms": 3.1914275646209718,
-              "min_ms": 3.088547945022583,
-              "max_ms": 3.198391914367676
-            },
-            "forward_peak_mib": 136.125,
-            "out_vs_fp64": {
-              "max_abs": 0.007810300996808017,
-              "relative_l2": 0.0016039478773382583
-            },
-            "lse_vs_fp64": {
-              "max_abs": 8.732049643356277e-07,
-              "relative_l2": 4.1651456242074347e-08
-            },
-            "repeat_bitwise": true,
-            "train_fwd_bwd": {
-              "median_ms": 12.200886726379395,
-              "p95_ms": 12.283522844314575,
-              "min_ms": 12.123411178588867,
-              "max_ms": 12.289777755737305
-            },
-            "train_peak_mib": 284.2509765625
-          },
           "triton-bitwise": {
             "forward": {
               "median_ms": 4.823986291885376,
@@ -262,6 +238,31 @@
               "max_ms": 20.38588523864746
             },
             "train_peak_mib": 284.2509765625
+          },
+          "reference-native": {
+            "forward": {
+              "median_ms": 3.1389429569244385,
+              "p95_ms": 3.1914275646209718,
+              "min_ms": 3.088547945022583,
+              "max_ms": 3.198391914367676
+            },
+            "forward_peak_mib": 136.125,
+            "out_vs_fp64": {
+              "max_abs": 0.007810300996808017,
+              "relative_l2": 0.0016039478773382583
+            },
+            "lse_vs_fp64": {
+              "max_abs": 8.732049643356277e-07,
+              "relative_l2": 4.1651456242074347e-08
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 12.200886726379395,
+              "p95_ms": 12.283522844314575,
+              "min_ms": 12.123411178588867,
+              "max_ms": 12.289777755737305
+            },
+            "train_peak_mib": 284.2509765625
           }
         },
         "triton_vs_reference": {
@@ -279,7 +280,8 @@
             "max_abs": 1.430511474609375e-06,
             "relative_l2": 5.160771963046382e-08
           },
-          "out_mismatched": 3454931
+          "out_mismatched": 3454931,
+          "production_path": "strict-aiter"
         }
       },
       {
@@ -336,31 +338,6 @@
             },
             "train_peak_mib": 4224.75146484375
           },
-          "reference-hip": {
-            "forward": {
-              "median_ms": 12.846725940704346,
-              "p95_ms": 12.992164230346681,
-              "min_ms": 12.708842277526855,
-              "max_ms": 13.059562683105469
-            },
-            "forward_peak_mib": 528.25,
-            "out_vs_fp64": {
-              "max_abs": 0.007803990877593758,
-              "relative_l2": 0.0016089924958069535
-            },
-            "lse_vs_fp64": {
-              "max_abs": 1.1420866119493667e-06,
-              "relative_l2": 4.112077326317473e-08
-            },
-            "repeat_bitwise": true,
-            "train_fwd_bwd": {
-              "median_ms": 47.87408638000488,
-              "p95_ms": 48.12248554229736,
-              "min_ms": 47.75138473510742,
-              "max_ms": 48.182064056396484
-            },
-            "train_peak_mib": 1080.5009765625
-          },
           "triton-bitwise": {
             "forward": {
               "median_ms": 19.422576904296875,
@@ -385,6 +362,31 @@
               "max_ms": 77.09093475341797
             },
             "train_peak_mib": 1080.5009765625
+          },
+          "reference-native": {
+            "forward": {
+              "median_ms": 12.846725940704346,
+              "p95_ms": 12.992164230346681,
+              "min_ms": 12.708842277526855,
+              "max_ms": 13.059562683105469
+            },
+            "forward_peak_mib": 528.25,
+            "out_vs_fp64": {
+              "max_abs": 0.007803990877593758,
+              "relative_l2": 0.0016089924958069535
+            },
+            "lse_vs_fp64": {
+              "max_abs": 1.1420866119493667e-06,
+              "relative_l2": 4.112077326317473e-08
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 47.87408638000488,
+              "p95_ms": 48.12248554229736,
+              "min_ms": 47.75138473510742,
+              "max_ms": 48.182064056396484
+            },
+            "train_peak_mib": 1080.5009765625
           }
         },
         "triton_vs_reference": {
@@ -402,7 +404,8 @@
             "max_abs": 1.9073486328125e-06,
             "relative_l2": 6.75179843473521e-08
           },
-          "out_mismatched": 6955314
+          "out_mismatched": 6955314,
+          "production_path": "strict-aiter"
         }
       },
       {
@@ -459,31 +462,6 @@
             },
             "train_peak_mib": 16641.50146484375
           },
-          "reference-hip": {
-            "forward": {
-              "median_ms": 49.36237716674805,
-              "p95_ms": 49.53416557312012,
-              "min_ms": 49.227455139160156,
-              "max_ms": 49.636383056640625
-            },
-            "forward_peak_mib": 2080.5,
-            "out_vs_fp64": {
-              "max_abs": 0.0078084380373617535,
-              "relative_l2": 0.0016189978158770984
-            },
-            "lse_vs_fp64": {
-              "max_abs": 1.3814724333371942e-06,
-              "relative_l2": 4.407682874169915e-08
-            },
-            "repeat_bitwise": true,
-            "train_fwd_bwd": {
-              "median_ms": 173.3364715576172,
-              "p95_ms": 173.54477233886718,
-              "min_ms": 173.05787658691406,
-              "max_ms": 173.5828399658203
-            },
-            "train_peak_mib": 4209.0009765625
-          },
           "triton-bitwise": {
             "forward": {
               "median_ms": 86.06550979614258,
@@ -508,6 +486,31 @@
               "max_ms": 304.59844970703125
             },
             "train_peak_mib": 4209.0009765625
+          },
+          "reference-native": {
+            "forward": {
+              "median_ms": 49.36237716674805,
+              "p95_ms": 49.53416557312012,
+              "min_ms": 49.227455139160156,
+              "max_ms": 49.636383056640625
+            },
+            "forward_peak_mib": 2080.5,
+            "out_vs_fp64": {
+              "max_abs": 0.0078084380373617535,
+              "relative_l2": 0.0016189978158770984
+            },
+            "lse_vs_fp64": {
+              "max_abs": 1.3814724333371942e-06,
+              "relative_l2": 4.407682874169915e-08
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 173.3364715576172,
+              "p95_ms": 173.54477233886718,
+              "min_ms": 173.05787658691406,
+              "max_ms": 173.5828399658203
+            },
+            "train_peak_mib": 4209.0009765625
           }
         },
         "triton_vs_reference": {
@@ -525,7 +528,8 @@
             "max_abs": 3.814697265625e-06,
             "relative_l2": 1.0616847591543177e-07
           },
-          "out_mismatched": 13983861
+          "out_mismatched": 13983861,
+          "production_path": "strict-aiter"
         }
       },
       {
@@ -582,31 +586,6 @@
             },
             "train_peak_mib": 288.18896484375
           },
-          "reference-hip": {
-            "forward": {
-              "median_ms": 0.9587844908237457,
-              "p95_ms": 1.0179794907569886,
-              "min_ms": 0.9101120233535767,
-              "max_ms": 1.0238410234451294
-            },
-            "forward_peak_mib": 36.0625,
-            "out_vs_fp64": {
-              "max_abs": 0.000970187372193454,
-              "relative_l2": 0.00019891305228570232
-            },
-            "lse_vs_fp64": {
-              "max_abs": 8.340042594312536e-07,
-              "relative_l2": 4.5004346410580595e-08
-            },
-            "repeat_bitwise": true,
-            "train_fwd_bwd": {
-              "median_ms": 3.0363115072250366,
-              "p95_ms": 3.0743917584419247,
-              "min_ms": 2.9352810382843018,
-              "max_ms": 3.082179069519043
-            },
-            "train_peak_mib": 78.1259765625
-          },
           "triton-bitwise": {
             "forward": {
               "median_ms": 1.3660094738006592,
@@ -631,6 +610,31 @@
               "max_ms": 4.90432596206665
             },
             "train_peak_mib": 78.1259765625
+          },
+          "reference-native": {
+            "forward": {
+              "median_ms": 0.9587844908237457,
+              "p95_ms": 1.0179794907569886,
+              "min_ms": 0.9101120233535767,
+              "max_ms": 1.0238410234451294
+            },
+            "forward_peak_mib": 36.0625,
+            "out_vs_fp64": {
+              "max_abs": 0.000970187372193454,
+              "relative_l2": 0.00019891305228570232
+            },
+            "lse_vs_fp64": {
+              "max_abs": 8.340042594312536e-07,
+              "relative_l2": 4.5004346410580595e-08
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 3.0363115072250366,
+              "p95_ms": 3.0743917584419247,
+              "min_ms": 2.9352810382843018,
+              "max_ms": 3.082179069519043
+            },
+            "train_peak_mib": 78.1259765625
           }
         },
         "triton_vs_reference": {
@@ -648,7 +652,8 @@
             "max_abs": 9.5367431640625e-07,
             "relative_l2": 4.962085268945435e-08
           },
-          "out_mismatched": 1200744
+          "out_mismatched": 1200744,
+          "production_path": "strict-aiter"
         }
       },
       {
@@ -705,31 +710,6 @@
             },
             "train_peak_mib": 1088.37646484375
           },
-          "reference-hip": {
-            "forward": {
-              "median_ms": 3.066275477409363,
-              "p95_ms": 3.1217862606048588,
-              "min_ms": 3.0435619354248047,
-              "max_ms": 3.1246020793914795
-            },
-            "forward_peak_mib": 136.125,
-            "out_vs_fp64": {
-              "max_abs": 0.0009756507335656472,
-              "relative_l2": 0.0002006938787806314
-            },
-            "lse_vs_fp64": {
-              "max_abs": 1.0114761641588643e-06,
-              "relative_l2": 4.218427372109014e-08
-            },
-            "repeat_bitwise": true,
-            "train_fwd_bwd": {
-              "median_ms": 12.0067777633667,
-              "p95_ms": 12.071291828155518,
-              "min_ms": 11.944625854492188,
-              "max_ms": 12.07181453704834
-            },
-            "train_peak_mib": 284.2509765625
-          },
           "triton-bitwise": {
             "forward": {
               "median_ms": 4.7733314037323,
@@ -754,6 +734,31 @@
               "max_ms": 19.566869735717773
             },
             "train_peak_mib": 284.2509765625
+          },
+          "reference-native": {
+            "forward": {
+              "median_ms": 3.066275477409363,
+              "p95_ms": 3.1217862606048588,
+              "min_ms": 3.0435619354248047,
+              "max_ms": 3.1246020793914795
+            },
+            "forward_peak_mib": 136.125,
+            "out_vs_fp64": {
+              "max_abs": 0.0009756507335656472,
+              "relative_l2": 0.0002006938787806314
+            },
+            "lse_vs_fp64": {
+              "max_abs": 1.0114761641588643e-06,
+              "relative_l2": 4.218427372109014e-08
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 12.0067777633667,
+              "p95_ms": 12.071291828155518,
+              "min_ms": 11.944625854492188,
+              "max_ms": 12.07181453704834
+            },
+            "train_peak_mib": 284.2509765625
           }
         },
         "triton_vs_reference": {
@@ -771,7 +776,8 @@
             "max_abs": 1.430511474609375e-06,
             "relative_l2": 5.213412779092794e-08
           },
-          "out_mismatched": 2434520
+          "out_mismatched": 2434520,
+          "production_path": "strict-aiter"
         }
       },
       {
@@ -828,31 +834,6 @@
             },
             "train_peak_mib": 4224.75146484375
           },
-          "reference-hip": {
-            "forward": {
-              "median_ms": 12.534762859344482,
-              "p95_ms": 12.737589597702026,
-              "min_ms": 12.424939155578613,
-              "max_ms": 12.798213958740234
-            },
-            "forward_peak_mib": 528.25,
-            "out_vs_fp64": {
-              "max_abs": 0.000909865866452364,
-              "relative_l2": 0.00020150767732632786
-            },
-            "lse_vs_fp64": {
-              "max_abs": 1.102904860772469e-06,
-              "relative_l2": 4.146891383633236e-08
-            },
-            "repeat_bitwise": true,
-            "train_fwd_bwd": {
-              "median_ms": 47.51166534423828,
-              "p95_ms": 47.73727970123291,
-              "min_ms": 47.379112243652344,
-              "max_ms": 47.80305862426758
-            },
-            "train_peak_mib": 1080.5009765625
-          },
           "triton-bitwise": {
             "forward": {
               "median_ms": 19.188227653503418,
@@ -877,6 +858,31 @@
               "max_ms": 76.14364624023438
             },
             "train_peak_mib": 1080.5009765625
+          },
+          "reference-native": {
+            "forward": {
+              "median_ms": 12.534762859344482,
+              "p95_ms": 12.737589597702026,
+              "min_ms": 12.424939155578613,
+              "max_ms": 12.798213958740234
+            },
+            "forward_peak_mib": 528.25,
+            "out_vs_fp64": {
+              "max_abs": 0.000909865866452364,
+              "relative_l2": 0.00020150767732632786
+            },
+            "lse_vs_fp64": {
+              "max_abs": 1.102904860772469e-06,
+              "relative_l2": 4.146891383633236e-08
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 47.51166534423828,
+              "p95_ms": 47.73727970123291,
+              "min_ms": 47.379112243652344,
+              "max_ms": 47.80305862426758
+            },
+            "train_peak_mib": 1080.5009765625
           }
         },
         "triton_vs_reference": {
@@ -894,7 +900,8 @@
             "max_abs": 2.86102294921875e-06,
             "relative_l2": 6.734176413189059e-08
           },
-          "out_mismatched": 4922569
+          "out_mismatched": 4922569,
+          "production_path": "strict-aiter"
         }
       },
       {
@@ -951,31 +958,6 @@
             },
             "train_peak_mib": 16641.50146484375
           },
-          "reference-hip": {
-            "forward": {
-              "median_ms": 48.31145668029785,
-              "p95_ms": 48.41316184997559,
-              "min_ms": 48.2238883972168,
-              "max_ms": 48.416053771972656
-            },
-            "forward_peak_mib": 2080.5,
-            "out_vs_fp64": {
-              "max_abs": 0.0009680650127679158,
-              "relative_l2": 0.00020199318189363435
-            },
-            "lse_vs_fp64": {
-              "max_abs": 1.5106917023999245e-06,
-              "relative_l2": 4.425631521647521e-08
-            },
-            "repeat_bitwise": true,
-            "train_fwd_bwd": {
-              "median_ms": 171.56171417236328,
-              "p95_ms": 171.73365631103513,
-              "min_ms": 171.35488891601562,
-              "max_ms": 171.74888610839844
-            },
-            "train_peak_mib": 4209.0009765625
-          },
           "triton-bitwise": {
             "forward": {
               "median_ms": 84.9071273803711,
@@ -1000,6 +982,31 @@
               "max_ms": 301.9183654785156
             },
             "train_peak_mib": 4209.0009765625
+          },
+          "reference-native": {
+            "forward": {
+              "median_ms": 48.31145668029785,
+              "p95_ms": 48.41316184997559,
+              "min_ms": 48.2238883972168,
+              "max_ms": 48.416053771972656
+            },
+            "forward_peak_mib": 2080.5,
+            "out_vs_fp64": {
+              "max_abs": 0.0009680650127679158,
+              "relative_l2": 0.00020199318189363435
+            },
+            "lse_vs_fp64": {
+              "max_abs": 1.5106917023999245e-06,
+              "relative_l2": 4.425631521647521e-08
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 171.56171417236328,
+              "p95_ms": 171.73365631103513,
+              "min_ms": 171.35488891601562,
+              "max_ms": 171.74888610839844
+            },
+            "train_peak_mib": 4209.0009765625
           }
         },
         "triton_vs_reference": {
@@ -1017,7 +1024,8 @@
             "max_abs": 3.814697265625e-06,
             "relative_l2": 1.0641371875326284e-07
           },
-          "out_mismatched": 9932656
+          "out_mismatched": 9932656,
+          "production_path": "strict-aiter"
         }
       }
     ]
@@ -1069,14 +1077,14 @@
           "out_mismatched": 0,
           "note": "core executes one logical batch row per launch"
         },
-        "reference-hip": {
+        "triton-bitwise": {
           "batch_gt1_rejected": false,
           "out_bitwise": true,
           "out_mismatched": 0,
           "out_max_abs": 0.0,
           "lse_bitwise": true
         },
-        "triton-bitwise": {
+        "reference-native": {
           "batch_gt1_rejected": false,
           "out_bitwise": true,
           "out_mismatched": 0,
@@ -1101,14 +1109,14 @@
           "out_mismatched": 0,
           "note": "core executes one logical batch row per launch"
         },
-        "reference-hip": {
+        "triton-bitwise": {
           "batch_gt1_rejected": false,
           "out_bitwise": true,
           "out_mismatched": 0,
           "out_max_abs": 0.0,
           "lse_bitwise": true
         },
-        "triton-bitwise": {
+        "reference-native": {
           "batch_gt1_rejected": false,
           "out_bitwise": true,
           "out_mismatched": 0,
@@ -1133,14 +1141,14 @@
           "out_mismatched": 0,
           "note": "core executes one logical batch row per launch"
         },
-        "reference-hip": {
+        "triton-bitwise": {
           "batch_gt1_rejected": false,
           "out_bitwise": true,
           "out_mismatched": 0,
           "out_max_abs": 0.0,
           "lse_bitwise": true
         },
-        "triton-bitwise": {
+        "reference-native": {
           "batch_gt1_rejected": false,
           "out_bitwise": true,
           "out_mismatched": 0,
@@ -1165,14 +1173,14 @@
           "out_mismatched": 0,
           "note": "core executes one logical batch row per launch"
         },
-        "reference-hip": {
+        "triton-bitwise": {
           "batch_gt1_rejected": false,
           "out_bitwise": true,
           "out_mismatched": 0,
           "out_max_abs": 0.0,
           "lse_bitwise": true
         },
-        "triton-bitwise": {
+        "reference-native": {
           "batch_gt1_rejected": false,
           "out_bitwise": true,
           "out_mismatched": 0,
