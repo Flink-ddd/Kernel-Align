@@ -450,8 +450,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Run the TP=8 deterministic rank-ordered all-gather kernel");
 #endif
 
-    // Prefix-shared attention uses NVIDIA PTX and falls back to PyTorch SDPA on
-    // ROCm; it is covered by the same guard opened above.
+#if !defined(USE_ROCM)
+    // Prefix-shared attention uses NVIDIA PTX; the declaration above carries the
+    // same guard, so the registration must repeat it or a ROCm build fails on an
+    // undeclared identifier.
     m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
 #endif
 
