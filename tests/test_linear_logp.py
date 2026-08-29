@@ -1261,7 +1261,9 @@ def test_registry_dispatch_matches_native():
     from rl_engine.platforms.device import device_ctx
 
     op = kernel_registry.get_op("linear_logp")
-    device = device_ctx.device if device_ctx.device_type == "cuda" else "cpu"
+    # ROCm reports device_type "rocm" but tensors still live on torch "cuda"
+    # devices; only true CPU hosts fall back to CPU inputs.
+    device = device_ctx.device if device_ctx.device_type in ("cuda", "rocm") else "cpu"
     hidden, weight, target, bias = _inputs(6, device=device)
     out = op(hidden, weight, target, bias)
     ref = NativeLinearLogpOp()(hidden, weight, target, bias)

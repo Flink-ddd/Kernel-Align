@@ -396,16 +396,17 @@ def _det_linear_logp_merge_kernel(
     rows = pid * BLOCK_N + tl.arange(0, BLOCK_N)
     row_mask = rows < N
 
+    rows64 = rows.to(tl.int64)
     m = tl.load(part_max_ptr + rows, mask=row_mask, other=float("-inf"))
     for split in range(1, n_split):
-        base = split.to(tl.int64) * N + rows
+        base = rows64 + split * N
         m = tl.maximum(m, tl.load(part_max_ptr + base, mask=row_mask, other=float("-inf")))
 
     finite = m != float("-inf")
     s = tl.zeros((BLOCK_N,), tl.float32)
     zt = tl.zeros((BLOCK_N,), tl.float32)
     for split in range(0, n_split):
-        base = split.to(tl.int64) * N + rows
+        base = rows64 + split * N
         pm = tl.load(part_max_ptr + base, mask=row_mask, other=float("-inf"))
         ps = tl.load(part_sum_ptr + base, mask=row_mask, other=0.0)
         term = tl.where(finite & (pm != float("-inf")), ps * tl.exp(pm - m), 0.0)
@@ -694,6 +695,7 @@ def triton_deterministic_linear_logp(
     logp = torch.minimum(zt - lse, torch.zeros_like(lse)).reshape(lead_shape)
     lse = lse.reshape(lead_shape)
     if return_logits:
+        assert logits is not None
         return logp, lse, logits.reshape(*lead_shape, weight.size(0))
     return logp, lse
 
