@@ -10,15 +10,15 @@
 | architecture | n/a |
 | cpu_count | 192 |
 | cuda | None |
-| extension_attention_symbols | deterministic_attention_backward, deterministic_attention_forward |
+| extension_attention_symbols | none |
 | gpu | n/a (host execution) |
-| gpu_count | 8 |
-| hip | 7.14.60850 |
-| native_collective | torch.distributed ProcessGroupNCCL (RCCL on ROCm) |
+| gpu_count | 0 |
+| hip | None |
+| native_collective | n/a (single-process host run) |
 | python | 3.12.3 |
 | torch | 2.12.0+rocm7.14.0a20260608 |
-| torch_threads | 32 |
-| triton | 3.7.0 |
+| torch_threads | 192 |
+| triton | n/a (host execution) |
 
 ## Methodology
 
@@ -65,23 +65,23 @@ Acceptance is 0 mismatched elements. This is the contract the Triton core exists
 
 | S | Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB | out max-abs vs FP64 | lse max-abs vs FP64 | Repeat |
 |---:|---|---:|---:|---:|---:|---:|---:|:---:|
-| 512 | sdpa | 31.5270 | 34.1950 | 1.00x | 0.0 | 8.606e-03 | n/a | yes |
-| 512 | pytorch-native | 15.3921 | 15.8488 | 0.49x | 32.7 | 1.947e-02 | n/a | yes |
-| 1024 | sdpa | 98.3129 | 98.4924 | 1.00x | 43.6 | 8.191e-03 | n/a | yes |
-| 1024 | pytorch-native | 51.5739 | 51.9609 | 0.52x | 127.8 | 1.610e-02 | n/a | yes |
-| 2048 | sdpa | 304.6115 | 308.9697 | 1.00x | 50.5 | 9.314e-03 | n/a | yes |
-| 2048 | pytorch-native | 216.1569 | 235.2967 | 0.71x | 543.6 | 1.790e-02 | n/a | yes |
+| 512 | sdpa | 38.1068 | 43.2369 | 1.00x | 0.1 | 8.606e-03 | n/a | yes |
+| 512 | pytorch-native | 7.0910 | 9.0480 | 0.19x | 0.0 | 1.947e-02 | n/a | yes |
+| 1024 | sdpa | 174.7517 | 252.6524 | 1.00x | 109.8 | 8.191e-03 | n/a | yes |
+| 1024 | pytorch-native | 58.5536 | 87.5402 | 0.34x | 130.2 | 1.610e-02 | n/a | yes |
+| 2048 | sdpa | 192.7010 | 232.4717 | 1.00x | 111.9 | 9.314e-03 | n/a | yes |
+| 2048 | pytorch-native | 227.7564 | 307.3500 | 1.18x | 548.6 | 1.790e-02 | n/a | yes |
 
 ### Forward+backward
 
 | S | Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB |
 |---:|---|---:|---:|---:|---:|
-| 512 | sdpa | 53.7609 | 54.4313 | 1.00x | 0.0 |
-| 512 | pytorch-native | 24.7810 | 25.4956 | 0.46x | 46.4 |
-| 1024 | sdpa | 163.8662 | 167.7328 | 1.00x | 30.9 |
-| 1024 | pytorch-native | 107.9884 | 110.4447 | 0.66x | 191.6 |
-| 2048 | sdpa | 533.5067 | 648.9086 | 1.00x | 31.7 |
-| 2048 | pytorch-native | 422.9041 | 424.9965 | 0.79x | 776.1 |
+| 512 | sdpa | 170.4205 | 175.4842 | 1.00x | 7.5 |
+| 512 | pytorch-native | 48.0205 | 156.2514 | 0.28x | 64.8 |
+| 1024 | sdpa | 297.3551 | 358.7597 | 1.00x | 135.3 |
+| 1024 | pytorch-native | 267.1181 | 313.6076 | 0.90x | 190.8 |
+| 2048 | sdpa | 555.5966 | 569.2160 | 1.00x | 112.9 |
+| 2048 | pytorch-native | 489.2399 | 550.9883 | 0.88x | 815.6 |
 
 ## Single-device Attention (fp16)
 
@@ -89,23 +89,23 @@ Acceptance is 0 mismatched elements. This is the contract the Triton core exists
 
 | S | Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB | out max-abs vs FP64 | lse max-abs vs FP64 | Repeat |
 |---:|---|---:|---:|---:|---:|---:|---:|:---:|
-| 512 | sdpa | 35.0730 | 38.8791 | 1.00x | 0.0 | 1.045e-03 | n/a | yes |
-| 512 | pytorch-native | 734.5447 | 1132.5722 | 20.94x | 0.0 | 2.811e-03 | n/a | yes |
-| 1024 | sdpa | 105.0845 | 109.9980 | 1.00x | 0.0 | 1.075e-03 | n/a | yes |
-| 1024 | pytorch-native | 3093.5610 | 3837.3499 | 29.44x | 128.0 | 2.117e-03 | n/a | yes |
-| 2048 | sdpa | 1566.1332 | 1683.1755 | 1.00x | 51.0 | 1.065e-03 | n/a | yes |
-| 2048 | pytorch-native | 13198.5082 | 13483.8688 | 8.43x | 561.1 | 2.143e-03 | n/a | yes |
+| 512 | sdpa | 31.7511 | 33.4260 | 1.00x | 0.0 | 1.045e-03 | n/a | yes |
+| 512 | pytorch-native | 697.2643 | 707.5163 | 21.96x | 0.0 | 2.811e-03 | n/a | yes |
+| 1024 | sdpa | 96.1593 | 113.6039 | 1.00x | 79.9 | 1.075e-03 | n/a | yes |
+| 1024 | pytorch-native | 2726.1935 | 2804.8509 | 28.35x | 65.7 | 2.117e-03 | n/a | yes |
+| 2048 | sdpa | 250.5798 | 286.6925 | 1.00x | 81.5 | 1.065e-03 | n/a | yes |
+| 2048 | pytorch-native | 21112.2733 | 21152.1648 | 84.25x | 515.2 | 2.143e-03 | n/a | yes |
 
 ### Forward+backward
 
 | S | Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB |
 |---:|---|---:|---:|---:|---:|
-| 512 | sdpa | 156.9364 | 240.0815 | 1.00x | 0.0 |
-| 512 | pytorch-native | 2364.2130 | 3938.9163 | 15.06x | 0.0 |
-| 1024 | sdpa | 335.7934 | 337.1536 | 1.00x | 79.1 |
-| 1024 | pytorch-native | 11104.1810 | 13321.1288 | 33.07x | 192.2 |
-| 2048 | sdpa | 1089.9534 | 1090.4449 | 1.00x | 143.9 |
-| 2048 | pytorch-native | 37002.9627 | 38977.8489 | 33.95x | 766.4 |
+| 512 | sdpa | 204.9800 | 242.0397 | 1.00x | 0.0 |
+| 512 | pytorch-native | 2154.7387 | 2248.4103 | 10.51x | 0.0 |
+| 1024 | sdpa | 386.7709 | 387.0739 | 1.00x | 79.7 |
+| 1024 | pytorch-native | 8579.2534 | 12587.9295 | 22.18x | 189.2 |
+| 2048 | sdpa | 1122.4169 | 1212.3130 | 1.00x | 79.7 |
+| 2048 | pytorch-native | 53718.0483 | 54692.0301 | 47.86x | 764.6 |
 
 ## Production core versus the reference core
 

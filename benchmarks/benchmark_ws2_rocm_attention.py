@@ -122,12 +122,18 @@ def _mismatch_count(a: torch.Tensor, b: torch.Tensor) -> int:
     return int((a != b).sum().item())
 
 
-def _gpu_event_samples(function: Callable[[], Any], *, warmup: int, samples: int) -> list[float]:
+def _gpu_event_samples(
+    function: Callable[[], Any], *, warmup: int, samples: int, deadline: float = 0.0
+) -> list[float]:
     for _ in range(warmup):
         function()
+        if deadline and time.perf_counter() > deadline:
+            break
     torch.cuda.synchronize()
     events = []
     for _ in range(samples):
+        if deadline and events and time.perf_counter() > deadline:
+            break
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -138,12 +144,18 @@ def _gpu_event_samples(function: Callable[[], Any], *, warmup: int, samples: int
     return [float(start.elapsed_time(end)) for start, end in events]
 
 
-def _host_wall_samples(function: Callable[[], Any], *, warmup: int, samples: int) -> list[float]:
+def _host_wall_samples(
+    function: Callable[[], Any], *, warmup: int, samples: int, deadline: float = 0.0
+) -> list[float]:
     """Wall-clock timing for host execution, where CUDA events do not apply."""
     for _ in range(warmup):
         function()
+        if deadline and time.perf_counter() > deadline:
+            break
     timings = []
     for _ in range(samples):
+        if deadline and timings and time.perf_counter() > deadline:
+            break
         start = time.perf_counter()
         function()
         timings.append((time.perf_counter() - start) * 1000.0)
@@ -151,11 +163,23 @@ def _host_wall_samples(function: Callable[[], Any], *, warmup: int, samples: int
 
 
 def _timed_samples(
-    function: Callable[[], Any], *, warmup: int, samples: int, device: torch.device
+    function: Callable[[], Any],
+    *,
+    warmup: int,
+    samples: int,
+    device: torch.device,
+    deadline: float = 0.0,
 ) -> list[float]:
+    """Sample, stopping early once ``deadline`` (a perf_counter value) passes.
+
+    The pre-flight projection can under-estimate badly: at S=4096 the materialized
+    score matrix leaves cache and the compute model stops holding. So the budget is
+    also enforced here as a hard wall clock, not only as an estimate. At least one
+    sample is always taken, so a row is never empty.
+    """
     if device.type == "cuda":
-        return _gpu_event_samples(function, warmup=warmup, samples=samples)
-    return _host_wall_samples(function, warmup=warmup, samples=samples)
+        return _gpu_event_samples(function, warmup=warmup, samples=samples, deadline=deadline)
+    return _host_wall_samples(function, warmup=warmup, samples=samples, deadline=deadline)
 
 
 def _rss_mib() -> float:
@@ -485,13 +509,17 @@ def _single_gpu_benchmarks(
                     _empty_cache(device)
                     continue
 
-                forward = _summary_ms(
-                    _timed_samples(runner, warmup=warmup, samples=samples, device=device)
+                deadline = time.perf_counter() + budget_seconds if budget_seconds else 0.0
+                forward_ms = _timed_samples(
+                    runner, warmup=warmup, samples=samples, device=device, deadline=deadline
                 )
+                forward = _summary_ms(forward_ms)
                 forward_peak = _peak_memory_mib(runner, device)
 
                 entry: dict[str, Any] = {
                     "forward": forward,
+                    "forward_samples": len(forward_ms),
+                    "forward_truncated": len(forward_ms) < samples,
                     "forward_peak_mib": forward_peak,
                     "out_vs_fp64": _accuracy(out.double(), oracle_out),
                 }
@@ -508,14 +536,17 @@ def _single_gpu_benchmarks(
                     paths, name, q, k, v, causal=True, scale=scale, positions=positions
                 )
                 if training is not None:
-                    entry["train_fwd_bwd"] = _summary_ms(
-                        _timed_samples(
-                            training,
-                            warmup=max(1, warmup // 2),
-                            samples=training_samples,
-                            device=device,
-                        )
+                    train_deadline = time.perf_counter() + budget_seconds if budget_seconds else 0.0
+                    train_ms = _timed_samples(
+                        training,
+                        warmup=max(1, warmup // 2),
+                        samples=training_samples,
+                        device=device,
+                        deadline=train_deadline,
                     )
+                    entry["train_fwd_bwd"] = _summary_ms(train_ms)
+                    entry["train_samples"] = len(train_ms)
+                    entry["train_truncated"] = len(train_ms) < training_samples
                     entry["train_peak_mib"] = _peak_memory_mib(training, device)
 
                 row["paths"][name] = entry
@@ -1895,7 +1926,7 @@ def main() -> None:
     parser.add_argument(
         "--path-budget-seconds",
         type=float,
-        default=900.0,
+        default=300.0,
         help=(
             "Skip a (path, case) whose measured single call implies more than this many "
             "seconds of sampling. The row records the observed cost instead, which is "
