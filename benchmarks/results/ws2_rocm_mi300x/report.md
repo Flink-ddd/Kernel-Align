@@ -5,7 +5,7 @@
 
 ## Environment
 
-| Item | Value |
+| Item | this run |
 |---|---|
 | architecture | gfx942:sramecc+:xnack- |
 | cuda | None |
@@ -58,7 +58,7 @@ Acceptance is 0 mismatched elements. This is the contract the Triton core exists
 
 `dQ/dK/dV` are measured on the BF16 sweep only; `n/a` marks the FP16 rows.
 
-## Single-GPU Attention (bf16)
+## Single-device Attention (bf16)
 
 ### Forward
 
@@ -102,7 +102,7 @@ Acceptance is 0 mismatched elements. This is the contract the Triton core exists
 | 4096 | reference-hip | 173.3365 | 173.5448 | 53.39x | 4209.0 |
 | 4096 | triton-bitwise | 304.1032 | 304.4993 | 93.67x | 4209.0 |
 
-## Single-GPU Attention (fp16)
+## Single-device Attention (fp16)
 
 ### Forward
 
@@ -232,12 +232,12 @@ Schedule: all-gather Q/K/V and the position ids over the CP group, run the stric
 
 | Topology | World | TP | CP | Replicas | S | Median (ms) | p95 (ms) | Peak MiB/rank | out bitwise | lse bitwise | Repeat |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|:---:|
-| tp1_cp2 | 2 | 1 | 2 | 1 | 4096 | 1.8352 | 1.8726 | 160.5 | yes | yes | yes |
-| tp2_cp2 | 4 | 2 | 2 | 1 | 4096 | 1.2114 | 1.3138 | 80.3 | yes | yes | yes |
-| tp1_cp4 | 4 | 1 | 4 | 1 | 4096 | 1.3973 | 1.4363 | 160.5 | yes | yes | yes |
-| tp2_cp2_x2 | 8 | 2 | 2 | 2 | 4096 | 1.2297 | 1.2948 | 80.3 | yes | yes | yes |
-| tp2_cp4 | 8 | 2 | 4 | 1 | 4096 | 1.2594 | 1.3294 | 80.3 | yes | yes | yes |
-| tp1_cp8 | 8 | 1 | 8 | 1 | 4096 | 1.4112 | 2.2029 | 160.5 | yes | yes | yes |
+| tp1_cp2 | 2 | 1 | 2 | 1 | 4096 | 1.8323 | 1.9342 | 160.5 | yes | yes | yes |
+| tp2_cp2 | 4 | 2 | 2 | 1 | 4096 | 1.2505 | 2.0656 | 80.3 | yes | yes | yes |
+| tp1_cp4 | 4 | 1 | 4 | 1 | 4096 | 1.4118 | 1.4399 | 160.5 | yes | yes | yes |
+| tp2_cp2_x2 | 8 | 2 | 2 | 2 | 4096 | 1.1947 | 1.2464 | 80.3 | yes | yes | yes |
+| tp2_cp4 | 8 | 2 | 4 | 1 | 4096 | 1.2911 | 1.8001 | 80.3 | yes | yes | yes |
+| tp1_cp8 | 8 | 1 | 8 | 1 | 4096 | 1.4065 | 1.9273 | 160.5 | yes | yes | yes |
 
 ## Figures
 
@@ -248,6 +248,8 @@ Schedule: all-gather Q/K/V and the position ids over the CP group, run the stric
 ![Single-device latency](single_gpu_latency.png)
 
 ![Single-device peak memory](single_gpu_memory.png)
+
+![Bitwise exactness matrix](exactness_matrix.png)
 
 ![TP-degree invariance](tp_degree_invariance.png)
 

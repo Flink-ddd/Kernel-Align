@@ -18,18 +18,19 @@ Paths measured:
                       accuracy claim is mixed into the speed comparison.
 - ``strict-aiter``    ``StrictRocmAiterCKAttentionCore`` — the ROCm production core
                       (AITER CK dense MHA, non-split API).
-- ``reference-hip``   ``_C.deterministic_attention_forward/backward`` — the materializing
+- ``reference-native``   ``_C.deterministic_attention_forward/backward`` — the materializing
                       FP32 reference core, hipified from the shared ``.cu``.
 - ``triton-bitwise``  ``TritonDeterministicAttentionOp`` — the Triton port whose
-                      contract is bit-identity with ``reference-hip``.
+                      contract is bit-identity with ``reference-native``.
 
-The headline column is ``triton-bitwise`` versus ``reference-hip``: acceptance is
+The headline column is ``triton-bitwise`` versus ``reference-native``: acceptance is
 0 mismatched elements on out, lse, dQ, dK and dV.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import multiprocessing as mp
@@ -38,6 +39,8 @@ import platform
 import queue
 import statistics
 import tempfile
+import threading
+import time
 import traceback
 from datetime import timedelta
 from pathlib import Path
@@ -135,15 +138,79 @@ def _gpu_event_samples(function: Callable[[], Any], *, warmup: int, samples: int
     return [float(start.elapsed_time(end)) for start, end in events]
 
 
-def _peak_memory_mib(function: Callable[[], Any]) -> float:
+def _host_wall_samples(function: Callable[[], Any], *, warmup: int, samples: int) -> list[float]:
+    """Wall-clock timing for host execution, where CUDA events do not apply."""
+    for _ in range(warmup):
+        function()
+    timings = []
+    for _ in range(samples):
+        start = time.perf_counter()
+        function()
+        timings.append((time.perf_counter() - start) * 1000.0)
+    return timings
+
+
+def _timed_samples(
+    function: Callable[[], Any], *, warmup: int, samples: int, device: torch.device
+) -> list[float]:
+    if device.type == "cuda":
+        return _gpu_event_samples(function, warmup=warmup, samples=samples)
+    return _host_wall_samples(function, warmup=warmup, samples=samples)
+
+
+def _rss_mib() -> float:
+    with open("/proc/self/statm", "r", encoding="ascii") as handle:
+        resident_pages = int(handle.read().split()[1])
+    return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024.0 * 1024.0)
+
+
+def _host_peak_rss_mib(function: Callable[[], Any]) -> float:
+    """Peak resident-set increase during one host call, sampled from /proc.
+
+    The closest host analogue of ``torch.cuda.max_memory_allocated``, but an RSS
+    high-water delta rather than an allocator statistic: it includes caching-allocator
+    reuse and page granularity, so it is an approximation and not directly comparable
+    to the device figures. A call served from already-resident pages can report ~0.
+    """
+    gc.collect()
+    baseline = _rss_mib()
+    peak = baseline
+    stop = threading.Event()
+
+    def sampler() -> None:
+        nonlocal peak
+        while not stop.is_set():
+            peak = max(peak, _rss_mib())
+            stop.wait(0.001)
+
+    thread = threading.Thread(target=sampler, daemon=True)
+    thread.start()
+    try:
+        function()
+    finally:
+        stop.set()
+        thread.join()
+    return float(max(peak, _rss_mib()) - baseline)
+
+
+def _peak_memory_mib(function: Callable[[], Any], device: torch.device) -> float:
     """Peak memory used by one call, above what was live before it."""
+    if device.type != "cuda":
+        return _host_peak_rss_mib(function)
     torch.cuda.synchronize()
-    torch.cuda.empty_cache()
+    _empty_cache(device)
     torch.cuda.reset_peak_memory_stats()
     baseline = torch.cuda.memory_allocated()
     function()
     torch.cuda.synchronize()
     return float((torch.cuda.max_memory_allocated() - baseline) / (1024.0 * 1024.0))
+
+
+def _empty_cache(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    else:
+        gc.collect()
 
 
 # ---------------------------------------------------------------------------
@@ -216,11 +283,27 @@ def _sdpa_forward(q, k, v, *, causal, scale):
 class _Paths:
     """Lazily constructed attention paths, so a missing backend skips one row."""
 
-    def __init__(self) -> None:
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
         self.errors: dict[str, str] = {}
-        self.strict = self._try("strict-aiter", self._make_strict)
-        self.reference = self._try("reference-hip", self._make_reference)
-        self.triton = self._try("triton-bitwise", self._make_triton)
+        # The PyTorch reference is the only non-SDPA path that also runs on the host.
+        self.native = self._try("pytorch-native", self._make_native)
+        self.is_rocm = torch.version.hip is not None
+        if device.type == "cuda":
+            if self.is_rocm:
+                self.strict = self._try("strict-aiter", self._make_strict)
+                self.strict_fa4 = None
+                self.errors["strict-fa4"] = "CUDA-only path; this run is ROCm"
+            else:
+                self.strict = None
+                self.errors["strict-aiter"] = "ROCm-only path; this run is CUDA"
+                self.strict_fa4 = self._try("strict-fa4", self._make_strict_fa4)
+            self.reference = self._try("reference-native", self._make_reference)
+            self.triton = self._try("triton-bitwise", self._make_triton)
+        else:
+            self.strict = self.strict_fa4 = self.reference = self.triton = None
+            for name in ("strict-aiter", "strict-fa4", "reference-native", "triton-bitwise"):
+                self.errors[name] = "GPU-only path; not available on the host"
 
     def _try(self, name: str, factory: Callable[[], Any]) -> Any:
         try:
@@ -230,10 +313,22 @@ class _Paths:
             return None
 
     @staticmethod
+    def _make_native():
+        from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
+
+        return NativeAttentionOp()
+
+    @staticmethod
     def _make_strict():
         from rl_engine.kernels.ops.rocm.attention.flash_attn import StrictRocmAiterCKAttentionCore
 
         return StrictRocmAiterCKAttentionCore()
+
+    @staticmethod
+    def _make_strict_fa4():
+        from rl_engine.kernels.ops.cuda.attention.flash_attn import StrictFlashAttention4Core
+
+        return StrictFlashAttention4Core()
 
     @staticmethod
     def _make_reference():
@@ -243,18 +338,26 @@ class _Paths:
 
         return DeterministicAttentionOp()
 
-    @staticmethod
-    def _make_triton():
+    def _make_triton(self):
         from rl_engine.kernels.ops.triton.attention.deterministic_attn import (
+            BITWISE_LIBM_PARITY,
             TritonDeterministicAttentionOp,
         )
 
-        return TritonDeterministicAttentionOp()
+        # The bitwise expf/logf sequence is only ported for HIP, so on CUDA the op
+        # refuses by default. Measure it anyway, but the report must not call it bitwise.
+        return TritonDeterministicAttentionOp(require_bitwise_libm=BITWISE_LIBM_PARITY)
 
     def runner(self, name: str, q, k, v, *, causal: bool, scale: float, positions):
         """Return ``() -> (out, lse|None)`` for one path, or None when unavailable."""
         if name == "sdpa":
             return lambda: (_sdpa_forward(q, k, v, causal=causal, scale=scale), None)
+        if name == "pytorch-native" and self.native is not None:
+            # NativeAttentionOp is the repo's ground-truth reference; it returns out only.
+            return lambda: (
+                self.native.forward(q, k, v, causal=causal, scale=scale),
+                None,
+            )
         if name == "strict-aiter" and self.strict is not None:
 
             def run_strict():
@@ -270,14 +373,36 @@ class _Paths:
                 return result.out, result.lse
 
             return run_strict
-        if name == "reference-hip" and self.reference is not None:
+        if name == "strict-fa4" and self.strict_fa4 is not None:
+
+            def run_fa4():
+                result = self.strict_fa4.forward_with_lse(
+                    q,
+                    k,
+                    v,
+                    causal=causal,
+                    scale=scale,
+                    query_position_ids=positions if causal else None,
+                    key_position_ids=positions if causal else None,
+                )
+                return result.out, result.lse
+
+            return run_fa4
+        if name == "reference-native" and self.reference is not None:
             return lambda: self.reference.forward_with_lse(q, k, v, causal=causal, scale=scale)
         if name == "triton-bitwise" and self.triton is not None:
             return lambda: self.triton.forward_with_lse(q, k, v, causal=causal, scale=scale)
         return None
 
 
-PATH_NAMES = ("sdpa", "strict-aiter", "reference-hip", "triton-bitwise")
+PATH_NAMES = (
+    "sdpa",
+    "pytorch-native",
+    "strict-aiter",
+    "strict-fa4",
+    "reference-native",
+    "triton-bitwise",
+)
 
 
 def _single_gpu_benchmarks(
@@ -328,8 +453,10 @@ def _single_gpu_benchmarks(
                     None if lse is None else lse.detach().clone(),
                 )
 
-                forward = _summary_ms(_gpu_event_samples(runner, warmup=warmup, samples=samples))
-                forward_peak = _peak_memory_mib(runner)
+                forward = _summary_ms(
+                    _timed_samples(runner, warmup=warmup, samples=samples, device=device)
+                )
+                forward_peak = _peak_memory_mib(runner, device)
 
                 entry: dict[str, Any] = {
                     "forward": forward,
@@ -350,20 +477,23 @@ def _single_gpu_benchmarks(
                 )
                 if training is not None:
                     entry["train_fwd_bwd"] = _summary_ms(
-                        _gpu_event_samples(
-                            training, warmup=max(1, warmup // 2), samples=training_samples
+                        _timed_samples(
+                            training,
+                            warmup=max(1, warmup // 2),
+                            samples=training_samples,
+                            device=device,
                         )
                     )
-                    entry["train_peak_mib"] = _peak_memory_mib(training)
+                    entry["train_peak_mib"] = _peak_memory_mib(training, device)
 
                 row["paths"][name] = entry
                 del out, lse, repeat_out, repeat_lse
-                torch.cuda.empty_cache()
+                _empty_cache(device)
 
             # Headline: Triton must be bit-identical to the native reference core.
-            if "triton-bitwise" in captured and "reference-hip" in captured:
+            if "triton-bitwise" in captured and "reference-native" in captured:
                 t_out, t_lse = captured["triton-bitwise"]
-                r_out, r_lse = captured["reference-hip"]
+                r_out, r_lse = captured["reference-native"]
                 row["triton_vs_reference"] = {
                     "out_mismatched": _mismatch_count(t_out, r_out),
                     "lse_mismatched": _mismatch_count(t_lse, r_lse),
@@ -372,10 +502,12 @@ def _single_gpu_benchmarks(
                 }
             # The production core is a different vendor kernel; report the gap, do
             # not claim parity with it.
-            if "strict-aiter" in captured and "reference-hip" in captured:
-                s_out, s_lse = captured["strict-aiter"]
-                r_out, r_lse = captured["reference-hip"]
+            production = "strict-aiter" if "strict-aiter" in captured else "strict-fa4"
+            if production in captured and "reference-native" in captured:
+                s_out, s_lse = captured[production]
+                r_out, r_lse = captured["reference-native"]
                 row["strict_vs_reference"] = {
+                    "production_path": production,
                     "out": _accuracy(s_out, r_out),
                     "lse": _accuracy(s_lse, r_lse),
                     "out_mismatched": _mismatch_count(s_out, r_out),
@@ -383,7 +515,7 @@ def _single_gpu_benchmarks(
 
             cases.append(row)
             del q, k, v, oracle_out, oracle_lse, captured
-            torch.cuda.empty_cache()
+            _empty_cache(device)
     return cases
 
 
@@ -400,9 +532,23 @@ def _training_runner(paths, name, q, k, v, *, causal, scale, positions):
 
         return train_sdpa
 
+    if name == "pytorch-native":
+        if paths.native is None:
+            return None
+
+        def train_native() -> None:
+            qr = q.detach().requires_grad_(True)
+            kr = k.detach().requires_grad_(True)
+            vr = v.detach().requires_grad_(True)
+            out = paths.native.forward(qr, kr, vr, causal=causal, scale=scale)
+            out.sum().backward()
+
+        return train_native
+
     op = {
         "strict-aiter": paths.strict,
-        "reference-hip": paths.reference,
+        "strict-fa4": paths.strict_fa4,
+        "reference-native": paths.reference,
         "triton-bitwise": paths.triton,
     }.get(name)
     if op is None:
@@ -413,7 +559,7 @@ def _training_runner(paths, name, q, k, v, *, causal, scale, positions):
         kr = k.detach().requires_grad_(True)
         vr = v.detach().requires_grad_(True)
         kwargs: dict[str, Any] = {"causal": causal, "scale": scale}
-        if name == "strict-aiter" and causal:
+        if name in ("strict-aiter", "strict-fa4") and causal:
             kwargs["query_position_ids"] = positions
             kwargs["key_position_ids"] = positions
         result = op.forward_with_lse(qr, kr, vr, **kwargs)
@@ -452,14 +598,14 @@ def _backward_parity(
             generator=torch.Generator(device=device).manual_seed(100),
         )
         grads = {}
-        for name, op in (("reference-hip", paths.reference), ("triton-bitwise", paths.triton)):
+        for name, op in (("reference-native", paths.reference), ("triton-bitwise", paths.triton)):
             qr = q.detach().requires_grad_(True)
             kr = k.detach().requires_grad_(True)
             vr = v.detach().requires_grad_(True)
             out, _lse = op.forward_with_lse(qr, kr, vr, causal=True, scale=scale)
             out.backward(grad_out)
             grads[name] = (qr.grad.clone(), kr.grad.clone(), vr.grad.clone())
-        reference = grads["reference-hip"]
+        reference = grads["reference-native"]
         triton_grads = grads["triton-bitwise"]
         rows.append(
             {
@@ -471,7 +617,7 @@ def _backward_parity(
             }
         )
         del q, k, v, grad_out, grads
-        torch.cuda.empty_cache()
+        _empty_cache(device)
     return rows
 
 
@@ -537,10 +683,10 @@ def _batch_composition(
                 ),
             }
             del batch_out, batch_lse, single_out, single_lse
-            torch.cuda.empty_cache()
+            _empty_cache(device)
         rows.append(row)
         del q, k, v
-        torch.cuda.empty_cache()
+        _empty_cache(device)
     return rows
 
 
@@ -603,20 +749,21 @@ def _tp_head_sensitivity(
                     }
                 )
                 del shard_out, shard_lse
-                torch.cuda.empty_cache()
+                _empty_cache(device)
             del full_out, full_lse
-            torch.cuda.empty_cache()
+            _empty_cache(device)
         del q, k, v
-        torch.cuda.empty_cache()
+        _empty_cache(device)
     return rows
 
 
 def _tp_schedule_forward(paths, q, k, v, scale, positions, schedule):
     """Run the strict core either in one launch or one launch per KV group."""
-    if paths.strict is None:
+    core = paths.strict if paths.strict is not None else paths.strict_fa4
+    if core is None:
         return None
     if schedule == "raw_launch":
-        result = paths.strict.forward_with_lse(
+        result = core.forward_with_lse(
             q,
             k,
             v,
@@ -631,7 +778,7 @@ def _tp_schedule_forward(paths, q, k, v, scale, positions, schedule):
     outs, lses = [], []
     for kv_index in range(k.size(1)):
         lo, hi = kv_index * group, (kv_index + 1) * group
-        result = paths.strict.forward_with_lse(
+        result = core.forward_with_lse(
             q[:, lo:hi],
             k[:, kv_index : kv_index + 1],
             v[:, kv_index : kv_index + 1],
@@ -713,7 +860,7 @@ def _distributed_cp_case(
     kv_heads: int,
     head_dim: int,
 ) -> dict[str, Any]:
-    """One CP topology running the real AG/RS schedule over the RCCL transport.
+    """One CP topology running the real AG/RS schedule over the platform's transport.
 
     Schedule (same one ``scripts/ws2_p2p_nccl_attention_reference_check.py`` accepts):
     all-gather Q/K/V and the position ids over the CP group, run the strict core
@@ -725,9 +872,26 @@ def _distributed_cp_case(
         AttentionCPBlockMetadata,
         AttentionCPCommunicationPlan,
         AttentionParallelSpec,
+        CUDAAGRSAttentionCPCommunication,
         RCCLAGRSAttentionCPCommunication,
     )
-    from rl_engine.kernels.ops.rocm.attention.flash_attn import StrictRocmAiterCKAttentionCore
+
+    # ROCm runs AITER over the RCCL transport; CUDA runs FA4 over the CUDA IPC transport.
+    is_rocm = torch.version.hip is not None
+    if is_rocm:
+        from rl_engine.kernels.ops.rocm.attention.flash_attn import (
+            StrictRocmAiterCKAttentionCore as _StrictCore,
+        )
+
+        _Transport = RCCLAGRSAttentionCPCommunication
+        transport_id = "rccl_ag_rs"
+    else:
+        from rl_engine.kernels.ops.cuda.attention.flash_attn import (
+            StrictFlashAttention4Core as _StrictCore,
+        )
+
+        _Transport = CUDAAGRSAttentionCPCommunication
+        transport_id = "cuda_ag_rs"
 
     label, tp_world, cp_world, replicas = topology
     device = torch.device("cuda", rank)
@@ -783,15 +947,15 @@ def _distributed_cp_case(
             cp_world_size=cp_world,
             cp_rank=cp_rank,
         ),
-        backend="rccl_ag_rs",
+        backend=transport_id,
         status="implemented",
         expected_blocks=tuple(blocks),
         expected_kv_token_range=(0, seq_len),
         query_token_ranges=owner_ranges,
     )
 
-    core = StrictRocmAiterCKAttentionCore()
-    communication = RCCLAGRSAttentionCPCommunication(process_group=cp_group)
+    core = _StrictCore()
+    communication = _Transport(process_group=cp_group)
 
     query_start, query_end = owner_ranges[cp_rank]
     q_local = q[:, :, query_start:query_end, :].contiguous()
@@ -820,19 +984,23 @@ def _distributed_cp_case(
     forward_ms = _summary_ms(
         _gpu_event_samples(lambda: cp_forward(), warmup=warmup, samples=samples)
     )
-    peak = _peak_memory_mib(lambda: cp_forward())
+    peak = _peak_memory_mib(lambda: cp_forward(), device)
 
     # CP=1 acceptance: the same core on the same full-sequence inputs, then take
     # this rank's query range out of it.
-    single = core.forward_with_lse(
-        q,
-        k,
-        v,
-        causal=True,
-        scale=scale,
-        query_position_ids=positions,
-        key_position_ids=positions,
-    )
+    def cp1_forward():
+        return core.forward_with_lse(
+            q,
+            k,
+            v,
+            causal=True,
+            scale=scale,
+            query_position_ids=positions,
+            key_position_ids=positions,
+        )
+
+    single = cp1_forward()
+    cp1_ms = _summary_ms(_gpu_event_samples(cp1_forward, warmup=warmup, samples=samples))
     expected_out = single.out[:, :, query_start:query_end, :].contiguous()
     expected_lse = single.lse[:, :, query_start:query_end].contiguous()
 
@@ -868,8 +1036,9 @@ def _distributed_cp_case(
         "seq_len": seq_len,
         "local_q_heads": local_q_heads,
         "local_kv_heads": local_kv_heads,
-        "transport": "rccl_ag_rs",
+        "transport": transport_id,
         "forward": forward_ms,
+        "cp1_baseline": cp1_ms,
         "peak_mib_per_rank": peak,
         "out_bitwise_vs_cp1": bool(flags[0].item() == 1.0),
         "lse_bitwise_vs_cp1": bool(flags[1].item() == 1.0),
@@ -942,8 +1111,33 @@ def _run_distributed_topology(
 # ---------------------------------------------------------------------------
 
 
-def _environment() -> dict[str, Any]:
-    properties = torch.cuda.get_device_properties(0) if torch.cuda.is_available() else None
+def _default_platform_label(device: torch.device) -> str:
+    if device.type != "cuda":
+        return "cpu"
+    name = torch.cuda.get_device_name(0).lower()
+    if "mi300" in name:
+        return "mi300x"
+    if "h100" in name:
+        return "h100"
+    return name.replace(" ", "-")[:24]
+
+
+def _load_comparisons(specs: list[str]) -> list[tuple[str, dict[str, Any]]]:
+    """Parse ``--compare-with LABEL=PATH`` into (label, payload) pairs."""
+    loaded: list[tuple[str, dict[str, Any]]] = []
+    for spec in specs:
+        if "=" not in spec:
+            raise SystemExit(f"--compare-with expects LABEL=PATH, got {spec!r}")
+        label, _, path = spec.partition("=")
+        loaded.append((label, json.loads(Path(path).read_text())))
+    return loaded
+
+
+def _environment(device: torch.device | None = None) -> dict[str, Any]:
+    on_gpu = device is None or device.type == "cuda"
+    properties = (
+        torch.cuda.get_device_properties(0) if on_gpu and torch.cuda.is_available() else None
+    )
     try:
         from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 
@@ -957,7 +1151,9 @@ def _environment() -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         triton_version = "unavailable"
     return {
-        "gpu": properties.name if properties else "n/a",
+        "cpu_count": os.cpu_count(),
+        "torch_threads": torch.get_num_threads(),
+        "gpu": properties.name if properties else "n/a (host execution)",
         "architecture": getattr(properties, "gcnArchName", "unknown") if properties else "n/a",
         "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
         "hip": torch.version.hip,
@@ -968,6 +1164,13 @@ def _environment() -> dict[str, Any]:
         "extension_attention_symbols": symbols,
         "native_collective": "torch.distributed ProcessGroupNCCL (RCCL on ROCm)",
     }
+
+
+def _case_for(payload: dict[str, Any], dtype: str, seq_len: int) -> dict[str, Any] | None:
+    for case in payload.get("single_gpu", {}).get("cases", []):
+        if case["dtype"] == dtype and case["seq_len"] == seq_len:
+            return case
+    return None
 
 
 def _fmt(value: Any, spec: str = ".4f") -> str:
@@ -983,8 +1186,14 @@ def _fmt(value: Any, spec: str = ".4f") -> str:
         return str(value)
 
 
-def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
-    environment = payload["environment"]
+def _write_report(
+    payload: dict[str, Any],
+    output_directory: Path,
+    comparisons: list[tuple[str, dict[str, Any]]] | None = None,
+) -> None:
+    platforms: list[tuple[str, dict[str, Any]]] = [
+        (payload.get("platform_label", "this run"), payload)
+    ] + list(comparisons or [])
     configuration = payload["configuration"]
     lines: list[str] = []
     add = lines.append
@@ -996,12 +1205,25 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
     add("")
     add("## Environment")
     add("")
-    add("| Item | Value |")
-    add("|---|---|")
-    for key in sorted(environment):
-        value = environment[key]
-        add(f"| {key} | {value if not isinstance(value, list) else ', '.join(value) or 'none'} |")
+    keys = sorted({k for _, pl in platforms for k in pl["environment"]})
+    add("| Item | " + " | ".join(label for label, _ in platforms) + " |")
+    add("|---|" + "---|" * len(platforms))
+    for key in keys:
+        cells = []
+        for _, pl in platforms:
+            value = pl["environment"].get(key, "n/a")
+            if isinstance(value, list):
+                value = ", ".join(value) or "none"
+            cells.append(str(value))
+        add(f"| {key} | " + " | ".join(cells) + " |")
     add("")
+    if len(platforms) > 1:
+        add(
+            "A missing row below means the backend cannot exist on that platform, not that it "
+            "failed: `strict-aiter` is ROCm-only, `reference-native` and `triton-bitwise` need a "
+            "GPU, and only `sdpa` and `pytorch-native` also run on the host."
+        )
+        add("")
 
     add("## Methodology")
     add("")
@@ -1022,12 +1244,12 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
         "per (batch row, KV group). See the per-KV-group schedule table for that cost."
     )
     add(
-        "  - `reference-hip`: `_C.deterministic_attention_forward/backward`, the materializing "
+        "  - `reference-native`: `_C.deterministic_attention_forward/backward`, the materializing "
         "FP32 reference core hipified from the shared `.cu`."
     )
     add(
         "  - `triton-bitwise`: `TritonDeterministicAttentionOp`, whose contract is bit-identity "
-        "with `reference-hip`."
+        "with `reference-native`."
     )
     add(
         "- Timing: CUDA events, median and p95. Peak memory is the per-call increase in "
@@ -1087,54 +1309,81 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
     add("")
 
     # ---- single GPU speed
+    multi = len(platforms) > 1
+    platform_column = "Platform | " if multi else ""
+    platform_rule = "---|" if multi else ""
     for dtype in configuration["dtypes"]:
-        cases = [c for c in payload["single_gpu"]["cases"] if c["dtype"] == dtype]
-        if not cases:
+        seq_lens = sorted(
+            {
+                c["seq_len"]
+                for _, pl in platforms
+                for c in pl.get("single_gpu", {}).get("cases", [])
+                if c["dtype"] == dtype
+            }
+        )
+        if not seq_lens:
             continue
-        add(f"## Single-GPU Attention ({dtype})")
+        add(f"## Single-device Attention ({dtype})")
         add("")
         add("### Forward")
         add("")
         add(
-            "| S | Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB | out max-abs vs FP64 | "
-            "lse max-abs vs FP64 | Repeat |"
+            f"| S | {platform_column}Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB | "
+            "out max-abs vs FP64 | lse max-abs vs FP64 | Repeat |"
         )
-        add("|---:|---|---:|---:|---:|---:|---:|---:|:---:|")
-        for case in cases:
-            baseline = case["paths"].get("sdpa", {}).get("forward", {}).get("median_ms")
-            for name in PATH_NAMES:
-                entry = case["paths"].get(name)
-                if not entry:
+        add(f"|---:|{platform_rule}---|---:|---:|---:|---:|---:|---:|:---:|")
+        for seq_len in seq_lens:
+            for label, pl in platforms:
+                case = _case_for(pl, dtype, seq_len)
+                if case is None:
                     continue
-                median = entry["forward"]["median_ms"]
-                ratio = f"{median / baseline:.2f}x" if baseline else "n/a"
-                add(
-                    f"| {case['seq_len']} | {name} | {median:.4f} | "
-                    f"{entry['forward']['p95_ms']:.4f} | {ratio} | "
-                    f"{entry['forward_peak_mib']:.1f} | "
-                    f"{entry['out_vs_fp64']['max_abs']:.3e} | "
-                    f"{_fmt(entry.get('lse_vs_fp64', {}).get('max_abs'), '.3e')} | "
-                    f"{_fmt(entry['repeat_bitwise'])} |"
-                )
+                baseline = case["paths"].get("sdpa", {}).get("forward", {}).get("median_ms")
+                for name in PATH_NAMES:
+                    entry = case["paths"].get(name)
+                    if not entry:
+                        continue
+                    median = entry["forward"]["median_ms"]
+                    ratio = f"{median / baseline:.2f}x" if baseline else "n/a"
+                    prefix = f"{label} | " if multi else ""
+                    add(
+                        f"| {seq_len} | {prefix}{name} | {median:.4f} | "
+                        f"{entry['forward']['p95_ms']:.4f} | {ratio} | "
+                        f"{entry['forward_peak_mib']:.1f} | "
+                        f"{entry['out_vs_fp64']['max_abs']:.3e} | "
+                        f"{_fmt(entry.get('lse_vs_fp64', {}).get('max_abs'), '.3e')} | "
+                        f"{_fmt(entry['repeat_bitwise'])} |"
+                    )
         add("")
         add("### Forward+backward")
         add("")
-        add("| S | Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB |")
-        add("|---:|---|---:|---:|---:|---:|")
-        for case in cases:
-            baseline = case["paths"].get("sdpa", {}).get("train_fwd_bwd", {}).get("median_ms")
-            for name in PATH_NAMES:
-                entry = case["paths"].get(name)
-                if not entry or "train_fwd_bwd" not in entry:
+        add(f"| S | {platform_column}Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB |")
+        add(f"|---:|{platform_rule}---|---:|---:|---:|---:|")
+        for seq_len in seq_lens:
+            for label, pl in platforms:
+                case = _case_for(pl, dtype, seq_len)
+                if case is None:
                     continue
-                median = entry["train_fwd_bwd"]["median_ms"]
-                ratio = f"{median / baseline:.2f}x" if baseline else "n/a"
-                add(
-                    f"| {case['seq_len']} | {name} | {median:.4f} | "
-                    f"{entry['train_fwd_bwd']['p95_ms']:.4f} | {ratio} | "
-                    f"{entry['train_peak_mib']:.1f} |"
-                )
+                baseline = case["paths"].get("sdpa", {}).get("train_fwd_bwd", {}).get("median_ms")
+                for name in PATH_NAMES:
+                    entry = case["paths"].get(name)
+                    if not entry or "train_fwd_bwd" not in entry:
+                        continue
+                    median = entry["train_fwd_bwd"]["median_ms"]
+                    ratio = f"{median / baseline:.2f}x" if baseline else "n/a"
+                    prefix = f"{label} | " if multi else ""
+                    add(
+                        f"| {seq_len} | {prefix}{name} | {median:.4f} | "
+                        f"{entry['train_fwd_bwd']['p95_ms']:.4f} | {ratio} | "
+                        f"{entry['train_peak_mib']:.1f} |"
+                    )
         add("")
+        if multi:
+            add(
+                "Host peak memory is an RSS high-water delta sampled from `/proc`, not an "
+                "allocator statistic, so the `cpu` rows approximate and are not directly "
+                "comparable to the device figures."
+            )
+            add("")
 
     # ---- production core vs reference
     add("## Production core versus the reference core")
@@ -1265,7 +1514,7 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
     add("## Figures")
     add("")
     add(
-        "`reference-hip` and `triton-bitwise` allocate exactly the same buffers, so their "
+        "`reference-native` and `triton-bitwise` allocate exactly the same buffers, so their "
         "memory curves coincide and the later-drawn series hides the earlier one."
     )
     add("")
@@ -1274,6 +1523,8 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
     add("![Single-device latency](single_gpu_latency.png)")
     add("")
     add("![Single-device peak memory](single_gpu_memory.png)")
+    add("")
+    add("![Bitwise exactness matrix](exactness_matrix.png)")
     add("")
     add("![TP-degree invariance](tp_degree_invariance.png)")
     add("")
@@ -1296,7 +1547,7 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
     style = {
         "sdpa": {"marker": "o", "color": "#888888", "linestyle": "--"},
         "strict-aiter": {"marker": "s", "color": "#d62728"},
-        "reference-hip": {"marker": "^", "color": "#1f77b4"},
+        "reference-native": {"marker": "^", "color": "#1f77b4"},
         "triton-bitwise": {"marker": "D", "color": "#2ca02c"},
     }
 
@@ -1395,22 +1646,113 @@ def _write_figures(payload: dict[str, Any], output_directory: Path) -> None:
         figure.savefig(output_directory / "tp_degree_invariance.png", dpi=180)
         plt.close(figure)
 
-    distributed = payload.get("distributed") or []
+    distributed = [r for r in (payload.get("distributed") or []) if "error" not in r]
     if distributed:
-        figure, axis = plt.subplots(figsize=(max(8, 1.5 * len(distributed)), 4.8))
+        figure, axis = plt.subplots(figsize=(max(9, 1.7 * len(distributed)), 5.0))
         labels = [f"{r['topology']}\nS={r['seq_len']}" for r in distributed]
-        axis.bar(
-            range(len(distributed)),
-            [r["forward"]["median_ms"] for r in distributed],
-            color="#2ca02c",
+        xs = list(range(len(distributed)))
+        width = 0.38
+        baseline = [r.get("cp1_baseline", {}).get("median_ms", float("nan")) for r in distributed]
+        measured = [r["forward"]["median_ms"] for r in distributed]
+        bars_a = axis.bar(
+            [x - width / 2 for x in xs], baseline, width, label="CP=1 baseline", color="#888888"
         )
-        axis.set_xticks(range(len(distributed)))
+        bars_b = axis.bar(
+            [x + width / 2 for x in xs], measured, width, label="CP AG/RS", color="#2ca02c"
+        )
+        for bars in (bars_a, bars_b):
+            axis.bar_label(bars, fmt="%.2f", fontsize=8, padding=2)
+        axis.set_xticks(xs)
         axis.set_xticklabels(labels, fontsize=9)
         axis.set_ylabel("median ms")
-        axis.set_title("Strict ROCm Attention + RCCL AG/RS CP transport, BF16")
+        axis.set_title(
+            "Strict ROCm Attention: CP=1 baseline vs RCCL AG/RS CP transport, BF16 S=4096"
+        )
         axis.grid(True, axis="y", alpha=0.3)
+        axis.legend()
         figure.tight_layout()
         figure.savefig(output_directory / "distributed_cp_latency.png", dpi=180)
+        plt.close(figure)
+
+    # ---- exactness matrix, in the shape PR #325 uses for its topology mismatch heatmap
+    single_rows, single_labels = [], []
+    for case in payload["single_gpu"]["cases"]:
+        parity = case.get("triton_vs_reference")
+        if not parity:
+            continue
+        grads = next(
+            (r for r in payload.get("backward_parity", []) if r["seq_len"] == case["seq_len"]),
+            {},
+        )
+        use_grads = case["dtype"] == "bf16" and grads
+        # Gradients are only measured on the BF16 sweep; NaN renders as "not measured"
+        # rather than a zero that would read as "measured and equal".
+        missing = float("nan")
+        single_rows.append(
+            [
+                parity["out_mismatched"],
+                parity["lse_mismatched"],
+                grads.get("dq_mismatched", missing) if use_grads else missing,
+                grads.get("dk_mismatched", missing) if use_grads else missing,
+                grads.get("dv_mismatched", missing) if use_grads else missing,
+            ]
+        )
+        single_labels.append(f"{case['dtype']}, S={case['seq_len']}")
+
+    dist_rows = [
+        [r["out_mismatched_all_ranks"], r["lse_mismatched_all_ranks"]] for r in distributed
+    ]
+    dist_labels = [
+        f"{r['topology']} (TP={r['tp_world_size']}, CP={r['cp_world_size']})" for r in distributed
+    ]
+
+    if single_rows or dist_rows:
+        panels = []
+        if single_rows:
+            panels.append(
+                (
+                    single_rows,
+                    single_labels,
+                    ["out", "lse", "dQ", "dK", "dV"],
+                    "Triton core vs native reference core",
+                )
+            )
+        if dist_rows:
+            panels.append((dist_rows, dist_labels, ["out", "lse"], "CP topology vs CP=1"))
+        figure, axes = plt.subplots(1, len(panels), figsize=(7.5 * len(panels), 5.6), squeeze=False)
+        for axis, (rows, row_labels, col_labels, title) in zip(axes.flat, panels):
+            matrix = [[float(value) for value in row] for row in rows]
+            colormap = plt.get_cmap("RdYlGn_r").copy()
+            colormap.set_bad("#d9d9d9")
+            image = axis.imshow(matrix, aspect="auto", cmap=colormap, vmin=0, vmax=1.0)
+            axis.grid(False)
+            for y in range(len(matrix)):
+                for x in range(len(matrix[y])):
+                    cell = matrix[y][x]
+                    label = "n/m" if cell != cell else str(int(cell))
+                    axis.text(
+                        x,
+                        y,
+                        label,
+                        ha="center",
+                        va="center",
+                        fontsize=15,
+                        fontweight="bold",
+                        color="#222222",
+                    )
+            axis.set_xticks(range(len(col_labels)), col_labels)
+            axis.set_yticks(range(len(row_labels)), row_labels)
+            axis.set_xlabel("Compared tensor")
+            axis.set_title(title)
+            figure.colorbar(image, ax=axis, fraction=0.03, pad=0.03).set_label(
+                "Mismatched elements"
+            )
+        figure.suptitle(
+            "Bitwise exactness — every measured cell must be 0 (n/m = not measured)",
+            fontsize=13,
+        )
+        figure.tight_layout(rect=(0, 0, 1, 0.95))
+        figure.savefig(output_directory / "exactness_matrix.png", dpi=180)
         plt.close(figure)
 
 
@@ -1432,6 +1774,23 @@ def main() -> None:
         default=DEFAULT_SEQ_LENS,
     )
     parser.add_argument("--dtypes", default="bf16,fp16")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="auto | cuda | cpu. On cpu only the sdpa and pytorch-native paths exist.",
+    )
+    parser.add_argument(
+        "--platform-label",
+        default=None,
+        help="Name for this run in merged reports (default: mi300x / h100 / cpu, auto-detected).",
+    )
+    parser.add_argument(
+        "--compare-with",
+        action="append",
+        default=[],
+        metavar="LABEL=PATH",
+        help="Merge another platform's results.json into the report. Repeatable.",
+    )
     parser.add_argument("--skip-distributed", action="store_true")
     parser.add_argument("--skip-figures", action="store_true")
     parser.add_argument(
@@ -1448,23 +1807,29 @@ def main() -> None:
 
     if arguments.report_only:
         payload = json.loads((arguments.output_dir / "results.json").read_text())
-        _write_report(payload, arguments.output_dir)
+        _write_report(payload, arguments.output_dir, _load_comparisons(arguments.compare_with))
         if not arguments.skip_figures:
             _write_figures(payload, arguments.output_dir)
         print(json.dumps({"output_dir": str(arguments.output_dir)}, indent=2))
         return
 
-    if not torch.cuda.is_available():
-        raise SystemExit("this benchmark requires a ROCm or CUDA GPU")
+    if arguments.device == "auto":
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device_type = arguments.device
+    if device_type == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("--device cuda requested but no CUDA/ROCm device is visible")
 
-    device = torch.device("cuda", 0)
-    torch.cuda.set_device(device)
+    device = torch.device(device_type, 0) if device_type == "cuda" else torch.device("cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dtypes = tuple(dtype_map[name] for name in arguments.dtypes.split(","))
 
-    paths = _Paths()
+    paths = _Paths(device)
     payload: dict[str, Any] = {
-        "environment": _environment(),
+        "platform_label": arguments.platform_label or _default_platform_label(device),
+        "environment": _environment(device),
         "configuration": {
             "batch": arguments.batch,
             "q_heads": arguments.q_heads,
@@ -1518,18 +1883,22 @@ def main() -> None:
             head_dim=arguments.head_dim,
             device=device,
         )
-        payload["tp_head_sensitivity"] = _tp_head_sensitivity(
-            paths=paths,
-            seq_lens=arguments.seq_lens,
-            tp_degrees=DEFAULT_TP_DEGREES,
-            q_heads=arguments.q_heads,
-            kv_heads=arguments.kv_heads,
-            head_dim=arguments.head_dim,
-            device=device,
+        payload["tp_head_sensitivity"] = (
+            []
+            if device.type != "cuda"
+            else _tp_head_sensitivity(
+                paths=paths,
+                seq_lens=arguments.seq_lens,
+                tp_degrees=DEFAULT_TP_DEGREES,
+                q_heads=arguments.q_heads,
+                kv_heads=arguments.kv_heads,
+                head_dim=arguments.head_dim,
+                device=device,
+            )
         )
 
     distributed: list[dict[str, Any]] = []
-    if not arguments.skip_distributed:
+    if not arguments.skip_distributed and device.type == "cuda":
         available = torch.cuda.device_count()
         for topology in DISTRIBUTED_TOPOLOGIES:
             if topology[1] * topology[2] * topology[3] > available:
@@ -1554,7 +1923,7 @@ def main() -> None:
 
     arguments.output_dir.mkdir(parents=True, exist_ok=True)
     (arguments.output_dir / "results.json").write_text(json.dumps(payload, indent=2) + "\n")
-    _write_report(payload, arguments.output_dir)
+    _write_report(payload, arguments.output_dir, _load_comparisons(arguments.compare_with))
     if not arguments.skip_figures:
         _write_figures(payload, arguments.output_dir)
     print(json.dumps({"output_dir": str(arguments.output_dir)}, indent=2))
