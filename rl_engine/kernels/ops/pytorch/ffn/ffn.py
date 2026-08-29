@@ -147,10 +147,10 @@ def _validate_ffn_inputs(
 def _create_collective(*, group: Any, max_size_bytes: int):
     """Create the platform-specific collective lazily.
 
-    NVIDIA keeps the existing CUDA IPC implementation.  ROCm selects the
-    RCCL transport-only implementation, which performs the floating-point
-    reduction in the shared deterministic local tree.  Keeping this boundary
-    small also makes the backend choice explicit and easy to inject in tests.
+    NVIDIA keeps the existing CUDA IPC implementation. ROCm selects HIP IPC or
+    RCCL transport while keeping floating-point reduction in the shared fixed
+    tree. Keeping this boundary small also makes the backend choice explicit
+    and easy to inject in tests.
     """
 
     try:
@@ -232,8 +232,14 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         tp_world = tp_dist.get_world_size(group=tp_group) if tp_dist is not None else 1
         gemm_tokens = rmsnorm_output_2d.size(0) * (tp_world if sequence_parallel else 1)
         element_size = rmsnorm_output_2d.element_size()
+        token_hidden_bytes = gemm_tokens * rmsnorm_output_2d.size(1) * element_size
+        # Sequence-parallel backward reduces the gate and up input-gradient
+        # lanes together. ``reduce_scatter_many`` packs those lanes along the
+        # final dimension, so reserve capacity for both lanes in one transport
+        # call rather than growing the collective (or failing) mid-backward.
+        reduction_bytes = token_hidden_bytes * (2 if sequence_parallel else 1)
         min_size_bytes = max(
-            gemm_tokens * rmsnorm_output_2d.size(1) * element_size,
+            reduction_bytes,
             gemm_tokens * gate_weight.size(0) * element_size,
             gate_weight.numel() * element_size,
             up_weight.numel() * element_size,
@@ -355,24 +361,21 @@ class _DeterministicFFNFunction(torch.autograd.Function):
 
         # Gate/Up input gradients reduce across TP, then add locally.
         grad_rmsnorm_from_gate = _gemm_fwd(grad_gate, gate_weight, disable_split_k=disable_split_k)
+        grad_rmsnorm_from_up = _gemm_fwd(grad_up, up_weight, disable_split_k=disable_split_k)
         if ctx.sequence_parallel:
-            grad_rmsnorm_from_gate = _reduce_scatter_tokens(
-                grad_rmsnorm_from_gate,
-                tp_collective,
+            # These are independent reduction lanes. Pack them into one
+            # ReduceScatter while keeping each lane's balanced rank tree
+            # separate; adding them before the collective would change the
+            # floating-point parenthesization and break cross-TP bitwise
+            # invariance.
+            grad_rmsnorm_from_gate, grad_rmsnorm_from_up = tp_collective.reduce_scatter_many(
+                (grad_rmsnorm_from_gate, grad_rmsnorm_from_up)
             )
         elif tp_collective is not None:
             grad_rmsnorm_from_gate = _all_reduce_inplace(
                 grad_rmsnorm_from_gate,
                 tp_collective,
             )
-
-        grad_rmsnorm_from_up = _gemm_fwd(grad_up, up_weight, disable_split_k=disable_split_k)
-        if ctx.sequence_parallel:
-            grad_rmsnorm_from_up = _reduce_scatter_tokens(
-                grad_rmsnorm_from_up,
-                tp_collective,
-            )
-        elif tp_collective is not None:
             grad_rmsnorm_from_up = _all_reduce_inplace(
                 grad_rmsnorm_from_up,
                 tp_collective,

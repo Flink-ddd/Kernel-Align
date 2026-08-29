@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from rl_engine.distributed import DeterministicCollective
+from rl_engine.distributed import create_deterministic_collective
 
 _MAX_WORLD_SIZE = 8
 _TP_SIZES = (1, 2, 4, 8)
@@ -70,7 +70,7 @@ def _worker(rank: int, port: int) -> None:
         groups = {tp_size: dist.new_group(ranks=list(range(tp_size))) for tp_size in _TP_SIZES}
         for tp_size, group in groups.items():
             if rank < tp_size:
-                with DeterministicCollective(
+                with create_deterministic_collective(
                     group=group,
                     device=device,
                     max_size_bytes=1024 * 1024,
@@ -95,6 +95,11 @@ def _worker(rank: int, port: int) -> None:
                         returned = collective.all_gather(input, out=provided)
                         assert returned is provided
                         assert torch.equal(provided, expected)
+
+                        empty_input = torch.empty((0, 7), dtype=dtype, device=device)
+                        empty_output = collective.all_gather(empty_input)
+                        assert empty_output.shape == (0, 7)
+                        assert empty_output.numel() == 0
             dist.barrier()
     finally:
         dist.destroy_process_group()
