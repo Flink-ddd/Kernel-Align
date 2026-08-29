@@ -206,6 +206,11 @@ def _peak_memory_mib(function: Callable[[], Any], device: torch.device) -> float
     return float((torch.cuda.max_memory_allocated() - baseline) / (1024.0 * 1024.0))
 
 
+def _device_sync(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
 def _empty_cache(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -418,6 +423,7 @@ def _single_gpu_benchmarks(
     samples: int,
     training_samples: int,
     device: torch.device,
+    budget_seconds: float = 0.0,
 ) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
     scale = 1.0 / math.sqrt(head_dim)
@@ -447,11 +453,37 @@ def _single_gpu_benchmarks(
                 if runner is None:
                     continue
 
+                # One untimed call both captures the outputs and prices the path. A cell
+                # whose sampling would blow the budget is skipped and says so, rather
+                # than silently costing an hour.
+                probe_start = time.perf_counter()
                 out, lse = runner()
+                _device_sync(device)
+                probe_seconds = time.perf_counter() - probe_start
                 captured[name] = (
                     out.detach().clone(),
                     None if lse is None else lse.detach().clone(),
                 )
+
+                forward_calls = warmup + samples + 2
+                training_calls = max(1, warmup // 2) + training_samples + 1
+                # Backward is empirically 2-4x the forward on these paths; 3x is the
+                # midpoint and only decides whether to run, never a reported number.
+                estimated = probe_seconds * (forward_calls + 3 * training_calls)
+                if budget_seconds > 0 and estimated > budget_seconds:
+                    row["paths"][name] = {
+                        "skipped": (
+                            f"one call took {probe_seconds:.1f}s; sampling would need about "
+                            f"{estimated / 60:.0f} min, over the "
+                            f"{budget_seconds / 60:.0f} min per-path budget"
+                        ),
+                        "probe_seconds": probe_seconds,
+                        "estimated_seconds": estimated,
+                        "out_vs_fp64": _accuracy(out.double(), oracle_out),
+                    }
+                    del out, lse
+                    _empty_cache(device)
+                    continue
 
                 forward = _summary_ms(
                     _timed_samples(runner, warmup=warmup, samples=samples, device=device)
@@ -1365,6 +1397,28 @@ def _write_report(
     add("`dQ/dK/dV` are measured on the BF16 sweep only; `n/a` marks the FP16 rows.")
     add("")
 
+    skipped_rows = [
+        (label, case["dtype"], case["seq_len"], name, entry["skipped"])
+        for label, pl in platforms
+        for case in pl.get("single_gpu", {}).get("cases", [])
+        for name, entry in case["paths"].items()
+        if isinstance(entry, dict) and "skipped" in entry
+    ]
+    if skipped_rows:
+        add("## Skipped cells")
+        add("")
+        add(
+            "A cell whose single call implies more sampling time than the per-path budget "
+            "is not measured. The observed single-call cost is reported instead, which is "
+            "the useful part: it is what made the cell unaffordable."
+        )
+        add("")
+        add("| Platform | dtype | S | Path | Why |")
+        add("|---|---|---:|---|---|")
+        for label, dtype, seq_len, name, why in skipped_rows:
+            add(f"| {label} | {dtype} | {seq_len} | {name} | {why} |")
+        add("")
+
     # ---- single GPU speed
     multi = len(platforms) > 1
     platform_column = "Platform | " if multi else ""
@@ -1398,6 +1452,13 @@ def _write_report(
                 for name in PATH_NAMES:
                     entry = case["paths"].get(name)
                     if not entry:
+                        continue
+                    if "skipped" in entry:
+                        prefix = f"{label} | " if multi else ""
+                        add(
+                            f"| {seq_len} | {prefix}{name} | skipped | — | — | — | "
+                            f"{entry['out_vs_fp64']['max_abs']:.3e} | — | — |"
+                        )
                         continue
                     median = entry["forward"]["median_ms"]
                     ratio = f"{median / baseline:.2f}x" if baseline else "n/a"
@@ -1831,6 +1892,16 @@ def main() -> None:
         default=DEFAULT_SEQ_LENS,
     )
     parser.add_argument("--dtypes", default="bf16,fp16")
+    parser.add_argument(
+        "--path-budget-seconds",
+        type=float,
+        default=900.0,
+        help=(
+            "Skip a (path, case) whose measured single call implies more than this many "
+            "seconds of sampling. The row records the observed cost instead, which is "
+            "itself the finding. 0 disables the budget."
+        ),
+    )
     parser.add_argument(
         "--device",
         default="auto",
