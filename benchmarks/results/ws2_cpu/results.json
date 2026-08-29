@@ -1,0 +1,419 @@
+{
+  "platform_label": "cpu",
+  "environment": {
+    "cpu_count": 192,
+    "torch_threads": 32,
+    "gpu": "n/a (host execution)",
+    "architecture": "n/a",
+    "gpu_count": 0,
+    "hip": null,
+    "cuda": null,
+    "torch": "2.12.0+rocm7.14.0a20260608",
+    "triton": "n/a (host execution)",
+    "python": "3.12.3",
+    "extension_attention_symbols": [],
+    "native_collective": "n/a (single-process host run)"
+  },
+  "configuration": {
+    "batch": 1,
+    "q_heads": 32,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "seq_lens": [
+      512,
+      1024,
+      2048
+    ],
+    "dtypes": [
+      "bf16",
+      "fp16"
+    ],
+    "warmup": 2,
+    "samples": 5,
+    "training_samples": 3
+  },
+  "unavailable_paths": {
+    "strict-aiter": "GPU-only path; not available on the host",
+    "strict-fa4": "GPU-only path; not available on the host",
+    "reference-native": "GPU-only path; not available on the host",
+    "triton-bitwise": "GPU-only path; not available on the host"
+  },
+  "single_gpu": {
+    "cases": [
+      {
+        "dtype": "bf16",
+        "seq_len": 512,
+        "batch": 1,
+        "q_heads": 32,
+        "kv_heads": 8,
+        "head_dim": 128,
+        "paths": {
+          "sdpa": {
+            "forward": {
+              "median_ms": 31.52696695178747,
+              "p95_ms": 34.19500198215246,
+              "min_ms": 29.54479120671749,
+              "max_ms": 34.68872793018818
+            },
+            "forward_peak_mib": 0.01953125,
+            "out_vs_fp64": {
+              "max_abs": 0.00860644332381133,
+              "relative_l2": 0.001973059990724691
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 53.76091971993446,
+              "p95_ms": 54.43128254264593,
+              "min_ms": 53.622123785316944,
+              "max_ms": 54.50576730072498
+            },
+            "train_peak_mib": 0.01953125
+          },
+          "pytorch-native": {
+            "forward": {
+              "median_ms": 15.392081812024117,
+              "p95_ms": 15.848848782479763,
+              "min_ms": 14.35321755707264,
+              "max_ms": 15.881960280239582
+            },
+            "forward_peak_mib": 32.73828125,
+            "out_vs_fp64": {
+              "max_abs": 0.01947146352388973,
+              "relative_l2": 0.004330172876834844
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 24.780988693237305,
+              "p95_ms": 25.495624728500843,
+              "min_ms": 19.345969893038273,
+              "max_ms": 25.575028732419014
+            },
+            "train_peak_mib": 46.40234375
+          }
+        }
+      },
+      {
+        "dtype": "bf16",
+        "seq_len": 1024,
+        "batch": 1,
+        "q_heads": 32,
+        "kv_heads": 8,
+        "head_dim": 128,
+        "paths": {
+          "sdpa": {
+            "forward": {
+              "median_ms": 98.31287991255522,
+              "p95_ms": 98.49240202456713,
+              "min_ms": 98.21581654250622,
+              "max_ms": 98.5084418207407
+            },
+            "forward_peak_mib": 43.56640625,
+            "out_vs_fp64": {
+              "max_abs": 0.008190526417996224,
+              "relative_l2": 0.002021095362635071
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 163.86622097343206,
+              "p95_ms": 167.7327803336084,
+              "min_ms": 160.76263692229986,
+              "max_ms": 168.16239804029465
+            },
+            "train_peak_mib": 30.93359375
+          },
+          "pytorch-native": {
+            "forward": {
+              "median_ms": 51.57393869012594,
+              "p95_ms": 51.960853673517704,
+              "min_ms": 50.85334833711386,
+              "max_ms": 51.99178960174322
+            },
+            "forward_peak_mib": 127.80859375,
+            "out_vs_fp64": {
+              "max_abs": 0.016100370761021,
+              "relative_l2": 0.004516966595870689
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 107.98836220055819,
+              "p95_ms": 110.44468563050032,
+              "min_ms": 106.3336431980133,
+              "max_ms": 110.71761045604944
+            },
+            "train_peak_mib": 191.6171875
+          }
+        }
+      },
+      {
+        "dtype": "bf16",
+        "seq_len": 2048,
+        "batch": 1,
+        "q_heads": 32,
+        "kv_heads": 8,
+        "head_dim": 128,
+        "paths": {
+          "sdpa": {
+            "forward": {
+              "median_ms": 304.6115078032017,
+              "p95_ms": 308.9697081595659,
+              "min_ms": 303.94353438168764,
+              "max_ms": 309.84257347881794
+            },
+            "forward_peak_mib": 50.52734375,
+            "out_vs_fp64": {
+              "max_abs": 0.00931387262518557,
+              "relative_l2": 0.002037123315687043
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 533.5067352280021,
+              "p95_ms": 648.9086364395915,
+              "min_ms": 529.2324423789978,
+              "max_ms": 661.731069907546
+            },
+            "train_peak_mib": 31.70703125
+          },
+          "pytorch-native": {
+            "forward": {
+              "median_ms": 216.15692228078842,
+              "p95_ms": 235.2967405691743,
+              "min_ms": 196.53789699077606,
+              "max_ms": 239.01280853897333
+            },
+            "forward_peak_mib": 543.61328125,
+            "out_vs_fp64": {
+              "max_abs": 0.0178950704113916,
+              "relative_l2": 0.004656276082238093
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 422.90409468114376,
+              "p95_ms": 424.99645575881004,
+              "min_ms": 417.9189233109355,
+              "max_ms": 425.2289403229952
+            },
+            "train_peak_mib": 776.13671875
+          }
+        }
+      },
+      {
+        "dtype": "fp16",
+        "seq_len": 512,
+        "batch": 1,
+        "q_heads": 32,
+        "kv_heads": 8,
+        "head_dim": 128,
+        "paths": {
+          "sdpa": {
+            "forward": {
+              "median_ms": 35.07298789918423,
+              "p95_ms": 38.87907024472952,
+              "min_ms": 35.05528252571821,
+              "max_ms": 39.82974961400032
+            },
+            "forward_peak_mib": 0.0,
+            "out_vs_fp64": {
+              "max_abs": 0.0010446820342941976,
+              "relative_l2": 0.00025098233651414496
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 156.93644620478153,
+              "p95_ms": 240.0815368629992,
+              "min_ms": 110.2369837462902,
+              "max_ms": 249.31988026946783
+            },
+            "train_peak_mib": 0.0
+          },
+          "pytorch-native": {
+            "forward": {
+              "median_ms": 734.5447409898043,
+              "p95_ms": 1132.5721632689238,
+              "min_ms": 692.6448438316584,
+              "max_ms": 1182.6508231461048
+            },
+            "forward_peak_mib": 0.0,
+            "out_vs_fp64": {
+              "max_abs": 0.002810583458336957,
+              "relative_l2": 0.0005388467180647695
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 2364.212989807129,
+              "p95_ms": 3938.916347548365,
+              "min_ms": 2019.2379858344793,
+              "max_ms": 4113.883387297392
+            },
+            "train_peak_mib": 0.0
+          }
+        }
+      },
+      {
+        "dtype": "fp16",
+        "seq_len": 1024,
+        "batch": 1,
+        "q_heads": 32,
+        "kv_heads": 8,
+        "head_dim": 128,
+        "paths": {
+          "sdpa": {
+            "forward": {
+              "median_ms": 105.08450027555227,
+              "p95_ms": 109.9980441853404,
+              "min_ms": 104.55065779387951,
+              "max_ms": 110.61816569417715
+            },
+            "forward_peak_mib": 0.0,
+            "out_vs_fp64": {
+              "max_abs": 0.0010750978941995726,
+              "relative_l2": 0.00025550971614830375
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 335.7933955267072,
+              "p95_ms": 337.15363508090377,
+              "min_ms": 335.052122361958,
+              "max_ms": 337.30477280914783
+            },
+            "train_peak_mib": 79.14453125
+          },
+          "pytorch-native": {
+            "forward": {
+              "median_ms": 3093.56103092432,
+              "p95_ms": 3837.349909357726,
+              "min_ms": 3021.5385919436812,
+              "max_ms": 4018.383893184364
+            },
+            "forward_peak_mib": 128.04296875,
+            "out_vs_fp64": {
+              "max_abs": 0.002116843588507722,
+              "relative_l2": 0.0005576223691406817
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 11104.180980473757,
+              "p95_ms": 13321.12881867215,
+              "min_ms": 8533.20586308837,
+              "max_ms": 13567.45635624975
+            },
+            "train_peak_mib": 192.1953125
+          }
+        }
+      },
+      {
+        "dtype": "fp16",
+        "seq_len": 2048,
+        "batch": 1,
+        "q_heads": 32,
+        "kv_heads": 8,
+        "head_dim": 128,
+        "paths": {
+          "sdpa": {
+            "forward": {
+              "median_ms": 1566.133220680058,
+              "p95_ms": 1683.1755116581917,
+              "min_ms": 1212.3965499922633,
+              "max_ms": 1689.712654799223
+            },
+            "forward_peak_mib": 51.04296875,
+            "out_vs_fp64": {
+              "max_abs": 0.0010650871035631226,
+              "relative_l2": 0.0002589060030057917
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 1089.9534411728382,
+              "p95_ms": 1090.444867964834,
+              "min_ms": 1087.7068433910608,
+              "max_ms": 1090.4994709417224
+            },
+            "train_peak_mib": 143.85546875
+          },
+          "pytorch-native": {
+            "forward": {
+              "median_ms": 13198.508179746568,
+              "p95_ms": 13483.868804574013,
+              "min_ms": 12426.476489752531,
+              "max_ms": 13548.32206852734
+            },
+            "forward_peak_mib": 561.1328125,
+            "out_vs_fp64": {
+              "max_abs": 0.0021428477134313173,
+              "relative_l2": 0.0005852208464456109
+            },
+            "repeat_bitwise": true,
+            "train_fwd_bwd": {
+              "median_ms": 37002.96266376972,
+              "p95_ms": 38977.848869841546,
+              "min_ms": 35062.47301120311,
+              "max_ms": 39197.28067051619
+            },
+            "train_peak_mib": 766.4140625
+          }
+        }
+      }
+    ]
+  },
+  "backward_parity": [],
+  "batch_composition": [
+    {
+      "seq_len": 512,
+      "paths": {
+        "sdpa": {
+          "batch_gt1_rejected": false,
+          "out_bitwise": true,
+          "out_mismatched": 0,
+          "out_max_abs": 0.0,
+          "lse_bitwise": null
+        },
+        "pytorch-native": {
+          "batch_gt1_rejected": false,
+          "out_bitwise": true,
+          "out_mismatched": 0,
+          "out_max_abs": 0.0,
+          "lse_bitwise": null
+        }
+      }
+    },
+    {
+      "seq_len": 1024,
+      "paths": {
+        "sdpa": {
+          "batch_gt1_rejected": false,
+          "out_bitwise": true,
+          "out_mismatched": 0,
+          "out_max_abs": 0.0,
+          "lse_bitwise": null
+        },
+        "pytorch-native": {
+          "batch_gt1_rejected": false,
+          "out_bitwise": true,
+          "out_mismatched": 0,
+          "out_max_abs": 0.0,
+          "lse_bitwise": null
+        }
+      }
+    },
+    {
+      "seq_len": 2048,
+      "paths": {
+        "sdpa": {
+          "batch_gt1_rejected": false,
+          "out_bitwise": true,
+          "out_mismatched": 0,
+          "out_max_abs": 0.0,
+          "lse_bitwise": null
+        },
+        "pytorch-native": {
+          "batch_gt1_rejected": false,
+          "out_bitwise": true,
+          "out_mismatched": 0,
+          "out_max_abs": 0.0,
+          "lse_bitwise": null
+        }
+      }
+    }
+  ],
+  "tp_head_sensitivity": [],
+  "distributed": []
+}

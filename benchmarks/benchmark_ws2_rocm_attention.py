@@ -757,6 +757,57 @@ def _tp_head_sensitivity(
     return rows
 
 
+def _tp_schedule_cost(
+    *,
+    paths: _Paths,
+    seq_lens: tuple[int, ...],
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    device: torch.device,
+    warmup: int,
+    samples: int,
+) -> list[dict[str, Any]]:
+    """What the TP-degree invariance costs.
+
+    ``raw_launch`` is one launch for all heads and is NOT the production schedule;
+    ``one_kv_group_per_launch`` is what the provider runs (``Hkv`` launches per row)
+    and is what makes the result independent of the TP degree.
+    """
+    if paths.strict is None and paths.strict_fa4 is None:
+        return []
+    rows: list[dict[str, Any]] = []
+    scale = 1.0 / math.sqrt(head_dim)
+    for seq_len in seq_lens:
+        q, k, v = _seeded_qkv(
+            1, q_heads, kv_heads, seq_len, head_dim, torch.bfloat16, device, seed=21
+        )
+        positions = _positions(1, seq_len, device)
+        entry: dict[str, Any] = {"seq_len": seq_len, "launches": kv_heads}
+        for schedule in ("raw_launch", "one_kv_group_per_launch"):
+
+            # Bind the tensors as defaults: they are deleted at the end of each
+            # iteration, so a late-binding closure would reference a dead name.
+            def run(chosen=schedule, q=q, k=k, v=v, positions=positions):
+                return _tp_schedule_forward(paths, q, k, v, scale, positions, chosen)
+
+            entry[schedule] = _summary_ms(
+                _timed_samples(run, warmup=warmup, samples=samples, device=device)
+            )
+            entry[f"{schedule}_peak_mib"] = _peak_memory_mib(run, device)
+
+        def run_sdpa(q=q, k=k, v=v):
+            return _sdpa_forward(q, k, v, causal=True, scale=scale)
+
+        entry["sdpa"] = _summary_ms(
+            _timed_samples(run_sdpa, warmup=warmup, samples=samples, device=device)
+        )
+        rows.append(entry)
+        del q, k, v
+        _empty_cache(device)
+    return rows
+
+
 def _tp_schedule_forward(paths, q, k, v, scale, positions, schedule):
     """Run the strict core either in one launch or one launch per KV group."""
     core = paths.strict if paths.strict is not None else paths.strict_fa4
@@ -1141,7 +1192,7 @@ def _environment(device: torch.device | None = None) -> dict[str, Any]:
     try:
         from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 
-        symbols = sorted(s for s in dir(_C) if "attention" in s) if _EXT_AVAILABLE else []
+        symbols = sorted(name for name in dir(_C) if "attention" in name) if _EXT_AVAILABLE else []
     except Exception:  # noqa: BLE001
         symbols = []
     try:
@@ -1150,19 +1201,25 @@ def _environment(device: torch.device | None = None) -> dict[str, Any]:
         triton_version = triton.__version__
     except Exception:  # noqa: BLE001
         triton_version = "unavailable"
+    # Device facts must not leak into a host run's column: a CPU row reporting
+    # gpu_count=8 and an RCCL collective would misdescribe what was measured.
     return {
         "cpu_count": os.cpu_count(),
         "torch_threads": torch.get_num_threads(),
         "gpu": properties.name if properties else "n/a (host execution)",
         "architecture": getattr(properties, "gcnArchName", "unknown") if properties else "n/a",
-        "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
-        "hip": torch.version.hip,
-        "cuda": torch.version.cuda,
+        "gpu_count": (torch.cuda.device_count() if on_gpu and torch.cuda.is_available() else 0),
+        "hip": torch.version.hip if on_gpu else None,
+        "cuda": torch.version.cuda if on_gpu else None,
         "torch": torch.__version__,
-        "triton": triton_version,
+        "triton": triton_version if on_gpu else "n/a (host execution)",
         "python": platform.python_version(),
-        "extension_attention_symbols": symbols,
-        "native_collective": "torch.distributed ProcessGroupNCCL (RCCL on ROCm)",
+        "extension_attention_symbols": symbols if on_gpu else [],
+        "native_collective": (
+            "torch.distributed ProcessGroupNCCL (RCCL on ROCm)"
+            if on_gpu
+            else "n/a (single-process host run)"
+        ),
     }
 
 

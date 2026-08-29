@@ -5,18 +5,22 @@
 
 ## Environment
 
-| Item | this run |
-|---|---|
-| architecture | gfx942:sramecc+:xnack- |
-| cuda | None |
-| extension_attention_symbols | deterministic_attention_backward, deterministic_attention_forward |
-| gpu | AMD Instinct MI300X |
-| gpu_count | 8 |
-| hip | 7.14.60850 |
-| native_collective | torch.distributed ProcessGroupNCCL (RCCL on ROCm) |
-| python | 3.12.3 |
-| torch | 2.12.0+rocm7.14.0a20260608 |
-| triton | 3.7.0 |
+| Item | mi300x | cpu |
+|---|---|---|
+| architecture | gfx942:sramecc+:xnack- | n/a |
+| cpu_count | 192 | 192 |
+| cuda | None | None |
+| extension_attention_symbols | deterministic_attention_backward, deterministic_attention_forward | none |
+| gpu | AMD Instinct MI300X | n/a (host execution) |
+| gpu_count | 8 | 0 |
+| hip | 7.14.60850 | None |
+| native_collective | torch.distributed ProcessGroupNCCL (RCCL on ROCm) | n/a (single-process host run) |
+| python | 3.12.3 | 3.12.3 |
+| torch | 2.12.0+rocm7.14.0a20260608 | 2.12.0+rocm7.14.0a20260608 |
+| torch_threads | 4 | 32 |
+| triton | 3.7.0 | n/a (host execution) |
+
+A missing row below means the backend cannot exist on that platform, not that it failed: `strict-aiter` is ROCm-only, `reference-native` and `triton-bitwise` need a GPU, and only `sdpa` and `pytorch-native` also run on the host.
 
 ## Methodology
 
@@ -41,6 +45,10 @@ python benchmarks/benchmark_ws2_rocm_attention.py \
   --output-dir benchmarks/results/ws2_rocm_mi300x
 ```
 
+### Unavailable paths
+
+- `strict-fa4`: CUDA-only path; this run is ROCm
+
 ## Bitwise parity: Triton port vs the native reference core
 
 Acceptance is 0 mismatched elements. This is the contract the Triton core exists to hold.
@@ -62,89 +70,133 @@ Acceptance is 0 mismatched elements. This is the contract the Triton core exists
 
 ### Forward
 
-| S | Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB | out max-abs vs FP64 | lse max-abs vs FP64 | Repeat |
-|---:|---|---:|---:|---:|---:|---:|---:|:---:|
-| 512 | sdpa | 0.0782 | 0.0820 | 1.00x | 12.1 | 8.195e-03 | n/a | yes |
-| 512 | strict-aiter | 0.2428 | 0.2560 | 3.11x | 14.1 | 2.468e-02 | 8.359e-07 | yes |
-| 512 | reference-native | 0.9659 | 1.0030 | 12.36x | 36.1 | 7.741e-03 | 8.111e-07 | yes |
-| 512 | triton-bitwise | 1.3816 | 1.3923 | 17.68x | 36.1 | 7.741e-03 | 8.111e-07 | yes |
-| 1024 | sdpa | 0.1319 | 0.1430 | 1.00x | 24.1 | 1.027e-02 | n/a | yes |
-| 1024 | strict-aiter | 0.2468 | 0.2578 | 1.87x | 28.1 | 2.609e-02 | 1.213e-06 | yes |
-| 1024 | reference-native | 3.1389 | 3.1914 | 23.79x | 136.1 | 7.810e-03 | 8.732e-07 | yes |
-| 1024 | triton-bitwise | 4.8240 | 4.8720 | 36.56x | 136.1 | 7.810e-03 | 8.732e-07 | yes |
-| 2048 | sdpa | 0.2887 | 0.2975 | 1.00x | 48.3 | 7.994e-03 | n/a | yes |
-| 2048 | strict-aiter | 0.2962 | 0.3394 | 1.03x | 56.3 | 2.027e-02 | 2.288e-06 | yes |
-| 2048 | reference-native | 12.8467 | 12.9922 | 44.50x | 528.2 | 7.804e-03 | 1.142e-06 | yes |
-| 2048 | triton-bitwise | 19.4226 | 19.5024 | 67.28x | 528.3 | 7.804e-03 | 1.142e-06 | yes |
-| 4096 | sdpa | 0.6936 | 0.7149 | 1.00x | 96.5 | 9.604e-03 | n/a | yes |
-| 4096 | strict-aiter | 0.5644 | 0.6076 | 0.81x | 112.5 | 2.138e-02 | 3.967e-06 | yes |
-| 4096 | reference-native | 49.3624 | 49.5342 | 71.17x | 2080.5 | 7.808e-03 | 1.381e-06 | yes |
-| 4096 | triton-bitwise | 86.0655 | 86.5760 | 124.08x | 2080.5 | 7.808e-03 | 1.381e-06 | yes |
+| S | Platform | Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB | out max-abs vs FP64 | lse max-abs vs FP64 | Repeat |
+|---:|---|---|---:|---:|---:|---:|---:|---:|:---:|
+| 512 | mi300x | sdpa | 0.0785 | 0.0843 | 1.00x | 12.1 | 8.195e-03 | n/a | yes |
+| 512 | mi300x | pytorch-native | 0.1981 | 0.3121 | 2.52x | 44.2 | 1.391e-02 | n/a | yes |
+| 512 | mi300x | strict-aiter | 0.2475 | 0.2714 | 3.15x | 14.1 | 2.468e-02 | 8.359e-07 | yes |
+| 512 | mi300x | reference-native | 1.0180 | 1.0542 | 12.97x | 36.1 | 7.741e-03 | 8.111e-07 | yes |
+| 512 | mi300x | triton-bitwise | 1.3627 | 1.3866 | 17.36x | 36.1 | 7.741e-03 | 8.111e-07 | yes |
+| 512 | cpu | sdpa | 31.5270 | 34.1950 | 1.00x | 0.0 | 8.606e-03 | n/a | yes |
+| 512 | cpu | pytorch-native | 15.3921 | 15.8488 | 0.49x | 32.7 | 1.947e-02 | n/a | yes |
+| 1024 | mi300x | sdpa | 0.1327 | 0.1440 | 1.00x | 24.1 | 1.027e-02 | n/a | yes |
+| 1024 | mi300x | pytorch-native | 0.3096 | 0.3200 | 2.33x | 153.0 | 1.571e-02 | n/a | yes |
+| 1024 | mi300x | strict-aiter | 0.2451 | 0.2578 | 1.85x | 28.1 | 2.609e-02 | 1.213e-06 | yes |
+| 1024 | mi300x | reference-native | 3.1537 | 3.8402 | 23.77x | 136.1 | 7.810e-03 | 8.732e-07 | yes |
+| 1024 | mi300x | triton-bitwise | 4.8326 | 4.8614 | 36.42x | 136.1 | 7.810e-03 | 8.732e-07 | yes |
+| 1024 | cpu | sdpa | 98.3129 | 98.4924 | 1.00x | 43.6 | 8.191e-03 | n/a | yes |
+| 1024 | cpu | pytorch-native | 51.5739 | 51.9609 | 0.52x | 127.8 | 1.610e-02 | n/a | yes |
+| 2048 | mi300x | sdpa | 0.2875 | 0.3083 | 1.00x | 48.3 | 7.994e-03 | n/a | yes |
+| 2048 | mi300x | pytorch-native | 1.0848 | 1.1129 | 3.77x | 564.0 | 1.803e-02 | n/a | yes |
+| 2048 | mi300x | strict-aiter | 0.2938 | 0.3060 | 1.02x | 56.3 | 2.027e-02 | 2.288e-06 | yes |
+| 2048 | mi300x | reference-native | 12.7428 | 12.9149 | 44.32x | 528.2 | 7.804e-03 | 1.142e-06 | yes |
+| 2048 | mi300x | triton-bitwise | 19.4210 | 19.5038 | 67.55x | 528.3 | 7.804e-03 | 1.142e-06 | yes |
+| 2048 | cpu | sdpa | 304.6115 | 308.9697 | 1.00x | 50.5 | 9.314e-03 | n/a | yes |
+| 2048 | cpu | pytorch-native | 216.1569 | 235.2967 | 0.71x | 543.6 | 1.790e-02 | n/a | yes |
+| 4096 | mi300x | sdpa | 0.6965 | 0.7457 | 1.00x | 96.5 | 9.604e-03 | n/a | yes |
+| 4096 | mi300x | pytorch-native | 3.9513 | 4.2331 | 5.67x | 2160.0 | 1.398e-02 | n/a | yes |
+| 4096 | mi300x | strict-aiter | 0.5569 | 0.5848 | 0.80x | 112.5 | 2.138e-02 | 3.967e-06 | yes |
+| 4096 | mi300x | reference-native | 49.3536 | 49.4533 | 70.86x | 2080.5 | 7.808e-03 | 1.381e-06 | yes |
+| 4096 | mi300x | triton-bitwise | 105.4049 | 110.6211 | 151.34x | 2080.5 | 7.808e-03 | 1.381e-06 | yes |
 
 ### Forward+backward
 
-| S | Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB |
-|---:|---|---:|---:|---:|---:|
-| 512 | sdpa | 0.3228 | 0.3510 | 1.00x | 32.2 |
-| 512 | strict-aiter | 0.6039 | 0.6560 | 1.87x | 288.2 |
-| 512 | reference-native | 2.9714 | 2.9876 | 9.21x | 78.1 |
-| 512 | triton-bitwise | 4.8578 | 4.9374 | 15.05x | 78.1 |
-| 1024 | sdpa | 0.4319 | 0.5795 | 1.00x | 64.3 |
-| 1024 | strict-aiter | 0.9293 | 0.9651 | 2.15x | 1088.4 |
-| 1024 | reference-native | 12.2009 | 12.2835 | 28.25x | 284.3 |
-| 1024 | triton-bitwise | 20.1771 | 20.3071 | 46.71x | 284.3 |
-| 2048 | sdpa | 1.0735 | 1.1114 | 1.00x | 128.8 |
-| 2048 | strict-aiter | 1.9019 | 1.9802 | 1.77x | 4224.8 |
-| 2048 | reference-native | 47.8741 | 48.1225 | 44.60x | 1080.5 |
-| 2048 | triton-bitwise | 76.7414 | 76.9707 | 71.49x | 1080.5 |
-| 4096 | sdpa | 3.2464 | 3.3146 | 1.00x | 257.5 |
-| 4096 | strict-aiter | 5.7304 | 5.7861 | 1.77x | 16641.5 |
-| 4096 | reference-native | 173.3365 | 173.5448 | 53.39x | 4209.0 |
-| 4096 | triton-bitwise | 304.1032 | 304.4993 | 93.67x | 4209.0 |
+| S | Platform | Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB |
+|---:|---|---|---:|---:|---:|---:|
+| 512 | mi300x | sdpa | 0.2836 | 0.5891 | 1.00x | 32.2 |
+| 512 | mi300x | pytorch-native | 0.9766 | 1.0728 | 3.44x | 76.3 |
+| 512 | mi300x | strict-aiter | 0.6328 | 0.6556 | 2.23x | 288.2 |
+| 512 | mi300x | reference-native | 3.1217 | 3.1910 | 11.01x | 78.1 |
+| 512 | mi300x | triton-bitwise | 4.8656 | 4.9558 | 17.15x | 78.1 |
+| 512 | cpu | sdpa | 53.7609 | 54.4313 | 1.00x | 0.0 |
+| 512 | cpu | pytorch-native | 24.7810 | 25.4956 | 0.46x | 46.4 |
+| 1024 | mi300x | sdpa | 0.4391 | 0.4822 | 1.00x | 64.3 |
+| 1024 | mi300x | pytorch-native | 0.7501 | 0.8035 | 1.71x | 281.0 |
+| 1024 | mi300x | strict-aiter | 0.8448 | 0.9276 | 1.92x | 1088.4 |
+| 1024 | mi300x | reference-native | 12.0942 | 12.2326 | 27.54x | 284.3 |
+| 1024 | mi300x | triton-bitwise | 20.0742 | 20.2126 | 45.72x | 284.3 |
+| 1024 | cpu | sdpa | 163.8662 | 167.7328 | 1.00x | 30.9 |
+| 1024 | cpu | pytorch-native | 107.9884 | 110.4447 | 0.66x | 191.6 |
+| 2048 | mi300x | sdpa | 1.0837 | 1.1348 | 1.00x | 128.8 |
+| 2048 | mi300x | pytorch-native | 2.3871 | 2.4252 | 2.20x | 1076.0 |
+| 2048 | mi300x | strict-aiter | 1.9570 | 2.0058 | 1.81x | 4224.8 |
+| 2048 | mi300x | reference-native | 47.8157 | 48.0608 | 44.12x | 1080.5 |
+| 2048 | mi300x | triton-bitwise | 76.7789 | 77.9824 | 70.85x | 1080.5 |
+| 2048 | cpu | sdpa | 533.5067 | 648.9086 | 1.00x | 31.7 |
+| 2048 | cpu | pytorch-native | 422.9041 | 424.9965 | 0.79x | 776.1 |
+| 4096 | mi300x | sdpa | 3.2163 | 3.3038 | 1.00x | 257.5 |
+| 4096 | mi300x | pytorch-native | 9.3608 | 9.4943 | 2.91x | 4208.0 |
+| 4096 | mi300x | strict-aiter | 5.7263 | 5.8219 | 1.78x | 16641.5 |
+| 4096 | mi300x | reference-native | 173.3246 | 177.7302 | 53.89x | 4209.0 |
+| 4096 | mi300x | triton-bitwise | 306.5966 | 346.2128 | 95.33x | 4209.0 |
+
+Host peak memory is an RSS high-water delta sampled from `/proc`, not an allocator statistic, so the `cpu` rows approximate and are not directly comparable to the device figures.
 
 ## Single-device Attention (fp16)
 
 ### Forward
 
-| S | Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB | out max-abs vs FP64 | lse max-abs vs FP64 | Repeat |
-|---:|---|---:|---:|---:|---:|---:|---:|:---:|
-| 512 | sdpa | 0.0700 | 0.0735 | 1.00x | 12.1 | 1.042e-03 | n/a | yes |
-| 512 | strict-aiter | 0.2472 | 0.3623 | 3.53x | 14.1 | 2.046e-03 | 8.756e-07 | yes |
-| 512 | reference-native | 0.9588 | 1.0180 | 13.70x | 36.1 | 9.702e-04 | 8.340e-07 | yes |
-| 512 | triton-bitwise | 1.3660 | 1.3787 | 19.52x | 36.1 | 9.702e-04 | 8.340e-07 | yes |
-| 1024 | sdpa | 0.1286 | 0.1435 | 1.00x | 24.1 | 1.053e-03 | n/a | yes |
-| 1024 | strict-aiter | 0.2423 | 0.2602 | 1.88x | 28.1 | 2.299e-03 | 1.250e-06 | yes |
-| 1024 | reference-native | 3.0663 | 3.1218 | 23.84x | 136.1 | 9.757e-04 | 1.011e-06 | yes |
-| 1024 | triton-bitwise | 4.7733 | 4.8062 | 37.11x | 136.1 | 9.757e-04 | 1.011e-06 | yes |
-| 2048 | sdpa | 0.2866 | 0.2997 | 1.00x | 48.3 | 9.099e-04 | n/a | yes |
-| 2048 | strict-aiter | 0.2942 | 0.3034 | 1.03x | 56.3 | 2.053e-03 | 2.540e-06 | yes |
-| 2048 | reference-native | 12.5348 | 12.7376 | 43.73x | 528.2 | 9.099e-04 | 1.103e-06 | yes |
-| 2048 | triton-bitwise | 19.1882 | 19.2599 | 66.94x | 528.3 | 9.099e-04 | 1.103e-06 | yes |
-| 4096 | sdpa | 1.0565 | 1.0855 | 1.00x | 96.5 | 9.905e-04 | n/a | yes |
-| 4096 | strict-aiter | 0.5813 | 0.6200 | 0.55x | 112.5 | 1.953e-03 | 3.805e-06 | yes |
-| 4096 | reference-native | 48.3115 | 48.4132 | 45.73x | 2080.5 | 9.681e-04 | 1.511e-06 | yes |
-| 4096 | triton-bitwise | 84.9071 | 85.0736 | 80.36x | 2080.5 | 9.681e-04 | 1.511e-06 | yes |
+| S | Platform | Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB | out max-abs vs FP64 | lse max-abs vs FP64 | Repeat |
+|---:|---|---|---:|---:|---:|---:|---:|---:|:---:|
+| 512 | mi300x | sdpa | 0.0703 | 0.1083 | 1.00x | 12.1 | 1.042e-03 | n/a | yes |
+| 512 | mi300x | pytorch-native | 0.1926 | 0.2989 | 2.74x | 44.2 | 1.811e-03 | n/a | yes |
+| 512 | mi300x | strict-aiter | 0.2729 | 0.2851 | 3.88x | 14.1 | 2.046e-03 | 8.756e-07 | yes |
+| 512 | mi300x | reference-native | 0.9919 | 1.0175 | 14.12x | 36.1 | 9.702e-04 | 8.340e-07 | yes |
+| 512 | mi300x | triton-bitwise | 1.3618 | 1.4008 | 19.38x | 36.1 | 9.702e-04 | 8.340e-07 | yes |
+| 512 | cpu | sdpa | 35.0730 | 38.8791 | 1.00x | 0.0 | 1.045e-03 | n/a | yes |
+| 512 | cpu | pytorch-native | 734.5447 | 1132.5722 | 20.94x | 0.0 | 2.811e-03 | n/a | yes |
+| 1024 | mi300x | sdpa | 0.1264 | 0.1373 | 1.00x | 24.1 | 1.053e-03 | n/a | yes |
+| 1024 | mi300x | pytorch-native | 0.3178 | 0.3455 | 2.51x | 153.0 | 2.487e-03 | n/a | yes |
+| 1024 | mi300x | strict-aiter | 0.2891 | 0.3381 | 2.29x | 28.1 | 2.299e-03 | 1.250e-06 | yes |
+| 1024 | mi300x | reference-native | 3.0663 | 3.0975 | 24.26x | 136.1 | 9.757e-04 | 1.011e-06 | yes |
+| 1024 | mi300x | triton-bitwise | 4.7755 | 4.8063 | 37.78x | 136.1 | 9.757e-04 | 1.011e-06 | yes |
+| 1024 | cpu | sdpa | 105.0845 | 109.9980 | 1.00x | 0.0 | 1.075e-03 | n/a | yes |
+| 1024 | cpu | pytorch-native | 3093.5610 | 3837.3499 | 29.44x | 128.0 | 2.117e-03 | n/a | yes |
+| 2048 | mi300x | sdpa | 0.2897 | 0.2998 | 1.00x | 48.3 | 9.099e-04 | n/a | yes |
+| 2048 | mi300x | pytorch-native | 1.0828 | 1.1133 | 3.74x | 564.0 | 1.727e-03 | n/a | yes |
+| 2048 | mi300x | strict-aiter | 0.2991 | 0.3337 | 1.03x | 56.3 | 2.053e-03 | 2.540e-06 | yes |
+| 2048 | mi300x | reference-native | 12.5615 | 12.6840 | 43.36x | 528.2 | 9.099e-04 | 1.103e-06 | yes |
+| 2048 | mi300x | triton-bitwise | 19.2360 | 19.3075 | 66.40x | 528.3 | 9.099e-04 | 1.103e-06 | yes |
+| 2048 | cpu | sdpa | 1566.1332 | 1683.1755 | 1.00x | 51.0 | 1.065e-03 | n/a | yes |
+| 2048 | cpu | pytorch-native | 13198.5082 | 13483.8688 | 8.43x | 561.1 | 2.143e-03 | n/a | yes |
+| 4096 | mi300x | sdpa | 1.0774 | 1.1026 | 1.00x | 96.5 | 9.905e-04 | n/a | yes |
+| 4096 | mi300x | pytorch-native | 3.9607 | 4.2144 | 3.68x | 2160.0 | 2.339e-03 | n/a | yes |
+| 4096 | mi300x | strict-aiter | 0.5825 | 0.6701 | 0.54x | 112.5 | 1.953e-03 | 3.805e-06 | yes |
+| 4096 | mi300x | reference-native | 48.5714 | 48.6788 | 45.08x | 2080.5 | 9.681e-04 | 1.511e-06 | yes |
+| 4096 | mi300x | triton-bitwise | 84.3475 | 86.5872 | 78.29x | 2080.5 | 9.681e-04 | 1.511e-06 | yes |
 
 ### Forward+backward
 
-| S | Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB |
-|---:|---|---:|---:|---:|---:|
-| 512 | sdpa | 0.3177 | 0.3328 | 1.00x | 32.2 |
-| 512 | strict-aiter | 1.0677 | 1.1007 | 3.36x | 288.2 |
-| 512 | reference-native | 3.0363 | 3.0744 | 9.56x | 78.1 |
-| 512 | triton-bitwise | 4.7821 | 4.8698 | 15.05x | 78.1 |
-| 1024 | sdpa | 0.4399 | 0.5001 | 1.00x | 64.4 |
-| 1024 | strict-aiter | 0.8350 | 0.9122 | 1.90x | 1088.4 |
-| 1024 | reference-native | 12.0068 | 12.0713 | 27.29x | 284.3 |
-| 1024 | triton-bitwise | 19.3157 | 19.4640 | 43.91x | 284.3 |
-| 2048 | sdpa | 1.1766 | 1.2269 | 1.00x | 128.5 |
-| 2048 | strict-aiter | 1.9060 | 2.0250 | 1.62x | 4224.8 |
-| 2048 | reference-native | 47.5117 | 47.7373 | 40.38x | 1080.5 |
-| 2048 | triton-bitwise | 75.7950 | 76.0022 | 64.42x | 1080.5 |
-| 4096 | sdpa | 4.0247 | 4.0579 | 1.00x | 257.0 |
-| 4096 | strict-aiter | 5.8475 | 5.8916 | 1.45x | 16641.5 |
-| 4096 | reference-native | 171.5617 | 171.7337 | 42.63x | 4209.0 |
-| 4096 | triton-bitwise | 300.1215 | 301.8339 | 74.57x | 4209.0 |
+| S | Platform | Path | Median (ms) | p95 (ms) | vs sdpa | Peak MiB |
+|---:|---|---|---:|---:|---:|---:|
+| 512 | mi300x | sdpa | 0.3330 | 0.3590 | 1.00x | 32.2 |
+| 512 | mi300x | pytorch-native | 0.9847 | 1.0736 | 2.96x | 76.3 |
+| 512 | mi300x | strict-aiter | 1.1291 | 1.5507 | 3.39x | 288.2 |
+| 512 | mi300x | reference-native | 3.0893 | 3.1265 | 9.28x | 78.1 |
+| 512 | mi300x | triton-bitwise | 4.7979 | 4.8599 | 14.41x | 78.1 |
+| 512 | cpu | sdpa | 156.9364 | 240.0815 | 1.00x | 0.0 |
+| 512 | cpu | pytorch-native | 2364.2130 | 3938.9163 | 15.06x | 0.0 |
+| 1024 | mi300x | sdpa | 0.4161 | 0.4702 | 1.00x | 64.4 |
+| 1024 | mi300x | pytorch-native | 0.7710 | 0.8476 | 1.85x | 281.0 |
+| 1024 | mi300x | strict-aiter | 0.8597 | 0.9174 | 2.07x | 1088.4 |
+| 1024 | mi300x | reference-native | 11.8471 | 11.9334 | 28.47x | 284.3 |
+| 1024 | mi300x | triton-bitwise | 19.5915 | 19.7842 | 47.09x | 284.3 |
+| 1024 | cpu | sdpa | 335.7934 | 337.1536 | 1.00x | 79.1 |
+| 1024 | cpu | pytorch-native | 11104.1810 | 13321.1288 | 33.07x | 192.2 |
+| 2048 | mi300x | sdpa | 1.1873 | 1.5985 | 1.00x | 128.5 |
+| 2048 | mi300x | pytorch-native | 2.3897 | 2.9295 | 2.01x | 1076.0 |
+| 2048 | mi300x | strict-aiter | 1.7668 | 1.7958 | 1.49x | 4224.8 |
+| 2048 | mi300x | reference-native | 47.4088 | 47.5834 | 39.93x | 1080.5 |
+| 2048 | mi300x | triton-bitwise | 75.9789 | 76.2766 | 63.99x | 1080.5 |
+| 2048 | cpu | sdpa | 1089.9534 | 1090.4449 | 1.00x | 143.9 |
+| 2048 | cpu | pytorch-native | 37002.9627 | 38977.8489 | 33.95x | 766.4 |
+| 4096 | mi300x | sdpa | 3.9710 | 4.0939 | 1.00x | 257.0 |
+| 4096 | mi300x | pytorch-native | 9.4752 | 9.7886 | 2.39x | 4208.0 |
+| 4096 | mi300x | strict-aiter | 5.9360 | 5.9734 | 1.49x | 16641.5 |
+| 4096 | mi300x | reference-native | 171.5709 | 171.7084 | 43.21x | 4209.0 |
+| 4096 | mi300x | triton-bitwise | 301.2615 | 302.5984 | 75.87x | 4209.0 |
+
+Host peak memory is an RSS high-water delta sampled from `/proc`, not an allocator statistic, so the `cpu` rows approximate and are not directly comparable to the device figures.
 
 ## Production core versus the reference core
 
@@ -168,21 +220,25 @@ A row computed alone must be bitwise equal to the same row inside a batch. The s
 | S | Path | Bitwise | Mismatched | Note |
 |---:|---|:---:|---:|---|
 | 512 | sdpa | yes | 0 | measured |
+| 512 | pytorch-native | yes | 0 | measured |
 | 512 | strict-aiter | yes | 0 | core executes one logical batch row per launch |
-| 512 | triton-bitwise | yes | 0 | measured |
 | 512 | reference-native | yes | 0 | measured |
+| 512 | triton-bitwise | yes | 0 | measured |
 | 1024 | sdpa | yes | 0 | measured |
+| 1024 | pytorch-native | yes | 0 | measured |
 | 1024 | strict-aiter | yes | 0 | core executes one logical batch row per launch |
-| 1024 | triton-bitwise | yes | 0 | measured |
 | 1024 | reference-native | yes | 0 | measured |
+| 1024 | triton-bitwise | yes | 0 | measured |
 | 2048 | sdpa | yes | 0 | measured |
+| 2048 | pytorch-native | yes | 0 | measured |
 | 2048 | strict-aiter | yes | 0 | core executes one logical batch row per launch |
-| 2048 | triton-bitwise | yes | 0 | measured |
 | 2048 | reference-native | yes | 0 | measured |
+| 2048 | triton-bitwise | yes | 0 | measured |
 | 4096 | sdpa | yes | 0 | measured |
+| 4096 | pytorch-native | yes | 0 | measured |
 | 4096 | strict-aiter | yes | 0 | core executes one logical batch row per launch |
-| 4096 | triton-bitwise | yes | 0 | measured |
 | 4096 | reference-native | yes | 0 | measured |
+| 4096 | triton-bitwise | yes | 0 | measured |
 
 ## TP-degree invariance of the strict ROCm core
 
@@ -221,10 +277,10 @@ A head shard computed under TP=N versus the same slice of an unsharded run. TP p
 
 | S | Launches | sdpa (ms) | raw_launch (ms) | per_kv_group (ms) | vs raw | vs sdpa |
 |---:|---:|---:|---:|---:|---:|---:|
-| 512 | 8 | 0.0721 | 0.2488 | 1.7717 | 7.12x | 24.56x |
-| 1024 | 8 | 0.1355 | 0.2467 | 1.8047 | 7.31x | 13.32x |
-| 2048 | 8 | 0.2848 | 0.3067 | 1.7629 | 5.75x | 6.19x |
-| 4096 | 8 | 0.7679 | 0.5965 | 2.4506 | 4.11x | 3.19x |
+| 512 | 8 | 0.0712 | 0.2579 | 1.7759 | 6.89x | 24.95x |
+| 1024 | 8 | 0.1302 | 0.2513 | 1.9985 | 7.95x | 15.35x |
+| 2048 | 8 | 0.2802 | 0.2917 | 1.7507 | 6.00x | 6.25x |
+| 4096 | 8 | 0.7046 | 0.5682 | 2.0472 | 3.60x | 2.91x |
 
 ## Distributed CP (RCCL AG/RS transport)
 
@@ -232,12 +288,12 @@ Schedule: all-gather Q/K/V and the position ids over the CP group, run the stric
 
 | Topology | World | TP | CP | Replicas | S | Median (ms) | p95 (ms) | Peak MiB/rank | out bitwise | lse bitwise | Repeat |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|:---:|
-| tp1_cp2 | 2 | 1 | 2 | 1 | 4096 | 1.8323 | 1.9342 | 160.5 | yes | yes | yes |
-| tp2_cp2 | 4 | 2 | 2 | 1 | 4096 | 1.2505 | 2.0656 | 80.3 | yes | yes | yes |
-| tp1_cp4 | 4 | 1 | 4 | 1 | 4096 | 1.4118 | 1.4399 | 160.5 | yes | yes | yes |
-| tp2_cp2_x2 | 8 | 2 | 2 | 2 | 4096 | 1.1947 | 1.2464 | 80.3 | yes | yes | yes |
-| tp2_cp4 | 8 | 2 | 4 | 1 | 4096 | 1.2911 | 1.8001 | 80.3 | yes | yes | yes |
-| tp1_cp8 | 8 | 1 | 8 | 1 | 4096 | 1.4065 | 1.9273 | 160.5 | yes | yes | yes |
+| tp1_cp2 | 2 | 1 | 2 | 1 | 4096 | 1.8379 | 1.9000 | 160.5 | yes | yes | yes |
+| tp2_cp2 | 4 | 2 | 2 | 1 | 4096 | 1.2288 | 1.2961 | 80.3 | yes | yes | yes |
+| tp1_cp4 | 4 | 1 | 4 | 1 | 4096 | 1.3988 | 1.4461 | 160.5 | yes | yes | yes |
+| tp2_cp2_x2 | 8 | 2 | 2 | 2 | 4096 | 1.2809 | 3.3578 | 80.3 | yes | yes | yes |
+| tp2_cp4 | 8 | 2 | 4 | 1 | 4096 | 2.3537 | 6.9351 | 80.3 | yes | yes | yes |
+| tp1_cp8 | 8 | 1 | 8 | 1 | 4096 | 3.0636 | 35.8611 | 160.5 | yes | yes | yes |
 
 ## Figures
 
