@@ -33,7 +33,8 @@ The op exposes the WS1 dual-path contract:
 | --- | --- | --- | --- |
 | PyTorch fallback | `NativeEmbeddingOp` | None | fp32 ground-truth reference; CPU and any GPU. |
 | CUDA SM90 (H200/Hopper) | `SM90EmbeddingOp` | `_C.embedding_sm90_forward` | Single-card batch-invariant forward backend; deterministic duplicate-id backward in the wrapper. |
-| ROCm / Triton | N/A | N/A | Falls back to the PyTorch native reference. |
+| Triton | `TritonEmbeddingOp` | `_embedding_fwd`, `_embedding_bwd` | CUDA gather with deterministic, atomic-free sorted-segment backward. |
+| ROCm | N/A | N/A | Falls back to the PyTorch native reference. |
 
 ## Tensor Contract
 
@@ -86,27 +87,39 @@ nondeterminism for repeated token ids at the cost of throughput.
 ## Tests
 
 ```bash
-python -m pytest tests/test_embedding.py -v
+python -m pytest \
+  tests/test_embedding.py \
+  tests/test_triton_embedding.py \
+  tests/test_canonical_embedding.py -v
 ```
 
 Covers: correctness vs direct indexing (bitwise), dtype paths, non-int64 id tolerance,
 Axis-A batch invariance (slice + padding), input purity, gradient flow to `weight`
 (including sparse-grad: unused rows stay zero), registry dispatch, and a GPU-only smoke
 test at the real Qwen3-8B dims (`vocab=151936, hidden=4096`, boundary ids `0` and
-`vocab-1`) that skips when CUDA or GPU memory is unavailable.
+`vocab-1`) that skips when CUDA or GPU memory is unavailable. Additional tests cover the
+Triton sorted-segment backward and canonical logical-row ordering.
 
 ## Implementation Files
 
 - `rl_engine/kernels/ops/pytorch/linear/embedding.py`
+- `rl_engine/kernels/ops/triton/linear/embedding.py`
 - `rl_engine/kernels/ops/cuda/linear/embedding.py`
+- `rl_engine/kernels/ops/canonical_embedding.py`
 - `csrc/cuda/embedding_lm_head_sm90.cu`
 - `rl_engine/kernels/registry.py`
 - `tests/test_embedding.py`
+- `tests/test_triton_embedding.py`
+- `tests/test_canonical_embedding.py`
 
 ## Known Limitations
 
-- The CUDA SM90 path is single-card coverage; TP/vocab-parallel and Triton embedding
-  backends are outside this PR.
-- Token ids must be in `[0, vocab)`. The SM90 host path validates the range before the
-  kernel launch and raises instead of masking invalid ids.
+- The CUDA SM90 and Triton paths are single-card coverage, not TP/vocab-parallel
+  integration paths.
+- Token ids must be in `[0, vocab)`. The Triton fast path reports invalid ids
+  asynchronously; use its explicit validator when the error must be raised at the call
+  boundary.
 - The deterministic SM90 backward is a reference path, not a tuned training kernel.
+- The standalone operator has no logical-row metadata, so its deterministic guarantee is
+  limited to a fixed flattened order. Cross-layout and cross-chunk invariance requires the
+  canonical Qwen training wrapper and its logical keys.

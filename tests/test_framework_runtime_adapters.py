@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import ast
 import os
+from collections import namedtuple
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import rl_engine.integrations.framework_operators as framework_operators
 import torch
+
+import rl_engine.integrations.framework_operators as framework_operators
 from rl_engine.integrations.ablation import (
     IntegrationPlan,
     configure_integration_environment,
@@ -19,14 +22,21 @@ from rl_engine.integrations.ablation import (
 from rl_engine.integrations.framework_operators import (
     MegatronAttentionOperator,
     SemanticOperatorHandle,
+    VllmLogpOperator,
     _megatron_zigzag_layout,
     _packed_local_sequence_layout,
     _vllm_kv_cache_views,
 )
-from rl_engine.integrations.megatron_runtime import install_megatron_integration
+from rl_engine.integrations.megatron_runtime import (
+    _patch_strict_attention_projections,
+    install_megatron_integration,
+)
 from rl_engine.integrations.runtime import FrameworkOperatorIntegration
 from rl_engine.integrations.state import clear_active_integration
-from rl_engine.integrations.vllm_runtime import configure_vllm_environment
+from rl_engine.integrations.vllm_runtime import (
+    _patch_qwen3_strict_model,
+    configure_vllm_environment,
+)
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_FA4_SCHEDULE_ID,
     STRICT_ATTENTION_PRODUCTION_CORE_ID,
@@ -37,7 +47,9 @@ from rl_engine.kernels.attention_contract import (
     ReductionSpec,
     ShardingSpec,
 )
-from rl_engine.kernels.ops.cuda.attention.strict_runtime import StrictCUDAAttentionRuntime
+from rl_engine.kernels.ops.cuda.attention.strict_runtime import (
+    StrictCUDAAttentionRuntime,
+)
 
 
 def test_framework_adapters_do_not_construct_registered_kernels_directly():
@@ -249,6 +261,141 @@ def test_vllm_current_flash_attention_kv_cache_layout_is_materialized():
     assert value.shape == (2, 4, 3, 5)
     assert torch.equal(key, cache.transpose(1, 2)[..., :5])
     assert torch.equal(value, cache.transpose(1, 2)[..., 5:])
+
+
+def test_megatron_strict_attention_projections_install_without_debug_environment(
+    monkeypatch,
+):
+    monkeypatch.delenv("RL_KERNEL_MODEL_DEBUG_DIR", raising=False)
+
+    class ColumnLinear:
+        def __init__(self):
+            self.allreduce_dgrad = True
+
+        def _forward_impl(self, input, weight, *args, **kwargs):
+            del args, kwargs
+            return input.new_full((*input.shape[:-1], weight.shape[0]), -1)
+
+    class RowLinear:
+        def _forward_impl(self, input, weight, *args, **kwargs):
+            del args, kwargs
+            return input.new_full((*input.shape[:-1], weight.shape[0]), -1)
+
+    class SelfAttention:
+        def __init__(self):
+            self.linear_qkv = ColumnLinear()
+            self.linear_proj = RowLinear()
+
+    _patch_strict_attention_projections(
+        self_attention_cls=SelfAttention,
+        column_linear_cls=ColumnLinear,
+        row_linear_cls=RowLinear,
+        det_gemm=lambda lhs, rhs: lhs @ rhs,
+    )
+    attention = SelfAttention()
+    value = torch.tensor([[1.0, 2.0]])
+    weight = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+
+    qkv = attention.linear_qkv._forward_impl(value, weight, bias=None)
+    projection = attention.linear_proj._forward_impl(value, weight, bias=None)
+    native = ColumnLinear()._forward_impl(value, weight, bias=None)
+
+    assert torch.equal(qkv, torch.tensor([[1.0, 2.0, 3.0]]))
+    assert torch.equal(projection, qkv)
+    assert torch.equal(native, torch.full((1, 3), -1.0))
+    assert attention.linear_qkv.allreduce_dgrad is False
+
+
+def test_vllm_qwen3_strict_model_installs_without_debug_environment(monkeypatch):
+    monkeypatch.delenv("RL_KERNEL_MODEL_DEBUG_DIR", raising=False)
+
+    class RMSNorm:
+        def __init__(self):
+            self.variance_size_override = None
+            self.has_weight = True
+            self.hidden_size = 2
+            self.weight = torch.tensor([1.5, 0.5])
+            self.variance_epsilon = 1e-6
+
+        def forward_cuda(self, x, residual=None):
+            del residual
+            return x.new_full(x.shape, -1)
+
+        def forward_native(self, x, residual=None):
+            del residual
+            return x.new_full(x.shape, -2)
+
+    class LinearLayer:
+        def __init__(self):
+            self.weight = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+
+    class LinearMethod:
+        def apply(self, layer, x, bias=None):
+            del bias
+            return x.new_full((*x.shape[:-1], layer.weight.shape[0]), -1)
+
+    class Attention:
+        def __init__(self):
+            self.qkv_proj = LinearLayer()
+            self.o_proj = LinearLayer()
+
+    _patch_qwen3_strict_model(
+        rms_norm_cls=RMSNorm,
+        linear_method_cls=LinearMethod,
+        attention_cls=Attention,
+        det_gemm=lambda lhs, rhs: lhs @ rhs,
+    )
+    attention = Attention()
+    method = LinearMethod()
+    value = torch.tensor([[1.0, 2.0]])
+    norm = RMSNorm()
+
+    assert torch.equal(
+        method.apply(attention.qkv_proj, value),
+        torch.tensor([[1.0, 2.0, 3.0]]),
+    )
+    assert torch.equal(
+        method.apply(LinearLayer(), value),
+        torch.full((1, 3), -1.0),
+    )
+    assert torch.equal(
+        norm.forward_cuda(value),
+        torch.nn.functional.rms_norm(value, (2,), norm.weight, 1e-6),
+    )
+
+
+def test_vllm_logp_replaces_every_duplicate_sampled_token_column():
+    logprobs_type = namedtuple(
+        "LogprobsTensors",
+        ("logprob_token_ids", "logprobs", "selected_token_ranks"),
+    )
+
+    @dataclass(frozen=True)
+    class SamplerResult:
+        sampled_token_ids: torch.Tensor
+        logprobs_tensors: object
+
+    operator = VllmLogpOperator(lambda *_args, **_kwargs: None)
+    result = SamplerResult(
+        sampled_token_ids=torch.tensor([[7], [8]]),
+        logprobs_tensors=logprobs_type(
+            logprob_token_ids=torch.tensor([[7, 7], [8, 9]]),
+            logprobs=torch.tensor([[-0.1, -0.1], [-0.2, -0.3]]),
+            selected_token_ranks=torch.tensor([1, 2]),
+        ),
+    )
+
+    updated = operator._replace_sampled_value(
+        result,
+        token_ids=torch.tensor([7, 8]),
+        selected=torch.tensor([-1.25, -2.5]),
+        provenance={},
+    )
+
+    assert torch.equal(
+        updated.logprobs_tensors.logprobs,
+        torch.tensor([[-1.25, -1.25], [-2.5, -0.3]]),
+    )
 
 
 def _cp1_contract(tokens: int) -> AttentionContract:

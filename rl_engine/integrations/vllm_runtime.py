@@ -5,10 +5,13 @@
 
 from __future__ import annotations
 
+import importlib
 import os
+import sys
 from typing import Any
 
 import torch
+
 from rl_engine.integrations.ablation import (
     Implementation,
     IntegrationPlan,
@@ -28,6 +31,8 @@ from rl_engine.integrations.state import get_active_integration, set_active_inte
 from rl_engine.integrations.vllm import VllmIntegration
 
 _PATCH_MARKER = "__rl_kernel_original_forward__"
+_STRICT_MODEL_PATCH_MARKER = "__rl_kernel_original_strict_model_init__"
+_STRICT_PROJECTION_MARKER = "__rl_kernel_strict_attention_projection__"
 _RLK_ATTENTION_BACKEND: type[Any] | None = None
 _RLK_ATTENTION_IMPL: type[Any] | None = None
 
@@ -237,6 +242,96 @@ def _patch_qwen_ffn(integration: VllmIntegration) -> None:
     integration.record_installed_hook("ffn", "vllm.model_executor.models.qwen2.Qwen2MLP.forward")
 
 
+def _install_flash_attn_ops_compatibility() -> None:
+    """Supply the legacy rotary import tree when an FA4-only package is installed."""
+
+    try:
+        importlib.import_module("flash_attn.ops.triton.rotary")
+        return
+    except (ImportError, OSError, RuntimeError):
+        pass
+
+    from vllm.vllm_flash_attn import ops as bundled_ops
+    from vllm.vllm_flash_attn.ops import triton as bundled_triton
+    from vllm.vllm_flash_attn.ops.triton import rotary as bundled_rotary
+
+    sys.modules.setdefault("flash_attn.ops", bundled_ops)
+    sys.modules.setdefault("flash_attn.ops.triton", bundled_triton)
+    sys.modules.setdefault("flash_attn.ops.triton.rotary", bundled_rotary)
+
+
+def _patch_qwen3_strict_model(
+    *,
+    rms_norm_cls: type[Any] | None = None,
+    linear_method_cls: type[Any] | None = None,
+    attention_cls: type[Any] | None = None,
+    det_gemm: Any | None = None,
+) -> None:
+    """Align vLLM's RMSNorm and Attention projections with Megatron."""
+
+    if rms_norm_cls is None or linear_method_cls is None or attention_cls is None:
+        from vllm.model_executor.layers.layernorm import RMSNorm
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        from vllm.model_executor.models.qwen3 import Qwen3Attention
+
+        rms_norm_cls = RMSNorm
+        linear_method_cls = UnquantizedLinearMethod
+        attention_cls = Qwen3Attention
+    if hasattr(attention_cls, _STRICT_MODEL_PATCH_MARKER):
+        return
+    if det_gemm is None:
+        from rl_engine.kernels.ops.cuda.matmul.det_gemm import DetGemmOp
+
+        det_gemm = DetGemmOp()
+
+    attention_init = attention_cls.__init__
+    unquantized_apply = linear_method_cls.apply
+
+    def deterministic_linear_apply(
+        method: Any,
+        layer: Any,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not hasattr(layer, _STRICT_PROJECTION_MARKER):
+            return unquantized_apply(method, layer, x, bias)
+        x_2d = x.reshape(-1, x.shape[-1])
+        output_2d = det_gemm(x_2d, layer.weight.t().contiguous())
+        output = output_2d.reshape(*x.shape[:-1], layer.weight.shape[0])
+        return output if bias is None else output + bias
+
+    def strict_rms_norm_forward_cuda(
+        instance: Any,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if instance.variance_size_override is not None:
+            return instance.forward_native(x, residual)
+        if residual is not None:
+            residual = x + residual
+            x = residual
+        weight = instance.weight.data if instance.has_weight else None
+        normalized = torch.nn.functional.rms_norm(
+            x,
+            (instance.hidden_size,),
+            weight,
+            instance.variance_epsilon,
+        )
+        if residual is None:
+            return normalized
+        return normalized, residual
+
+    def attention_init_wrapped(instance: Any, *args: Any, **kwargs: Any) -> None:
+        attention_init(instance, *args, **kwargs)
+        setattr(instance.qkv_proj, _STRICT_PROJECTION_MARKER, "qkv")
+        setattr(instance.o_proj, _STRICT_PROJECTION_MARKER, "o_proj")
+
+    setattr(attention_cls, _STRICT_MODEL_PATCH_MARKER, attention_init)
+    rms_norm_cls.forward_cuda = strict_rms_norm_forward_cuda
+    linear_method_cls.apply = deterministic_linear_apply
+    attention_cls.__init__ = attention_init_wrapped
+
+
 def _patch_sampler(integration: VllmIntegration, *, strict_linear_logp: bool) -> None:
     from vllm.v1.sample.sampler import Sampler
 
@@ -308,8 +403,14 @@ def _patch_worker_sampler(integration: VllmIntegration, *, strict_linear_logp: b
 def _register_attention_backend(integration: VllmIntegration) -> None:
     global _RLK_ATTENTION_BACKEND, _RLK_ATTENTION_IMPL
 
-    from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend, FlashAttentionImpl
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+    from vllm.v1.attention.backends.flash_attn import (
+        FlashAttentionBackend,
+        FlashAttentionImpl,
+    )
+    from vllm.v1.attention.backends.registry import (
+        AttentionBackendEnum,
+        register_backend,
+    )
 
     operator = VllmAttentionOperator()
     integration.install_operator("attention", operator)
@@ -361,6 +462,11 @@ def install_vllm_integration(plan: IntegrationPlan) -> VllmIntegration:
     integration = VllmIntegration(plan, rl_kernel_operators={})
     set_active_integration("vllm", integration)
     strict_linear_logp = plan.implementation_for("logp", "rollout") is Implementation.RL_KERNEL
+    strict_attention = plan.implementation_for("attention", "rollout") is Implementation.RL_KERNEL
+    if strict_attention or strict_linear_logp:
+        _install_flash_attn_ops_compatibility()
+    if strict_attention:
+        _patch_qwen3_strict_model()
     if strict_linear_logp:
         _patch_qwen_lm_head_padding()
         _patch_qwen_compute_logits(integration)

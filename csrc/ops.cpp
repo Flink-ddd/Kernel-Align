@@ -153,6 +153,12 @@ void rmsnorm_backward_reduce_dw_cuda(
 
 int64_t rmsnorm_backward_dw_chunks_cuda(int64_t rows);
 
+#if !defined(USE_ROCM)
+void reduce_rows_fp32_left_fold_cuda(
+  torch::Tensor rows,
+  torch::Tensor output);
+#endif
+
 static void rmsnorm_check_input(const torch::Tensor& x, const char* name) {
   TORCH_CHECK(x.is_cuda(), name, " must be a CUDA tensor");
   TORCH_CHECK(x.is_contiguous(), name, " must be contiguous");
@@ -234,6 +240,21 @@ torch::Tensor rmsnorm_backward_dw(
 
   return dw;
 }
+
+#if !defined(USE_ROCM)
+torch::Tensor reduce_rows_fp32_left_fold(torch::Tensor rows)
+{
+  rmsnorm_check_input(rows, "rows");
+  TORCH_CHECK(rows.dim() == 2, "rows must be 2D [R, C]");
+  TORCH_CHECK(rows.scalar_type() == torch::kFloat32, "rows must be float32");
+
+  auto output = torch::empty({rows.size(1)}, rows.options());
+  if (rows.size(1) != 0) {
+    reduce_rows_fp32_left_fold_cuda(rows, output);
+  }
+  return output;
+}
+#endif
 
 // SiLU / SwiGLU wrappers (WS1 elementwise activations)
 torch::Tensor silu_forward(torch::Tensor x) {
@@ -449,6 +470,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm_forward", &rmsnorm_forward, "Batch-invariant RMSNorm forward CUDA");
     m.def("rmsnorm_backward_dx", &rmsnorm_backward_dx, "Batch-invariant RMSNorm backward dx CUDA");
     m.def("rmsnorm_backward_dw", &rmsnorm_backward_dw, "Deterministic RMSNorm backward dweight CUDA");
+#if !defined(USE_ROCM)
+    m.def(
+        "reduce_rows_fp32_left_fold",
+        &reduce_rows_fp32_left_fold,
+        "Ascending-row FP32 left-fold reduction CUDA");
+#endif
 
     // registry SiLU / SwiGLU (elementwise activation)
     m.def("silu_forward", &silu_forward, "Batch-invariant SiLU forward CUDA");

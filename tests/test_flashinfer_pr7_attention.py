@@ -38,7 +38,9 @@ from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     P2PNCCLAttentionCPCommunication,
     sort_attention_cp_partial_states,
 )
-from rl_engine.kernels.ops.cuda.attention.deterministic_attn import DeterministicAttentionCoreResult
+from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
+    DeterministicAttentionCoreResult,
+)
 from rl_engine.kernels.ops.cuda.attention.flash_attn import (
     StrictFlashAttention4Core,
     StrictFlashAttentionUnavailable,
@@ -2114,6 +2116,7 @@ def test_fa4_core_fixes_reduction_controls_and_exports_fp32_lse(monkeypatch):
 
     core = StrictFlashAttention4Core(_op=fake_fa4, _package_version="4.test")
     monkeypatch.setattr(core, "_validate_inputs", lambda *_args: None)
+    monkeypatch.setattr(core, "_validate_bshd_inputs", lambda *_args: None)
     q = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
     k = torch.randn(1, 2, 3, 8, dtype=torch.bfloat16)
     v = torch.randn(1, 2, 3, 8, dtype=torch.bfloat16)
@@ -2148,6 +2151,63 @@ def test_fa4_core_fixes_reduction_controls_and_exports_fp32_lse(monkeypatch):
     assert result.provenance["dropout_p"] == 0.0
     assert result.provenance["native_attention_arithmetic"] is True
     assert result.provenance["production_ready"] is True
+
+
+def test_fa4_core_bshd_entrypoint_preserves_framework_layout(monkeypatch):
+    calls = []
+
+    def fake_fa4(
+        q,
+        k,
+        v,
+        *,
+        softmax_scale=None,
+        causal=False,
+        num_splits=0,
+        pack_gqa=None,
+        deterministic=False,
+        return_lse=False,
+    ):
+        calls.append(
+            {
+                "q_shape": tuple(q.shape),
+                "k_shape": tuple(k.shape),
+                "pack_gqa": pack_gqa,
+                "num_splits": num_splits,
+                "return_lse": return_lse,
+            }
+        )
+        return q.clone(), torch.zeros(
+            q.size(0), q.size(2), q.size(1), dtype=torch.float32, device=q.device
+        )
+
+    core = StrictFlashAttention4Core(_op=fake_fa4, _package_version="4.test")
+    monkeypatch.setattr(core, "_validate_bshd_inputs", lambda *_args: None)
+    q = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+    k = torch.randn(1, 3, 2, 8, dtype=torch.bfloat16)
+    v = torch.randn(1, 3, 2, 8, dtype=torch.bfloat16)
+
+    result = core.forward_bshd_with_lse(
+        q,
+        k,
+        v,
+        causal=False,
+        query_position_ids=torch.tensor([[2, 3]]),
+        key_position_ids=torch.tensor([[0, 1, 2]]),
+    )
+
+    assert calls == [
+        {
+            "q_shape": (1, 2, 4, 8),
+            "k_shape": (1, 3, 2, 8),
+            "pack_gqa": True,
+            "num_splits": 1,
+            "return_lse": True,
+        }
+    ]
+    assert result.out.shape == q.shape
+    assert result.lse.shape == (1, 4, 2)
+    assert result.lse.dtype is torch.float32
 
 
 # FA4 is the CUDA production core. On ROCm the strict default correctly resolves

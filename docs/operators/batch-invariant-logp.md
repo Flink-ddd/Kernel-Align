@@ -93,8 +93,8 @@ The optional Vime adapter is owned by RL-Kernel and can be selected without
 patching Megatron or vLLM:
 
 ```text
---selected-logprob-provider rl_engine.integrations.vime.logp.provider
---selected-logprob-provider-mode strict
+--linear-logp-provider rl_engine.integrations.vime.linear_logp_provider.provider
+--linear-logp-provider-mode strict
 ```
 
 Vime passes the local `[T, V_local]` logits, shifted targets, TP subgroup,
