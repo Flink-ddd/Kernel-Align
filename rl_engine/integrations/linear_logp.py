@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+
 from rl_engine.integrations.ablation import operator_ablation_case
 
 
@@ -160,10 +161,10 @@ class LinearLogpWrapper:
             if bool((value <= 0).any().item()):
                 raise ValueError("temperature must be positive")
             return value
-        value = float(temperature)
-        if value <= 0.0:
-            raise ValueError(f"temperature must be positive, got {value}")
-        return torch.full((rows,), value, device=device, dtype=torch.float32)
+        scalar = float(temperature)
+        if scalar <= 0.0:
+            raise ValueError(f"temperature must be positive, got {scalar}")
+        return torch.full((rows,), scalar, device=device, dtype=torch.float32)
 
     @staticmethod
     def _validate_targets(target_ids: torch.Tensor, *, rows: int, real_vocab_size: int) -> None:
