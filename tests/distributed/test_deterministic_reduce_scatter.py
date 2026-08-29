@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from rl_engine.distributed import DeterministicCollective
+from rl_engine.distributed import create_deterministic_collective
 
 _MAX_WORLD_SIZE = 8
 _TP_SIZES = (1, 2, 4, 8)
@@ -61,7 +61,7 @@ def _worker(rank: int, port: int) -> None:
         groups = {tp_size: dist.new_group(ranks=list(range(tp_size))) for tp_size in _TP_SIZES}
         for tp_size, group in groups.items():
             if rank < tp_size:
-                with DeterministicCollective(
+                with create_deterministic_collective(
                     group=group,
                     device=device,
                     max_size_bytes=1024 * 1024,
@@ -98,6 +98,49 @@ def _worker(rank: int, port: int) -> None:
                         returned = collective.reduce_scatter(input, out=provided)
                         assert returned is provided
                         assert torch.equal(provided, expected)
+
+                        if dtype in (torch.float16, torch.bfloat16):
+                            output_storage = torch.empty(
+                                expected.numel() + 1,
+                                dtype=dtype,
+                                device=device,
+                            )
+                            misaligned_output = output_storage[1:].view_as(expected)
+                            returned = collective.reduce_scatter(
+                                input,
+                                out=misaligned_output,
+                            )
+                            assert returned is misaligned_output
+                            assert torch.equal(misaligned_output, expected)
+
+                        other_generator = torch.Generator().manual_seed(20260817)
+                        other_leaves_tensor = torch.randn(
+                            _MAX_WORLD_SIZE,
+                            _MAX_WORLD_SIZE * 17,
+                            19,
+                            dtype=torch.float32,
+                            generator=other_generator,
+                        ).to(device=device, dtype=dtype)
+                        other_leaves = list(other_leaves_tensor.unbind())
+                        other_input = _fixed_tree_reference(
+                            other_leaves[start : start + leaves_per_rank]
+                        )
+                        other_reduced = _fixed_tree_reference(other_leaves)
+                        other_expected = other_reduced.chunk(tp_size, dim=0)[group_rank]
+                        many_outs = (torch.empty_like(expected), torch.empty_like(other_expected))
+                        many_returned = collective.reduce_scatter_many(
+                            (input, other_input),
+                            outs=many_outs,
+                        )
+                        assert many_returned[0] is many_outs[0]
+                        assert many_returned[1] is many_outs[1]
+                        assert torch.equal(many_returned[0], expected)
+                        assert torch.equal(many_returned[1], other_expected)
+                        many_baseline = tuple(value.clone() for value in many_returned)
+                        for _ in range(3):
+                            many_repeated = collective.reduce_scatter_many((input, other_input))
+                            assert torch.equal(many_repeated[0], many_baseline[0])
+                            assert torch.equal(many_repeated[1], many_baseline[1])
             dist.barrier()
     finally:
         dist.destroy_process_group()

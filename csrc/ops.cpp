@@ -105,6 +105,54 @@ void deterministic_collective_reduce_scatter(int64_t handle, torch::Tensor& outp
 void deterministic_collective_all_gather(int64_t handle, torch::Tensor& output);
 #endif
 
+#if defined(KERNEL_ALIGN_WITH_ROCM)
+// ROCm keeps arithmetic in a fixed balanced tree while using either RCCL or
+// HIP IPC for rank-ordered transport. These kernels expose the local and IPC
+// reduction paths without changing the CUDA implementation.
+void deterministic_collective_rocm_all_reduce(
+    torch::Tensor rank_inputs,
+    torch::Tensor output);
+void deterministic_collective_rocm_reduce_scatter(
+    torch::Tensor rank_inputs,
+    torch::Tensor output);
+torch::Tensor deterministic_collective_rocm_ipc_allocate(int64_t size_bytes);
+std::tuple<std::vector<int64_t>, int64_t>
+deterministic_collective_rocm_ipc_meta(torch::Tensor tensor);
+int64_t deterministic_collective_rocm_ipc_create(
+    torch::Tensor staging,
+    const std::vector<std::vector<int64_t>>& handles,
+    const std::vector<int64_t>& offsets,
+    int64_t rank);
+void deterministic_collective_rocm_ipc_synchronize(int64_t handle);
+void deterministic_collective_rocm_ipc_destroy(int64_t handle);
+void deterministic_collective_rocm_ipc_stage(int64_t handle, torch::Tensor input);
+void deterministic_collective_rocm_ipc_all_reduce(
+    int64_t handle,
+    torch::Tensor output);
+void deterministic_collective_rocm_ipc_all_reduce_input(
+    int64_t handle,
+    torch::Tensor input,
+    torch::Tensor output);
+void deterministic_collective_rocm_ipc_reduce_scatter(
+    int64_t handle,
+    torch::Tensor output);
+void deterministic_collective_rocm_ipc_reduce_scatter_input(
+    int64_t handle,
+    torch::Tensor input,
+    torch::Tensor output);
+void deterministic_collective_rocm_ipc_reduce_scatter_many(
+    int64_t handle,
+    const std::vector<torch::Tensor>& inputs,
+    const std::vector<torch::Tensor>& outputs);
+void deterministic_collective_rocm_ipc_all_gather(
+    int64_t handle,
+    torch::Tensor output);
+void deterministic_collective_rocm_ipc_all_gather_input(
+    int64_t handle,
+    torch::Tensor input,
+    torch::Tensor output);
+#endif
+
 // Batch-Invariant Deterministic GEMM Declarations
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
 torch::Tensor det_gemm_fwd_fp32(torch::Tensor a, torch::Tensor b);
@@ -426,6 +474,56 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // registry Prefix-Shared Attention
     m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
+#endif
+
+#if defined(KERNEL_ALIGN_WITH_ROCM)
+    m.def(
+        "deterministic_collective_rocm_all_reduce",
+        &deterministic_collective_rocm_all_reduce,
+        "Run the ROCm fixed-tree all-reduce kernel");
+    m.def(
+        "deterministic_collective_rocm_reduce_scatter",
+        &deterministic_collective_rocm_reduce_scatter,
+        "Run the ROCm fixed-tree reduce-scatter kernel");
+    m.def("deterministic_collective_rocm_ipc_meta",
+          &deterministic_collective_rocm_ipc_meta,
+          "Export a ROCm allocation for IPC deterministic collectives");
+    m.def("deterministic_collective_rocm_ipc_allocate",
+          &deterministic_collective_rocm_ipc_allocate,
+          "Allocate ROCm memory that supports IPC export");
+    m.def("deterministic_collective_rocm_ipc_create",
+          &deterministic_collective_rocm_ipc_create,
+          "Create a ROCm IPC deterministic collective state");
+    m.def("deterministic_collective_rocm_ipc_destroy",
+          &deterministic_collective_rocm_ipc_destroy,
+          "Destroy a ROCm IPC deterministic collective state");
+    m.def("deterministic_collective_rocm_ipc_synchronize",
+          &deterministic_collective_rocm_ipc_synchronize,
+          "Wait until every rank finishes reading ROCm IPC staging");
+    m.def("deterministic_collective_rocm_ipc_stage",
+          &deterministic_collective_rocm_ipc_stage,
+          "Stage an input for ROCm IPC deterministic collectives");
+    m.def("deterministic_collective_rocm_ipc_all_reduce",
+          &deterministic_collective_rocm_ipc_all_reduce,
+          "Run a direct ROCm IPC fixed-tree all-reduce");
+    m.def("deterministic_collective_rocm_ipc_all_reduce_input",
+          &deterministic_collective_rocm_ipc_all_reduce_input,
+          "Stage and run a direct ROCm IPC fixed-tree all-reduce");
+    m.def("deterministic_collective_rocm_ipc_reduce_scatter",
+          &deterministic_collective_rocm_ipc_reduce_scatter,
+          "Run a direct ROCm IPC fixed-tree reduce-scatter");
+    m.def("deterministic_collective_rocm_ipc_reduce_scatter_input",
+          &deterministic_collective_rocm_ipc_reduce_scatter_input,
+          "Stage and run a direct ROCm IPC fixed-tree reduce-scatter");
+    m.def("deterministic_collective_rocm_ipc_reduce_scatter_many",
+          &deterministic_collective_rocm_ipc_reduce_scatter_many,
+          "Run multiple ROCm IPC fixed-tree reduce-scatters with one synchronization");
+    m.def("deterministic_collective_rocm_ipc_all_gather",
+          &deterministic_collective_rocm_ipc_all_gather,
+          "Run a direct ROCm IPC rank-ordered all-gather");
+    m.def("deterministic_collective_rocm_ipc_all_gather_input",
+          &deterministic_collective_rocm_ipc_all_gather_input,
+          "Stage and run a direct ROCm IPC rank-ordered all-gather");
 #endif
 
     // registry Batch-Invariant Deterministic GEMM

@@ -149,6 +149,10 @@ def get_extensions():
                     "csrc/cuda/distributed/deterministic_collective.cu",
                 ]
             )
+        else:
+            cuda_sources.append(
+                "csrc/rocm/distributed/deterministic_collective.hip"
+            )
 
         nvcc_flags = ["-O3", "-Xfatbin", "-compress-all"]
         if envs.env_flag(envs.KERNEL_ALIGN_USE_FAST_MATH):
@@ -218,6 +222,9 @@ def get_extensions():
         platform_define = "-DKERNEL_ALIGN_WITH_ROCM" if is_rocm else "-DKERNEL_ALIGN_WITH_CUDA"
         cxx_flags = ["-O3", "-std=c++17", platform_define]
         extra_link_args = list(torch_rpath)
+        if os.name != "nt" and not is_rocm:
+            # CUDA IPC metadata queries use the driver API (cuPointerGetAttribute).
+            extra_link_args.append("-lcuda")
 
         if not is_rocm:
             sm90_srcs = [

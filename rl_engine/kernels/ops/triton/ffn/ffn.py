@@ -461,8 +461,12 @@ class _TritonDeterministicFFNFunction(torch.autograd.Function):
         tp_world = tp_dist.get_world_size(group=tp_group) if tp_dist is not None else 1
         gemm_tokens = rmsnorm_output_2d.size(0) * (tp_world if sequence_parallel else 1)
         element_size = rmsnorm_output_2d.element_size()
+        token_hidden_bytes = gemm_tokens * rmsnorm_output_2d.size(1) * element_size
+        # Sequence-parallel backward reduces the independent gate/up input
+        # gradient lanes in one fixed-tree transport call.
+        reduction_bytes = token_hidden_bytes * (2 if sequence_parallel else 1)
         min_size_bytes = max(
-            gemm_tokens * rmsnorm_output_2d.size(1) * element_size,
+            reduction_bytes,
             gemm_tokens * gate_weight.size(0) * element_size,
             gate_weight.numel() * element_size,
             up_weight.numel() * element_size,
@@ -550,24 +554,18 @@ class _TritonDeterministicFFNFunction(torch.autograd.Function):
             grad_up_weight = _gemm_db(rmsnorm_output, grad_up)
 
         grad_rmsnorm_from_gate = _gemm(grad_gate, gate_weight)
+        grad_rmsnorm_from_up = _gemm(grad_up, up_weight)
         if ctx.sequence_parallel:
-            grad_rmsnorm_from_gate = _reduce_scatter_tokens(
-                grad_rmsnorm_from_gate,
-                tp_collective,
+            grad_rmsnorm_from_gate, grad_rmsnorm_from_up = (
+                tp_collective.reduce_scatter_many(
+                    (grad_rmsnorm_from_gate, grad_rmsnorm_from_up)
+                )
             )
         elif tp_collective is not None:
             grad_rmsnorm_from_gate = _all_reduce_inplace(
                 grad_rmsnorm_from_gate,
                 tp_collective,
             )
-
-        grad_rmsnorm_from_up = _gemm(grad_up, up_weight)
-        if ctx.sequence_parallel:
-            grad_rmsnorm_from_up = _reduce_scatter_tokens(
-                grad_rmsnorm_from_up,
-                tp_collective,
-            )
-        elif tp_collective is not None:
             grad_rmsnorm_from_up = _all_reduce_inplace(
                 grad_rmsnorm_from_up,
                 tp_collective,

@@ -628,8 +628,13 @@ class _RCCLRankOrderedTransport:
             raise AttentionCPCommunicationUnavailable(
                 "RCCL scatter leading dimension must divide the CP world size"
             )
-        chunks = tuple(chunk.contiguous() for chunk in full.chunk(self.world_size, dim=0))
-        local = torch.empty_like(chunks[self.rank])
+        # Leading-dimension chunks are already contiguous. Avoid materializing
+        # copies for every rank; non-root ranks do not need a scatter list.
+        local_shape = (full.size(0) // self.world_size, *full.shape[1:])
+        local = torch.empty(local_shape, dtype=full.dtype, device=full.device)
+        if self.world_size == 1:
+            local.copy_(full)
+            return local
         global_root = self.root
         if self.group is not None:
             get_global_rank = getattr(dist, "get_global_rank", None)
@@ -637,12 +642,8 @@ class _RCCLRankOrderedTransport:
                 global_root = int(get_global_rank(self.group, self.root))
             else:
                 global_root = int(dist.get_process_group_ranks(self.group)[self.root])
-        dist.scatter(
-            local,
-            scatter_list=list(chunks) if self.rank == self.root else None,
-            src=global_root,
-            group=self.group,
-        )
+        scatter_list = list(full.chunk(self.world_size, dim=0)) if self.rank == self.root else None
+        dist.scatter(local, scatter_list=scatter_list, src=global_root, group=self.group)
         return local
 
     def reduce_scatter(self, full: torch.Tensor) -> torch.Tensor:
@@ -680,6 +681,8 @@ class RCCLAGRSAttentionCPCommunication(CUDAAGRSAttentionCPCommunication):
     backend_id = "rccl_ag_rs"
     supports_autograd = True
     transport_only = True
+    supports_async_overlap = False
+    supports_compute_communication_fusion = False
 
     def _get_collective(self, plan: AttentionCPCommunicationPlan):
         if self._collective is None:
