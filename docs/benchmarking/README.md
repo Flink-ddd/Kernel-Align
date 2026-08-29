@@ -14,8 +14,29 @@ python benchmarks/profiler.py --format json --output reports/profile.json
 python benchmarks/benchmark_sampling.py
 python benchmarks/benchmark_grpo_op.py
 python benchmarks/benchmark_pack.py --smoke
+python benchmarks/benchmark_rocm_ffn.py --help
 python scripts/run_perf.py
 ```
+
+## Unified ROCm deterministic FFN benchmark
+
+The RCCL/FFN benchmark has one entry point. It measures the deterministic
+Triton FFN across TP, CP, and sequence-parallel layouts, checks bitwise
+exactness against deterministic TP=1, and compares four distributed paths at
+the same topology: H100 official/deterministic and MI300X
+official/deterministic. TP=1 latency is not part of the distributed figure.
+
+```bash
+HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NCCL_IB_DISABLE=1 PYTHONPATH=. \
+  python benchmarks/benchmark_rocm_ffn.py \
+  --warmup 5 --samples 20 --training-samples 10 \
+  --output-dir benchmarks/results/pr325_rocm_mi300x
+```
+
+The checked-in report is
+`benchmarks/results/pr325_rocm_mi300x/report.md`, with the machine-readable
+data in `results.json` and the updated topology figure in
+`distributed_ffn_overhead.png`.
 
 The automated profiler records one row per workload shape with:
 

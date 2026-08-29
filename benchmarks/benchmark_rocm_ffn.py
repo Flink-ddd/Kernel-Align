@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""ROCm analysis for the deterministic distributed Triton Qwen3 FFN.
+"""ROCm benchmark for the deterministic distributed Triton Qwen3 FFN.
 
-Performance compares the PR's FFN with the official Hugging Face Qwen3MLP at
-TP=1. Determinism compares every Triton TP/CP/SP layout bitwise with Triton
-TP=1. A separate, simple FP16-versus-FP32 observation uses official Qwen3MLP.
-No model checkpoint or serving engine is used.
+Distributed performance compares four paths at the same TP/CP/SP topology:
+H100 official/deterministic and MI300X official/deterministic. Determinism
+compares every Triton TP/CP/SP layout bitwise with Triton TP=1. A separate
+single-GPU section retains the official Hugging Face Qwen3MLP TP=1 context. No
+model checkpoint or serving engine is used.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from typing import Any, Callable
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.nn.functional as F
 from transformers import __version__ as transformers_version
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
@@ -50,6 +52,33 @@ _DISTRIBUTED_CONFIGS: dict[int, tuple[tuple[str, int, int, bool], ...]] = {
     ),
 }
 _TP1_FORWARD_CACHE_BYTES = 3 * 4096 * 12288 * torch.bfloat16.itemsize
+_COMMUNICATION_CONTRACT = {
+    "forward": {"all_gather": 1, "reduce_scatter": 1, "total": 2},
+    "train_fwd_bwd": {
+        "all_gather": 7,
+        "reduce_scatter_logical_lanes": 3,
+        "logical_total": 10,
+        "collective_invocations": 9,
+    },
+}
+_PREVIOUS_DISTRIBUTED_TRITON_MS = {
+    ("tp2", "forward"): 0.9039933793246746,
+    ("tp2", "train_fwd_bwd"): 2.6996671222150326,
+    ("tp2_sp", "forward"): 1.0561398230493069,
+    ("tp2_sp", "train_fwd_bwd"): 2.9646214097738266,
+    ("tp4", "forward"): 0.8358820341527462,
+    ("tp4", "train_fwd_bwd"): 2.6998785324394703,
+    ("tp2_cp2", "forward"): 0.9015901014208794,
+    ("tp2_cp2", "train_fwd_bwd"): 3.5605919547379017,
+    ("tp2_cp2_sp", "forward"): 1.1296039447188377,
+    ("tp2_cp2_sp", "train_fwd_bwd"): 3.992859274148941,
+    ("tp8", "forward"): 1.0859542526304722,
+    ("tp8", "train_fwd_bwd"): 2.5620022788643837,
+    ("tp4_cp2", "forward"): 1.0536308400332928,
+    ("tp4_cp2", "train_fwd_bwd"): 3.259910736232996,
+    ("tp4_cp2_sp", "forward"): 1.1927778832614422,
+    ("tp4_cp2_sp", "train_fwd_bwd"): 3.7497887387871742,
+}
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -168,6 +197,154 @@ def _training_step(
         value.grad = None
     output = function(*inputs)
     output.backward(grad_output)
+    return output
+
+
+class _NativeAllReduce(torch.autograd.Function):
+    """Autograd-aware native ProcessGroup all-reduce used by the baseline."""
+
+    @staticmethod
+    def forward(ctx: Any, input: torch.Tensor, group: Any) -> torch.Tensor:
+        ctx.group = group
+        output = input.contiguous().clone()
+        dist.all_reduce(output, group=group)
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return grad_output, None
+
+
+class _NativeCopyToTensorParallel(torch.autograd.Function):
+    """Identity in forward and native all-reduce in backward."""
+
+    @staticmethod
+    def forward(ctx: Any, input: torch.Tensor, group: Any) -> torch.Tensor:
+        ctx.group = group
+        return input
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        grad_input = grad_output.contiguous().clone()
+        dist.all_reduce(grad_input, group=ctx.group)
+        return grad_input, None
+
+
+class _NativeAllGather(torch.autograd.Function):
+    """Autograd-aware native first-dimension all-gather baseline."""
+
+    @staticmethod
+    def forward(ctx: Any, input: torch.Tensor, group: Any) -> torch.Tensor:
+        world_size = dist.get_world_size(group=group)
+        ctx.group = group
+        ctx.input_shape = tuple(input.shape)
+        input_flat = input.contiguous().view(-1)
+        output_flat = torch.empty(
+            world_size * input_flat.numel(),
+            dtype=input.dtype,
+            device=input.device,
+        )
+        dist.all_gather_into_tensor(output_flat, input_flat, group=group)
+        return output_flat.view(world_size * input.size(0), *input.shape[1:])
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        grad_output_flat = grad_output.contiguous().view(-1)
+        grad_input_flat = torch.empty(
+            math.prod(ctx.input_shape),
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        )
+        dist.reduce_scatter_tensor(
+            grad_input_flat,
+            grad_output_flat,
+            group=ctx.group,
+        )
+        return grad_input_flat.view(ctx.input_shape), None
+
+
+class _NativeReduceScatter(torch.autograd.Function):
+    """Autograd-aware native first-dimension reduce-scatter baseline."""
+
+    @staticmethod
+    def forward(ctx: Any, input: torch.Tensor, group: Any) -> torch.Tensor:
+        world_size = dist.get_world_size(group=group)
+        if input.size(0) % world_size != 0:
+            raise ValueError("native reduce-scatter requires divisible dimension 0")
+        ctx.group = group
+        ctx.input_shape = tuple(input.shape)
+        output_shape = (input.size(0) // world_size, *input.shape[1:])
+        output_flat = torch.empty(
+            math.prod(output_shape),
+            dtype=input.dtype,
+            device=input.device,
+        )
+        dist.reduce_scatter_tensor(
+            output_flat,
+            input.contiguous().view(-1),
+            group=group,
+        )
+        return output_flat.view(output_shape)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        grad_output_flat = grad_output.contiguous().view(-1)
+        grad_input_flat = torch.empty(
+            math.prod(ctx.input_shape),
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        )
+        dist.all_gather_into_tensor(
+            grad_input_flat,
+            grad_output_flat,
+            group=ctx.group,
+        )
+        return grad_input_flat.view(ctx.input_shape), None
+
+
+def _official_distributed_ffn(
+    hidden: torch.Tensor,
+    gate_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    *,
+    tp_group: Any,
+    sequence_parallel: bool,
+) -> torch.Tensor:
+    """Upstream Qwen3 FFN math with native distributed collectives."""
+    full_hidden = (
+        _NativeAllGather.apply(hidden, tp_group)
+        if sequence_parallel
+        else _NativeCopyToTensorParallel.apply(hidden, tp_group)
+    )
+    activated = F.silu(F.linear(full_hidden, gate_weight)) * F.linear(
+        full_hidden, up_weight
+    )
+    partial_output = F.linear(activated, down_weight)
+    if sequence_parallel:
+        return _NativeReduceScatter.apply(partial_output, tp_group)
+    return _NativeAllReduce.apply(partial_output, tp_group)
+
+
+def _official_distributed_training_step(
+    inputs: list[torch.Tensor],
+    grad_output: torch.Tensor,
+    *,
+    tp_group: Any,
+    cp_group: Any,
+    sequence_parallel: bool,
+) -> torch.Tensor:
+    for value in inputs:
+        value.grad = None
+    output = _official_distributed_ffn(
+        *inputs,
+        tp_group=tp_group,
+        sequence_parallel=sequence_parallel,
+    )
+    output.backward(grad_output)
+    if cp_group is not None:
+        for weight in inputs[1:]:
+            dist.all_reduce(weight.grad, group=cp_group)
     return output
 
 
@@ -446,42 +623,6 @@ def _distributed_ffn_benchmark(
         (token_count, hidden_size), seed=5004, device=device
     )
 
-    # Performance reference: upstream Qwen3MLP, unsharded TP=1, full M=32 input.
-    official = _official_qwen3_mlp(gate_full, up_full, down_full)
-
-    def official_forward() -> torch.Tensor:
-        return _official_inference(official, hidden_full)
-
-    official_forward_summary = _slowest_rank_summary(
-        _distributed_wall_samples(
-            official_forward,
-            group=dist.group.WORLD,
-            warmup=warmup,
-            samples=samples,
-        ),
-        dist.group.WORLD,
-    )
-    official_hidden = hidden_full.detach().clone().requires_grad_(True)
-
-    def official_training_step() -> torch.Tensor:
-        official.zero_grad(set_to_none=True)
-        official_hidden.grad = None
-        output = official(official_hidden)
-        output.backward(grad_output_full)
-        return output
-
-    official_train_summary = _slowest_rank_summary(
-        _distributed_wall_samples(
-            official_training_step,
-            group=dist.group.WORLD,
-            warmup=max(1, warmup // 2),
-            samples=training_samples,
-        ),
-        dist.group.WORLD,
-    )
-    del official, official_hidden
-    torch.cuda.empty_cache()
-
     # Exactness reference: the same deterministic Triton implementation at TP=1.
     full_values = (hidden_full, gate_full, up_full, down_full)
     tp1_forward_weights = pack_qwen3_ffn_forward_weights(*full_values[1:])
@@ -534,6 +675,42 @@ def _distributed_ffn_benchmark(
         )
         shard_forward_weights = pack_qwen3_ffn_forward_weights(*shard[1:])
         local_grad_output = grad_output_full[token_start:token_end].contiguous()
+
+        def official_distributed_forward():
+            with torch.no_grad():
+                return _official_distributed_ffn(
+                    *shard,
+                    tp_group=tp_group,
+                    sequence_parallel=sequence_parallel,
+                )
+
+        official_forward_summary = _slowest_rank_summary(
+            _distributed_wall_samples(
+                official_distributed_forward,
+                group=dist.group.WORLD,
+                warmup=warmup,
+                samples=samples,
+            ),
+            dist.group.WORLD,
+        )
+        official_inputs = [
+            value.detach().clone().requires_grad_(True) for value in shard
+        ]
+        official_train_summary = _slowest_rank_summary(
+            _distributed_wall_samples(
+                lambda: _official_distributed_training_step(
+                    official_inputs,
+                    local_grad_output,
+                    tp_group=tp_group,
+                    cp_group=cp_group,
+                    sequence_parallel=sequence_parallel,
+                ),
+                group=dist.group.WORLD,
+                warmup=max(1, warmup // 2),
+                samples=training_samples,
+            ),
+            dist.group.WORLD,
+        )
 
         def triton_forward():
             return qwen3_ffn(
@@ -650,9 +827,9 @@ def _distributed_ffn_benchmark(
                     {
                         **common,
                         "direction": "forward",
-                        "official_tp1": official_forward_summary,
+                        "official_distributed": official_forward_summary,
                         "triton": triton_forward_summary,
-                        "latency_ratio_vs_official_tp1": (
+                        "latency_ratio_triton_vs_official_distributed": (
                             triton_forward_summary["median_ms"]
                             / official_forward_summary["median_ms"]
                         ),
@@ -671,9 +848,9 @@ def _distributed_ffn_benchmark(
                     {
                         **common,
                         "direction": "train_fwd_bwd",
-                        "official_tp1": official_train_summary,
+                        "official_distributed": official_train_summary,
                         "triton": triton_train_summary,
-                        "latency_ratio_vs_official_tp1": (
+                        "latency_ratio_triton_vs_official_distributed": (
                             triton_train_summary["median_ms"]
                             / official_train_summary["median_ms"]
                         ),
@@ -700,6 +877,7 @@ def _distributed_ffn_benchmark(
         del (
             shard,
             shard_forward_weights,
+            official_inputs,
             triton_inputs,
             triton_forward_weights,
             repeat_inputs,
@@ -724,6 +902,19 @@ def _distributed_worker(
     training_samples: int,
 ) -> None:
     try:
+        try:
+            available_cpus = sorted(os.sched_getaffinity(0))
+            numa_span = max(1, len(available_cpus) // 2)
+            numa_index = 0 if rank < 4 else 1
+            local_rank = rank % 4
+            cpu_index = min(
+                numa_index * numa_span + local_rank,
+                len(available_cpus) - 1,
+            )
+            os.sched_setaffinity(0, {available_cpus[cpu_index]})
+        except (AttributeError, OSError):
+            pass
+        torch.set_num_threads(1)
         torch.cuda.set_device(rank)
         dist.init_process_group(
             backend="nccl",
@@ -868,6 +1059,77 @@ def _load_cuda_cpu_comparison(
     return json.loads(comparison_path.read_text(encoding="utf-8"))
 
 
+def _distributed_platform_comparison_rows(
+    current_rows: list[dict[str, Any]],
+    comparison_payload: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Join H100 and MI300X distributed timings by topology and direction."""
+    if comparison_payload is None:
+        return []
+    h100_lookup = {
+        (row["name"], row["direction"]): row
+        for row in comparison_payload["distributed"]
+    }
+    rows: list[dict[str, Any]] = []
+    for current in current_rows:
+        key = (current["name"], current["direction"])
+        h100 = h100_lookup.get(key)
+        if h100 is None:
+            continue
+        h100_official_ms = float(h100["official_h100_ms"])
+        h100_deterministic_ms = float(h100["cuda_h100_ms"])
+        mi300x_official_ms = float(
+            current["official_distributed"]["median_ms"]
+        )
+        mi300x_deterministic_ms = float(current["triton"]["median_ms"])
+        rows.append(
+            {
+                "name": current["name"],
+                "direction": current["direction"],
+                "tp_size": current["tp_size"],
+                "cp_size": current["cp_size"],
+                "sequence_parallel": current["sequence_parallel"],
+                "h100_official_distributed_ms": h100_official_ms,
+                "h100_deterministic_cuda_ms": h100_deterministic_ms,
+                "mi300x_official_distributed_ms": mi300x_official_ms,
+                "mi300x_deterministic_triton_ms": mi300x_deterministic_ms,
+                "h100_deterministic_over_official_ratio": (
+                    h100_deterministic_ms / h100_official_ms
+                ),
+                "mi300x_deterministic_over_official_ratio": (
+                    mi300x_deterministic_ms / mi300x_official_ms
+                ),
+                "deterministic_mi300x_over_h100_ratio": (
+                    mi300x_deterministic_ms / h100_deterministic_ms
+                ),
+            }
+        )
+    return rows
+
+
+def _previous_deterministic_comparison_rows(
+    current_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compare the current MI300X run with the previous checked report data."""
+    rows: list[dict[str, Any]] = []
+    for current in current_rows:
+        key = (current["name"], current["direction"])
+        previous_ms = _PREVIOUS_DISTRIBUTED_TRITON_MS.get(key)
+        if previous_ms is None:
+            continue
+        current_ms = float(current["triton"]["median_ms"])
+        rows.append(
+            {
+                "name": current["name"],
+                "direction": current["direction"],
+                "previous_ms": previous_ms,
+                "current_ms": current_ms,
+                "latency_reduction_ratio": 1.0 - current_ms / previous_ms,
+            }
+        )
+    return rows
+
+
 def _write_report(
     payload: dict[str, Any],
     output_directory: Path,
@@ -878,12 +1140,22 @@ def _write_report(
     single_speed = payload["single_gpu"]["speed"]
     dtype_rows = payload["single_gpu"]["dtype_accuracy"]
     distributed_speed = payload["distributed_ffn"]
+    platform_comparison = _distributed_platform_comparison_rows(
+        distributed_speed, comparison_payload
+    )
+    previous_comparison = _previous_deterministic_comparison_rows(
+        distributed_speed
+    )
+    previous_reductions = [
+        row["latency_reduction_ratio"] for row in previous_comparison
+    ]
     exactness_rows = _topology_exactness_rows(distributed_speed)
     single_ratios = [
         row["latency_ratio_vs_official_tp1"] for row in single_speed
     ]
-    distributed_ratios = [
-        row["latency_ratio_vs_official_tp1"] for row in distributed_speed
+    platform_ratios = [
+        row["deterministic_mi300x_over_h100_ratio"]
+        for row in platform_comparison
     ]
     total_tp1_mismatch = sum(
         row[key]
@@ -912,9 +1184,9 @@ def _write_report(
         "element mismatch count; acceptance requires 0.",
         "2. **FP16/FP32:** one separate, simple output comparison runs official "
         "Hugging Face `Qwen3MLP` at TP=1 in FP16 and FP32. FP32 is the reference.",
-        "3. **Speed:** official Hugging Face `Qwen3MLP` at TP=1 is the only speed "
-        "baseline. Speed tables and figures intentionally contain no numerical "
-        "accuracy comparison between official FFN and Triton.",
+        "3. **Speed:** single-GPU speed retains the official Qwen3MLP TP=1 "
+        "context. Distributed speed compares four same-topology paths: H100 "
+        "official/deterministic and MI300X official/deterministic.",
         "",
         "## Environment",
         "",
@@ -932,9 +1204,14 @@ def _write_report(
             "determinism measurements.",
             "- Single-GPU shapes use M=1/8/32. Distributed cases use the same full "
             "logical M=32 input for TP2/4/8, TP+CP, and sequence parallelism.",
-            "- The official performance baseline is upstream Transformers "
-            "`Qwen3MLP` with unsharded weights and input (TP=1). Each distributed "
-            "rank runs that TP=1 reference and the slowest rank/sample is reported.",
+            "- The distributed comparison joins rows by topology and direction: "
+            "H100 and MI300X use the same logical M=32 workload and TP/CP/SP layout. "
+            "Official TP=1 latency is neither collected nor used in that distributed "
+            "ratio.",
+            "- MI300X official distributed uses upstream Qwen3 FFN math with native "
+            "PyTorch BF16 GEMMs and native RCCL collectives over the same shards; "
+            "the deterministic path uses the current Triton FFN and fixed-order "
+            "transport.",
             "- Deterministic Triton timings use the explicit prepacked forward-weight "
             "cache. Packing happens once outside the timed region; canonical source "
             "weights remain the autograd and optimizer source of truth.",
@@ -944,8 +1221,18 @@ def _write_report(
             "- The distributed exactness baseline is the PR's deterministic Triton "
             "FFN at TP=1. Local outputs, dHidden, and sharded dWeights are compared "
             "against their exact TP=1 slices.",
+            "- Communication contract for TP+CP+SP: forward uses 1 TP AllGather "
+            "plus 1 TP ReduceScatter (2 calls). Forward+backward retains 7 "
+            "AllGathers plus 3 logical ReduceScatter lanes; PR #357 merges the "
+            "two independent backward gate/up lanes into one "
+            "`reduce_scatter_many` call, for 9 collective invocations.",
+            "- Implementation note: the current ROCm deterministic communication "
+            "operator is adopted from PR #357. This changes the implementation "
+            "under test, not the benchmark comparison contract.",
             f"- Single-GPU timing: {methodology['single_gpu_timing']}; distributed "
             f"timing: {methodology['distributed_timing']}.",
+            f"- Distributed workers: {methodology['distributed_worker_cpu_affinity']} "
+            "to reduce host-scheduler noise in synchronized wall-clock samples.",
             f"- {methodology['warmup']} warmups, {methodology['samples']} measured "
             f"forward samples, and {methodology['training_samples']} measured "
             "forward+backward samples.",
@@ -972,9 +1259,22 @@ def _write_report(
             f"- Single-GPU deterministic Triton packed-cache latency is "
             f"**{min(single_ratios):.2f}-{max(single_ratios):.2f}x** the official "
             "Qwen3MLP TP=1 latency across M=1/8/32 and forward/training.",
-            f"- Distributed deterministic Triton packed-cache latency is "
-            f"**{min(distributed_ratios):.2f}-{max(distributed_ratios):.2f}x** the "
-            "official Qwen3MLP TP=1 latency across tested parallel layouts.",
+            (
+                f"- MI300X deterministic Triton latency is **{min(platform_ratios):.2f}-"
+                f"{max(platform_ratios):.2f}x** the H100 deterministic CUDA latency "
+                "for the same distributed layouts. Both official distributed "
+                "paths are reported alongside them."
+                if platform_ratios
+                else "- No matching H100 distributed rows were supplied."
+            ),
+            (
+                f"- Versus the previous deterministic MI300X benchmark, PR #357 "
+                f"improves **{sum(value > 0 for value in previous_reductions)}/"
+                f"{len(previous_reductions)}** rows, with a mean latency reduction "
+                f"of **{statistics.mean(previous_reductions) * 100:.1f}%**."
+                if previous_reductions
+                else "- No previous deterministic MI300X rows were available."
+            ),
             f"- The separate official-Qwen3MLP FP16 versus FP32 observation has "
             f"relative-L2 error **{dtype_row['relative_l2']:.3e}** for "
             "(M,H,I)=(8,4096,12288).",
@@ -996,37 +1296,76 @@ def _write_report(
             f"{row['latency_ratio_vs_official_tp1']:.2f}x |"
         )
 
-    lines.extend(
-        (
-            "",
-            "## Distributed FFN speed",
-            "",
-            "The baseline remains the full logical M=32 official FFN at TP=1 for "
-            "every row. Performance only; no numerical accuracy is mixed into "
-            "this comparison.",
-            "",
-            "| Parallel layout | Direction | Official Qwen3MLP TP=1 (ms) | "
-            "Deterministic distributed Triton, packed (ms) | Triton / official "
-            "TP=1 |",
-            "|---|---|---:|---:|---:|",
+    lines.extend(("", "## Distributed FFN speed", ""))
+    if platform_comparison:
+        lines.extend(
+            (
+                "Every row compares the same distributed topology and direction. "
+                "No TP=1 latency is used in this table.",
+                "",
+                "| Parallel layout | Direction | H100 official distributed (ms) | "
+                "H100 deterministic CUDA (ms) | MI300X official distributed (ms) | "
+                "MI300X deterministic Triton (ms) | H100 det / official | "
+                "MI300X det / official |",
+                "|---|---|---:|---:|---:|---:|---:|---:|",
+            )
         )
-    )
-    for row in distributed_speed:
-        lines.append(
-            f"| {row['name']} | {row['direction']} | "
-            f"{row['official_tp1']['median_ms']:.4f} | "
-            f"{row['triton']['median_ms']:.4f} | "
-            f"{row['latency_ratio_vs_official_tp1']:.2f}x |"
+        for row in platform_comparison:
+            lines.append(
+                f"| {row['name']} | {row['direction']} | "
+                f"{row['h100_official_distributed_ms']:.4f} | "
+                f"{row['h100_deterministic_cuda_ms']:.4f} | "
+                f"{row['mi300x_official_distributed_ms']:.4f} | "
+                f"{row['mi300x_deterministic_triton_ms']:.4f} | "
+                f"{row['h100_deterministic_over_official_ratio']:.2f}x | "
+                f"{row['mi300x_deterministic_over_official_ratio']:.2f}x |"
+            )
+    else:
+        lines.extend(
+            (
+                "No matching H100 distributed data was supplied; current MI300X "
+                "latency is reported without a TP=1 ratio.",
+                "",
+                "| Parallel layout | Direction | MI300X official distributed (ms) | "
+                "MI300X deterministic Triton (ms) | Deterministic / official |",
+                "|---|---|---:|---:|---:|",
+            )
         )
+        for row in distributed_speed:
+            lines.append(
+                f"| {row['name']} | {row['direction']} | "
+                f"{row['official_distributed']['median_ms']:.4f} | "
+                f"{row['triton']['median_ms']:.4f} | "
+                f"{row['latency_ratio_triton_vs_official_distributed']:.2f}x |"
+            )
+
+    if previous_comparison:
+        lines.extend(
+            (
+                "",
+                "### PR #357 latency change versus the previous benchmark",
+                "",
+                "This comparison changes only the deterministic ROCm communication "
+                "implementation. It is not included as another series in the main "
+                "four-path figure.",
+                "",
+                "| Parallel layout | Direction | Previous (ms) | Current (ms) | "
+                "Latency reduction |",
+                "|---|---|---:|---:|---:|",
+            )
+        )
+        for row in previous_comparison:
+            lines.append(
+                f"| {row['name']} | {row['direction']} | "
+                f"{row['previous_ms']:.4f} | {row['current_ms']:.4f} | "
+                f"{row['latency_reduction_ratio'] * 100:.1f}% |"
+            )
 
     if comparison_payload is not None:
         comparison_environment = comparison_payload["environment"]
         comparison_source = comparison_payload["source"]
         local_single = {
             (row["tokens"], row["direction"]): row for row in single_speed
-        }
-        local_distributed = {
-            (row["name"], row["direction"]): row for row in distributed_speed
         }
         lines.extend(
             (
@@ -1081,29 +1420,12 @@ def _write_report(
         lines.extend(
             (
                 "",
-                "### Distributed absolute latency",
-                "",
-                "No distributed CPU or H100 Triton replay measurement was supplied. "
-                "Each deterministic implementation is therefore compared with its "
-                "own hardware's official TP=1 baseline.",
-                "",
-                "| Layout | Direction | H100 official TP=1 (ms) | H100 CUDA "
-                "(ms) | CUDA / H100 official | MI300X official TP=1 (ms) | "
-                "MI300X Triton (ms) | Triton / MI300X official |",
-                "|---|---|---:|---:|---:|---:|---:|---:|",
+                "Both H100 columns used in the main distributed table are the "
+                "user-supplied distributed timings. They are joined directly with "
+                "MI300X rows of the same topology and direction; TP=1 values are "
+                "excluded from all four columns.",
             )
         )
-        for row in comparison_payload["distributed"]:
-            local = local_distributed[(row["name"], row["direction"])]
-            lines.append(
-                f"| {row['name']} | {row['direction']} | "
-                f"{row['official_h100_ms']:.4f} | "
-                f"{row['cuda_h100_ms']:.4f} | "
-                f"{row['cuda_h100_ms'] / row['official_h100_ms']:.2f}x | "
-                f"{local['official_tp1']['median_ms']:.4f} | "
-                f"{local['triton']['median_ms']:.4f} | "
-                f"{local['latency_ratio_vs_official_tp1']:.2f}x |"
-            )
 
     lines.extend(
         (
@@ -1385,33 +1707,36 @@ def _write_figures(
     plt.close(figure)
 
     rows = payload["distributed_ffn"]
+    platform_comparison = _distributed_platform_comparison_rows(
+        rows, comparison_payload
+    )
     figure, axes = plt.subplots(1, 2, figsize=(26, 10), sharey=True)
-    if comparison_payload is None:
-        distributed_series = (
-            ("Official Qwen3MLP TP=1", "official_mi300x_ms", "#2563eb"),
-            (
-                "Deterministic distributed Triton (packed)",
-                "triton_mi300x_ms",
-                "#7c3aed",
-            ),
-        )
-        width = 0.37
-    else:
+    if platform_comparison:
         comparison_lookup = {
             (row["name"], row["direction"]): row
-            for row in comparison_payload["distributed"]
+            for row in platform_comparison
         }
         distributed_series = (
-            ("H100 official TP=1", "official_h100_ms", "#60a5fa"),
-            ("H100 deterministic CUDA", "cuda_h100_ms", "#dc2626"),
-            ("MI300X official TP=1", "official_mi300x_ms", "#86efac"),
+            ("H100 official distributed", "h100_official_distributed_ms", "#60a5fa"),
+            ("H100 deterministic CUDA", "h100_deterministic_cuda_ms", "#dc2626"),
+            ("MI300X official distributed", "mi300x_official_distributed_ms", "#86efac"),
             (
-                "MI300X deterministic Triton (packed)",
-                "triton_mi300x_ms",
+                "MI300X deterministic Triton",
+                "mi300x_deterministic_triton_ms",
                 "#7c3aed",
             ),
         )
         width = 0.19
+    else:
+        distributed_series = (
+            ("MI300X official distributed", "mi300x_official_distributed_ms", "#86efac"),
+            (
+                "MI300X deterministic Triton",
+                "mi300x_deterministic_triton_ms",
+                "#7c3aed",
+            ),
+        )
+        width = 0.34
     for axis, direction, direction_label in (
         (axes[0], "forward", "Forward"),
         (axes[1], "train_fwd_bwd", "Forward + backward"),
@@ -1422,10 +1747,10 @@ def _write_figures(
         combined_rows = []
         for row in direction_rows:
             combined = {
-                "official_mi300x_ms": row["official_tp1"]["median_ms"],
-                "triton_mi300x_ms": row["triton"]["median_ms"],
+                "mi300x_official_distributed_ms": row["official_distributed"]["median_ms"],
+                "mi300x_deterministic_triton_ms": row["triton"]["median_ms"],
             }
-            if comparison_payload is not None:
+            if platform_comparison:
                 combined.update(comparison_lookup[(row["name"], direction)])
             combined_rows.append(combined)
         for series_index, (label, key, color) in enumerate(distributed_series):
@@ -1444,7 +1769,7 @@ def _write_figures(
                 bars,
                 labels=[f"{value:.2f}" for value in values],
                 padding=3,
-                fontsize=9 if comparison_payload is not None else 12,
+                fontsize=10,
                 rotation=90,
             )
         axis.set_yscale("log")
@@ -1453,10 +1778,10 @@ def _write_figures(
         axis.set_xticks(positions, labels)
     axes[0].set_ylabel("Median latency (ms, log scale)")
     handles, labels = axes[0].get_legend_handles_labels()
-    if comparison_payload is None:
+    if not platform_comparison:
         axes[0].legend(loc="upper left")
         figure.suptitle(
-            "MI300X distributed FFN speed: official TP=1 vs Triton",
+            "MI300X distributed FFN latency",
             y=0.99,
         )
         figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
@@ -1470,14 +1795,14 @@ def _write_figures(
             ncol=4,
         )
         figure.suptitle(
-            "Distributed FFN absolute latency: H100 CUDA vs MI300X Triton",
+            "Distributed FFN latency: H100 CUDA vs MI300X Triton",
             y=0.99,
         )
         figure.text(
             0.5,
             0.01,
-            "Absolute latency across different hardware; each deterministic path "
-            "uses its own platform's official TP=1 baseline.",
+            "All four paths use the same M=32 workload, direction, and TP/CP/SP "
+            "topology; no TP=1 latency is included.",
             ha="center",
             fontsize=14,
         )
@@ -1497,9 +1822,10 @@ def _environment() -> dict[str, Any]:
         "hip": torch.version.hip,
         "python": os.sys.version.split()[0],
         "git_commit": os.popen("git rev-parse HEAD").read().strip(),
-        "speed_baseline": "Hugging Face Transformers Qwen3MLP, TP=1",
+        "single_gpu_speed_context": "Hugging Face Transformers Qwen3MLP, TP=1",
+        "distributed_speed_comparison": "four same-topology H100/MI300X paths",
         "deterministic_compute": "ROCm-native Triton",
-        "deterministic_transport": "fixed-order RCCL on ROCm",
+        "deterministic_transport": "fixed-tree HIP IPC with RCCL fallback on ROCm",
         "NCCL_IB_DISABLE": os.environ.get("NCCL_IB_DISABLE", ""),
     }
 
@@ -1520,6 +1846,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("benchmarks/results/pr325_rocm_mi300x"),
     )
+    parser.add_argument(
+        "--world-sizes",
+        type=int,
+        nargs="+",
+        choices=(2, 4, 8),
+        default=(2, 4, 8),
+        help="distributed world sizes to benchmark (default: 2 4 8)",
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--training-samples", type=int, default=5)
@@ -1536,6 +1870,7 @@ def main() -> None:
         "methodology": {
             "single_gpu_timing": "GPU events, median and p95",
             "distributed_timing": "synchronized wall clock, slowest rank/sample",
+            "distributed_worker_cpu_affinity": "one NUMA-local CPU per GPU rank",
             "warmup": args.warmup,
             "samples": args.samples,
             "training_samples": args.training_samples,
@@ -1543,6 +1878,7 @@ def main() -> None:
             "triton_weight_layout": "packed_forward_cache_outside_timed_region",
             "tp1_forward_cache_bytes": _TP1_FORWARD_CACHE_BYTES,
         },
+        "communication_contract": _COMMUNICATION_CONTRACT,
         "single_gpu": _single_gpu_benchmarks(
             warmup=args.warmup,
             samples=args.samples,
@@ -1551,7 +1887,7 @@ def main() -> None:
         "distributed_ffn": [],
     }
     torch.cuda.empty_cache()
-    for world_size in (2, 4, 8):
+    for world_size in args.world_sizes:
         result = _run_distributed_world(
             world_size,
             warmup=args.warmup,
@@ -1559,10 +1895,27 @@ def main() -> None:
             training_samples=args.training_samples,
         )
         payload["distributed_ffn"].extend(result["distributed_ffn"])
+    comparison_payload = _load_cuda_cpu_comparison(args.output_dir)
+    platform_comparison = _distributed_platform_comparison_rows(
+        payload["distributed_ffn"], comparison_payload
+    )
+    if platform_comparison:
+        payload["distributed_platform_comparison"] = {
+            "source": "cuda_cpu_comparison.json",
+            "contract": "same M=32 workload, direction, and TP/CP/SP topology",
+            "rows": platform_comparison,
+        }
+    previous_comparison = _previous_deterministic_comparison_rows(
+        payload["distributed_ffn"]
+    )
+    if previous_comparison:
+        payload["previous_deterministic_comparison"] = {
+            "source": "previous checked MI300X benchmark before PR #357",
+            "rows": previous_comparison,
+        }
     (args.output_dir / "results.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
     )
-    comparison_payload = _load_cuda_cpu_comparison(args.output_dir)
     _write_report(payload, args.output_dir, comparison_payload)
     _write_figures(payload, args.output_dir, comparison_payload)
     print(json.dumps({"output_dir": str(args.output_dir), "status": "ok"}))
