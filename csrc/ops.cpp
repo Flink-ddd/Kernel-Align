@@ -93,8 +93,9 @@ torch::Tensor deterministic_logp_forward_fp32(torch::Tensor logits, torch::Tenso
 torch::Tensor deterministic_logp_forward_indexed_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices, torch::Tensor output);
 torch::Tensor deterministic_logp_forward_indexed_fp32(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices);
 
-#if !defined(USE_ROCM)
-// Single-node TP=8 deterministic CUDA collectives.
+#if !defined(USE_ROCM) && !defined(KERNEL_ALIGN_WITH_ROCM)
+// Single-node TP=8 deterministic CUDA IPC collectives. ROCm uses the
+// rank-ordered RCCL transport in rl_engine.distributed.collectives.
 std::tuple<std::vector<int64_t>, int64_t> deterministic_collective_ipc_meta(
     torch::Tensor& tensor);
 int64_t deterministic_collective_create(
@@ -416,10 +417,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deterministic_logp_forward_indexed_out", &deterministic_logp_forward_indexed_out, "Batch-invariant deterministic logp indexed out");
     m.def("deterministic_logp_forward_indexed_fp32", &deterministic_logp_forward_indexed_fp32, "Batch-invariant deterministic logp indexed fp32");
 
-#if !defined(USE_ROCM)
-    // Single-node TP=8 fixed-tree CUDA collectives.  These use CUDA IPC and
-    // their declarations are ROCm-guarded above, so the registrations must be
-    // guarded too or a ROCm build fails on undeclared identifiers.
+#if !defined(USE_ROCM) && !defined(KERNEL_ALIGN_WITH_ROCM)
+    // Single-node TP=8 fixed-tree CUDA IPC collectives. ROCm dispatches to
+    // the Python RCCL transport implementation instead.
     m.def(
         "deterministic_collective_ipc_meta",
         &deterministic_collective_ipc_meta,
@@ -448,6 +448,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "deterministic_collective_all_gather",
         &deterministic_collective_all_gather,
         "Run the TP=8 deterministic rank-ordered all-gather kernel");
+#endif
 
     // Prefix-shared attention uses NVIDIA PTX and falls back to PyTorch SDPA on
     // ROCm; it is covered by the same guard opened above.
