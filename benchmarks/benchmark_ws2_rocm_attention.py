@@ -1017,8 +1017,9 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
         "as in PR #325, no accuracy comparison is mixed into the speed table."
     )
     add(
-        "  - `strict-aiter`: `StrictRocmAiterCKAttentionCore`, the ROCm production core "
-        "(AITER CK dense MHA, non-split API, one logical batch row per launch)."
+        "  - `strict-aiter`: `StrictRocmAiterCKAttentionCore` called **once for all heads**. "
+        "This is the core, not the production schedule: the Vime provider launches it once "
+        "per (batch row, KV group). See the per-KV-group schedule table for that cost."
     )
     add(
         "  - `reference-hip`: `_C.deterministic_attention_forward/backward`, the materializing "
@@ -1194,6 +1195,34 @@ def _write_report(payload: dict[str, Any], output_directory: Path) -> None:
             f"{_fmt(row['invariant'])} |"
         )
     add("")
+
+    # ---- schedule cost
+    schedule = payload.get("tp_schedule_cost") or []
+    if schedule:
+        add("## Cost of the per-KV-group launch schedule")
+        add("")
+        add(
+            "§ TP-degree invariance is bought by launching the core once per "
+            "`(batch row, KV group)` instead of once for all heads. This table is that "
+            "bill. `raw_launch` is one launch for all heads and is **not** the production "
+            "schedule; `per_kv_group` is what the Vime provider actually runs "
+            "(`Hkv` launches per row)."
+        )
+        add("")
+        add(
+            "| S | Launches | sdpa (ms) | raw_launch (ms) | per_kv_group (ms) | "
+            "vs raw | vs sdpa |"
+        )
+        add("|---:|---:|---:|---:|---:|---:|---:|")
+        for row in schedule:
+            raw = row["raw_launch"]["median_ms"]
+            group = row["one_kv_group_per_launch"]["median_ms"]
+            sdpa = row["sdpa"]["median_ms"]
+            add(
+                f"| {row['seq_len']} | {row['launches']} | {sdpa:.4f} | {raw:.4f} | "
+                f"{group:.4f} | {group / raw:.2f}x | {group / sdpa:.2f}x |"
+            )
+        add("")
 
     # ---- distributed
     distributed = payload.get("distributed") or []

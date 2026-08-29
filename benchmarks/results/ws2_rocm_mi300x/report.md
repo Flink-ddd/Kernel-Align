@@ -23,7 +23,7 @@
 - Operator shape: `Hq=32`, `Hkv=8`, `D=128`, `B=1`, causal; sequence sweep 512, 1024, 2048, 4096.
 - Measured paths:
   - `sdpa`: `torch.nn.functional.scaled_dot_product_attention`. **Speed baseline only** — as in PR #325, no accuracy comparison is mixed into the speed table.
-  - `strict-aiter`: `StrictRocmAiterCKAttentionCore`, the ROCm production core (AITER CK dense MHA, non-split API, one logical batch row per launch).
+  - `strict-aiter`: `StrictRocmAiterCKAttentionCore` called **once for all heads**. This is the core, not the production schedule: the Vime provider launches it once per (batch row, KV group). See the per-KV-group schedule table for that cost.
   - `reference-hip`: `_C.deterministic_attention_forward/backward`, the materializing FP32 reference core hipified from the shared `.cu`.
   - `triton-bitwise`: `TritonDeterministicAttentionOp`, whose contract is bit-identity with `reference-hip`.
 - Timing: CUDA events, median and p95. Peak memory is the per-call increase in `torch.cuda.max_memory_allocated` above what was live before the call.
@@ -214,6 +214,17 @@ A head shard computed under TP=N versus the same slice of an unsharded run. TP p
 | 4096 | one_kv_group_per_launch | 2 | 16 | 4 | 0.000000e+00 | 0.000000e+00 | yes |
 | 4096 | one_kv_group_per_launch | 4 | 8 | 2 | 0.000000e+00 | 0.000000e+00 | yes |
 | 4096 | one_kv_group_per_launch | 8 | 4 | 1 | 0.000000e+00 | 0.000000e+00 | yes |
+
+## Cost of the per-KV-group launch schedule
+
+§ TP-degree invariance is bought by launching the core once per `(batch row, KV group)` instead of once for all heads. This table is that bill. `raw_launch` is one launch for all heads and is **not** the production schedule; `per_kv_group` is what the Vime provider actually runs (`Hkv` launches per row).
+
+| S | Launches | sdpa (ms) | raw_launch (ms) | per_kv_group (ms) | vs raw | vs sdpa |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 8 | 0.0721 | 0.2488 | 1.7717 | 7.12x | 24.56x |
+| 1024 | 8 | 0.1355 | 0.2467 | 1.8047 | 7.31x | 13.32x |
+| 2048 | 8 | 0.2848 | 0.3067 | 1.7629 | 5.75x | 6.19x |
+| 4096 | 8 | 0.7679 | 0.5965 | 2.4506 | 4.11x | 3.19x |
 
 ## Distributed CP (RCCL AG/RS transport)
 
