@@ -138,7 +138,7 @@ def _close_ffn_collectives() -> None:
 
 
 def test_ffn_collective_creation_uses_platform_factory(monkeypatch):
-    import rl_engine.distributed as distributed
+    import rl_engine.distributed.collectives as collectives
 
     sentinel = object()
     calls = []
@@ -147,13 +147,36 @@ def test_ffn_collective_creation_uses_platform_factory(monkeypatch):
         calls.append(kwargs)
         return sentinel
 
-    monkeypatch.setattr(distributed, "create_deterministic_collective", fake_factory)
+    monkeypatch.setattr(collectives, "create_deterministic_collective", fake_factory)
+    monkeypatch.setattr(collectives.dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(collectives.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(collectives.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(ffn_module, "_COLLECTIVE_MIN_CAPACITY_BYTES", 2048)
     group = object()
 
-    result = ffn_module._create_collective(group=group, max_size_bytes=1234)
+    ffn_module._COLLECTIVES.clear()
+    result = ffn_module._collective_for_group(group, min_size_bytes=1234)
 
     assert result is sentinel
-    assert calls == [{"group": group, "max_size_bytes": 1234}]
+    assert calls == [{"group": group, "device": 0, "max_size_bytes": 2048}]
+    ffn_module._COLLECTIVES.clear()
+
+
+def test_packed_tp_inference_fails_closed_on_rocm(monkeypatch):
+    class _FakeDist:
+        @staticmethod
+        def get_world_size(*, group):
+            return 2
+
+    monkeypatch.setattr(ffn_module, "_require_parallel_group", lambda group, name: _FakeDist())
+    monkeypatch.setattr(torch.version, "hip", "6.3", raising=False)
+
+    with pytest.raises(RuntimeError, match="not available with the ROCm/RCCL transport"):
+        ffn_module.Qwen3FFNOp().prepare_packed_inference(
+            torch.empty(2, 2),
+            torch.empty(2, 2),
+            tp_group=object(),
+        )
 
 
 def _shard_ranges(

@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Deterministic collectives for native CUDA IPC and rank-ordered transport.
+"""Deterministic collectives for CUDA IPC and ROCm rank-ordered transport.
 
-The ROCm transport never performs a floating-point reduction. It gathers every
-rank's input through RCCL, after which each rank evaluates the same balanced
-reduction tree locally.
+ROCm uses HIP IPC where it wins and RCCL otherwise. Reduction arithmetic stays
+outside RCCL and follows the same fixed balanced rank tree on every rank.
 """
 
 from __future__ import annotations
@@ -19,10 +18,18 @@ import torch.distributed as dist
 
 _SUPPORTED_WORLD_SIZES = (1, 2, 4, 8)
 _DEFAULT_MAX_SIZE_BYTES = 64 * 1024 * 1024
+# Packing two independent lanes saves a collective launch for small tensors,
+# but doubles the message size seen by RCCL. On MI300X, separate AllGather
+# transports win once the packed payload reaches the multi-megabyte regime.
+# Keep the crossover explicit and easy to retune with new RCCL releases.
+_PACKED_REDUCE_SCATTER_MAX_BYTES = 8 * 1024 * 1024
+_ROCM_IPC_DIRECT_ALL_REDUCE_MAX_BYTES = 768 * 1024
+_ROCM_IPC_SHARDED_ALL_REDUCE_MIN_BYTES = 2176 * 1024
+_ROCM_IPC_ALL_GATHER_MAX_BYTES = 256 * 1024
 _COLLECTIVE_STAGING_FRAMES = 3
 _COLLECTIVE_FRAME_METADATA_BYTES = 3 * 8
 _REDUCTION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
-_COLLECTIVES: dict[tuple[int, int, int, int], DeterministicCollective] = {}
+_COLLECTIVES: dict[tuple[int, int, int, int], Any] = {}
 DETERMINISTIC_ALL_REDUCE_OP = "rl_kernel::deterministic_all_reduce_"
 
 
@@ -121,8 +128,10 @@ class DeterministicCollective:
             "deterministic_collective_destroy",
             "deterministic_collective_stage",
             "deterministic_collective_all_reduce",
+            "deterministic_collective_all_reduce_fused",
             "deterministic_collective_reduce_scatter",
             "deterministic_collective_all_gather",
+            "deterministic_collective_all_gather_fused",
         )
         missing = [name for name in required_symbols if not hasattr(_C, name)]
         if missing:
@@ -274,17 +283,33 @@ class DeterministicCollective:
 
     def reduce_scatter_many(
         self,
-        inputs: tuple[torch.Tensor, ...],
+        inputs: tuple[torch.Tensor, ...] | list[torch.Tensor],
         *,
+        outs: tuple[torch.Tensor, ...] | list[torch.Tensor] | None = None,
         validate_signature: bool = True,
     ) -> tuple[torch.Tensor, ...]:
-        """Reduce-scatter several tensors through the single-tensor ABI."""
+        """Compatibility fallback for CUDA IPC collectives.
 
-        if not inputs:
+        The native CUDA IPC backend has no packed transport primitive yet, so
+        it preserves its established behavior by issuing the individual
+        fixed-tree calls. The ROCm transport subclass overrides this method
+        with a packed implementation.
+        """
+
+        values = tuple(inputs)
+        if not values:
             raise ValueError("reduce_scatter_many requires at least one input")
-        return tuple(
-            self.reduce_scatter(input, validate_signature=validate_signature) for input in inputs
+        if outs is not None and len(outs) != len(values):
+            raise ValueError("reduce_scatter_many outs must match the number of inputs")
+        results = tuple(
+            self.reduce_scatter(
+                value,
+                out=None if outs is None else outs[index],
+                validate_signature=validate_signature,
+            )
+            for index, value in enumerate(values)
         )
+        return results
 
     def close(self) -> None:
         """Release imported CUDA IPC mappings after the last collective call."""
@@ -471,6 +496,10 @@ class TorchDistributedDeterministicCollective:
         self._backend = str(dist.get_backend(self.group)).lower()
         self._lock = threading.Lock()
         self._closed = False
+        # Keep a lifecycle marker for callers that historically inspected the
+        # CUDA IPC collective's ``_handle`` while managing the cache. Concrete
+        # transports own any native resource through their own state.
+        self._handle = id(self)
         # One dtype-agnostic byte workspace is grown on demand and reused by
         # reduction collectives. AllGather writes directly into its output.
         self._workspace: torch.Tensor | None = None
@@ -527,6 +556,7 @@ class TorchDistributedDeterministicCollective:
         input: torch.Tensor,
         *,
         out: torch.Tensor | None = None,
+        validate_signature: bool = True,
     ) -> torch.Tensor:
         """Return the fixed balanced-tree sum on every rank."""
 
@@ -535,13 +565,24 @@ class TorchDistributedDeterministicCollective:
         if out is None:
             out = torch.empty_like(input)
         self._validate_output(out, input, tuple(input.shape))
+        if self.world_size == 1:
+            out.copy_(input)
+            return out
 
         with self._lock:
             self._check_open()
-            self._validate_matching_signature("all_reduce", input)
+            if validate_signature:
+                self._validate_matching_signature("all_reduce", input)
+            if self._direct_all_reduce(input, out):
+                return out
             rank_inputs = self._all_gather_transport(input)
-            reduced = self._balanced_tree_sum(rank_inputs)
-            out.copy_(reduced)
+            if not self._fused_reduction(
+                rank_inputs,
+                out,
+                operation="all_reduce",
+            ):
+                reduced = self._balanced_tree_sum(rank_inputs)
+                out.copy_(reduced)
         return out
 
     def all_gather(
@@ -549,6 +590,7 @@ class TorchDistributedDeterministicCollective:
         input: torch.Tensor,
         *,
         out: torch.Tensor | None = None,
+        validate_signature: bool = True,
     ) -> torch.Tensor:
         """Gather rank-ordered input bit patterns along dimension 0."""
 
@@ -558,18 +600,39 @@ class TorchDistributedDeterministicCollective:
         if out is None:
             out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
         self._validate_output(out, input, output_shape)
+        if self.world_size == 1:
+            out.copy_(input)
+            return out
 
         with self._lock:
             self._check_open()
-            self._validate_matching_signature("all_gather", input)
+            if validate_signature:
+                self._validate_matching_signature("all_gather", input)
+            if self._direct_all_gather(input, out):
+                return out
             self._all_gather_transport(input, gathered_flat=out.view(-1))
         return out
+
+    def all_gather_many(
+        self,
+        inputs: tuple[torch.Tensor, ...],
+        *,
+        validate_signature: bool = True,
+    ) -> tuple[torch.Tensor, ...]:
+        """Gather several tensors through the single-tensor transport ABI."""
+
+        if not inputs:
+            raise ValueError("all_gather_many requires at least one input")
+        return tuple(
+            self.all_gather(input, validate_signature=validate_signature) for input in inputs
+        )
 
     def reduce_scatter(
         self,
         input: torch.Tensor,
         *,
         out: torch.Tensor | None = None,
+        validate_signature: bool = True,
     ) -> torch.Tensor:
         """Fixed-tree sum followed by rank-ordered dimension-0 slicing."""
 
@@ -587,15 +650,182 @@ class TorchDistributedDeterministicCollective:
         if out is None:
             out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
         self._validate_output(out, input, output_shape)
+        if self.world_size == 1:
+            out.copy_(input)
+            return out
 
         with self._lock:
             self._check_open()
-            self._validate_matching_signature("reduce_scatter", input)
+            if validate_signature:
+                self._validate_matching_signature("reduce_scatter", input)
+            if self._direct_reduce_scatter(input, out):
+                return out
             rank_inputs = self._all_gather_transport(input)
-            reduced = self._balanced_tree_sum(rank_inputs)
             begin = self.rank * rows_per_rank
-            out.copy_(reduced.narrow(0, begin, rows_per_rank))
+            # Only this rank's output shard participates in the reduction. The
+            # previous implementation reduced every global row and sliced the
+            # result afterwards, doing world_size times more arithmetic than
+            # ReduceScatter needs. The fixed rank tree is unchanged.
+            reduced = rank_inputs[:, begin : begin + rows_per_rank]
+            if not self._fused_reduction(reduced, out, operation="reduce_scatter"):
+                reduced = self._balanced_tree_sum(reduced)
+                out.copy_(reduced)
         return out
+
+    def reduce_scatter_many(
+        self,
+        inputs: tuple[torch.Tensor, ...] | list[torch.Tensor],
+        *,
+        outs: tuple[torch.Tensor, ...] | list[torch.Tensor] | None = None,
+        validate_signature: bool = True,
+    ) -> tuple[torch.Tensor, ...]:
+        """Reduce-scatter independent tensors in one fixed-tree collective.
+
+        The tensors are packed along their final dimension, so each tensor's
+        element still follows the same balanced rank tree as an individual
+        ``reduce_scatter`` call. This is useful for independent gradient lanes:
+        packing them together removes one RCCL launch without changing the
+        floating-point expression for either lane. Inputs must have matching
+        shape/device/dtype except for the final dimension.
+        """
+
+        self._check_open()
+        values = tuple(inputs)
+        if not values:
+            raise ValueError("reduce_scatter_many requires at least one input")
+        if outs is not None and len(outs) != len(values):
+            raise ValueError("reduce_scatter_many outs must match the number of inputs")
+        if len(values) == 1:
+            return (
+                self.reduce_scatter(
+                    values[0],
+                    out=None if outs is None else outs[0],
+                    validate_signature=validate_signature,
+                ),
+            )
+
+        first = values[0]
+        self._validate_reduction_input(first)
+        if first.dim() < 2:
+            raise ValueError(
+                "reduce_scatter_many inputs must have at least two dimensions "
+                "when packing independent lanes"
+            )
+        if first.size(0) % self.world_size != 0:
+            raise ValueError("reduce_scatter_many inputs must have a divisible leading dimension")
+        for value in values[1:]:
+            self._validate_reduction_input(value)
+            if value.dim() != first.dim() or value.shape[:-1] != first.shape[:-1]:
+                raise ValueError(
+                    "reduce_scatter_many inputs must match in rank and all dimensions "
+                    "except the final dimension"
+                )
+            if value.device != first.device or value.dtype != first.dtype:
+                raise ValueError("reduce_scatter_many inputs must share device and dtype")
+        lane_sizes = tuple(int(value.size(-1)) for value in values)
+        rows_per_rank = first.size(0) // self.world_size
+        output_shape = (rows_per_rank, *first.shape[1:-1])
+        if outs is not None:
+            for lane_size, out in zip(lane_sizes, outs, strict=True):
+                self._validate_output(
+                    out,
+                    first,
+                    (*output_shape, lane_size),
+                )
+
+        packed_bytes = sum(value.numel() * value.element_size() for value in values)
+        if self._can_direct_reduce_scatter_many():
+            if packed_bytes > self.max_size_bytes:
+                raise ValueError(
+                    "reduce_scatter_many packed input requires "
+                    f"{packed_bytes} bytes but max_size_bytes={self.max_size_bytes}"
+                )
+            direct_outputs = tuple(
+                (
+                    outs[index]
+                    if outs is not None
+                    else torch.empty(
+                        (*output_shape, lane_size),
+                        dtype=first.dtype,
+                        device=first.device,
+                    )
+                )
+                for index, lane_size in enumerate(lane_sizes)
+            )
+            with self._lock:
+                self._check_open()
+                if validate_signature:
+                    self._validate_matching_signature(
+                        f"reduce_scatter_many:{lane_sizes}",
+                        first,
+                    )
+                if self._direct_reduce_scatter_many(values, direct_outputs):
+                    return direct_outputs
+
+        if packed_bytes > _PACKED_REDUCE_SCATTER_MAX_BYTES:
+            # A single packed AllGather moves the same bytes as two separate
+            # calls but loses RCCL's smaller-message algorithm. Use the
+            # established per-lane path above the measured crossover; this
+            # keeps the convenience API from regressing large FFN gradients.
+            return tuple(
+                self.reduce_scatter(
+                    value,
+                    out=None if outs is None else outs[index],
+                    validate_signature=validate_signature,
+                )
+                for index, value in enumerate(values)
+            )
+
+        if packed_bytes > self.max_size_bytes:
+            raise ValueError(
+                "reduce_scatter_many packed input requires "
+                f"{packed_bytes} bytes but max_size_bytes={self.max_size_bytes}"
+            )
+        packed = torch.cat(values, dim=-1)
+        packed_out = torch.empty(
+            (packed.size(0) // self.world_size, *packed.shape[1:]),
+            dtype=packed.dtype,
+            device=packed.device,
+        )
+        with self._lock:
+            self._check_open()
+            # Include lane boundaries in the signature. Equal packed shapes
+            # alone do not guarantee that every rank will split the result the
+            # same way, which could silently associate gradients with the
+            # wrong lane.
+            if validate_signature:
+                self._validate_matching_signature(
+                    f"reduce_scatter_many:{lane_sizes}",
+                    packed,
+                )
+            if self._direct_reduce_scatter(packed, packed_out):
+                pieces = tuple(packed_out.split(tuple(value.size(-1) for value in values), dim=-1))
+                if outs is None:
+                    return pieces
+                result: list[torch.Tensor] = []
+                for piece, out in zip(pieces, outs, strict=True):
+                    out.copy_(piece)
+                    result.append(out)
+                return tuple(result)
+            rank_inputs = self._all_gather_transport(packed)
+            begin = self.rank * rows_per_rank
+            reduced = rank_inputs[:, begin : begin + rows_per_rank]
+            if not self._fused_reduction(
+                reduced,
+                packed_out,
+                operation="reduce_scatter",
+            ):
+                reduced = self._balanced_tree_sum(reduced)
+                packed_out.copy_(reduced)
+
+        pieces = tuple(packed_out.split(tuple(value.size(-1) for value in values), dim=-1))
+        if outs is None:
+            return pieces
+        result: list[torch.Tensor] = []
+        for piece, out in zip(pieces, outs, strict=True):
+            out.copy_(piece)
+            result.append(out)
+        return tuple(result)
 
     def close(self) -> None:
         """Close the instance.
@@ -608,6 +838,7 @@ class TorchDistributedDeterministicCollective:
             self._workspace = None
             self._validated_signatures.clear()
             self._closed = True
+            self._handle = 0
 
     def __enter__(self) -> TorchDistributedDeterministicCollective:
         self._check_open()
@@ -744,6 +975,25 @@ class TorchDistributedDeterministicCollective:
         # an allocation or copy. Restrict the view to the current operation.
         return workspace[:required_bytes].view(input.dtype)
 
+    def _direct_all_reduce(self, input: torch.Tensor, output: torch.Tensor) -> bool:
+        return False
+
+    def _direct_reduce_scatter(self, input: torch.Tensor, output: torch.Tensor) -> bool:
+        return False
+
+    def _can_direct_reduce_scatter_many(self) -> bool:
+        return False
+
+    def _direct_reduce_scatter_many(
+        self,
+        inputs: tuple[torch.Tensor, ...],
+        outputs: tuple[torch.Tensor, ...],
+    ) -> bool:
+        return False
+
+    def _direct_all_gather(self, input: torch.Tensor, output: torch.Tensor) -> bool:
+        return False
+
     @staticmethod
     def _balanced_tree_sum(rank_inputs: torch.Tensor) -> torch.Tensor:
         world_size = rank_inputs.size(0)
@@ -762,11 +1012,43 @@ class TorchDistributedDeterministicCollective:
             stride *= 2
         return rank_inputs[0]
 
+    @staticmethod
+    def _fused_reduction(
+        rank_inputs: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        operation: str,
+    ) -> bool:
+        """Use the optional ROCm fused fixed-tree kernel when available.
+
+        The extension is deliberately optional: CPU/Gloo reference collectives
+        and installations built without the ROCm kernel retain the executable
+        Python implementation above.
+        """
+
+        if getattr(torch.version, "hip", None) is None or not rank_inputs.is_cuda:
+            return False
+        try:
+            from rl_engine import _C
+        except ImportError:
+            return False
+        if operation == "all_reduce":
+            fn = getattr(_C, "deterministic_collective_rocm_all_reduce", None)
+            if fn is not None:
+                fn(rank_inputs, output)
+                return True
+        elif operation == "reduce_scatter":
+            fn = getattr(_C, "deterministic_collective_rocm_reduce_scatter", None)
+            if fn is not None:
+                fn(rank_inputs, output)
+                return True
+        return False
+
 
 class RCCLDeterministicCollective(TorchDistributedDeterministicCollective):
-    """ROCm collective using RCCL AllGather strictly as tensor transport."""
+    """Single-node ROCm fixed-tree collective using HIP IPC and RCCL."""
 
-    backend_id = "rccl_all_gather_balanced_tree"
+    backend_id = "rocm_ipc_fixed_tree"
 
     def __init__(
         self,
@@ -794,6 +1076,154 @@ class RCCLDeterministicCollective(TorchDistributedDeterministicCollective):
             raise RuntimeError(
                 "RCCL deterministic collectives require PyTorch's NCCL process-group API"
             )
+        self._ipc_handle = 0
+        self._ipc_staging: torch.Tensor | None = None
+        self._initialize_ipc_transport()
+
+    @property
+    def workspace_size_bytes(self) -> int:
+        staging = self._ipc_staging
+        staging_bytes = 0 if staging is None else int(staging.numel())
+        return staging_bytes + super().workspace_size_bytes
+
+    def _initialize_ipc_transport(self) -> None:
+        if self.world_size == 1:
+            return
+        try:
+            from rl_engine import _C
+        except ImportError:
+            return
+        required_symbols = (
+            "deterministic_collective_rocm_ipc_allocate",
+            "deterministic_collective_rocm_ipc_meta",
+            "deterministic_collective_rocm_ipc_create",
+            "deterministic_collective_rocm_ipc_synchronize",
+            "deterministic_collective_rocm_ipc_destroy",
+            "deterministic_collective_rocm_ipc_stage",
+            "deterministic_collective_rocm_ipc_all_reduce",
+            "deterministic_collective_rocm_ipc_all_reduce_input",
+            "deterministic_collective_rocm_ipc_reduce_scatter",
+            "deterministic_collective_rocm_ipc_reduce_scatter_input",
+            "deterministic_collective_rocm_ipc_reduce_scatter_many",
+            "deterministic_collective_rocm_ipc_all_gather",
+            "deterministic_collective_rocm_ipc_all_gather_input",
+        )
+        if any(not hasattr(_C, symbol) for symbol in required_symbols):
+            return
+
+        staging = _C.deterministic_collective_rocm_ipc_allocate(self.max_size_bytes)
+        handle, offset = _C.deterministic_collective_rocm_ipc_meta(staging)
+        local_metadata = (socket.gethostname(), handle, int(offset))
+        gathered_metadata: list[tuple[str, list[int], int] | None] = [None] * self.world_size
+        dist.all_gather_object(gathered_metadata, local_metadata, group=self.group)
+        if any(metadata is None for metadata in gathered_metadata):
+            raise RuntimeError("failed to exchange ROCm IPC metadata")
+        complete_metadata = [metadata for metadata in gathered_metadata if metadata is not None]
+        if len({metadata[0] for metadata in complete_metadata}) != 1:
+            return
+        self._ipc_handle = int(
+            _C.deterministic_collective_rocm_ipc_create(
+                staging,
+                [metadata[1] for metadata in complete_metadata],
+                [metadata[2] for metadata in complete_metadata],
+                self.rank,
+            )
+        )
+        self._ipc_staging = staging
+
+    def _direct_all_reduce(self, input: torch.Tensor, output: torch.Tensor) -> bool:
+        handle = self._ipc_handle
+        if not handle:
+            return False
+        from rl_engine import _C
+
+        input_bytes = input.numel() * input.element_size()
+        if (
+            _ROCM_IPC_DIRECT_ALL_REDUCE_MAX_BYTES
+            < input_bytes
+            < _ROCM_IPC_SHARDED_ALL_REDUCE_MIN_BYTES
+            and input.numel() % self.world_size == 0
+        ):
+            return False
+
+        if (
+            input_bytes <= _ROCM_IPC_DIRECT_ALL_REDUCE_MAX_BYTES
+            or input.numel() % self.world_size != 0
+        ):
+            _C.deterministic_collective_rocm_ipc_all_reduce_input(
+                handle,
+                input,
+                output,
+            )
+            return True
+
+        shard = self._workspace_for(input, input.numel() // self.world_size)
+        _C.deterministic_collective_rocm_ipc_reduce_scatter_input(
+            handle,
+            input,
+            shard,
+        )
+        dist.all_gather_into_tensor(output.view(-1), shard, group=self.group)
+        return True
+
+    def _direct_reduce_scatter(self, input: torch.Tensor, output: torch.Tensor) -> bool:
+        handle = self._ipc_handle
+        if not handle:
+            return False
+        from rl_engine import _C
+
+        _C.deterministic_collective_rocm_ipc_reduce_scatter_input(
+            handle,
+            input,
+            output,
+        )
+        return True
+
+    def _can_direct_reduce_scatter_many(self) -> bool:
+        return bool(self._ipc_handle)
+
+    def _direct_reduce_scatter_many(
+        self,
+        inputs: tuple[torch.Tensor, ...],
+        outputs: tuple[torch.Tensor, ...],
+    ) -> bool:
+        handle = self._ipc_handle
+        if not handle:
+            return False
+        from rl_engine import _C
+
+        _C.deterministic_collective_rocm_ipc_reduce_scatter_many(
+            handle,
+            inputs,
+            outputs,
+        )
+        return True
+
+    def _direct_all_gather(self, input: torch.Tensor, output: torch.Tensor) -> bool:
+        handle = self._ipc_handle
+        input_bytes = input.numel() * input.element_size()
+        if not handle or input_bytes > _ROCM_IPC_ALL_GATHER_MAX_BYTES:
+            return False
+        from rl_engine import _C
+
+        _C.deterministic_collective_rocm_ipc_all_gather_input(
+            handle,
+            input,
+            output,
+        )
+        return True
+
+    def close(self) -> None:
+        handle = getattr(self, "_ipc_handle", 0)
+        if handle:
+            from rl_engine import _C
+
+            _C.deterministic_collective_rocm_ipc_synchronize(handle)
+            torch.cuda.synchronize(self.device)
+            self._ipc_handle = 0
+            _C.deterministic_collective_rocm_ipc_destroy(handle)
+            self._ipc_staging = None
+        super().close()
 
 
 def create_deterministic_collective(
@@ -805,9 +1235,10 @@ def create_deterministic_collective(
     """Create the platform-appropriate deterministic collective.
 
     CUDA uses the native ``DeterministicCollective`` implementation. ROCm uses
-    RCCL only to gather rank inputs, followed by the shared local balanced-tree
-    reduction. The returned object has independent ownership; callers may cache
-    it and must close an entry before replacing it.
+    HIP IPC or RCCL for rank-ordered transport while preserving the fixed local
+    reduction tree. The returned object has independent ownership. Shared caches
+    may replace an entry without closing it immediately because active autograd
+    contexts can retain the previous instance until their work completes.
     """
 
     if getattr(torch.version, "hip", None) is not None:
@@ -830,7 +1261,7 @@ def collective_for_group(
     min_size_bytes: int = 0,
     minimum_capacity_bytes: int = _DEFAULT_MAX_SIZE_BYTES,
     device: torch.device | str | int | None = None,
-) -> DeterministicCollective | None:
+) -> Any | None:
     """Return the process-local RL-Kernel collective shared by hot-path ops."""
 
     if group is None:
@@ -871,9 +1302,11 @@ def collective_for_group(
 
 
 __all__ = [
+    "DETERMINISTIC_ALL_REDUCE_OP",
     "DeterministicCollective",
     "RCCLDeterministicCollective",
     "TorchDistributedDeterministicCollective",
     "collective_for_group",
     "create_deterministic_collective",
+    "deterministic_all_reduce_inplace",
 ]

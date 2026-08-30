@@ -144,14 +144,19 @@ def get_extensions():
             "csrc/cuda/attention/deterministic_attention.cu",
         ]
         if not is_rocm:
-            # This source contains NVIDIA PTX (cp.async, ldmatrix, and mma.sync).
-            # The ROCm dispatcher falls back to PyTorch SDPA for this operator.
+            # prefix_shared_attention contains NVIDIA PTX (cp.async, ldmatrix,
+            # and mma.sync); the ROCm dispatcher falls back to PyTorch SDPA for
+            # it. The CUDA collective owns CUDA IPC handles and driver API calls.
             cuda_sources.extend(
                 [
                     "csrc/cuda/attention/prefix_shared_attention.cu",
                     "csrc/cuda/distributed/deterministic_collective.cu",
                 ]
             )
+        else:
+            # RCCL stays transport-only on ROCm; this HIP kernel performs the
+            # fixed balanced-tree arithmetic after AllGather.
+            cuda_sources.append("csrc/rocm/distributed/deterministic_collective.hip")
 
         nvcc_flags = ["-O3", "-Xfatbin", "-compress-all"]
         if envs.env_flag(envs.KERNEL_ALIGN_USE_FAST_MATH):
@@ -407,6 +412,12 @@ setup(
         "cuda": ["flashinfer"],
         "rocm": ["aiter"],
         "vllm": ["vllm>=0.6.0"],
+        "drift-viewer": ["Pillow>=10", "PySide6>=6.6"],
+    },
+    entry_points={
+        "console_scripts": [
+            "rlk-drift-view=rl_engine.alignment.cross_config.drift_viewer:main",
+        ],
     },
     python_requires=">=3.10",
     include_package_data=True,

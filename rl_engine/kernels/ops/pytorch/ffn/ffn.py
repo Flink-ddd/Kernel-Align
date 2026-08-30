@@ -240,29 +240,6 @@ def _validate_ffn_inputs(
             )
 
 
-def _create_collective(*, group: Any, max_size_bytes: int):
-    """Create the platform-specific collective lazily.
-
-    NVIDIA keeps the existing CUDA IPC implementation.  ROCm selects the
-    RCCL transport-only implementation, which performs the floating-point
-    reduction in the shared deterministic local tree.  Keeping this boundary
-    small also makes the backend choice explicit and easy to inject in tests.
-    """
-
-    try:
-        from rl_engine.distributed import create_deterministic_collective
-    except ImportError as exc:
-        raise RuntimeError(
-            "parallel qwen3_ffn requires the platform deterministic collective "
-            "factory; single-device qwen3_ffn remains available"
-        ) from exc
-
-    return create_deterministic_collective(
-        group=group,
-        max_size_bytes=max_size_bytes,
-    )
-
-
 def _collective_for_group(group: Any, *, min_size_bytes: int):
     return collective_for_group(
         group=group,
@@ -319,8 +296,14 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         tp_world = tp_dist.get_world_size(group=tp_group) if tp_dist is not None else 1
         gemm_tokens = rmsnorm_output_2d.size(0) * (tp_world if sequence_parallel else 1)
         element_size = rmsnorm_output_2d.element_size()
+        token_hidden_bytes = gemm_tokens * rmsnorm_output_2d.size(1) * element_size
+        # Sequence-parallel backward reduces the gate and up input-gradient
+        # lanes together. ``reduce_scatter_many`` packs those lanes along the
+        # final dimension, so reserve capacity for both lanes in one transport
+        # call rather than growing the collective (or failing) mid-backward.
+        reduction_bytes = token_hidden_bytes * (2 if sequence_parallel else 1)
         min_size_bytes = max(
-            gemm_tokens * rmsnorm_output_2d.size(1) * element_size,
+            reduction_bytes,
             gemm_tokens * gate_weight.size(0) * element_size,
             gate_weight.numel() * element_size,
             up_weight.numel() * element_size,
@@ -490,28 +473,25 @@ class _DeterministicFFNFunction(torch.autograd.Function):
             gate_weight,
             disable_split_k=disable_split_k,
         )
-        if ctx.sequence_parallel:
-            grad_rmsnorm_from_gate = _reduce_scatter_tokens(
-                grad_rmsnorm_from_gate,
-                tp_collective,
-            )
-        elif tp_collective is not None:
-            grad_rmsnorm_from_gate = _all_reduce_inplace(
-                grad_rmsnorm_from_gate,
-                tp_collective,
-            )
-
         grad_rmsnorm_from_up = _linear_da(
             grad_up,
             up_weight,
             disable_split_k=disable_split_k,
         )
         if ctx.sequence_parallel:
-            grad_rmsnorm_from_up = _reduce_scatter_tokens(
-                grad_rmsnorm_from_up,
-                tp_collective,
+            # These are independent reduction lanes. Pack them into one
+            # ReduceScatter while keeping each lane's balanced rank tree
+            # separate; adding them before the collective would change the
+            # floating-point parenthesization and break cross-TP bitwise
+            # invariance.
+            grad_rmsnorm_from_gate, grad_rmsnorm_from_up = tp_collective.reduce_scatter_many(
+                (grad_rmsnorm_from_gate, grad_rmsnorm_from_up)
             )
         elif tp_collective is not None:
+            grad_rmsnorm_from_gate = _all_reduce_inplace(
+                grad_rmsnorm_from_gate,
+                tp_collective,
+            )
             grad_rmsnorm_from_up = _all_reduce_inplace(
                 grad_rmsnorm_from_up,
                 tp_collective,
@@ -654,6 +634,11 @@ class Qwen3FFNOp:
         dist = _require_parallel_group(tp_group, "tensor")
         if dist is None:
             return 0, 1
+        if getattr(torch.version, "hip", None) is not None:
+            raise RuntimeError(
+                "packed TP inference requires the native CUDA IPC collective and "
+                "is not available with the ROCm/RCCL transport"
+            )
         tp_world_size = int(dist.get_world_size(group=tp_group))
         if fused_gate_up_weight.size(0) % 2:
             raise ValueError("fused gate/up weight must contain two equal shards")
