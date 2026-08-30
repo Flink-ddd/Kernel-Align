@@ -104,6 +104,9 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     CUDA_BATCH_INVARIANT_LOGP_SM90 = (
         "rl_engine.kernels.ops.cuda.loss.batch_invariant_logp.BatchInvariantLogpSM90Op"
     )
+    ASCEND_BATCH_INVARIANT_LOGP = (
+        "rl_engine.kernels.ops.ascend.loss.batch_invariant_logp.BatchInvariantLogpAscendOp"
+    )
     # Deterministic vocab-parallel TP logprob reference (WS2 #241 PR3)
     PYTORCH_VOCAB_PARALLEL_LOGP = (
         "rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp.VocabParallelLogprobOp"
@@ -344,7 +347,10 @@ def resolve_logp_op_type(
 
 
 class KernelRegistry:
-    """Legacy hardware dispatcher plus a composed semantic operator catalog."""
+    """
+    Central dispatcher for high-performance kernels.
+    Handles dynamic routing between CUDA, ROCm, and MUSA backends at runtime.
+    """
 
     def __init__(self):
         self._instance_cache: Dict[str, Any] = {}
@@ -557,6 +563,30 @@ class KernelRegistry:
                 "silu": [OpBackend.TRITON_SILU, OpBackend.PYTORCH_NATIVE_SILU],
                 "swiglu": [OpBackend.TRITON_SWIGLU, OpBackend.PYTORCH_NATIVE_SWIGLU],
             },
+            "musa": {
+                "logp": [OpBackend.PYTORCH_NATIVE],
+                "logp_indexed": [OpBackend.PYTORCH_NATIVE],
+                "logp_online": [OpBackend.PYTORCH_NATIVE],
+                "logp_online_indexed": [OpBackend.PYTORCH_NATIVE],
+                "logp_deterministic": [OpBackend.PYTORCH_NATIVE],
+                "logp_deterministic_indexed": [OpBackend.PYTORCH_NATIVE],
+                "attn": [OpBackend.PYTORCH_ATTN],
+                "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
+                "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
+                "grpo_loss": [OpBackend.PYTORCH_GRPO_LOSS],
+                "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
+                "linear_logp": [OpBackend.PYTORCH_LINEAR_LOGP],
+                "ratio_kl": [OpBackend.PYTORCH_RATIO_KL],
+                "pack": [OpBackend.PYTORCH_PACK],
+                "det_gemm": [],
+                "batch_invariant_logp": [OpBackend.PYTORCH_BATCH_INVARIANT_LOGP],
+                "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
+                "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
+                "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
+                "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
+                "silu": [OpBackend.PYTORCH_NATIVE_SILU],
+                "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
+            },
             "cpu": {
                 "logp": [OpBackend.PYTORCH_NATIVE],
                 "logp_deterministic": [OpBackend.PYTORCH_NATIVE],
@@ -583,6 +613,15 @@ class KernelRegistry:
                 "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
             },
         }
+        # Preserve the former CPU fallback behavior for every operator on NPU,
+        # then override only the operator with an Ascend-specific backend.
+        self._priority_map["npu"] = {
+            op_type: candidates.copy() for op_type, candidates in self._priority_map["cpu"].items()
+        }
+        self._priority_map["npu"]["batch_invariant_logp"] = [
+            OpBackend.ASCEND_BATCH_INVARIANT_LOGP,
+            OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
+        ]
         logger.info(f"KernelRegistry initialized for {device_ctx.device_type}")
         self._adjust_priority_for_hardware()
         self._adjust_priority_from_env()
@@ -726,6 +765,8 @@ class KernelRegistry:
         resolved = torch.device(device)
         if resolved.type == "cuda":
             return "rocm" if torch.version.hip is not None else "cuda"
+        if resolved.type == "musa":
+            return "musa"
         if resolved.type in self._priority_map:
             return resolved.type
         return "cpu"
@@ -964,6 +1005,10 @@ class KernelRegistry:
             return "rocm"
         if device_ctx.device_type == "cuda":
             return "cuda"
+        if device_ctx.device_type == "npu":
+            return "npu"
+        if device_ctx.is_musa or device_ctx.device_type == "musa":
+            return "musa"
         return "cpu"
 
     def _get_or_create_backend(self, backend: OpBackend) -> Optional[Any]:

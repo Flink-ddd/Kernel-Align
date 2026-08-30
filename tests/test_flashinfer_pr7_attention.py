@@ -32,9 +32,7 @@ from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     P2PNCCLAttentionCPCommunication,
     sort_attention_cp_partial_states,
 )
-from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
-    DeterministicAttentionCoreResult,
-)
+from rl_engine.kernels.ops.cuda.attention.deterministic_attn import DeterministicAttentionCoreResult
 from rl_engine.kernels.ops.cuda.attention.flash_attn import (
     StrictFlashAttention4Core,
     StrictFlashAttentionUnavailable,

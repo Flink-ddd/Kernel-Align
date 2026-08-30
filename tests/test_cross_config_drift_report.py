@@ -258,6 +258,7 @@ def test_consistency_trace_is_expandable_chrome_trace_json(tmp_path: Path):
 
 @pytest.mark.unit
 def test_consistency_bundle_contains_report_trace_and_preview(tmp_path: Path):
+    pytest.importorskip("PIL")
     manifest, cube = _artifacts()
     report = build_drift_report(replay_manifest=manifest, result_cube=cube)
 

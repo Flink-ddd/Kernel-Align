@@ -93,6 +93,47 @@ __global__ void swiglu_backward_kernel(
   d_gate[idx] = static_cast<scalar_t>(dyv * uv * silu_grad_f32(gv));
 }
 
+template <typename scalar_t>
+__global__ void swiglu_packed_forward_kernel(
+    const scalar_t* __restrict__ gate_up,
+    scalar_t* __restrict__ y,
+    const int64_t n,
+    const int64_t width) {
+  const int64_t idx = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+  if (idx >= n) {
+    return;
+  }
+  const int64_t row = idx / width;
+  const int64_t column = idx - row * width;
+  const int64_t gate_index = row * (2 * width) + column;
+  const float gv = static_cast<float>(gate_up[gate_index]);
+  const float uv = static_cast<float>(gate_up[gate_index + width]);
+  y[idx] = static_cast<scalar_t>(silu_f32(gv) * uv);
+}
+
+template <typename scalar_t>
+__global__ void swiglu_packed_backward_kernel(
+    const scalar_t* __restrict__ dy,
+    const scalar_t* __restrict__ gate_up,
+    scalar_t* __restrict__ d_gate,
+    scalar_t* __restrict__ d_up,
+    const int64_t n,
+    const int64_t width) {
+  const int64_t idx = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+  if (idx >= n) {
+    return;
+  }
+  const int64_t row = idx / width;
+  const int64_t column = idx - row * width;
+  const int64_t gate_index = row * (2 * width) + column;
+  const float dyv = static_cast<float>(dy[idx]);
+  const float gv = static_cast<float>(gate_up[gate_index]);
+  const float uv = static_cast<float>(gate_up[gate_index + width]);
+  const float s = silu_f32(gv);
+  d_up[idx] = static_cast<scalar_t>(dyv * s);
+  d_gate[idx] = static_cast<scalar_t>(dyv * uv * silu_grad_f32(gv));
+}
+
 static void launch_1d(int64_t n, int& threads, int64_t& blocks) {
   threads = 256;
   blocks = (n + threads - 1) / threads;
@@ -247,6 +288,78 @@ std::vector<torch::Tensor> swiglu_backward_cuda(
             d_gate.data_ptr<scalar_t>(),
             d_up.data_ptr<scalar_t>(),
             n);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {d_gate, d_up};
+}
+
+torch::Tensor swiglu_packed_forward_cuda(torch::Tensor gate_up) {
+  check_cuda_contig(gate_up, "gate_up");
+  TORCH_CHECK(gate_up.dim() == 2, "gate_up must be [rows, 2 * intermediate]");
+  TORCH_CHECK(gate_up.size(1) % 2 == 0, "gate_up width must be even");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(gate_up));
+  const int64_t width = gate_up.size(1) / 2;
+  auto y = torch::empty({gate_up.size(0), width}, gate_up.options());
+  const int64_t n = y.numel();
+  if (n == 0) {
+    return y;
+  }
+  int threads = 0;
+  int64_t blocks = 0;
+  launch_1d(n, threads, blocks);
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      gate_up.scalar_type(),
+      "swiglu_packed_forward_cuda",
+      [&] {
+        swiglu_packed_forward_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+            gate_up.data_ptr<scalar_t>(), y.data_ptr<scalar_t>(), n, width);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return y;
+}
+
+std::vector<torch::Tensor> swiglu_packed_backward_cuda(
+    torch::Tensor dy,
+    torch::Tensor gate_up) {
+  check_cuda_contig(dy, "dy");
+  check_cuda_contig(gate_up, "gate_up");
+  check_same_device(dy, gate_up, "dy", "gate_up");
+  TORCH_CHECK(gate_up.dim() == 2, "gate_up must be [rows, 2 * intermediate]");
+  TORCH_CHECK(gate_up.size(1) % 2 == 0, "gate_up width must be even");
+  TORCH_CHECK(dy.dim() == 2, "dy must be [rows, intermediate]");
+  TORCH_CHECK(
+      dy.size(0) == gate_up.size(0) && dy.size(1) * 2 == gate_up.size(1),
+      "dy shape must match the packed gate/up halves");
+  TORCH_CHECK(dy.scalar_type() == gate_up.scalar_type(), "dy and gate_up must share dtype");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(gate_up));
+  auto d_gate = torch::empty_like(dy);
+  auto d_up = torch::empty_like(dy);
+  const int64_t n = dy.numel();
+  if (n == 0) {
+    return {d_gate, d_up};
+  }
+  int threads = 0;
+  int64_t blocks = 0;
+  launch_1d(n, threads, blocks);
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      gate_up.scalar_type(),
+      "swiglu_packed_backward_cuda",
+      [&] {
+        swiglu_packed_backward_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+            dy.data_ptr<scalar_t>(),
+            gate_up.data_ptr<scalar_t>(),
+            d_gate.data_ptr<scalar_t>(),
+            d_up.data_ptr<scalar_t>(),
+            n,
+            dy.size(1));
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {d_gate, d_up};

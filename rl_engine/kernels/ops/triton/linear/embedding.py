@@ -17,20 +17,12 @@ _BACKWARD_BLOCK_H = 128
 
 def _validate_embedding_inputs(token_ids: torch.Tensor, weight: torch.Tensor) -> None:
     if weight.dim() != 2:
-        raise ValueError(
-            f"embedding weight must be [vocab, hidden], got {tuple(weight.shape)}"
-        )
+        raise ValueError(f"embedding weight must be [vocab, hidden], got {tuple(weight.shape)}")
     if weight.size(0) <= 0 or weight.size(1) <= 0:
-        raise ValueError(
-            "embedding weight must have positive vocab and hidden dimensions"
-        )
+        raise ValueError("embedding weight must have positive vocab and hidden dimensions")
     if weight.dtype not in _SUPPORTED_WEIGHT_DTYPES:
         raise TypeError("embedding weight must use fp16, bf16, or fp32")
-    if (
-        token_ids.is_floating_point()
-        or token_ids.is_complex()
-        or token_ids.dtype == torch.bool
-    ):
+    if token_ids.is_floating_point() or token_ids.is_complex() or token_ids.dtype == torch.bool:
         raise TypeError("embedding token_ids must use an integer dtype")
     if token_ids.device != weight.device:
         raise RuntimeError("embedding token_ids and weight must be on the same device")
@@ -46,11 +38,7 @@ def _assert_valid_token_ids_async(ids: torch.Tensor, vocab_size: int) -> None:
 def _validate_token_ids_sync(token_ids: torch.Tensor, vocab_size: int) -> None:
     if vocab_size <= 0:
         raise ValueError("embedding vocab_size must be positive")
-    if (
-        token_ids.is_floating_point()
-        or token_ids.is_complex()
-        or token_ids.dtype == torch.bool
-    ):
+    if token_ids.is_floating_point() or token_ids.is_complex() or token_ids.dtype == torch.bool:
         raise TypeError("embedding token_ids must use an integer dtype")
     ids = token_ids.reshape(-1).to(dtype=torch.int64)
     if ids.numel() and bool(((ids < 0) | (ids >= vocab_size)).any().item()):
@@ -81,8 +69,7 @@ def _validate_embedding_backward_inputs(
         raise ValueError("embedding backward ids must be flattened to one dimension")
     if grad_rows.ndim != 2 or grad_rows.shape != (ids.numel(), weight_shape[1]):
         raise ValueError(
-            "embedding backward rows must have shape "
-            f"[{ids.numel()}, {weight_shape[1]}]"
+            "embedding backward rows must have shape " f"[{ids.numel()}, {weight_shape[1]}]"
         )
     if ids.device != grad_rows.device:
         raise RuntimeError("embedding backward ids and rows must share a device")
@@ -202,9 +189,7 @@ class _TritonEmbeddingFunction(torch.autograd.Function):
         ids = token_ids.reshape(-1).to(dtype=torch.int64).contiguous()
         vocab, hidden = weight.shape
         _assert_valid_token_ids_async(ids, vocab)
-        out = torch.empty(
-            (ids.numel(), hidden), device=weight.device, dtype=weight.dtype
-        )
+        out = torch.empty((ids.numel(), hidden), device=weight.device, dtype=weight.dtype)
         if ids.numel():
             _embedding_fwd[(ids.numel(),)](
                 ids,
