@@ -125,6 +125,18 @@ class LinearLogpWrapper:
         op = (
             sm90_deterministic_linear_logp_tp if tensor_parallel else sm90_deterministic_linear_logp
         )
+        # This wrapper is the strict boundary. Fail closed if a refactor ever
+        # swaps in the native/provider logp path under the same API.
+        expected_name = (
+            "sm90_deterministic_linear_logp_tp"
+            if tensor_parallel
+            else "sm90_deterministic_linear_logp"
+        )
+        if getattr(op, "__name__", "") != expected_name:
+            raise RuntimeError(
+                "strict linear_logp resolved a non-deterministic implementation: "
+                f"{getattr(op, '__name__', op)!r}"
+            )
         if tensor_parallel:
             self._tp_op = op
         else:
@@ -158,7 +170,10 @@ class LinearLogpWrapper:
                 raise ValueError(
                     f"temperature must be scalar or one value per row, got {value.numel()}"
                 )
-            if bool((value <= 0).any().item()):
+            positive = torch.all(value > 0)
+            if positive.is_cuda:
+                torch._assert_async(positive, "temperature must be positive")
+            elif not bool(positive):
                 raise ValueError("temperature must be positive")
             return value
         scalar = float(temperature)
@@ -176,7 +191,13 @@ class LinearLogpWrapper:
             raise TypeError("linear_logp target_ids must use an integer dtype")
         if target_ids.numel():
             target_long = target_ids.to(dtype=torch.long)
-            if bool(((target_long < 0) | (target_long >= real_vocab_size)).any().item()):
+            valid = torch.all((target_long >= 0) & (target_long < real_vocab_size))
+            if valid.is_cuda:
+                torch._assert_async(
+                    valid,
+                    f"linear_logp target_ids must be in [0, {real_vocab_size})",
+                )
+            elif not bool(valid):
                 raise ValueError(
                     f"linear_logp target_ids must be in [0, {real_vocab_size}), got invalid ids"
                 )
@@ -246,6 +267,82 @@ class LinearLogpWrapper:
             )
         cls._validate_targets(target_ids, rows=hidden.size(0), real_vocab_size=real)
         return tensor_parallel, requested_global, real
+
+    def from_local_logits(
+        self,
+        local_logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        *,
+        tp_group: Any,
+        vocab_start_index: int,
+        global_vocab_size: int,
+        real_vocab_size: int,
+        target: str = "rollout",
+        temperature: float | torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Score deterministic local LM-head logits without a duplicate GEMM."""
+
+        if local_logits.ndim != 2 or local_logits.dtype != torch.bfloat16:
+            raise TypeError("strict reused LM-head logits must be 2-D bfloat16")
+        if not local_logits.is_cuda or torch.version.hip is not None:
+            raise RuntimeError("strict reused LM-head logits require NVIDIA CUDA")
+        if target_ids.device != local_logits.device:
+            raise ValueError("linear_logp target_ids must share the logits device")
+        rank, world = self._tp_coordinates(tp_group)
+        if tp_group is None or world <= 1:
+            raise ValueError("reused rollout LM-head logits require a multi-rank TP group")
+        local_vocab = int(local_logits.size(1))
+        requested_global = int(global_vocab_size)
+        expected_global = local_vocab * world
+        expected_start = rank * local_vocab
+        if requested_global != expected_global or int(vocab_start_index) != expected_start:
+            raise ValueError("reused rollout LM-head logits must use equal rank-ordered TP shards")
+        real = int(real_vocab_size)
+        if not 0 < real <= requested_global:
+            raise ValueError("real_vocab_size must be within the padded global vocabulary")
+        self._validate_targets(
+            target_ids,
+            rows=local_logits.size(0),
+            real_vocab_size=real,
+        )
+        temperature_tensor = self._temperature_tensor(
+            temperature,
+            rows=local_logits.size(0),
+            device=local_logits.device,
+        )
+        from rl_engine.kernels.ops.cuda.loss.linear_logp import (
+            sm90_deterministic_logp_from_local_logits_tp,
+        )
+
+        result, _lse = sm90_deterministic_logp_from_local_logits_tp(
+            local_logits.contiguous(),
+            target_ids,
+            tp_group=tp_group,
+            vocab_start_index=int(vocab_start_index),
+            global_vocab_size=requested_global,
+            real_vocab_size=real,
+            temperature=temperature_tensor,
+        )
+        self._last_provenance = {
+            **self._mismatch_provenance(),
+            "target": target,
+            "runtime_platform": "cuda",
+            "triton_used": False,
+            "actual_backend": self.backend_id,
+            "deterministic_linear_logp": True,
+            "strict_entrypoint": "sm90_deterministic_logp_from_local_logits_tp",
+            "local_logits_shape": list(local_logits.shape),
+            "target_shape": list(target_ids.shape),
+            "tp_group_present": True,
+            "vocab_start_index": int(vocab_start_index),
+            "global_vocab_size": requested_global,
+            "real_vocab_size": real,
+            "temperature": None if temperature is None else "provided",
+            "contract_version": "cuda-det-gemm-linear-logp-sm90-contract-v2",
+            "logits_materialized": True,
+            "lm_head_result_reused": True,
+        }
+        return result
 
     @staticmethod
     def _mismatch_provenance() -> dict[str, Any]:
@@ -343,6 +440,12 @@ class LinearLogpWrapper:
             "runtime_platform": "cuda",
             "triton_used": False,
             "actual_backend": actual_backend,
+            "deterministic_linear_logp": True,
+            "strict_entrypoint": (
+                "sm90_deterministic_linear_logp_tp"
+                if tensor_parallel
+                else "sm90_deterministic_linear_logp"
+            ),
             "hidden_shape": list(hidden.shape),
             "hidden_dtype": str(hidden.dtype).replace("torch.", ""),
             "lm_head_weight_shape": list(lm_head_weight.shape),

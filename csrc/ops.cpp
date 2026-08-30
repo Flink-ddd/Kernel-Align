@@ -104,10 +104,15 @@ int64_t deterministic_collective_create(
 void deterministic_collective_destroy(int64_t handle);
 void deterministic_collective_stage(int64_t handle, torch::Tensor& input);
 void deterministic_collective_all_reduce(int64_t handle, torch::Tensor& output);
+void deterministic_collective_all_reduce_fused(
+    int64_t handle, torch::Tensor& input, torch::Tensor& output);
 void deterministic_collective_reduce_scatter(int64_t handle, torch::Tensor& output);
 void deterministic_collective_all_gather(int64_t handle, torch::Tensor& output);
+void deterministic_collective_all_gather_fused(
+    int64_t handle, torch::Tensor& input, torch::Tensor& output);
 
 // Batch-Invariant Deterministic GEMM Declarations
+bool det_gemm_sm90_compiled();
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
 torch::Tensor det_gemm_fwd_rhs_transposed(torch::Tensor a, torch::Tensor bt);
 torch::Tensor det_gemm_da(torch::Tensor dc, torch::Tensor b);
@@ -121,6 +126,10 @@ std::vector<torch::Tensor> swiglu_backward_cuda(
     torch::Tensor dy,
     torch::Tensor gate,
     torch::Tensor up);
+torch::Tensor swiglu_packed_forward_cuda(torch::Tensor gate_up);
+std::vector<torch::Tensor> swiglu_packed_backward_cuda(
+    torch::Tensor dy,
+    torch::Tensor gate_up);
 
 // RMSNorm Declarations & Wrappers
 
@@ -272,6 +281,16 @@ std::vector<torch::Tensor> swiglu_backward(
     torch::Tensor gate,
     torch::Tensor up) {
   return swiglu_backward_cuda(dy, gate, up);
+}
+
+torch::Tensor swiglu_packed_forward(torch::Tensor gate_up) {
+  return swiglu_packed_forward_cuda(gate_up);
+}
+
+std::vector<torch::Tensor> swiglu_packed_backward(
+    torch::Tensor dy,
+    torch::Tensor gate_up) {
+  return swiglu_packed_backward_cuda(dy, gate_up);
 }
 
 // Deterministic standard-softmax attention (issue #147)
@@ -428,6 +447,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &deterministic_collective_all_reduce,
         "Run the TP=8 deterministic fixed-tree all-reduce kernel");
     m.def(
+        "deterministic_collective_all_reduce_fused",
+        &deterministic_collective_all_reduce_fused,
+        "Run a fused small-message deterministic fixed-tree all-reduce");
+    m.def(
         "deterministic_collective_reduce_scatter",
         &deterministic_collective_reduce_scatter,
         "Run the TP=8 deterministic fixed-tree reduce-scatter kernel");
@@ -435,6 +458,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "deterministic_collective_all_gather",
         &deterministic_collective_all_gather,
         "Run the TP=8 deterministic rank-ordered all-gather kernel");
+    m.def(
+        "deterministic_collective_all_gather_fused",
+        &deterministic_collective_all_gather_fused,
+        "Run a fused small-message deterministic rank-ordered all-gather");
 
     // Prefix-shared attention uses NVIDIA PTX and falls back to PyTorch SDPA on ROCm.
 #if !defined(USE_ROCM)
@@ -442,6 +469,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #endif
 
     // registry Batch-Invariant Deterministic GEMM
+    m.def("det_gemm_sm90_compiled", &det_gemm_sm90_compiled,
+          "Whether the extension contains the SM90 deterministic GEMM implementation");
     m.def("det_gemm_fwd", &det_gemm_fwd, "Batch-invariant deterministic GEMM forward (C=A@B)");
     m.def(
         "det_gemm_fwd_rhs_transposed",
@@ -469,6 +498,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("silu_backward", &silu_backward, "Batch-invariant SiLU backward CUDA");
     m.def("swiglu_forward", &swiglu_forward, "Batch-invariant SwiGLU forward CUDA");
     m.def("swiglu_backward", &swiglu_backward, "Batch-invariant SwiGLU backward CUDA");
+    m.def("swiglu_packed_forward", &swiglu_packed_forward,
+          "Batch-invariant SwiGLU forward for [rows, 2 * intermediate]");
+    m.def("swiglu_packed_backward", &swiglu_packed_backward,
+          "Batch-invariant SwiGLU backward for [rows, 2 * intermediate]");
 
     // Deterministic standard-softmax attention (issue #147)
     m.def(

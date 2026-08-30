@@ -10,7 +10,7 @@ import torch
 
 pytest.importorskip("triton")
 
-from rl_engine.kernels.ops.triton.linear import embedding as embedding_module
+from rl_engine.kernels.ops.triton.linear import embedding as embedding_module  # noqa: E402
 
 
 @dataclass
@@ -82,9 +82,7 @@ def _install_fake_kernels(
     backward = _FakeBackwardKernel()
     monkeypatch.setattr(embedding_module, "_embedding_fwd", forward)
     monkeypatch.setattr(embedding_module, "_embedding_bwd", backward)
-    monkeypatch.setattr(
-        embedding_module, "record_backward", lambda *args, **kwargs: None
-    )
+    monkeypatch.setattr(embedding_module, "record_backward", lambda *args, **kwargs: None)
     return forward, backward
 
 
@@ -113,9 +111,7 @@ def _run_fake_autograd(
     grad_output: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     differentiable_weight = weight.detach().clone().requires_grad_(True)
-    output = embedding_module._TritonEmbeddingFunction.apply(
-        token_ids, differentiable_weight
-    )
+    output = embedding_module._TritonEmbeddingFunction.apply(token_ids, differentiable_weight)
     output.backward(grad_output)
     assert differentiable_weight.grad is not None
     return output.detach(), differentiable_weight.grad.detach()
@@ -125,9 +121,7 @@ def test_stable_sort_preserves_original_positions_within_each_token() -> None:
     ids = torch.tensor([4, 1, 4, 2, 1, 4], dtype=torch.long)
     positions = torch.arange(ids.numel(), dtype=torch.float32).unsqueeze(1)
 
-    sorted_ids, sorted_positions = embedding_module._stable_sort_token_rows(
-        ids, positions
-    )
+    sorted_ids, sorted_positions = embedding_module._stable_sort_token_rows(ids, positions)
 
     assert sorted_ids.tolist() == [1, 1, 2, 4, 4, 4]
     assert sorted_positions.squeeze(1).tolist() == [1.0, 4.0, 3.0, 0.0, 2.0, 5.0]
@@ -178,9 +172,9 @@ def test_fake_autograd_matches_stable_fp32_left_fold(
     forward_kernel, backward_kernel = _install_fake_kernels(monkeypatch)
     vocab_size, hidden = 8, 7
     token_ids = torch.tensor(flat_ids, dtype=torch.int32).reshape(shape)
-    weight = torch.linspace(
-        -1.0, 1.0, vocab_size * hidden, dtype=torch.float32
-    ).reshape(vocab_size, hidden)
+    weight = torch.linspace(-1.0, 1.0, vocab_size * hidden, dtype=torch.float32).reshape(
+        vocab_size, hidden
+    )
     weight = weight.to(dtype)
     grad_output = torch.arange(
         token_ids.numel() * hidden,
@@ -269,9 +263,7 @@ def test_forward_path_does_not_depend_on_weight_requires_grad(
     weight = torch.randn(5, 4, dtype=torch.bfloat16)
 
     inference = embedding_module._TritonEmbeddingFunction.apply(ids, weight)
-    training = embedding_module._TritonEmbeddingFunction.apply(
-        ids, weight.requires_grad_(True)
-    )
+    training = embedding_module._TritonEmbeddingFunction.apply(ids, weight.requires_grad_(True))
 
     assert torch.equal(inference, training)
     assert len(forward_kernel.grids) == 2
@@ -396,9 +388,9 @@ def test_triton_embedding_cuda_backward_is_repeatable() -> None:
     gradients = []
     for _ in range(3):
         differentiable_weight = weight.detach().clone().requires_grad_(True)
-        embedding_module.TritonEmbeddingOp().forward(
-            token_ids, differentiable_weight
-        ).backward(grad_output)
+        embedding_module.TritonEmbeddingOp().forward(token_ids, differentiable_weight).backward(
+            grad_output
+        )
         assert differentiable_weight.grad is not None
         gradients.append(differentiable_weight.grad.detach())
 

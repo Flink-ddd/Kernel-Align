@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
+import shlex
 import statistics
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -89,6 +92,13 @@ def _sync(device: torch.device) -> None:
 
 
 def _time_ms(fn, device: torch.device, *, warmup: int = 3, repeat: int = 10) -> tuple[Any, float]:
+    result, elapsed = _time_samples_ms(fn, device, warmup=warmup, repeat=repeat)
+    return result, statistics.median(elapsed)
+
+
+def _time_samples_ms(
+    fn, device: torch.device, *, warmup: int = 3, repeat: int = 10
+) -> tuple[Any, list[float]]:
     result = None
     for _ in range(max(0, warmup)):
         result = fn()
@@ -112,7 +122,7 @@ def _time_ms(fn, device: torch.device, *, warmup: int = 3, repeat: int = 10) -> 
             elapsed.append((time.perf_counter() - start_time) * 1000.0)
 
     _sync(device)
-    return result, statistics.median(elapsed)
+    return result, elapsed
 
 
 def _peak_memory_gb(device: torch.device) -> float:
@@ -125,6 +135,164 @@ def _reset_peak(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
+
+
+def _incremental_peak_bytes(fn, device: torch.device) -> int:
+    _reset_peak(device)
+    baseline = torch.cuda.memory_allocated(device)
+    result = fn()
+    _sync(device)
+    peak = torch.cuda.max_memory_allocated(device) - baseline
+    del result
+    return peak
+
+
+def _backward_row(config: BenchmarkConfig) -> dict[str, Any]:
+    if config.device.type != "cuda":
+        raise RuntimeError("backward suite requires CUDA")
+
+    from rl_engine.kernels.ops.triton.loss.ratio_kl import TritonRatioKLOp
+
+    batch = make_synthetic_rl_kernel_batch(
+        num_prompts=config.num_prompts,
+        samples_per_prompt=config.samples_per_prompt,
+        prompt_len=config.prompt_len,
+        completion_len=config.completion_len,
+        vocab_size=config.vocab_size,
+        valid_density=config.mask_density,
+        dtype=config.dtype,
+        device=config.device,
+        seed=config.seed,
+    )
+    shape = (batch.batch_size, batch.completion_len, config.vocab_size)
+    torch.manual_seed(config.seed)
+    policy = torch.randn(shape, device=config.device, dtype=config.dtype)
+    ref = torch.randn_like(policy)
+    grad_ratio = torch.randn(*shape[:-1], 2, device=config.device)[:, :, 0]
+    grad_kl = torch.randn(*shape[:-1], 2, device=config.device)[:, :, 0]
+    op = TritonRatioKLOp()
+
+    def measure_isolated_backward():
+        isolated_policy = policy.detach().requires_grad_(True)
+        ratio, kl = op(
+            isolated_policy,
+            ref,
+            batch.token_ids,
+            batch.completion_mask,
+            batch.old_logps,
+        )
+
+        def isolated_backward():
+            isolated_policy.grad = None
+            torch.autograd.backward((ratio, kl), (grad_ratio, grad_kl), retain_graph=True)
+            return isolated_policy.grad
+
+        last_grad, samples = _time_samples_ms(
+            isolated_backward,
+            config.device,
+            warmup=config.warmup,
+            repeat=config.repeat,
+        )
+        isolated_policy.grad = None
+        del last_grad
+        peak = _incremental_peak_bytes(isolated_backward, config.device)
+        isolated_policy.grad = None
+        return samples, peak
+
+    isolated_samples, isolated_peak = measure_isolated_backward()
+
+    torch.cuda.empty_cache()
+
+    def forward_backward():
+        current_policy = policy.detach().requires_grad_(True)
+        current_ratio, current_kl = op(
+            current_policy,
+            ref,
+            batch.token_ids,
+            batch.completion_mask,
+            batch.old_logps,
+        )
+        torch.autograd.backward((current_ratio, current_kl), (grad_ratio, grad_kl))
+        return current_policy.grad
+
+    _, forward_backward_samples = _time_samples_ms(
+        forward_backward,
+        config.device,
+        warmup=config.warmup,
+        repeat=config.repeat,
+    )
+
+    direct_output = torch.version.hip is None and config.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    )
+    return {
+        "shape": list(shape),
+        "dtype": str(config.dtype),
+        "mask_density": config.mask_density,
+        "valid_tokens": batch.benchmark_metadata()["valid_tokens"],
+        "isolated_backward_ms": isolated_samples,
+        "isolated_backward_median_ms": statistics.median(isolated_samples),
+        "forward_backward_ms": forward_backward_samples,
+        "forward_backward_median_ms": statistics.median(forward_backward_samples),
+        "incremental_peak_bytes": isolated_peak,
+        "expected_direct_output_bytes": (
+            policy.numel() * policy.element_size() if direct_output else 0
+        ),
+        "expected_staging_saving_bytes": 4 * policy.numel() if direct_output else 0,
+    }
+
+
+def _metadata_value(command: list[str]) -> str:
+    try:
+        return subprocess.check_output(command, text=True).strip()
+    except (subprocess.CalledProcessError, OSError):
+        return "unknown"
+
+
+def _write_backward_results(
+    rows: list[dict[str, Any]], config: BenchmarkConfig, output: Path | None
+) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    sha = _metadata_value(["git", "rev-parse", "HEAD"])
+    output = output or REPO_ROOT / ".cache/benchmarks/ratio_kl" / f"raw-{sha[:8]}-{stamp}.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    driver = _metadata_value(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"])
+    payload = {
+        "metadata": {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "git_sha": sha,
+            "gpu": torch.cuda.get_device_name(config.device),
+            "compute_capability": list(torch.cuda.get_device_capability(config.device)),
+            "driver": driver,
+            "torch": torch.__version__,
+            "triton": __import__("triton").__version__,
+            "backend": "TritonRatioKLOp",
+            "seed": config.seed,
+            "warmup": config.warmup,
+            "iterations": config.repeat,
+            "command": shlex.join([sys.executable, *sys.argv]),
+        },
+        "results": rows,
+    }
+    output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    lines = [
+        "# ratio_kl backward benchmark",
+        "",
+        f"Raw data: `{output.name}`",
+        "",
+        "| dtype | shape | density | isolated ms | forward+backward ms | peak MiB |",
+        "| --- | --- | ---: | ---: | ---: | ---: |",
+    ]
+    lines.extend(
+        f"| {row['dtype']} | {row['shape']} | {row['mask_density']} | "
+        f"{row['isolated_backward_median_ms']:.4f} | "
+        f"{row['forward_backward_median_ms']:.4f} | "
+        f"{row['incremental_peak_bytes'] / 2**20:.1f} |"
+        for row in rows
+    )
+    output.with_suffix(".md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output
 
 
 def _ratio_kl_row(config: BenchmarkConfig) -> dict[str, Any]:
@@ -248,6 +416,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Fused ratio/KL RL-Kernel benchmark runner")
     parser.add_argument("--case", default="ratio_kl", choices=["ratio_kl"])
     parser.add_argument("--candidate", default="triton", choices=["triton"])
+    parser.add_argument(
+        "--backward-suite",
+        action="store_true",
+        help="Measure isolated backward, forward+backward, and incremental peak VRAM.",
+    )
     parser.add_argument("--smoke", action="store_true", help="Run a small local-development shape")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", default="float16")
@@ -305,8 +478,12 @@ def main() -> None:
                         repeat=args.repeat,
                     )
                     try:
-                        rows.append(_ratio_kl_row(config))
+                        rows.append(
+                            _backward_row(config) if args.backward_suite else _ratio_kl_row(config)
+                        )
                     except torch.cuda.OutOfMemoryError as exc:
+                        if args.backward_suite:
+                            raise
                         rows.append(
                             {
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -333,7 +510,12 @@ def main() -> None:
                             }
                         )
 
-    _write_rows(rows, args.output)
+    if args.backward_suite:
+        output = _write_backward_results(rows, config, args.output)
+        print(output)
+        print(output.with_suffix(".md"))
+    else:
+        _write_rows(rows, args.output)
 
 
 if __name__ == "__main__":

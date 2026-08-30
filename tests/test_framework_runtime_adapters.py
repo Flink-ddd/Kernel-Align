@@ -47,9 +47,7 @@ from rl_engine.kernels.attention_contract import (
     ReductionSpec,
     ShardingSpec,
 )
-from rl_engine.kernels.ops.cuda.attention.strict_runtime import (
-    StrictCUDAAttentionRuntime,
-)
+from rl_engine.kernels.ops.cuda.attention.strict_runtime import StrictCUDAAttentionRuntime
 
 
 def test_framework_adapters_do_not_construct_registered_kernels_directly():
@@ -241,14 +239,13 @@ def test_megatron_packed_attention_runs_each_sequence_in_thd_order(monkeypatch):
     )
 
     assert output.shape == (8, 8)
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert [call["contract"].sharding.global_sequence_length for call in calls] == [
         8,
-        8,
     ]
-    assert [call["query_position_ids"].tolist() for call in calls] == [
-        [[0, 1, 6, 7]],
-        [[0, 1, 6, 7]],
+    assert calls[0]["query_position_ids"].tolist() == [
+        [0, 1, 6, 7],
+        [0, 1, 6, 7],
     ]
 
 
@@ -465,8 +462,8 @@ def test_strict_cuda_runtime_pins_training_to_single_query_prefixes(monkeypatch)
         key_position_ids=positions,
     )
 
-    assert calls == [(1, 1, False), (1, 2, False), (1, 3, False), (1, 4, False)]
-    assert result.provenance["query_schedule"] == "single_query_causal_prefix"
+    assert calls == [(4, 4, True)]
+    assert result.provenance["query_schedule"] == "full_sequence_causal_single_launch"
 
 
 class _ReadbackOperator:
