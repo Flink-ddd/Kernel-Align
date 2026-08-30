@@ -161,10 +161,14 @@ def test_npu_registry_preserves_per_operator_cpu_fallbacks(monkeypatch):
     registry.get_op("rms_norm")
 
     assert registry._priority_map["npu"].keys() == registry._priority_map["cpu"].keys()
-    assert loaded[0] == OpBackend.PYTORCH_NATIVE_RMS_NORM
+    assert loaded[0] == OpBackend.ASCEND_RMS_NORM
     assert registry._priority_map["npu"]["batch_invariant_logp"] == [
         OpBackend.ASCEND_BATCH_INVARIANT_LOGP,
         OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
+    ]
+    assert registry._priority_map["npu"]["rms_norm"] == [
+        OpBackend.ASCEND_RMS_NORM,
+        OpBackend.PYTORCH_NATIVE_RMS_NORM,
     ]
 
 
