@@ -630,8 +630,7 @@ class TorchDistributedDeterministicCollective:
         if not inputs:
             raise ValueError("reduce_scatter_many requires at least one input")
         return tuple(
-            self.reduce_scatter(input, validate_signature=validate_signature)
-            for input in inputs
+            self.reduce_scatter(input, validate_signature=validate_signature) for input in inputs
         )
 
     def close(self) -> None:
