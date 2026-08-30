@@ -29,6 +29,44 @@ from rl_engine.utils.logger import logger
 
 _MAX_TESTED_ROCM_TRITON_HEAD_DIM = 512
 _AITER_API_SOURCE = "aiter.ops.mha"
+_AITER_OP_NAMESPACE = "aiter"
+
+# AITER wraps its kernels in a JIT loader whose Python signature is
+# ``(*args, **kwargs)``, so ``inspect.signature`` cannot see the contract the
+# way it can for the FA4 CuTe API. The names live in the registered Torch
+# schema instead, and the calls below are positional, so the order is part of
+# what has to hold: an upstream insertion would silently reinterpret every
+# argument after it. These tuples are the exact positional prefix each call
+# site assumes.
+_AITER_FWD_POSITIONAL_CONTRACT = (
+    "q",
+    "k",
+    "v",
+    "dropout_p",
+    "softmax_scale",
+    "is_causal",
+    "window_size_left",
+    "window_size_right",
+    "sink_size",
+    "return_softmax_lse",
+    "return_dropout_randval",
+)
+_AITER_BWD_POSITIONAL_CONTRACT = (
+    "dout",
+    "q",
+    "k",
+    "v",
+    "out",
+    "softmax_lse",
+    "dropout_p",
+    "softmax_scale",
+    "is_causal",
+    "window_size_left",
+    "window_size_right",
+    "deterministic",
+)
+# Passed by keyword, so only presence matters.
+_AITER_BWD_REQUIRED_KEYWORDS = frozenset({"rng_state"})
 
 # Stable dispatch identity for the strict ROCm attention core.  Kept at module
 # scope so contract-aware dispatch and the Vime adapter name one constant
@@ -38,6 +76,51 @@ BACKEND_ID = "aiter.rocm.ck_dense_mha"
 
 class StrictRocmAttentionUnavailable(RuntimeError):
     """Raised when the exact AITER CK strict contract is unavailable."""
+
+
+def _aiter_schema_argument_names(op_name: str) -> tuple[str, ...]:
+    """Return the registered Torch schema argument names for one AITER op."""
+
+    namespace = getattr(torch.ops, _AITER_OP_NAMESPACE, None)
+    if namespace is None:
+        raise StrictRocmAttentionUnavailable(
+            f"the '{_AITER_OP_NAMESPACE}' Torch operator namespace is not registered"
+        )
+    try:
+        overload = getattr(namespace, op_name).default
+        arguments = overload._schema.arguments
+    except (AttributeError, RuntimeError) as exc:
+        raise StrictRocmAttentionUnavailable(
+            f"cannot read the Torch schema for {_AITER_OP_NAMESPACE}::{op_name}"
+        ) from exc
+    return tuple(argument.name for argument in arguments)
+
+
+def _validate_aiter_schema(
+    op_name: str,
+    positional_contract: tuple[str, ...],
+    *,
+    required_keywords: frozenset[str] = frozenset(),
+) -> None:
+    """Fail closed unless AITER still accepts what the call sites pass.
+
+    The strict calls are positional, so a renamed *or reordered* argument
+    changes their meaning without changing their shape. Checking the ordered
+    prefix catches both, which name-presence alone would not.
+    """
+
+    names = _aiter_schema_argument_names(op_name)
+    prefix = names[: len(positional_contract)]
+    if prefix != positional_contract:
+        raise StrictRocmAttentionUnavailable(
+            f"AITER {op_name} positional contract changed: strict ROCm Attention "
+            f"passes {positional_contract} but the schema declares {prefix}"
+        )
+    missing = sorted(required_keywords.difference(names))
+    if missing:
+        raise StrictRocmAttentionUnavailable(
+            f"AITER {op_name} is missing strict controls: " + ", ".join(missing)
+        )
 
 
 def _load_aiter_ck_ops() -> tuple[Callable[..., Any], Callable[..., Any], str]:
@@ -51,6 +134,12 @@ def _load_aiter_ck_ops() -> tuple[Callable[..., Any], Callable[..., Any], str]:
         ) from exc
     if not callable(mha_fwd) or not callable(mha_bwd):
         raise StrictRocmAttentionUnavailable("AITER CK MHA entry points are not callable")
+    _validate_aiter_schema("mha_fwd", _AITER_FWD_POSITIONAL_CONTRACT)
+    _validate_aiter_schema(
+        "mha_bwd",
+        _AITER_BWD_POSITIONAL_CONTRACT,
+        required_keywords=_AITER_BWD_REQUIRED_KEYWORDS,
+    )
     module_file = inspect.getsourcefile(module)
     if not module_file:
         raise StrictRocmAttentionUnavailable("cannot fingerprint the AITER MHA source module")
