@@ -706,10 +706,16 @@ class KernelRegistry:
                     roles=frozenset({AttentionRole.TRAIN, AttentionRole.INFER}),
                     modes=frozenset({AttentionMode.PREFILL, AttentionMode.CHUNKED_PREFILL}),
                     dtypes=frozenset({AttentionDType.BF16, AttentionDType.FP16}),
-                    cp_world_sizes=(1,),
+                    # The core itself is single-rank arithmetic. CP is supplied
+                    # by StrictRocmAttentionRuntime, which wraps this core in
+                    # the RCCL AG/RS transport; the sizes mirror the world
+                    # sizes _RCCLRankOrderedTransport accepts. The merge order
+                    # is the transport's fixed balanced rank tree, not RCCL's
+                    # own reduction, so the CP merge is deterministic.
+                    cp_world_sizes=(1, 2, 4, 8),
                     tp_world_sizes=None,
                     exports_attention_lse=True,
-                    deterministic_cp_merge=False,
+                    deterministic_cp_merge=True,
                     supports_packed_varlen=False,
                     supports_kv_cache=False,
                     supports_rope_metadata=True,

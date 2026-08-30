@@ -19,10 +19,13 @@ Two boundaries are deliberate and are enforced rather than documented:
   of a row/group independent of how many rows or heads its caller happened to
   hold, which is what lets training and rollout compare bitwise across
   different batch sizes and TP degrees.  It costs roughly 3x forward time.
-* CP is not a merge axis here.  The strict ROCm core owns single-rank attention
-  arithmetic only; the cross-rank ``(out, lse)`` merge lives in the CP transport
-  path.  CP rank and layout are recorded as row-ownership provenance and a
-  request that asks this provider to perform the CP merge fails closed.
+* CP merges through the transport, never here.  The strict ROCm core owns
+  single-rank attention arithmetic only.  At ``CP > 1`` this provider hands the
+  schedule to :class:`StrictRocmAttentionRuntime`, whose RCCL AG/RS transport
+  combines the cross-rank ``(out, lse)`` in a fixed balanced rank tree, so no
+  second merge order is ever defined here.  The layout must be ``allgather``;
+  ``zigzag`` fails closed because the strict CP plan describes one contiguous
+  block per rank.
 """
 
 from __future__ import annotations
@@ -45,6 +48,7 @@ from rl_engine.kernels.attention_contract import (
     SplitKVSpec,
 )
 from rl_engine.kernels.ops.rocm.attention.flash_attn import BACKEND_ID
+from rl_engine.kernels.ops.rocm.attention.strict_runtime import StrictRocmAttentionRuntime
 from rl_engine.kernels.registry import kernel_registry
 
 
@@ -203,14 +207,13 @@ def _contract_for_request(
         raise AttentionProviderUnavailable(
             "context_parallel layout does not describe local CP token ownership"
         )
-    if cp_world_size > 1:
-        # The strict ROCm core is single-rank attention arithmetic.  Performing
-        # the cross-rank (out, lse) merge here would silently introduce a second
-        # merge implementation with its own order; the CP transport path owns it.
+    if cp_world_size > 1 and cp_layout != "allgather":
+        # The strict CP plan describes one contiguous block per rank. A zigzag
+        # rank owns two discontiguous token runs, so accepting it here would
+        # silently disagree with the block manifest the transport validates.
         raise AttentionProviderUnavailable(
-            f"CP={cp_world_size} requires the strict CP transport path; this provider owns "
-            "single-rank attention arithmetic and will not perform the cross-rank "
-            "(out, lse) merge"
+            f"CP={cp_world_size} requires the 'allgather' layout; got {cp_layout!r}, "
+            "whose block ownership the strict CP plan does not describe"
         )
 
     tp_rank, tp_world_size = _tp_coordinates(getattr(request, "tensor_parallel_group", None))
@@ -271,7 +274,9 @@ def _contract_for_request(
     scale = metadata.get("softmax_scale")
     resolved_scale = 1.0 / math.sqrt(head_dim) if scale is None else float(scale)
 
-    # CP=1: this rank owns the whole logical sequence as one block.
+    # Each CP rank owns one contiguous block of the logical sequence; at CP=1
+    # that block is the whole sequence. The allgather layout checked above is
+    # what makes the block contiguous.
     sharding = ShardingSpec(
         tp_rank=tp_rank,
         tp_world_size=tp_world_size,
@@ -283,10 +288,10 @@ def _contract_for_request(
         local_q_heads=local_q_heads,
         local_kv_head_start=tp_rank * local_kv_heads,
         local_kv_heads=local_kv_heads,
-        global_sequence_length=kv_len,
+        global_sequence_length=kv_len * cp_world_size,
         local_sequence_length=kv_len,
-        global_block_indices=(0,),
-        global_block_token_starts=(0,),
+        global_block_indices=(cp_rank,),
+        global_block_token_starts=(cp_rank * kv_len,),
         local_block_offsets=(0, kv_len),
     )
     # Causal alignment: the query block is the tail of the logical sequence, so
@@ -366,41 +371,40 @@ def attention_provider(request: Any) -> AttentionProviderResult:
         raise RuntimeError("explicit strict attention dispatch changed during materialization")
 
     query_len = query.shape[2]
-    local_kv_heads = key.shape[1]
-    group_size = query.shape[1] // local_kv_heads
-
-    row_outs: list[torch.Tensor] = []
-    row_lses: list[torch.Tensor] = []
-    core_provenance: dict[str, Any] | None = None
-    launches = 0
-    for row in range(query.shape[0]):
-        row_key_positions = key_positions[row : row + 1]
-        group_outs: list[torch.Tensor] = []
-        group_lses: list[torch.Tensor] = []
-        for group in range(local_kv_heads):
-            q_lo, q_hi = group * group_size, (group + 1) * group_size
-            result = dispatch.op.forward_with_lse(
-                query[row : row + 1, q_lo:q_hi],
-                key[row : row + 1, group : group + 1],
-                value[row : row + 1, group : group + 1],
-                causal=contract.causal,
-                scale=scale,
-                key_padding_mask=None,
-                query_position_ids=row_key_positions[:, -query_len:] if contract.causal else None,
-                key_position_ids=row_key_positions if contract.causal else None,
-                output_dtype=query.dtype,
+    cp_world_size = contract.sharding.cp_world_size
+    if cp_world_size > 1:
+        cp_group = getattr(request, "context_parallel_group", None)
+        if cp_group is None:
+            raise AttentionProviderUnavailable(
+                f"CP={cp_world_size} requires request.context_parallel_group so the strict "
+                "RCCL AG/RS transport can be built; CP=1 does not need one"
             )
-            group_outs.append(result.out)
-            group_lses.append(result.lse)
-            launches += 1
-            if core_provenance is None:
-                core_provenance = dict(result.provenance)
-        row_outs.append(torch.cat(group_outs, dim=1))
-        row_lses.append(torch.cat(group_lses, dim=1))
+    else:
+        cp_group = None
 
-    out = torch.cat(row_outs, dim=0)
-    lse = torch.cat(row_lses, dim=0)
-    assert core_provenance is not None  # batch_size and kv heads are validated positive
+    # One runtime owns the launch schedule for both CP degrees, so the
+    # per-(batch row, KV group) launch loop that makes the result TP-degree
+    # invariant cannot drift between the single-rank and CP paths.
+    runtime = StrictRocmAttentionRuntime(process_group=cp_group, core=dispatch.op)
+    runtime_result = runtime.forward_with_lse(
+        query,
+        key,
+        value,
+        contract=contract,
+        causal=contract.causal,
+        scale=scale,
+        cp_world_size=cp_world_size,
+        query_position_ids=key_positions[:, -query_len:],
+        key_position_ids=key_positions,
+        # At CP=1 this rank already holds the logical sequence in position
+        # order, so the reorder the CP path needs would be a no-op copy.
+        positions_are_sorted=cp_world_size == 1,
+    )
+
+    out = runtime_result.out
+    lse = runtime_result.lse
+    core_provenance = runtime_result.provenance["core"]
+    launches = runtime_result.provenance["core_launch_count"]
 
     provenance = dict(dispatch.provenance)
     provenance["core"] = core_provenance
@@ -429,15 +433,21 @@ def attention_provider(request: Any) -> AttentionProviderResult:
         "cp_world_size": contract.sharding.cp_world_size,
         "layout": getattr(request.context_parallel, "layout"),
         "local_token_rows": contract.sharding.local_sequence_length,
-        "cp_is_merge_axis": False,
+        # The merge happens in the RCCL AG/RS transport's fixed rank tree, not
+        # in this provider; the flag records that CP was an axis at all.
+        "cp_is_merge_axis": cp_world_size > 1,
+        "cp_merge_owner": (
+            runtime_result.provenance["communication_backend"] if cp_world_size > 1 else "none"
+        ),
     }
     provenance["lse_domain"] = "attention"
     # The qualified ROCm core's reduction order depends on the launch head
-    # count, so a head shard computed under TP=4 is not bit-identical to the
-    # same shard under TP=8 at some shapes.  RL-Kernel binds the degree rather
-    # than paying ~3x forward time to remove the dependence: training and
-    # rollout must run the same TP/CP degree.  ``contract_id`` encodes both, so
-    # comparing it across the two sides is the preflight that enforces this.
+    # count, so raw AITER gives a head shard computed under TP=4 different bits
+    # from the same shard under TP=8 at some shapes.  RL-Kernel removes the
+    # dependence instead of binding the degree: every launch carries exactly one
+    # KV group, which is bitwise TP-invariant at 12 of 12 measured points.
+    # ``contract_id`` still encodes TP/CP so the preflight can compare the two
+    # sides, but it is no longer what buys the invariance.
     provenance["cross_config_binding"] = {
         "bound_fields": list(CROSS_CONFIG_BOUND_FIELDS),
         "tp_world_size": contract.sharding.tp_world_size,

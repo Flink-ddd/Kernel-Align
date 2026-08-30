@@ -119,6 +119,27 @@ def test_strict_rocm_core_is_registered_only_when_the_vendor_stack_loads():
         )
 
 
+def test_rocm_strict_cp_capability_matches_the_transport():
+    """The declared CP degrees must be the ones the RCCL transport accepts.
+
+    CP is supplied by StrictRocmAttentionRuntime wrapping this core in the RCCL
+    AG/RS transport. Declaring a degree the transport rejects would make
+    dispatch hand back a backend that fails at materialization; declaring fewer
+    would hide working CP behind an "unsupported" rejection.
+    """
+
+    if not _rocm_strict_attention_available():
+        pytest.skip("strict ROCm attention requires a ROCm device with aiter.ops.mha")
+
+    capability = KernelRegistry()._attention_capabilities[OpBackend.ROCM_STRICT_ATTENTION]
+
+    assert capability.cp_world_sizes == (1, 2, 4, 8)
+    # The merge order is the transport's fixed balanced rank tree, so the CP
+    # combine is deterministic even though the core is single-rank arithmetic.
+    assert capability.deterministic_cp_merge is True
+    assert capability.exports_attention_lse is True
+
+
 def test_registered_backend_resolves_with_provenance(registry):
     registry.register_attention_backend(
         OpBackend.ROCM_STRICT_ATTENTION, _capability(), platform=_platform(registry)

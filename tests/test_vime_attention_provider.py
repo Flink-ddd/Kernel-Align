@@ -86,11 +86,45 @@ def _cpu_request(**kwargs):
 # ---------------------------------------------------------------------------
 
 
-def test_cp_greater_than_one_refuses_the_cross_rank_merge():
+def test_cp_zigzag_layout_fails_closed():
+    """Only the contiguous-per-rank layout matches the strict CP block plan."""
+
     request = _cpu_request(cp_world_size=2, cp_rank=1, cp_layout="zigzag")
 
-    with pytest.raises(AttentionProviderUnavailable, match="strict CP transport path"):
+    with pytest.raises(AttentionProviderUnavailable, match="requires the 'allgather' layout"):
         attention_provider(request)
+
+
+def test_cp_without_a_process_group_fails_closed():
+    """CP>1 needs a group to build the RCCL transport; it must not fall back."""
+
+    request = _cpu_request(cp_world_size=2, cp_rank=1, cp_layout="allgather")
+
+    with pytest.raises(AttentionProviderUnavailable, match="context_parallel_group"):
+        attention_provider(request)
+
+
+def test_cp_contract_describes_one_contiguous_block_per_rank():
+    """The CP sharding must place this rank's block at its global offset."""
+
+    from rl_engine.integrations.vime.attention import _contract_for_request
+
+    seq_len = 8
+    request = _cpu_request(
+        seq_len=seq_len,
+        cp_world_size=4,
+        cp_rank=2,
+        cp_layout="allgather",
+    )
+    contract, *_ = _contract_for_request(request)
+    sharding = contract.sharding
+
+    assert sharding.cp_world_size == 4
+    assert sharding.global_sequence_length == seq_len * 4
+    assert sharding.local_sequence_length == seq_len
+    assert sharding.global_block_indices == (2,)
+    assert sharding.global_block_token_starts == (2 * seq_len,)
+    assert sharding.local_block_offsets == (0, seq_len)
 
 
 def test_decode_without_kv_cache_identity_fails_closed():
