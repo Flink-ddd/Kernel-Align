@@ -444,7 +444,7 @@ def _ascend_rmsnorm_available() -> bool:
     if not _npu_available():
         return False
     try:
-        from rl_engine.kernels.ops.ascend.norm.rmsnorm import _C_npu, _NPU_EXT_AVAILABLE
+        from rl_engine.kernels.ops.ascend.norm.rmsnorm import _NPU_EXT_AVAILABLE, _C_npu
     except Exception:
         return False
     return _NPU_EXT_AVAILABLE and hasattr(_C_npu, "rmsnorm_ascend")

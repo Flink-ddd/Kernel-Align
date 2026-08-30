@@ -8,7 +8,6 @@ def batch_invariant_logp_ascend(
     target: torch.Tensor,
     ignore_index: int,
 ) -> list[torch.Tensor]: ...
-
 def rmsnorm_ascend(
     x: torch.Tensor,
     weight: torch.Tensor,
