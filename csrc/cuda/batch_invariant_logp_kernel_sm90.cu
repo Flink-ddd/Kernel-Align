@@ -18,6 +18,20 @@ namespace {
 #define TMA_BOX 256
 static constexpr int LOADS_PER_TILE = SMEM_TILE / TMA_BOX;
 
+// CUDA 13's CCCL no longer exposes cub::Max/Sum as public functors. Keep the
+// reduction tree explicit so the SM90 build remains portable and deterministic.
+struct DeterministicMax {
+    __device__ __forceinline__ float operator()(float lhs, float rhs) const {
+        return lhs > rhs ? lhs : rhs;
+    }
+};
+
+struct DeterministicSum {
+    __device__ __forceinline__ float operator()(float lhs, float rhs) const {
+        return lhs + rhs;
+    }
+};
+
 template <typename T> __device__ __forceinline__ float to_float(T x);
 template <> __device__ __forceinline__ float to_float<nv_bfloat16>(nv_bfloat16 x) {
     return __bfloat162float(x);
@@ -81,7 +95,7 @@ __global__ void batch_invariant_logp_sm90_kernel(const __grid_constant__ CUtenso
         for (int i = tid; i < current_tile_size; i += NUM_THREADS) {
             tile_max = max(tile_max, to_float<T>(smem_logits[i]));
         }
-        float block_tile_max = BlockReduce(temp_storage).Reduce(tile_max, cub::Max());
+        float block_tile_max = BlockReduce(temp_storage).Reduce(tile_max, DeterministicMax());
         if (tid == 0)
             s_tile_max = block_tile_max;
         __syncthreads();
@@ -91,7 +105,7 @@ __global__ void batch_invariant_logp_sm90_kernel(const __grid_constant__ CUtenso
         for (int i = tid; i < current_tile_size; i += NUM_THREADS) {
             tile_sum += expf(to_float<T>(smem_logits[i]) - s_tile_max);
         }
-        float block_tile_sum = BlockReduce(temp_storage).Reduce(tile_sum, cub::Sum());
+        float block_tile_sum = BlockReduce(temp_storage).Reduce(tile_sum, DeterministicSum());
 
         // Online log-sum-exp merge of this tile into the running row state.
         if (tid == 0) {
@@ -110,7 +124,7 @@ __global__ void batch_invariant_logp_sm90_kernel(const __grid_constant__ CUtenso
         for (int i = tid; i < tail; i += NUM_THREADS) {
             tail_max = max(tail_max, to_float<T>(logits_gmem[base + i]));
         }
-        float block_tail_max = BlockReduce(temp_storage).Reduce(tail_max, cub::Max());
+        float block_tail_max = BlockReduce(temp_storage).Reduce(tail_max, DeterministicMax());
         if (tid == 0)
             s_tile_max = block_tail_max;
         __syncthreads();
@@ -119,7 +133,7 @@ __global__ void batch_invariant_logp_sm90_kernel(const __grid_constant__ CUtenso
         for (int i = tid; i < tail; i += NUM_THREADS) {
             tail_sum += expf(to_float<T>(logits_gmem[base + i]) - s_tile_max);
         }
-        float block_tail_sum = BlockReduce(temp_storage).Reduce(tail_sum, cub::Sum());
+        float block_tail_sum = BlockReduce(temp_storage).Reduce(tail_sum, DeterministicSum());
         if (tid == 0) {
             const float new_max = max(row_max, s_tile_max);
             row_sum = row_sum * expf(row_max - new_max) + block_tail_sum * expf(s_tile_max - new_max);

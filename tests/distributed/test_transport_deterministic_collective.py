@@ -243,6 +243,30 @@ def test_matching_signature_is_validated_once_per_hot_path(
     assert fake_dist.object_gather_calls == constructor_object_gathers + 1
 
 
+def test_latest_collective_api_can_skip_signature_handshakes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peers = [torch.full((4, 2), rank + 1, dtype=torch.float32) for rank in range(2)]
+    collective, fake_dist = _make_collective(monkeypatch, peers, backend="nccl")
+    constructor_object_gathers = fake_dist.object_gather_calls
+
+    collective.all_reduce(peers[0], validate_signature=False)
+    collective.all_gather(peers[0], validate_signature=False)
+    collective.reduce_scatter(peers[0], validate_signature=False)
+    gathered = collective.all_gather_many(
+        (peers[0], peers[0]),
+        validate_signature=False,
+    )
+    scattered = collective.reduce_scatter_many(
+        (peers[0], peers[0]),
+        validate_signature=False,
+    )
+
+    assert len(gathered) == 2
+    assert len(scattered) == 2
+    assert fake_dist.object_gather_calls == constructor_object_gathers
+
+
 def test_reduce_scatter_reduces_then_selects_local_leading_shard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

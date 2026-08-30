@@ -512,6 +512,14 @@ torch::Tensor gemm_dispatch(const torch::Tensor& a, const torch::Tensor& rhs,
 
 }  // anonymous namespace
 
+bool det_gemm_sm90_compiled() {
+#if defined(RL_KERNEL_ENABLE_SM90)
+  return true;
+#else
+  return false;
+#endif
+}
+
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b) {
   check_in(a, "A"); check_in(b, "B");
   a = a.contiguous(); b = b.contiguous();

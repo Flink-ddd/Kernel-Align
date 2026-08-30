@@ -6,6 +6,76 @@ from __future__ import annotations
 import torch
 
 
+@torch.library.custom_op("rl_kernel::strict_rms_norm", mutates_args=())
+def _strict_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Preserve PyTorch eager RMSNorm arithmetic across graph compilation."""
+
+    return torch.nn.functional.rms_norm(x, (x.shape[-1],), weight, eps)
+
+
+@_strict_rms_norm.register_fake
+def _strict_rms_norm_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    del weight, eps
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op("rl_kernel::strict_add_rms_norm", mutates_args=())
+def _strict_add_rms_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Preserve vLLM's eager residual-add and RMSNorm contract."""
+
+    updated_residual = x + residual
+    normalized = torch.nn.functional.rms_norm(
+        updated_residual,
+        (updated_residual.shape[-1],),
+        weight,
+        eps,
+    )
+    return normalized, updated_residual
+
+
+@_strict_add_rms_norm.register_fake
+def _strict_add_rms_norm_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del residual, weight, eps
+    return torch.empty_like(x), torch.empty_like(x)
+
+
+def strict_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    return _strict_rms_norm(x, weight, eps)
+
+
+def strict_add_rms_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _strict_add_rms_norm(x, residual, weight, eps)
+
+
 class NativeRMSNormOp:
     """
     Pure Pytorch native RMSNorm reference

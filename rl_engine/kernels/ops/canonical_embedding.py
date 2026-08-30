@@ -17,9 +17,7 @@ def _canonical_embedding_family(family: str) -> str:
     requested = str(family)
     normalized = "cuda" if requested.startswith("cuda") else requested
     if normalized not in {"cuda", "pytorch", "triton"}:
-        raise RuntimeError(
-            f"unsupported canonical embedding backend family: {requested!r}"
-        )
+        raise RuntimeError(f"unsupported canonical embedding backend family: {requested!r}")
     return normalized
 
 
@@ -44,9 +42,7 @@ def _reduce_embedding_grad_weight(
     if family not in {"cuda", "pytorch"}:
         raise RuntimeError(f"unsupported canonical embedding backend family: {family!r}")
 
-    from rl_engine.kernels.ops.cuda.linear.embedding import (
-        _deterministic_embedding_grad_weight,
-    )
+    from rl_engine.kernels.ops.cuda.linear.embedding import _deterministic_embedding_grad_weight
 
     return _deterministic_embedding_grad_weight(
         ids.reshape(-1).to(dtype=torch.long),
@@ -69,15 +65,11 @@ class _CanonicalEmbeddingFunction(torch.autograd.Function):
     ) -> torch.Tensor:
         session = active_session()
         if session is None:
-            raise RuntimeError(
-                "canonical embedding requires an active backward session"
-            )
+            raise RuntimeError("canonical embedding requires an active backward session")
         if weight.ndim != 2:
             raise ValueError("canonical embedding weight must be [vocab, hidden]")
         if logical_keys.ndim < 2 or logical_keys.shape[-1] not in (2, 3):
-            raise ValueError(
-                "canonical embedding logical keys must end in width 2 or 3"
-            )
+            raise ValueError("canonical embedding logical keys must end in width 2 or 3")
         if logical_keys.device != token_ids.device:
             raise ValueError("canonical embedding token ids and logical keys must share a device")
 
@@ -90,9 +82,7 @@ class _CanonicalEmbeddingFunction(torch.autograd.Function):
         ctx.save_for_backward(ids)
         ctx.session = session
         ctx.parameter_id = str(parameter_id)
-        ctx.slot = (
-            session.register(ctx.parameter_id, keys) if weight.requires_grad else None
-        )
+        ctx.slot = session.register(ctx.parameter_id, keys) if weight.requires_grad else None
         ctx.weight_shape = (int(weight.shape[0]), int(weight.shape[1]))
         ctx.weight_dtype = weight.dtype
         ctx.family = normalized_family
@@ -109,9 +99,7 @@ class _CanonicalEmbeddingFunction(torch.autograd.Function):
             hidden = ctx.weight_shape[1]
             grad_rows = grad_output.reshape(-1, hidden).contiguous()
 
-            def reducer(
-                ordered_ids: torch.Tensor, ordered_grads: torch.Tensor
-            ) -> torch.Tensor:
+            def reducer(ordered_ids: torch.Tensor, ordered_grads: torch.Tensor) -> torch.Tensor:
                 return _reduce_embedding_grad_weight(
                     ordered_ids,
                     ordered_grads,

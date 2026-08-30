@@ -18,10 +18,7 @@ from typing import Any, Mapping, cast
 import torch
 
 from rl_engine.alignment.cross_config.operators import OperatorBridge, OperatorOverride
-from rl_engine.integrations.linear_logp import (
-    LinearLogpWrapper,
-    take_rollout_linear_logp_context,
-)
+from rl_engine.integrations.linear_logp import LinearLogpWrapper, take_rollout_linear_logp_context
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_FA4_SCHEDULE_ID,
     STRICT_ATTENTION_PRODUCTION_CORE_ID,
@@ -32,24 +29,16 @@ from rl_engine.kernels.attention_contract import (
 )
 from rl_engine.kernels.attention_contract import ReductionSpec as AttentionReductionSpec
 from rl_engine.kernels.attention_contract import ShardingSpec as AttentionShardingSpec
-from rl_engine.kernels.attention_contract import (
-    SplitKVSpec,
-)
-from rl_engine.kernels.logprob_contract import (
-    LogprobContract,
-    LogprobDType,
-    LogprobRole,
-    MaskSpec,
-)
+from rl_engine.kernels.attention_contract import SplitKVSpec
+from rl_engine.kernels.logprob_contract import LogprobContract, LogprobDType, LogprobRole, MaskSpec
 from rl_engine.kernels.logprob_contract import ReductionSpec as LogprobReductionSpec
 from rl_engine.kernels.logprob_contract import ShardingSpec as LogprobShardingSpec
+from rl_engine.kernels.ops.cuda.matmul.det_gemm import det_gemm_backend_id
 from rl_engine.kernels.ops.pytorch.attention.ablation import AttentionAblationConfig
 from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import BACKEND_ID as LOGP_BACKEND_ID
-from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import (
-    DEFAULT_NUM_VOCAB_TILES,
-)
-from rl_engine.kernels.registry import kernel_registry
+from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import DEFAULT_NUM_VOCAB_TILES
 from rl_engine.kernels.semantic_registry import OperatorRequirements
+from rl_engine.runtime_mode import strict_contract_enabled
 
 ATTENTION_BACKEND_ID = "rlkernel.attention.deterministic.v1"
 FFN_BACKEND_ID = "rlkernel.ffn.qwen3.deterministic.v1"
@@ -75,14 +64,20 @@ def _optional_env_int(name: str) -> int | None:
         return None
 
 
+def _tensor_metadata(tensor: torch.Tensor) -> dict[str, Any]:
+    """Describe a hot-path tensor without reading CUDA values on the host."""
+
+    return {
+        "shape": list(tensor.shape),
+        "dtype": _dtype_name(tensor),
+        "device": str(tensor.device),
+        "numel": int(tensor.numel()),
+    }
+
+
 def _tensor_debug_stats(tensor: torch.Tensor) -> dict[str, Any]:
     detached = tensor.detach()
-    stats: dict[str, Any] = {
-        "shape": list(detached.shape),
-        "dtype": _dtype_name(detached),
-        "device": str(detached.device),
-        "numel": int(detached.numel()),
-    }
+    stats = _tensor_metadata(detached)
     if detached.numel() == 0:
         return stats
     values = detached.float()
@@ -136,8 +131,9 @@ class SemanticOperatorHandle:
         self.backend_id = backend_id
         self._bridge = OperatorBridge()
         self._instance: Any | None = None
-        self._requirements: OperatorRequirements | None = None
         self._provenance: dict[str, Any] | None = None
+        self._runtime_device: torch.device | None = None
+        self._runtime_dtype: torch.dtype | None = None
         self._lock = Lock()
 
     def get(
@@ -147,12 +143,6 @@ class SemanticOperatorHandle:
         topology: Mapping[str, Any],
         factory_kwargs: Mapping[str, Any] | None = None,
     ) -> Any:
-        requirements = OperatorRequirements(
-            device=_device_name(tensor),
-            dtype=_dtype_name(tensor),
-            topology=topology,
-            alignment_properties={"deterministic": True},
-        )
         # This method is called from vLLM model forwards that may be captured
         # by torch.compile.  A Lock context manager is unsupported in a
         # Dynamo fullgraph, so keep the hot-path lookup lock-free.  Handles
@@ -165,14 +155,17 @@ class SemanticOperatorHandle:
             # TP=2. The operator receives the live group at invocation time;
             # keep device and dtype strict, but do not reject this topology
             # transition after the semantic instance is resolved.
-            if self._requirements is not None and (
-                requirements.device != self._requirements.device
-                or requirements.dtype != self._requirements.dtype
-            ):
+            if tensor.device != self._runtime_device or tensor.dtype != self._runtime_dtype:
                 raise RuntimeError(
                     f"{self.semantic_op} runtime device/dtype changed after resolution"
                 )
             return self._instance
+        requirements = OperatorRequirements(
+            device=_device_name(tensor),
+            dtype=_dtype_name(tensor),
+            topology=topology,
+            alignment_properties={"deterministic": True},
+        )
         target = cast(Any, self.target)
         resolved = self._bridge.resolve_override(
             OperatorOverride.for_target(
@@ -201,8 +194,9 @@ class SemanticOperatorHandle:
                 f"{actual_backend!r}"
             )
         self._instance = instance
-        self._requirements = requirements
         self._provenance = provenance.to_dict()
+        self._runtime_device = tensor.device
+        self._runtime_dtype = tensor.dtype
         return instance
 
     @property
@@ -217,6 +211,33 @@ def _weight(module: Any, name: str) -> torch.Tensor:
     if value.ndim != 2:
         raise RuntimeError(f"{name}.weight must be two-dimensional")
     return value
+
+
+def _fused_rms_norm_input(
+    projection: Any,
+    hidden_states: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    """Recover the RMSNorm hidden by TE's LayerNormLinear wrapper."""
+
+    weight = getattr(projection, "layer_norm_weight", None)
+    if weight is None:
+        return hidden_states
+    if not isinstance(weight, torch.Tensor):
+        raise RuntimeError(f"{name}.layer_norm_weight must be a tensor")
+    if getattr(projection, "normalization", None) != "RMSNorm":
+        raise RuntimeError(f"strict {name} requires fused RMSNorm")
+    if getattr(projection, "layer_norm_bias", None) is not None:
+        raise RuntimeError(f"strict {name} RMSNorm must be bias-free")
+    if bool(getattr(projection, "zero_centered_gamma", False)):
+        raise RuntimeError(f"strict {name} does not support zero-centered gamma")
+    eps = float(getattr(projection, "eps"))
+    return torch.nn.functional.rms_norm(
+        hidden_states,
+        (hidden_states.shape[-1],),
+        weight,
+        eps,
+    )
 
 
 def _split_gate_up(weight: torch.Tensor, name: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -293,6 +314,19 @@ def _packed_local_sequence_layout(
     if local_offsets[-1] != local_query_tokens or local_offsets[-1] != local_kv_tokens:
         raise RuntimeError("packed Attention cu_seqlens do not cover the local Q/KV token rows")
     return tuple(local_offsets), global_lengths
+
+
+def _tensor_cache_token(tensor: torch.Tensor) -> tuple[Any, ...]:
+    """Identify one tensor value while it is reused across framework layers."""
+
+    return (
+        tensor.data_ptr(),
+        tuple(tensor.shape),
+        tensor.dtype,
+        tensor.device.type,
+        tensor.device.index,
+        int(tensor._version),
+    )
 
 
 def _compact_attention_provenance(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -373,10 +407,50 @@ class MegatronAttentionOperator:
             target="training", semantic_op="attention", backend_id=self.backend_id
         )
         self._last_provenance: dict[str, Any] = {}
+        self._packed_layout_owner: Any | None = None
+        self._packed_layout_key: tuple[Any, ...] | None = None
+        self._packed_layout_value: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+
+    def _packed_layout(
+        self,
+        packed_seq_params: Any,
+        *,
+        cp_world_size: int,
+        local_query_tokens: int,
+        local_kv_tokens: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        query_cu = getattr(packed_seq_params, "cu_seqlens_q", None)
+        kv_cu = getattr(packed_seq_params, "cu_seqlens_kv", None)
+        if not isinstance(query_cu, torch.Tensor) or not isinstance(kv_cu, torch.Tensor):
+            raise RuntimeError("packed Attention requires tensor cu_seqlens_q/cu_seqlens_kv")
+        key = (
+            _tensor_cache_token(query_cu),
+            _tensor_cache_token(kv_cu),
+            cp_world_size,
+            local_query_tokens,
+            local_kv_tokens,
+        )
+        if self._packed_layout_owner is packed_seq_params and self._packed_layout_key == key:
+            if self._packed_layout_value is None:
+                raise RuntimeError("packed Attention layout cache is empty")
+            return self._packed_layout_value
+        value = _packed_local_sequence_layout(
+            packed_seq_params,
+            cp_world_size=cp_world_size,
+            local_query_tokens=local_query_tokens,
+            local_kv_tokens=local_kv_tokens,
+        )
+        self._packed_layout_owner = packed_seq_params
+        self._packed_layout_key = key
+        self._packed_layout_value = value
+        return value
 
     @property
     def provenance(self) -> Mapping[str, Any]:
         return {
+            "interface": "megatron.attention.forward",
+            "operator": self.backend_id,
+            "fallback": False,
             "semantic_instance": self._handle.provenance,
             "execution": dict(self._last_provenance),
         }
@@ -486,14 +560,13 @@ class MegatronAttentionOperator:
                 "operator": _compact_attention_provenance(result.provenance),
             }
         else:
-            local_offsets, global_lengths = _packed_local_sequence_layout(
+            local_offsets, global_lengths = self._packed_layout(
                 packed_seq_params,
                 cp_world_size=cp_world,
                 local_query_tokens=query.size(0),
                 local_kv_tokens=key.size(0),
             )
-            outputs: list[torch.Tensor] = []
-            sequence_provenance: list[dict[str, Any]] = []
+            grouped_sequences: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
             for sequence_index, (start, end, global_length) in enumerate(
                 zip(
                     local_offsets[:-1],
@@ -502,30 +575,56 @@ class MegatronAttentionOperator:
                     strict=True,
                 )
             ):
-                q_ready = query[start:end].permute(1, 0, 2).unsqueeze(0).contiguous()
-                k_ready = key[start:end].permute(1, 0, 2).unsqueeze(0).contiguous()
-                v_ready = value[start:end].permute(1, 0, 2).unsqueeze(0).contiguous()
+                grouped_sequences.setdefault((end - start, global_length), []).append(
+                    (sequence_index, start, end)
+                )
+
+            outputs: list[torch.Tensor | None] = [None] * len(global_lengths)
+            sequence_provenance: list[dict[str, Any] | None] = [None] * len(global_lengths)
+            launch_group_count = 0
+            for (local_length, global_length), sequences in grouped_sequences.items():
+                q_ready = (
+                    torch.stack([query[start:end] for _index, start, end in sequences], dim=0)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
+                k_ready = (
+                    torch.stack([key[start:end] for _index, start, end in sequences], dim=0)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
+                v_ready = (
+                    torch.stack([value[start:end] for _index, start, end in sequences], dim=0)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
                 result = execute_sequence(
                     q_ready,
                     k_ready,
                     v_ready,
                     global_sequence_length=global_length,
                 )
-                outputs.append(
-                    result.out.squeeze(0).permute(1, 0, 2).contiguous().flatten(start_dim=1)
-                )
-                sequence_provenance.append(
-                    {
+                group_output = result.out.permute(0, 2, 1, 3).contiguous().flatten(start_dim=2)
+                operator_provenance = _compact_attention_provenance(result.provenance)
+                for batch_index, (sequence_index, _start, _end) in enumerate(sequences):
+                    outputs[sequence_index] = group_output[batch_index]
+                    sequence_provenance[sequence_index] = {
                         "sequence_index": sequence_index,
-                        "local_tokens": end - start,
+                        "local_tokens": local_length,
                         "global_tokens": global_length,
-                        "operator": _compact_attention_provenance(result.provenance),
+                        "operator": operator_provenance,
                     }
-                )
-            output = torch.cat(outputs, dim=0)
+                launch_group_count += 1
+            if any(item is None for item in outputs) or any(
+                item is None for item in sequence_provenance
+            ):
+                raise RuntimeError("packed Attention failed to materialize every sequence")
+            output = torch.cat(cast(list[torch.Tensor], outputs), dim=0)
             execution_provenance = {
                 "packed_sequence_count": len(global_lengths),
-                "sequences": sequence_provenance,
+                "launch_group_count": launch_group_count,
+                "sequence_batching": "equal_length_rows",
+                "sequences": cast(list[dict[str, Any]], sequence_provenance),
             }
         self._last_provenance = {
             "framework_layout": (
@@ -555,6 +654,9 @@ class MegatronFFNOperator:
     @property
     def provenance(self) -> Mapping[str, Any]:
         return {
+            "interface": "megatron.mlp.forward",
+            "operator": self.backend_id,
+            "fallback": False,
             "semantic_instance": self._handle.provenance,
             "execution": dict(self._last_provenance),
         }
@@ -585,7 +687,13 @@ class MegatronFFNOperator:
             raise RuntimeError("strict Qwen3 FFN requires bias-free projections")
         if not bool(getattr(config, "gated_linear_unit", False)):
             raise RuntimeError("strict Qwen3 FFN requires a gated linear unit")
-        gate, up = _split_gate_up(_weight(module.linear_fc1, "linear_fc1"), "linear_fc1")
+        hidden_states = _fused_rms_norm_input(
+            module.linear_fc1,
+            hidden_states,
+            "linear_fc1",
+        )
+        fused_gate_up = _weight(module.linear_fc1, "linear_fc1").contiguous()
+        gate, up = _split_gate_up(fused_gate_up, "linear_fc1")
         down = _weight(module.linear_fc2, "linear_fc2").contiguous()
         parallel_state = _megatron_parallel_state()
         cp_world = int(parallel_state.get_context_parallel_world_size())
@@ -615,6 +723,9 @@ class MegatronFFNOperator:
             "tp_world_size": tp_world,
             "runtime_platform": "cuda",
             "actual_backend": "rlkernel.cuda.det_gemm_swiglu",
+            "gemm_backend": det_gemm_backend_id(),
+            "fallback": False,
+            "gate_up_projection": "separate_strict_launches",
             "triton_used": False,
         }
         return output, None
@@ -660,32 +771,34 @@ class VllmAttentionOperator:
             target="rollout", semantic_op="attention", backend_id=self.backend_id
         )
         self._last_provenance: dict[str, Any] = {}
-        self._prime_semantic_handle()
+        self._tp_coordinates: tuple[int, int, Any] | None = None
+        self._metadata_cache_key: tuple[Any, ...] | None = None
+        self._metadata_cache_owners: set[int] = set()
+        self._metadata_cache_value: tuple[list[dict[str, Any]], dict[str, Any]] | None = None
 
-    def _prime_semantic_handle(self) -> None:
-        # vLLM wraps model execution in torch.compile. Resolve the semantic
-        # descriptor before graph capture so JSON/inspect-based provenance
-        # never runs inside Dynamo's fullgraph region.
-        if not torch.cuda.is_available():
+    def bind_inference(self) -> None:
+        """Resolve the backend after vLLM has selected the worker CUDA device."""
+
+        if self._tp_coordinates is not None:
             return
-        try:
-            tp_world, _rank, _group = _vllm_tp_coordinates()
-            self._handle.get(
-                torch.empty((1,), device="cuda", dtype=torch.bfloat16),
-                topology={
-                    "world_size": tp_world,
-                    "tensor_parallel_size": tp_world,
-                    "context_parallel_size": 1,
-                },
-            )
-        except (RuntimeError, ValueError, ImportError):
-            # API-server/plugin construction can precede worker CUDA setup;
-            # the worker retries during initialization before graph capture.
-            return
+        tp_world, tp_rank, tp_group = _vllm_tp_coordinates()
+        device = torch.device("cuda", torch.cuda.current_device())
+        self._handle.get(
+            torch.empty((1,), device=device, dtype=torch.bfloat16),
+            topology={
+                "world_size": tp_world,
+                "tensor_parallel_size": tp_world,
+                "context_parallel_size": 1,
+            },
+        )
+        self._tp_coordinates = (tp_world, tp_rank, tp_group)
 
     @property
     def provenance(self) -> Mapping[str, Any]:
         return {
+            "interface": "vllm.attention.forward",
+            "operator": self.backend_id,
+            "fallback": False,
             "semantic_instance": self._handle.provenance,
             "execution": dict(self._last_provenance),
         }
@@ -697,6 +810,104 @@ class VllmAttentionOperator:
             if isinstance(value, torch.Tensor):
                 return value
         raise RuntimeError(f"vLLM Attention metadata is missing {'/'.join(names)}")
+
+    def _materialization_groups(
+        self,
+        attn_metadata: Any,
+        *,
+        query: torch.Tensor,
+        block_table: torch.Tensor,
+        block_size: int,
+        num_actual: int,
+        cache_owner: Any | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Build one paged launch from vLLM's graph-replayable GPU metadata."""
+
+        query_starts_source = self._metadata_tensor(
+            attn_metadata, "query_start_loc", "query_start_loc_cpu"
+        )
+        seq_lens_source = self._metadata_tensor(attn_metadata, "seq_lens", "seq_lens_cpu")
+        if num_actual == 0:
+            return [], {
+                "row_count": 0,
+                "query_position_range": [None, None],
+                "kv_token_range": [None, None],
+                "launch_group_count": 0,
+                "metadata_source": "vllm_gpu",
+            }
+
+        query_starts = query_starts_source.to(device=query.device, dtype=torch.int32)
+        seq_lens = seq_lens_source.to(device=query.device, dtype=torch.int32)
+        query_indices = torch.arange(num_actual, dtype=torch.int32, device=query.device)
+        query_ends = query_starts[1:]
+        request_indices = torch.searchsorted(query_ends, query_indices, right=True).to(
+            dtype=torch.long
+        )
+        active_queries = query_indices < query_starts[-1]
+        request_indices = request_indices.clamp_max(seq_lens.numel() - 1)
+        request_query_ends = query_ends.index_select(0, request_indices)
+        request_seq_lens = seq_lens.index_select(0, request_indices)
+        seqused_k = request_seq_lens - (request_query_ends - query_indices) + 1
+        seqused_k = torch.where(
+            active_queries,
+            seqused_k,
+            torch.ones_like(seqused_k),
+        )
+
+        max_seq_len = int(getattr(attn_metadata, "max_seq_len", block_table.size(1) * block_size))
+        page_count = min(block_table.size(1), (max_seq_len + block_size - 1) // block_size)
+        cache_key = (
+            _tensor_cache_token(query_starts_source),
+            _tensor_cache_token(seq_lens_source),
+            _tensor_cache_token(block_table),
+            query.device.type,
+            query.device.index,
+            num_actual,
+            block_size,
+            page_count,
+        )
+        owner_id = id(cache_owner) if cache_owner is not None else None
+        if (
+            owner_id is not None
+            and self._metadata_cache_key == cache_key
+            and owner_id not in self._metadata_cache_owners
+            and self._metadata_cache_value is not None
+        ):
+            self._metadata_cache_owners.add(owner_id)
+            groups, cached_summary = self._metadata_cache_value
+            return groups, {**cached_summary, "metadata_reused_across_layers": True}
+
+        pages = (
+            block_table.index_select(0, request_indices)[:, :page_count]
+            .to(dtype=torch.int32)
+            .contiguous()
+        )
+        groups = [
+            {
+                "page_count": page_count,
+                "pages": pages,
+                "query_indices": query_indices,
+                "query_start": 0,
+                "query_count": num_actual,
+                "query_contiguous": True,
+                "seqused_k": seqused_k,
+            }
+        ]
+        summary = {
+            "row_count": num_actual,
+            "query_position_range": "device_dynamic",
+            "kv_token_range": "device_dynamic",
+            "launch_group_count": 1,
+            "metadata_source": "vllm_gpu",
+            "metadata_reused_across_layers": False,
+        }
+        if owner_id is not None:
+            # The first repeated layer marks the next model forward (or graph
+            # capture), so dynamic metadata is re-derived instead of frozen.
+            self._metadata_cache_key = cache_key
+            self._metadata_cache_owners = {owner_id}
+            self._metadata_cache_value = (groups, summary)
+        return groups, summary
 
     def __call__(
         self,
@@ -711,7 +922,7 @@ class VllmAttentionOperator:
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del layer, key, value
+        del key, value
         if output_scale is not None or output_block_scale is not None:
             raise RuntimeError("strict vLLM Attention does not support quantized output")
         if attn_metadata is None:
@@ -728,26 +939,23 @@ class VllmAttentionOperator:
         if key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
             raise RuntimeError("strict vLLM Attention requires an unquantized KV cache")
 
-        query_starts = self._metadata_tensor(
-            attn_metadata, "query_start_loc", "query_start_loc_cpu"
-        ).to(device="cpu", dtype=torch.long)
-        seq_lens = self._metadata_tensor(attn_metadata, "seq_lens").to(
-            device="cpu", dtype=torch.long
-        )
-        block_table = self._metadata_tensor(attn_metadata, "block_table", "block_table_tensor").to(
-            device="cpu", dtype=torch.long
-        )
+        block_table = self._metadata_tensor(attn_metadata, "block_table", "block_table_tensor")
         num_actual = int(getattr(attn_metadata, "num_actual_tokens", query.size(0)))
+        if num_actual < 0 or num_actual > query.size(0):
+            raise RuntimeError("vLLM num_actual_tokens is outside the query buffer")
         if output is None:
             output = torch.empty(
                 (query.size(0), impl.num_heads * impl.head_size),
                 dtype=query.dtype,
                 device=query.device,
             )
-        output.zero_()
+        if output.size(0) < num_actual:
+            raise RuntimeError("vLLM output buffer is smaller than num_actual_tokens")
         output_heads = output.view(output.size(0), impl.num_heads, impl.head_size)
         block_size = key_cache.size(1)
-        tp_world, tp_rank, tp_group = _vllm_tp_coordinates()
+        if self._tp_coordinates is None:
+            self._tp_coordinates = _vllm_tp_coordinates()
+        tp_world, tp_rank, tp_group = self._tp_coordinates
         operator = self._handle.get(
             query,
             topology={
@@ -756,97 +964,62 @@ class VllmAttentionOperator:
                 "context_parallel_size": 1,
             },
         )
-        operator.bind_cuda_runtime()
-        row_count = 0
-        first_query_position: int | None = None
-        last_query_position: int | None = None
-        min_kv_tokens: int | None = None
-        max_kv_tokens: int | None = None
+        runtime = operator.bind_cuda_runtime()
+        groups, metadata_summary = self._materialization_groups(
+            attn_metadata,
+            query=query,
+            block_table=block_table,
+            block_size=block_size,
+            num_actual=num_actual,
+            cache_owner=layer,
+        )
         last_operator_provenance: dict[str, Any] = {}
-        for request_index in range(seq_lens.numel()):
-            q_start = int(query_starts[request_index])
-            q_end = min(int(query_starts[request_index + 1]), num_actual)
-            if q_start >= q_end:
-                continue
-            final_seq_len = int(seq_lens[request_index])
-            first_query_position = final_seq_len - (q_end - q_start)
-            for token_offset, query_index in enumerate(range(q_start, q_end)):
-                kv_len = first_query_position + token_offset + 1
-                page_count = (kv_len + block_size - 1) // block_size
-                page_ids = block_table[request_index, :page_count].tolist()
-                if any(page < 0 for page in page_ids):
-                    raise RuntimeError("vLLM block table contains an unallocated page")
-                pages = torch.tensor(page_ids, device=key_cache.device, dtype=torch.long)
-                k_row = key_cache.index_select(0, pages).reshape(
-                    -1, impl.num_kv_heads, impl.head_size
-                )[:kv_len]
-                v_row = value_cache.index_select(0, pages).reshape(
-                    -1, impl.num_kv_heads, impl.head_size
-                )[:kv_len]
-                q_ready = query[query_index : query_index + 1].permute(1, 0, 2).unsqueeze(0)
-                k_ready = k_row.permute(1, 0, 2).unsqueeze(0).contiguous()
-                v_ready = v_row.permute(1, 0, 2).unsqueeze(0).contiguous()
-                query_positions = torch.tensor(
-                    [[kv_len - 1]],
-                    dtype=torch.int64,
-                    device=query.device,
+        next_query_row = 0
+        for group in groups:
+            if not group["query_contiguous"] or group["query_start"] != next_query_row:
+                break
+            next_query_row += int(group["query_count"])
+        direct_output_buffer = bool(groups) and next_query_row == num_actual
+        if not direct_output_buffer:
+            output.zero_()
+        elif num_actual < output.size(0):
+            output[num_actual:].zero_()
+        for group in groups:
+            page_count = int(group["page_count"])
+            pages = group["pages"]
+            query_indices = group["query_indices"]
+            if group["query_contiguous"]:
+                query_start = int(group["query_start"])
+                query_count = int(group["query_count"])
+                q_ready = query.narrow(0, query_start, query_count).unsqueeze(2)
+            else:
+                q_ready = query.index_select(0, query_indices).unsqueeze(2).contiguous()
+            result = runtime.forward_paged_with_lse(
+                q_ready,
+                key_cache,
+                value_cache,
+                page_table=pages,
+                seqused_k=group["seqused_k"],
+                max_seqlen_k=page_count * block_size,
+                scale=float(impl.scale),
+            )
+            result_output = result.out.squeeze(2)
+            if group["query_contiguous"]:
+                output_heads.narrow(0, int(group["query_start"]), int(group["query_count"])).copy_(
+                    result_output
                 )
-                key_positions = torch.arange(
-                    kv_len,
-                    dtype=torch.int64,
-                    device=query.device,
-                ).unsqueeze(0)
-                result = operator(
-                    q_ready.contiguous(),
-                    k_ready,
-                    v_ready,
-                    contract=_dense_attention_contract(
-                        q_ready,
-                        k_ready,
-                        role=AttentionRole.INFER,
-                        # The causal prefix is already materialized as one dense row.
-                        causal=False,
-                        tp_rank=tp_rank,
-                        tp_world_size=tp_world,
-                        mode=AttentionMode.CHUNKED_PREFILL,
-                        global_sequence_length=kv_len,
-                        global_block_token_starts=(kv_len - 1,),
-                    ),
-                    config=AttentionAblationConfig(
-                        strict_core_id=STRICT_ATTENTION_PRODUCTION_CORE_ID,
-                        strict_schedule=STRICT_ATTENTION_FA4_SCHEDULE_ID,
-                    ),
-                    return_lse=True,
-                    query_position_ids=query_positions,
-                    key_position_ids=key_positions,
-                    scale=float(impl.scale),
-                )
-                output_heads[query_index].copy_(result.out[0, :, 0, :])
-                query_position = kv_len - 1
-                row_count += 1
-                first_query_position = (
-                    query_position
-                    if first_query_position is None
-                    else min(first_query_position, query_position)
-                )
-                last_query_position = (
-                    query_position
-                    if last_query_position is None
-                    else max(last_query_position, query_position)
-                )
-                min_kv_tokens = kv_len if min_kv_tokens is None else min(min_kv_tokens, kv_len)
-                max_kv_tokens = kv_len if max_kv_tokens is None else max(max_kv_tokens, kv_len)
-                last_operator_provenance = _compact_attention_provenance(result.provenance)
+            else:
+                output_heads.index_copy_(0, query_indices, result.out.squeeze(2))
+            last_operator_provenance = _compact_attention_provenance(result.provenance)
         self._last_provenance = {
             "framework_layout": "vllm_paged_kv",
-            "materialization": "one_causal_prefix_per_query_row",
+            "materialization": "direct_paged_fa4",
             "tp_world_size": tp_world,
             "tp_group_bound": tp_group is not None,
             "runtime_platform": "cuda",
             "triton_used": False,
-            "row_count": row_count,
-            "query_position_range": [first_query_position, last_query_position],
-            "kv_token_range": [min_kv_tokens, max_kv_tokens],
+            "direct_output_buffer": direct_output_buffer,
+            **metadata_summary,
             "operator": last_operator_provenance,
         }
         return output
@@ -860,41 +1033,76 @@ class VllmFFNOperator:
             target="rollout", semantic_op="ffn", backend_id=self.backend_id
         )
         self._last_provenance: dict[str, Any] = {}
-        self._prime_semantic_handle()
-
-    def _prime_semantic_handle(self) -> None:
-        # vLLM wraps model execution in torch.compile. Resolve the semantic
-        # descriptor before graph capture so JSON/inspect-based provenance
-        # never runs inside Dynamo's fullgraph region.
-        if not torch.cuda.is_available():
-            return
-        try:
-            tp_world, _rank, _group = _vllm_tp_coordinates()
-            self._handle.get(
-                torch.empty((1,), device="cuda", dtype=torch.bfloat16),
-                topology={
-                    "world_size": tp_world,
-                    "tensor_parallel_size": tp_world,
-                    "context_parallel_size": 1,
-                },
-            )
-        except (RuntimeError, ValueError, ImportError):
-            # API-server/plugin construction can precede worker CUDA setup;
-            # the worker retries during initialization before graph capture.
-            return
+        self._packed_inference_binding: tuple[int, int, str] | None = None
+        self._tp_coordinates: tuple[int, int, Any] | None = None
 
     @property
     def provenance(self) -> Mapping[str, Any]:
         return {
+            "interface": "vllm.qwen3.mlp.forward",
+            "operator": self.backend_id,
+            "fallback": False,
             "semantic_instance": self._handle.provenance,
             "execution": dict(self._last_provenance),
         }
 
+    def bind_packed_inference(self, module: Any) -> tuple[int, int]:
+        """Bind vLLM's TP group before torch.compile captures the model."""
+
+        fused_gate_up = _weight(module.gate_up_proj, "gate_up_proj")
+        down = _weight(module.down_proj, "down_proj")
+        tp_world, tp_rank, tp_group = _vllm_tp_coordinates()
+        self._tp_coordinates = (tp_world, tp_rank, tp_group)
+        operator = self._handle.get(
+            fused_gate_up,
+            topology={
+                "world_size": tp_world,
+                "tensor_parallel_size": tp_world,
+                "context_parallel_size": 1,
+            },
+        )
+        prepare = getattr(operator, "prepare_packed_inference", None)
+        if not callable(prepare):
+            raise RuntimeError("strict FFN backend lacks packed inference preparation")
+        collective_handle, bound_tp_world = prepare(
+            fused_gate_up,
+            down,
+            tp_group=tp_group,
+        )
+        backend_id = "deterministic_all_reduce.ipc_localized_fixed_tree.v1"
+        resolve_backend = getattr(operator, "packed_inference_backend_id", None)
+        if callable(resolve_backend) and collective_handle:
+            backend_id = str(resolve_backend(collective_handle))
+        self._packed_inference_binding = (
+            collective_handle,
+            bound_tp_world,
+            backend_id,
+        )
+        self._set_runtime_provenance(tp_world, backend_id)
+        return collective_handle, bound_tp_world
+
+    def _set_runtime_provenance(
+        self, tp_world: int, deterministic_all_reduce_backend: str = "unbound"
+    ) -> None:
+        self._last_provenance = {
+            "framework_layout": "vllm_tensor_parallel",
+            "tp_world_size": tp_world,
+            "runtime_platform": "cuda",
+            "actual_backend": "rlkernel.cuda.det_gemm_swiglu",
+            "gemm_backend": det_gemm_backend_id(),
+            "fallback": False,
+            "gate_up_projection": "packed_single_launch",
+            "deterministic_all_reduce_backend": deterministic_all_reduce_backend,
+            "triton_used": False,
+        }
+
     def __call__(self, module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
         _require_nvidia_cuda(hidden_states, "FFN")
-        gate, up = _split_gate_up(_weight(module.gate_up_proj, "gate_up_proj"), "gate_up_proj")
+        fused_gate_up = _weight(module.gate_up_proj, "gate_up_proj").contiguous()
         down = _weight(module.down_proj, "down_proj").contiguous()
-        tp_world, _tp_rank, tp_group = _vllm_tp_coordinates()
+        if self._tp_coordinates is None:
+            self._tp_coordinates = _vllm_tp_coordinates()
+        tp_world, _tp_rank, tp_group = self._tp_coordinates
         operator = self._handle.get(
             hidden_states,
             topology={
@@ -903,22 +1111,34 @@ class VllmFFNOperator:
                 "context_parallel_size": 1,
             },
         )
-        output = operator(
-            hidden_states,
-            gate,
-            up,
-            down,
-            tp_group=tp_group,
-            sequence_parallel=False,
-            deterministic=True,
-        )
-        self._last_provenance = {
-            "framework_layout": "vllm_tensor_parallel",
-            "tp_world_size": tp_world,
-            "runtime_platform": "cuda",
-            "actual_backend": "rlkernel.cuda.det_gemm_swiglu",
-            "triton_used": False,
-        }
+        bound_backend = "unbound"
+        if self._packed_inference_binding is not None:
+            bound_backend = self._packed_inference_binding[2]
+        self._set_runtime_provenance(tp_world, bound_backend)
+        if self._packed_inference_binding is not None:
+            collective_handle, bound_tp_world, _ = self._packed_inference_binding
+            if bound_tp_world != tp_world:
+                raise RuntimeError("packed rollout FFN TP topology changed after binding")
+            output = operator.packed_inference(
+                hidden_states,
+                fused_gate_up,
+                down,
+                collective_handle=collective_handle,
+                tp_world_size=bound_tp_world,
+            )
+        else:
+            if torch._dynamo.is_compiling():
+                raise RuntimeError("packed rollout FFN was not bound before torch.compile capture")
+            gate, up = _split_gate_up(fused_gate_up, "gate_up_proj")
+            output = operator(
+                hidden_states,
+                gate,
+                up,
+                down,
+                tp_group=tp_group,
+                sequence_parallel=False,
+                deterministic=True,
+            )
         return output
 
 
@@ -948,19 +1168,20 @@ class MegatronLogpOperator:
     def __call__(self, request: Any) -> Any:
         logits = getattr(request, "logits", None)
         context = getattr(request, "context", None)
-        hidden = getattr(context, "hidden", None)
-        strict = os.getenv("VIME_RL_KERNEL_STRICT", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        hidden = getattr(request, "hidden", None)
+        if not isinstance(hidden, torch.Tensor):
+            hidden = getattr(context, "hidden", None)
+        strict = strict_contract_enabled()
         if isinstance(hidden, torch.Tensor):
             if self._linear_logp is None:
                 raise RuntimeError("Megatron linear_logp route is not installed")
             _require_nvidia_cuda(hidden, "linear_logp")
             result = self._provider(request, linear_logp=self._linear_logp)
             self._last_provenance = {
+                "interface": "vime.selected_logprob_provider",
+                "operator": self.backend_id,
+                "actual_backend": self.backend_id,
+                "fallback": False,
                 "runtime_platform": "cuda",
                 "triton_used": False,
                 "provider": dict(getattr(result, "provenance", {})),
@@ -977,6 +1198,10 @@ class MegatronLogpOperator:
         _require_nvidia_cuda(logits, "Logp")
         result = self._provider(request)
         self._last_provenance = {
+            "interface": "vime.selected_logprob_provider",
+            "operator": self.backend_id,
+            "actual_backend": self.backend_id,
+            "fallback": False,
             "runtime_platform": "cuda",
             "triton_used": False,
             "provider": dict(getattr(result, "provenance", {})),
@@ -1095,24 +1320,29 @@ class VllmLogpOperator:
                 "strict vLLM logp selected output is not aligned with sampled tokens"
             )
         matches = ids == token_ids.unsqueeze(1)
-        if not bool(matches.any(dim=1).all().item()):
+        every_sample_present = matches.any(dim=1).all()
+        if every_sample_present.is_cuda:
+            torch._assert_async(
+                every_sample_present,
+                "vLLM logprob result does not contain every sampled token",
+            )
+        elif not bool(every_sample_present):
             raise RuntimeError("vLLM logprob result does not contain every sampled token")
-        columns = matches.to(torch.int64).argmax(dim=1)
-        native_selected = values[
-            torch.arange(values.size(0), device=values.device), columns
-        ].clone()
         # vLLM prepends the sampled token and then appends top-k tokens. When
         # the sample is also in top-k, its API conversion keeps the last
         # duplicate, so every matching column must carry the strict value.
         values = torch.where(matches, selected.unsqueeze(1), values)
         self._last_provenance = {
             **dict(provenance),
-            "sampled_token_ids": _tensor_debug_stats(token_ids),
+            "interface": "vllm.sampler.selected_logprob",
+            "operator": self.backend_id,
+            "actual_backend": self.backend_id,
+            "fallback": False,
+            "sampled_token_ids": _tensor_metadata(token_ids),
             "logprobs_shape": list(values.shape),
             "logprob_token_ids_shape": list(ids.shape),
-            "native_selected_logp_stats": _tensor_debug_stats(native_selected),
-            "rlkernel_selected_logp_stats": _tensor_debug_stats(selected),
-            "native_vs_rlkernel_selected_diff": _diff_debug_stats(native_selected, selected),
+            "strict_selected_logp": _tensor_metadata(selected),
+            "native_reference_compared": False,
         }
         if hasattr(logprobs_tensors, "_replace"):
             updated_tensors = logprobs_tensors._replace(logprobs=values)
@@ -1128,8 +1358,59 @@ class VllmLogpOperator:
         predict_bonus_token: bool = False,
         logprobs_mode_override: Any = None,
     ) -> Any:
-        source_logits = logits.clone()
+        # Native sampling owns logits; strict selected-logp preserves its raw
+        # local shard before the sampler applies in-place transformations.
+        source_logits = logits
         _require_nvidia_cuda(source_logits, "Logp")
+        context = None
+        local_logits = None
+        if self._strict_linear_logp:
+            context = take_rollout_linear_logp_context()
+            if source_logits.ndim != 2:
+                raise RuntimeError("vLLM sampler logits must be [tokens, vocab]")
+            if context.hidden.size(0) != source_logits.size(0):
+                raise RuntimeError(
+                    "strict rollout linear_logp hidden/logits row mismatch: "
+                    f"{context.hidden.size(0)} != {source_logits.size(0)}"
+                )
+            if source_logits.size(1) < context.real_vocab_size:
+                raise RuntimeError(
+                    "strict rollout source logits do not cover the real vocabulary: "
+                    f"{source_logits.size(1)} < {context.real_vocab_size}"
+                )
+            local_vocab = int(context.lm_head_weight.size(0))
+            available = max(
+                0,
+                min(
+                    local_vocab,
+                    source_logits.size(1) - context.vocab_start_index,
+                ),
+            )
+            # Preserve raw model logits before vLLM's sampler transforms its
+            # input in place (temperature, penalties, and masking).
+            if available == local_vocab:
+                # Rank 0 normally has a complete local shard. Narrowing first
+                # avoids a fill kernel followed by a second device copy.
+                local_logits = source_logits.narrow(
+                    1,
+                    context.vocab_start_index,
+                    local_vocab,
+                ).contiguous()
+            else:
+                # The final TP shard may include padded rows absent from the
+                # serving logits; retain the exact -inf padding contract.
+                local_logits = source_logits.new_full(
+                    (source_logits.size(0), local_vocab),
+                    float("-inf"),
+                )
+                if available:
+                    local_logits[:, :available].copy_(
+                        source_logits.narrow(
+                            1,
+                            context.vocab_start_index,
+                            available,
+                        )
+                    )
         if self._worker_sampler:
             result = self._native_forward(sampler, logits, sampling_metadata)
         else:
@@ -1149,25 +1430,16 @@ class VllmLogpOperator:
         token_ids = result.sampled_token_ids.reshape(-1).to(torch.long)
 
         if self._strict_linear_logp:
-            context = take_rollout_linear_logp_context()
-            if source_logits.ndim != 2:
-                raise RuntimeError("vLLM sampler logits must be [tokens, vocab]")
-            if context.hidden.size(0) != source_logits.size(0):
-                raise RuntimeError(
-                    "strict rollout linear_logp hidden/logits row mismatch: "
-                    f"{context.hidden.size(0)} != {source_logits.size(0)}"
-                )
+            assert context is not None and local_logits is not None
             if context.hidden.size(0) != token_ids.numel():
                 raise RuntimeError(
                     "strict rollout linear_logp hidden/sample row mismatch: "
                     f"{context.hidden.size(0)} != {token_ids.numel()}"
                 )
             assert self._linear_logp is not None
-            selected = self._linear_logp(
-                context.hidden,
-                context.lm_head_weight,
+            selected = self._linear_logp.from_local_logits(
+                local_logits,
                 token_ids,
-                context.lm_head_bias,
                 tp_group=context.tp_group,
                 vocab_start_index=context.vocab_start_index,
                 global_vocab_size=context.global_vocab_size,
@@ -1175,16 +1447,28 @@ class VllmLogpOperator:
                 temperature=float(os.getenv("RL_KERNEL_VLLM_TEMPERATURE", "1.0")),
                 target="rollout",
             )
+            strict_provenance = self._linear_logp.provenance
+            if (
+                strict_provenance.get("deterministic_linear_logp") is not True
+                or strict_provenance.get("actual_backend") != self._linear_logp.backend_id
+                or strict_provenance.get("strict_entrypoint")
+                != "sm90_deterministic_logp_from_local_logits_tp"
+            ):
+                raise RuntimeError(
+                    "strict vLLM rollout linear_logp did not execute the deterministic "
+                    "linear-logp entry point"
+                )
             provenance = {
-                **dict(self._linear_logp.provenance),
+                **dict(strict_provenance),
                 "runtime_platform": "cuda",
                 "triton_used": False,
                 "execution": {
                     "role": "vllm_rollout_linear_logprob",
                     "strict_backend": True,
-                    "sampling_logits_source": "native_vllm",
+                    "sampling_logits_source": "rlkernel_det_gemm_vllm",
                     "logits_materialized": True,
                     "padded_lm_head_alignment": True,
+                    "duplicate_lm_head_gemm": False,
                 },
                 "source_logits_shape": list(source_logits.shape),
                 "source_logits_dtype": _dtype_name(source_logits),
@@ -1204,6 +1488,8 @@ class VllmLogpOperator:
                 f"{DEFAULT_NUM_VOCAB_TILES}"
             )
         contract = _full_vocab_contract(source_logits)
+        from rl_engine.kernels.registry import kernel_registry
+
         dispatch = kernel_registry.get_logprob_op(contract, requested_backend=self.backend_id)
         if (
             dispatch.provenance["actual_backend"] != self.backend_id

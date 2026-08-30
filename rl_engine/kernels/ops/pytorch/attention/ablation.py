@@ -20,6 +20,8 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping, cast
 
 import torch
+from torch import Tensor
+
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_CORE_ID,
     STRICT_ATTENTION_SCHEDULE_ID,
@@ -28,7 +30,6 @@ from rl_engine.kernels.attention_contract import (
     AttentionDType,
     SplitKVMode,
 )
-from torch import Tensor
 
 BACKEND_ID = "rlkernel.attention.deterministic.v1"
 REFERENCE_BACKEND_ID = "rlkernel.attention.reference.v1"

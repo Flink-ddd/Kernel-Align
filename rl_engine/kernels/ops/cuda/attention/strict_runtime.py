@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_FA4_SCHEDULE_ID,
     STRICT_ATTENTION_PRODUCTION_CORE_ID,
@@ -73,6 +74,7 @@ class StrictCUDAAttentionRuntime:
         cp_world_size: int,
         query_position_ids: torch.Tensor,
         key_position_ids: torch.Tensor,
+        positions_are_sorted: bool = False,
     ) -> StrictCUDAAttentionResult:
         self._require_nvidia_cuda(q)
         if cp_world_size != contract.sharding.cp_world_size:
@@ -97,10 +99,21 @@ class StrictCUDAAttentionRuntime:
             communication_backend = "cuda_ag_rs"
             self.communication_executed = True
 
-        q_sorted, q_positions_sorted, q_sort = self._sort_by_position(global_q, global_q_positions)
-        k_sorted, k_positions_sorted, _ = self._sort_by_position(global_k, global_k_positions)
-        v_sorted = self._gather_sequence(global_v, torch.argsort(global_k_positions, dim=1))
-        self._validate_global_positions(q_positions_sorted, k_positions_sorted, causal)
+        if positions_are_sorted:
+            if cp_world_size != 1:
+                raise RuntimeError("pre-sorted Attention positions are supported only at CP=1")
+            q_sorted, k_sorted, v_sorted = global_q, global_k, global_v
+            q_positions_sorted, k_positions_sorted = global_q_positions, global_k_positions
+            q_sort = None
+        else:
+            q_sorted, q_positions_sorted, q_sort = self._sort_by_position(
+                global_q, global_q_positions
+            )
+            k_sorted, k_positions_sorted, k_sort = self._sort_by_position(
+                global_k, global_k_positions
+            )
+            v_sorted = self._gather_sequence(global_v, k_sort)
+            self._validate_global_positions(q_positions_sorted, k_positions_sorted, causal)
 
         # FA4 consumes [B, S, H, D]. Materialize that layout once for every
         # logical sequence instead of once per causal prefix.
@@ -108,57 +121,31 @@ class StrictCUDAAttentionRuntime:
         k_fa = k_sorted.transpose(1, 2).contiguous()
         v_fa = v_sorted.transpose(1, 2).contiguous()
 
-        batch_outputs: list[torch.Tensor] = []
-        batch_lses: list[torch.Tensor] = []
-        core_rows: list[dict[str, Any]] = []
-        for batch_index in range(q_sorted.size(0)):
-            query_outputs: list[torch.Tensor] = []
-            query_lses: list[torch.Tensor] = []
-            for query_index in range(q_sorted.size(2)):
-                query_position = q_positions_sorted[batch_index, query_index]
-                if causal:
-                    prefix_tokens = int(
-                        torch.searchsorted(
-                            k_positions_sorted[batch_index],
-                            query_position,
-                            right=True,
-                        ).item()
-                    )
-                else:
-                    prefix_tokens = k_sorted.size(2)
-                result = self._core.forward_bshd_with_lse(
-                    q_fa[batch_index : batch_index + 1, query_index : query_index + 1],
-                    k_fa[batch_index : batch_index + 1, :prefix_tokens],
-                    v_fa[batch_index : batch_index + 1, :prefix_tokens],
-                    # Prefix materialization is the mask. Both framework sides
-                    # therefore launch the exact same one-query FA4 shape.
-                    causal=False,
-                    scale=scale,
-                    query_position_ids=q_positions_sorted[
-                        batch_index : batch_index + 1,
-                        query_index : query_index + 1,
-                    ],
-                    key_position_ids=k_positions_sorted[
-                        batch_index : batch_index + 1,
-                        :prefix_tokens,
-                    ],
-                    output_dtype=q.dtype,
-                )
-                query_outputs.append(result.out)
-                query_lses.append(result.lse)
-                core_rows.append(
-                    {
-                        **dict(result.provenance),
-                        "query_position": int(query_position.item()),
-                        "kv_tokens": prefix_tokens,
-                    }
-                )
-            batch_outputs.append(torch.cat(query_outputs, dim=1))
-            batch_lses.append(torch.cat(query_lses, dim=2))
-        out_sorted = torch.cat(batch_outputs, dim=0).transpose(1, 2).contiguous()
-        lse_sorted = torch.cat(batch_lses, dim=0)
+        # FA4's full causal schedule produces the same output, LSE, and dQ as
+        # launching one single-query prefix at a time. Keeping all query rows
+        # in one launch removes O(sequence_length) Python and CUDA dispatches;
+        # deterministic=True still pins the backward implementation.
+        result = self._core.forward_bshd_with_lse(
+            q_fa,
+            k_fa,
+            v_fa,
+            causal=causal,
+            scale=scale,
+            query_position_ids=q_positions_sorted,
+            key_position_ids=k_positions_sorted,
+            output_dtype=q.dtype,
+        )
+        out_sorted = result.out.transpose(1, 2).contiguous()
+        lse_sorted = result.lse
+        backend = (
+            result.provenance.get("actual_backend")
+            or result.provenance.get("attention_backend")
+            or getattr(self._core, "backend_id", None)
+        )
 
         if cp_world_size > 1:
+            if q_sort is None:
+                raise RuntimeError("CP Attention requires a framework position reorder")
             inverse_q_sort = torch.argsort(q_sort, dim=1)
             out_rank_packed = self._gather_sequence(out_sorted, inverse_q_sort)
             lse_rank_packed = self._gather_sequence(lse_sorted, inverse_q_sort)
@@ -187,8 +174,80 @@ class StrictCUDAAttentionRuntime:
                 "reference_only": False,
                 "split_kv": "disabled",
                 "framework_position_reorder": True,
-                "query_schedule": "single_query_causal_prefix",
-                "core_rows": core_rows,
+                "query_schedule": "full_sequence_causal_single_launch",
+                "backward_schedule": "fa4_deterministic_full_sequence",
+                "core_row_count": q_sorted.size(0) * q_sorted.size(2),
+                "core_launch_count": 1,
+                "core_batch_size": q_sorted.size(0),
+                "core_query_length": q_sorted.size(2),
+                "core_actual_backends": [] if backend is None else [str(backend)],
+            },
+        )
+
+    def forward_paged_with_lse(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        page_table: torch.Tensor,
+        seqused_k: torch.Tensor,
+        max_seqlen_k: int,
+        scale: float | None,
+        out: torch.Tensor | None = None,
+    ) -> StrictCUDAAttentionResult:
+        """Run strict inference Attention without materializing paged KV rows."""
+
+        self._require_nvidia_cuda(q)
+        if out is not None and (
+            out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
+        ):
+            raise ValueError("paged Attention out must match q shape, dtype, and device")
+        paged_out = None
+        if out is not None:
+            paged_out = torch.empty(
+                q.transpose(1, 2).shape,
+                dtype=q.dtype,
+                device=q.device,
+            )
+        result = self._core.forward_paged_bshd_with_lse(
+            q.transpose(1, 2).contiguous(),
+            k_cache,
+            v_cache,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+            scale=scale,
+            output_dtype=q.dtype,
+            out=paged_out,
+        )
+        self.communication_executed = False
+        result_out = result.out.transpose(1, 2).contiguous()
+        if out is not None:
+            out.copy_(result_out)
+            result_out = out
+        return StrictCUDAAttentionResult(
+            out=result_out,
+            lse=result.lse,
+            provenance={
+                **result.provenance,
+                "strict_core_id": self.core_id,
+                "strict_schedule": self.strict_schedule,
+                "actual_backend": self.backend_id,
+                "communication_backend": "none",
+                "communication_executed": False,
+                "native_attention_arithmetic": True,
+                "production_ready": True,
+                "fallback": False,
+                "fallback_reason": None,
+                "reference_only": False,
+                "query_schedule": "paged_single_query_batch",
+                "core_row_count": q.size(0),
+                "core_launch_count": 1,
+                "core_batch_size": q.size(0),
+                "core_actual_backends": [
+                    result.provenance.get("attention_backend", "flash_attention_4.cute.paged")
+                ],
             },
         )
 
@@ -285,13 +344,16 @@ class StrictCUDAAttentionRuntime:
             (query_positions, "query"),
             (key_positions, "key"),
         ):
-            if positions.size(1) > 1 and bool((positions[:, 1:] <= positions[:, :-1]).any()):
-                raise RuntimeError(f"global {name} positions must be unique and increasing")
-        if causal and not torch.equal(
-            query_positions,
-            key_positions[:, -query_positions.size(1) :],
-        ):
-            raise RuntimeError("causal Attention queries must be the trailing global KV positions")
+            if positions.size(1) > 1:
+                torch._assert_async(
+                    torch.all(positions[:, 1:] > positions[:, :-1]),
+                    f"global {name} positions must be unique and increasing",
+                )
+        if causal:
+            torch._assert_async(
+                torch.all(query_positions == key_positions[:, -query_positions.size(1) :]),
+                "causal Attention queries must be the trailing global KV positions",
+            )
 
 
 __all__ = ["StrictCUDAAttentionResult", "StrictCUDAAttentionRuntime"]
