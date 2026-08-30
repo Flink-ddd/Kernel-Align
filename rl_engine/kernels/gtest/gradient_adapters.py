@@ -98,9 +98,25 @@ _DLOGITS = GradientTensorSpec("dlogits", "token", "logits")
 _DGATE = GradientTensorSpec("dgate", "token", "gate")
 _DUP = GradientTensorSpec("dup", "token", "up")
 _DW_LINEAR = GradientTensorSpec("dW", "parameter", "lm_head_weight")
+_DRESIDUAL = GradientTensorSpec("dresidual", "token", "residual")
+_DPRE = GradientTensorSpec("dpre", "token", "pre")
 
 
 GRADIENT_ADAPTERS: dict[str, GradientAdapterSpec] = {
+    "mhc_pre_h_aggregate": GradientAdapterSpec(
+        op_name="mhc_pre_h_aggregate",
+        chain_node="mhc_pre_h_aggregate",
+        op_class="reduction",
+        spec_name="mhc_pre_h_aggregate",
+        tensors=(_DRESIDUAL, _DPRE),
+        requirement="optional_fused",
+        source_files=(
+            "rl_engine/kernels/ops/cuda/mhc.py",
+            "rl_engine/kernels/ops/pytorch/mhc.py",
+            "csrc/cuda/mhc/mhc_pre_h_aggregate.cu",
+            "csrc/cuda/mhc/mhc_pre_h_aggregate_kernel.cuh",
+        ),
+    ),
     "rms_norm": GradientAdapterSpec(
         op_name="rms_norm",
         chain_node="rms_norm",
@@ -680,6 +696,18 @@ def _row_inputs(
         return {
             "gate": _stack_rows(keys, leading, (hidden,), device=device, dtype=dtype, offset=0),
             "up": _stack_rows(keys, leading, (hidden,), device=device, dtype=dtype, offset=1),
+        }
+    if op_name == "mhc_pre_h_aggregate":
+        return {
+            "residual": _stack_rows(keys, leading, (4, hidden), device=device, dtype=dtype),
+            "pre": _stack_rows(
+                keys,
+                leading,
+                (4,),
+                device=device,
+                dtype=torch.float32,
+                offset=1,
+            ),
         }
     if op_name == "det_gemm":
         return {

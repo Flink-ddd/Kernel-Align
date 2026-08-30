@@ -168,6 +168,11 @@ void reduce_rows_fp32_left_fold_cuda(
 torch::Tensor mhc_pre_h_aggregate_cuda(
   torch::Tensor residual,
   torch::Tensor pre);
+
+std::vector<torch::Tensor> mhc_pre_h_aggregate_backward_cuda(
+  torch::Tensor grad_output,
+  torch::Tensor residual,
+  torch::Tensor pre);
 #endif
 
 static void rmsnorm_check_input(const torch::Tensor& x, const char* name) {
@@ -499,6 +504,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "mhc_pre_h_aggregate",
         &mhc_pre_h_aggregate_cuda,
         "Batch-invariant MHC H Aggregate CUDA");
+    m.def(
+        "mhc_pre_h_aggregate_backward",
+        &mhc_pre_h_aggregate_backward_cuda,
+        "Batch-invariant MHC H Aggregate backward CUDA");
 #endif
 
     // registry SiLU / SwiGLU (elementwise activation)

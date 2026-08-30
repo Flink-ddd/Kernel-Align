@@ -25,6 +25,7 @@ def make_operator_inputs(
     device: torch.device,
 ) -> dict[str, Any]:
     builders = {
+        "mhc_pre_h_aggregate": _make_mhc_pre_h_aggregate_inputs,
         "rms_norm": _make_rms_norm_inputs,
         "qk_norm": _make_qk_norm_inputs,
         "pack": _make_pack_inputs,
@@ -52,6 +53,7 @@ def operator_shape_name(op_name: str, args: argparse.Namespace) -> str:
     batch, seq = _batch_seq(args)
     vocab = _arg_int(args, "vocab", DEFAULT_VOCAB)
     names = {
+        "mhc_pre_h_aggregate": f"{batch * seq}x4x{_normalized_dim(args)}",
         "rms_norm": f"{batch}x{seq}x{_normalized_dim(args)}",
         "qk_norm": f"{batch}x{seq}x{_arg_int(args, 'n_heads', DEFAULT_N_HEADS)}x"
         f"{_arg_int(args, 'head_dim', DEFAULT_HEAD_DIM)}",
@@ -85,6 +87,18 @@ def _make_rms_norm_inputs(
         "x": _floating_tensor((batch, seq, normalized_dim), args, dtype, device, offset=0),
         "weight": _floating_tensor((normalized_dim,), args, dtype, device, offset=1),
         "eps": _arg_float(args, "eps", DEFAULT_RMS_EPS),
+    }
+
+
+def _make_mhc_pre_h_aggregate_inputs(
+    args: argparse.Namespace, dtype: torch.dtype, device: torch.device
+) -> dict[str, Any]:
+    batch, seq = _batch_seq(args)
+    num_tokens = batch * seq
+    hidden = _normalized_dim(args)
+    return {
+        "residual": _floating_tensor((num_tokens, 4, hidden), args, dtype, device, offset=0),
+        "pre": _floating_tensor((num_tokens, 4), args, torch.float32, device, offset=1),
     }
 
 
