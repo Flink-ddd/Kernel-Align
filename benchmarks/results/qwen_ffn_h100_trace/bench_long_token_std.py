@@ -5,8 +5,7 @@ import torch
 
 from rl_engine.kernels.ops.pytorch.ffn.ffn import qwen3_ffn
 
-
-H, I = 4096, 12288
+H, INTERMEDIATE = 4096, 12288
 WARMUP = 5
 FW_ITERS = 20
 FB_ITERS = 10
@@ -42,7 +41,7 @@ def main():
         "device": torch.cuda.get_device_name(0),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
-        "shape": {"hidden": H, "intermediate": I, "dtype": "bfloat16"},
+        "shape": {"hidden": H, "intermediate": INTERMEDIATE, "dtype": "bfloat16"},
         "warmup": WARMUP,
         "forward_iters": FW_ITERS,
         "forward_backward_iters": FB_ITERS,
@@ -50,11 +49,12 @@ def main():
     }
     for tokens in map(int, sys.argv[1:]):
         x = torch.randn(tokens, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        gate = torch.randn(I, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        up = torch.randn(I, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        down = torch.randn(H, I, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        gate = torch.randn(INTERMEDIATE, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        up = torch.randn(INTERMEDIATE, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        down = torch.randn(H, INTERMEDIATE, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         dout = torch.randn(tokens, H, device="cuda", dtype=torch.bfloat16)
         for deterministic in (True, False):
+
             def forward():
                 return qwen3_ffn(x, gate, up, down, deterministic=deterministic)
 

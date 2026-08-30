@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 from collections import Counter
@@ -15,6 +16,7 @@ from threading import Lock
 from typing import Any
 
 import torch
+
 from rl_engine.integrations.ablation import Implementation, IntegrationPlan
 
 
@@ -27,6 +29,7 @@ class OperatorReadback:
     implementation: str
     backend_id: str
     call_count: int
+    execution_mode: str = "eager"
     provenance: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -51,10 +54,15 @@ class FrameworkOperatorIntegration:
         self.plan = plan
         self._rl_kernel_operators = dict(rl_kernel_operators)
         self._counts: Counter[str] = Counter()
+        self._profile_counts: Counter[str] = Counter()
         self._readbacks: dict[str, OperatorReadback] = {}
         self._installed_hooks: dict[str, str] = {}
         self._fallbacks: list[dict[str, str]] = []
+        self._reported_routes: set[str] = set()
+        self._persisted_route_fingerprints: dict[str, tuple[Any, ...]] = {}
         self._lock = Lock()
+        if os.getenv("RL_KERNEL_READBACK_DIR", "").strip():
+            atexit.register(self._persist_readback)
 
     def install_operator(self, module: str, operator: Callable[..., Any]) -> None:
         normalized = module.strip().lower()
@@ -112,6 +120,45 @@ class FrameworkOperatorIntegration:
         # inside the captured graph.
         if torch._dynamo.is_compiling():
             return result
+        raw_provenance = getattr(selected, "provenance", {})
+        if _contains_profile_only(raw_provenance):
+            self.record_profile_call(normalized)
+        else:
+            self.record_execution(normalized, selected)
+        return result
+
+    def record_profile_call(self, module: str) -> None:
+        """Record framework shape/profile work without treating it as execution."""
+
+        normalized = module.strip().lower()
+        if normalized not in self.plan.cases:
+            raise ValueError(f"unknown integration module {module!r}")
+        with self._lock:
+            self._profile_counts[normalized] += 1
+            first_call = self._profile_counts[normalized] == 1
+        if first_call:
+            self._persist_readback()
+
+    def record_execution(
+        self,
+        module: str,
+        selected: Callable[..., Any],
+        *,
+        execution_mode: str = "eager",
+    ) -> None:
+        """Record one eager or custom-op execution outside Dynamo tracing."""
+
+        normalized = module.strip().lower()
+        implementation = self.plan.implementation_for(normalized, self.target)
+        if implementation is Implementation.RL_KERNEL and (
+            selected is not self._rl_kernel_operators.get(normalized)
+        ):
+            raise RuntimeError(
+                f"{self.framework} {normalized} execution evidence did not use "
+                "the installed RL-Kernel operator"
+            )
+        if execution_mode not in {"eager", "compiled_cuda_graph"}:
+            raise ValueError(f"unknown execution mode {execution_mode!r}")
         backend_id = getattr(selected, "backend_id", None)
         if not isinstance(backend_id, str) or not backend_id.strip():
             backend_id = (
@@ -121,6 +168,17 @@ class FrameworkOperatorIntegration:
             )
         raw_provenance = getattr(selected, "provenance", {})
         provenance = dict(raw_provenance) if isinstance(raw_provenance, Mapping) else {}
+        actual_backend = _actual_backend(provenance) or backend_id
+        fallback = _contains_fallback(provenance)
+        should_report = False
+        route_changed = False
+        route_fingerprint = (
+            implementation.value,
+            backend_id,
+            actual_backend,
+            fallback,
+            _runtime_platform(provenance),
+        )
         with self._lock:
             self._counts[normalized] += 1
             case = self.plan.cases[normalized]
@@ -132,10 +190,30 @@ class FrameworkOperatorIntegration:
                 implementation=implementation.value,
                 backend_id=backend_id,
                 call_count=self._counts[normalized],
+                execution_mode=execution_mode,
                 provenance=provenance,
             )
-        self._persist_readback()
-        return result
+            if normalized not in self._reported_routes:
+                self._reported_routes.add(normalized)
+                should_report = _route_report_enabled()
+            if self._persisted_route_fingerprints.get(normalized) != route_fingerprint:
+                self._persisted_route_fingerprints[normalized] = route_fingerprint
+                route_changed = True
+        if route_changed:
+            self._persist_readback()
+        if should_report:
+            print(
+                "[RL-Kernel][route] "
+                f"framework={self.framework} target={self.target} module={normalized} "
+                f"requested={implementation.value} actual={actual_backend} "
+                f"fallback={str(fallback).lower()}",
+                flush=True,
+            )
+        if implementation is Implementation.RL_KERNEL and fallback:
+            self.record_fallback(normalized, f"operator provenance selected {actual_backend}")
+            raise RuntimeError(
+                f"{self.framework} {normalized} strict RL-Kernel route reported fallback"
+            )
 
     def readback(self) -> dict[str, Any]:
         with self._lock:
@@ -145,6 +223,7 @@ class FrameworkOperatorIntegration:
                 "plan": self.plan.to_dict(),
                 "installed_hooks": dict(self._installed_hooks),
                 "fallbacks": list(self._fallbacks),
+                "profile_calls": dict(self._profile_counts),
                 "operators": {
                     module: readback.to_dict() for module, readback in self._readbacks.items()
                 },
@@ -220,6 +299,63 @@ def _contains_triton(value: Any) -> bool:
     if isinstance(value, (list, tuple)):
         return any(_contains_triton(item) for item in value)
     return False
+
+
+def _contains_fallback(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            normalized_key = str(key).strip().lower()
+            if normalized_key in {
+                "fallback",
+                "fallback_used",
+                "split_kv_fallback",
+                "used_fallback",
+            } and item not in (False, None, "", 0):
+                return True
+            if _contains_fallback(item):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_contains_fallback(item) for item in value)
+    return False
+
+
+def _contains_profile_only(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    if value.get("profile_only") is True:
+        return True
+    return any(_contains_profile_only(item) for item in value.values())
+
+
+def _actual_backend(value: Any) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    direct = value.get("actual_backend")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    for item in value.values():
+        nested = _actual_backend(item)
+        if nested is not None:
+            return nested
+    return None
+
+
+def _route_report_enabled() -> bool:
+    enabled = os.getenv("RL_KERNEL_ROUTE_REPORT", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return False
+    all_ranks = os.getenv("RL_KERNEL_ROUTE_REPORT_ALL_RANKS", "0").strip().lower()
+    if all_ranks in {"1", "true", "yes", "on"}:
+        return True
+    for name in ("RANK", "LOCAL_RANK"):
+        value = os.getenv(name, "").strip()
+        if value:
+            try:
+                return int(value) == 0
+            except ValueError:
+                continue
+    return True
 
 
 def _runtime_platform(value: Any) -> str | None:

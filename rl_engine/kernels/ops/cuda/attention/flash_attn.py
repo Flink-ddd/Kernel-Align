@@ -29,6 +29,9 @@ _FA4_API_SOURCES = (_FA4_API_SOURCE, _FA4_COMPAT_API_SOURCE)
 _FA4_REQUIRED_PARAMETERS = frozenset(
     {"softmax_scale", "causal", "num_splits", "pack_gqa", "deterministic", "return_lse"}
 )
+_FA4_PAGED_REQUIRED_PARAMETERS = _FA4_REQUIRED_PARAMETERS | frozenset(
+    {"page_table", "seqused_k", "max_seqlen_k"}
+)
 
 
 class StrictFlashAttentionUnavailable(RuntimeError):
@@ -81,6 +84,7 @@ class StrictFlashAttention4Core:
         *,
         split_kv: SplitKVSpec | None = None,
         _op: Callable[..., Any] | None = None,
+        _paged_op: Callable[..., Any] | None = None,
         _package_version: str | None = None,
     ) -> None:
         requested = SplitKVSpec.disabled() if split_kv is None else split_kv
@@ -90,15 +94,20 @@ class StrictFlashAttention4Core:
             raise ValueError("strict FA4 Attention requires Split-KV to be disabled")
         if _op is None:
             op, package_version, api_source = _load_fa4_cute_op()
+            paged_op = getattr(importlib.import_module(api_source), "flash_attn_varlen_func", None)
         else:
             op = _op
+            paged_op = _paged_op
             package_version = "test-double" if _package_version is None else _package_version
             api_source = _FA4_API_SOURCE
         self._validate_api(op)
+        if paged_op is not None:
+            self._validate_paged_api(paged_op)
         self.split_kv = requested
         self.package_version = package_version
         self.api_source = api_source
         self._op = op
+        self._paged_op = paged_op
 
     @staticmethod
     def _validate_api(op: Callable[..., Any]) -> None:
@@ -112,6 +121,20 @@ class StrictFlashAttention4Core:
         if missing:
             raise StrictFlashAttentionUnavailable(
                 "FlashAttention CuTe API is missing strict controls: " + ", ".join(missing)
+            )
+
+    @staticmethod
+    def _validate_paged_api(op: Callable[..., Any]) -> None:
+        try:
+            parameters = inspect.signature(op).parameters
+        except (TypeError, ValueError) as exc:
+            raise StrictFlashAttentionUnavailable(
+                "cannot inspect the FlashAttention CuTe paged API signature"
+            ) from exc
+        missing = sorted(_FA4_PAGED_REQUIRED_PARAMETERS.difference(parameters))
+        if missing:
+            raise StrictFlashAttentionUnavailable(
+                "FlashAttention CuTe paged API is missing strict controls: " + ", ".join(missing)
             )
 
     def __call__(
@@ -255,6 +278,139 @@ class StrictFlashAttention4Core:
             },
         )
 
+    def forward_paged_bshd_with_lse(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        page_table: torch.Tensor,
+        seqused_k: torch.Tensor,
+        max_seqlen_k: int,
+        scale: float | None = None,
+        output_dtype: torch.dtype | None = None,
+        out: torch.Tensor | None = None,
+    ) -> DeterministicAttentionCoreResult:
+        """Run the strict FA4 schedule directly over a paged KV cache."""
+
+        if self._paged_op is None:
+            raise StrictFlashAttentionUnavailable(
+                "strict paged Attention requires flash_attn_varlen_func"
+            )
+        self._validate_paged_bshd_inputs(
+            q,
+            k_cache,
+            v_cache,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+        )
+        resolved_dtype = q.dtype if output_dtype is None else output_dtype
+        if resolved_dtype != q.dtype:
+            raise ValueError("strict Attention output_dtype must match the Q/K/V input dtype")
+        if out is not None:
+            if out.shape != q.shape:
+                raise ValueError("paged Attention out must have the same shape as q")
+            if out.dtype != resolved_dtype or out.device != q.device:
+                raise ValueError("paged Attention out must match the requested dtype and device")
+            if not out.is_contiguous():
+                raise ValueError("paged Attention out must be contiguous")
+
+        paged_kwargs = {
+            "page_table": page_table,
+            "seqused_k": seqused_k,
+            "max_seqlen_k": max_seqlen_k,
+            "softmax_scale": scale,
+            "causal": False,
+            "num_splits": self.num_splits,
+            "pack_gqa": q.size(2) > k_cache.size(2),
+            "deterministic": self.deterministic_backward,
+            "return_lse": True,
+        }
+        if out is not None:
+            paged_kwargs["out"] = out
+        out_fa, lse = self._paged_op(
+            q,
+            k_cache,
+            v_cache,
+            **paged_kwargs,
+        )
+        expected_lse_shape = (q.size(0), q.size(2), q.size(1))
+        if not isinstance(out_fa, torch.Tensor) or tuple(out_fa.shape) != tuple(q.shape):
+            raise StrictFlashAttentionUnavailable(
+                f"paged FlashAttention output must have shape {tuple(q.shape)}"
+            )
+        if not isinstance(lse, torch.Tensor) or tuple(lse.shape) != expected_lse_shape:
+            raise StrictFlashAttentionUnavailable(
+                f"paged FlashAttention LSE must have shape {expected_lse_shape}"
+            )
+        if out_fa.dtype != resolved_dtype or lse.dtype != torch.float32:
+            raise StrictFlashAttentionUnavailable(
+                "paged FlashAttention returned an incompatible output dtype"
+            )
+        if out is not None and out_fa.data_ptr() != out.data_ptr():
+            raise StrictFlashAttentionUnavailable(
+                "paged FlashAttention did not write to the requested output buffer"
+            )
+        return DeterministicAttentionCoreResult(
+            out=out_fa,
+            lse=lse.contiguous(),
+            provenance={
+                "strict_core_id": self.core_id,
+                "strict_schedule": self.strict_schedule,
+                "attention_backend": f"{self.backend_id}.paged",
+                "fa_api_source": self.api_source,
+                "fa_package_version": self.package_version,
+                "num_splits": self.num_splits,
+                "deterministic_backward": self.deterministic_backward,
+                "dropout_p": 0.0,
+                "split_kv": self.split_kv.resolve(max_seqlen_k, backend=self.backend_id).to_dict(),
+                "merge_order": self.merge_order,
+                "accum_dtype": self.accum_dtype,
+                "downcast_at": self.downcast_at,
+                "kv_layout": "paged_direct",
+                "output_buffer_reused": out is not None,
+                "fallback": False,
+                "fallback_reason": None,
+                "native_attention_arithmetic": True,
+                "production_ready": True,
+                "reference_only": False,
+            },
+        )
+
+    @staticmethod
+    def _validate_paged_bshd_inputs(
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        page_table: torch.Tensor,
+        seqused_k: torch.Tensor,
+        max_seqlen_k: int,
+    ) -> None:
+        if q.ndim != 4 or q.size(1) != 1:
+            raise ValueError("paged q must use [B, 1, H, D]")
+        if k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
+            raise ValueError("paged k/v must use [pages, page_size, H, D]")
+        if q.size(2) % k_cache.size(2) != 0 or q.size(3) != k_cache.size(3):
+            raise ValueError("paged q/k head counts or head dimensions are incompatible")
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("strict paged Attention supports FP16/BF16 only")
+        if k_cache.dtype != q.dtype or v_cache.dtype != q.dtype:
+            raise ValueError("paged q/k/v must share one dtype")
+        if not (q.is_cuda and k_cache.is_cuda and v_cache.is_cuda):
+            raise ValueError("strict paged Attention requires CUDA tensors")
+        if not (q.device == k_cache.device == v_cache.device):
+            raise ValueError("paged q/k/v must be on one CUDA device")
+        if page_table.shape[0] != q.size(0) or page_table.dtype != torch.int32:
+            raise ValueError("page_table must be int32 with one row per query")
+        if seqused_k.shape != (q.size(0),) or seqused_k.dtype != torch.int32:
+            raise ValueError("seqused_k must be int32 with one length per query")
+        if page_table.device != q.device or seqused_k.device != q.device:
+            raise ValueError("paged Attention metadata must be on the Q device")
+        if max_seqlen_k <= 0 or max_seqlen_k > page_table.size(1) * k_cache.size(1):
+            raise ValueError("max_seqlen_k exceeds the page table capacity")
+
     @staticmethod
     def _validate_bshd_inputs(
         q: torch.Tensor,
@@ -268,9 +424,9 @@ class StrictFlashAttention4Core:
             )
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError("q/k/v must be 4-D [B, S, H, D]")
-        if q.size(0) != 1:
-            raise ValueError("strict FA4 core executes one logical batch row at a time")
-        if k.size(0) != 1 or v.size(0) != 1:
+        if q.size(0) < 1:
+            raise ValueError("strict FA4 core requires at least one logical batch row")
+        if k.size(0) != q.size(0) or v.size(0) != q.size(0):
             raise ValueError("q/k/v batch sizes must match")
         if k.shape != v.shape or q.size(3) != k.size(3):
             raise ValueError("k/v shapes and q/k/v head dimensions must match")
@@ -298,9 +454,9 @@ class StrictFlashAttention4Core:
             )
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError("q/k/v must be 4-D [B, H, S, D]")
-        if q.size(0) != 1:
-            raise ValueError("strict FA4 core executes one logical batch row at a time")
-        if k.size(0) != 1 or v.size(0) != 1:
+        if q.size(0) < 1:
+            raise ValueError("strict FA4 core requires at least one logical batch row")
+        if k.size(0) != q.size(0) or v.size(0) != q.size(0):
             raise ValueError("q/k/v batch sizes must match")
         if k.shape != v.shape or q.size(3) != k.size(3):
             raise ValueError("k/v shapes and q/k/v head dimensions must match")

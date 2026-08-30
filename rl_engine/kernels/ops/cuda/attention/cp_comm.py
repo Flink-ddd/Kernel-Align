@@ -391,16 +391,20 @@ class CUDAAGRSAttentionCPCommunication:
         if self._collective is not None:
             return self._collective
         try:
-            from rl_engine.distributed import DeterministicCollective
+            from rl_engine.distributed.collectives import collective_for_group
         except ImportError as exc:
             raise AttentionCPCommunicationUnavailable(
                 "self-owned CUDA AG/RS requires PR311/PR312 DeterministicCollective"
             ) from exc
         try:
-            self._collective = DeterministicCollective(
-                group=self._process_group,
+            dist = self._dist()
+            group = self._process_group if self._process_group is not None else dist.group.WORLD
+            self._collective = collective_for_group(
+                group=group,
                 device=torch.device("cuda", torch.cuda.current_device()),
             )
+            if self._collective is None:
+                raise RuntimeError("the CP process group is unavailable")
         except (RuntimeError, ValueError, TypeError) as exc:
             raise AttentionCPCommunicationUnavailable(
                 f"self-owned CUDA AG/RS is unavailable: {exc}"

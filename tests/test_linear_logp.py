@@ -611,18 +611,18 @@ def test_sm90_strict_contract_is_bitwise_batch_invariant():
     )
     row = 37
     row_logp, row_lse = sm90_deterministic_linear_logp(
-        hidden[row:row + 1],
+        hidden[row : row + 1],
         weight,
-        target[row:row + 1],
+        target[row : row + 1],
         bias,
-        temperature=temperature[row:row + 1],
+        temperature=temperature[row : row + 1],
         real_vocab_size=real_vocab,
     )
 
     assert SM90_LINEAR_LOGP_CONTRACT_VERSION == "cuda-fused-linear-logp-sm90-contract-v1"
     assert SM90_N_SPLIT_CONTRACT == 64
-    assert torch.equal(full_logp[row:row + 1].view(torch.int32), row_logp.view(torch.int32))
-    assert torch.equal(full_lse[row:row + 1].view(torch.int32), row_lse.view(torch.int32))
+    assert torch.equal(full_logp[row : row + 1].view(torch.int32), row_logp.view(torch.int32))
+    assert torch.equal(full_lse[row : row + 1].view(torch.int32), row_lse.view(torch.int32))
 
 
 @requires_sm90
@@ -675,9 +675,7 @@ def test_sm90_strict_contract_backward_matches_logp_and_lse_reference():
     grad_logp = torch.linspace(-0.5, 0.5, _SM90_N, device="cuda")
     grad_lse = torch.linspace(0.25, -0.25, _SM90_N, device="cuda")
 
-    logp, lse = sm90_deterministic_linear_logp(
-        hidden, weight, target, temperature=temperature
-    )
+    logp, lse = sm90_deterministic_linear_logp(hidden, weight, target, temperature=temperature)
     torch.autograd.backward((logp, lse), (grad_logp, grad_lse))
 
     ref_hidden = hidden.detach().float().requires_grad_(True)

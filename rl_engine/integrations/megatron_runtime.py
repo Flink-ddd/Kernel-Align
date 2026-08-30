@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import importlib
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from types import MethodType
 from typing import Any
 
 import torch
@@ -16,6 +17,7 @@ from rl_engine.integrations.framework_operators import (
     MegatronAttentionOperator,
     MegatronFFNOperator,
     MegatronLogpOperator,
+    _fused_rms_norm_input,
 )
 from rl_engine.integrations.linear_logp import LinearLogpWrapper
 from rl_engine.integrations.megatron import MegatronIntegration
@@ -25,6 +27,7 @@ from rl_engine.integrations.vime.linear_logp_provider import _provider_impl
 _PATCH_MARKER = "__rl_kernel_original_forward__"
 _STRICT_ATTENTION_PATCH_MARKER = "__rl_kernel_original_strict_attention_init__"
 _STRICT_ATTENTION_PROJECTION_MARKER = "__rl_kernel_strict_attention_projection__"
+_STRICT_TE_RMS_NORM_PATCH_MARKER = "__rl_kernel_original_strict_rms_norm_forward__"
 
 
 def _optional_class(path: str) -> type[Any] | None:
@@ -82,14 +85,13 @@ def _patch_strict_attention_projections(
     column_linear_cls: type[Any] | None = None,
     row_linear_cls: type[Any] | None = None,
     det_gemm: Any | None = None,
+    copy_to_tp: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    reduce_from_tp: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> None:
     """Use the shared deterministic GEMM for Megatron Attention projections."""
 
     if self_attention_cls is None or column_linear_cls is None or row_linear_cls is None:
-        from megatron.core.tensor_parallel.layers import (
-            ColumnParallelLinear,
-            RowParallelLinear,
-        )
+        from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
         from megatron.core.transformer.attention import SelfAttention
 
         self_attention_cls = SelfAttention
@@ -106,22 +108,60 @@ def _patch_strict_attention_projections(
     column_forward_impl = column_linear_cls._forward_impl
     row_forward_impl = row_linear_cls._forward_impl
 
+    def tp_mappings() -> tuple[
+        Callable[[torch.Tensor], torch.Tensor],
+        Callable[[torch.Tensor], torch.Tensor],
+    ]:
+        if copy_to_tp is not None and reduce_from_tp is not None:
+            return copy_to_tp, reduce_from_tp
+        from megatron.core.tensor_parallel.mappings import (
+            copy_to_tensor_model_parallel_region,
+            reduce_from_tensor_model_parallel_region,
+        )
+
+        return (
+            copy_to_tensor_model_parallel_region,
+            reduce_from_tensor_model_parallel_region,
+        )
+
     def deterministic_projection(
         input_value: torch.Tensor,
         weight: torch.Tensor,
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
         input_2d = input_value.reshape(-1, input_value.shape[-1])
-        output_2d = det_gemm(input_2d, weight.t().contiguous())
+        linear = getattr(det_gemm, "linear", None)
+        output_2d = (
+            linear(input_2d, weight)
+            if linear is not None
+            else det_gemm(input_2d, weight.t().contiguous())
+        )
         output = output_2d.reshape(*input_value.shape[:-1], weight.shape[0])
         return output if bias is None else output + bias
 
     def attention_init_wrapped(instance: Any, *args: Any, **kwargs: Any) -> None:
         attention_init(instance, *args, **kwargs)
-        setattr(instance.linear_qkv, _STRICT_ATTENTION_PROJECTION_MARKER, "qkv")
-        setattr(instance.linear_proj, _STRICT_ATTENTION_PROJECTION_MARKER, "o_proj")
-        # copy_to_tensor_model_parallel_region already owns this TP dgrad reduction.
-        instance.linear_qkv.allreduce_dgrad = False
+        qkv = instance.linear_qkv
+        projection = instance.linear_proj
+        setattr(qkv, _STRICT_ATTENTION_PROJECTION_MARKER, "qkv")
+        setattr(projection, _STRICT_ATTENTION_PROJECTION_MARKER, "o_proj")
+        if hasattr(qkv, "layer_norm_weight"):
+            tp_copy, tp_reduce = tp_mappings()
+
+            def te_qkv_forward(module: Any, input_value: torch.Tensor) -> Any:
+                normalized = _fused_rms_norm_input(module, input_value, "linear_qkv")
+                normalized = tp_copy(normalized)
+                return deterministic_projection(normalized, module.weight, None), None
+
+            def te_projection_forward(module: Any, input_value: torch.Tensor) -> Any:
+                output = deterministic_projection(input_value, module.weight, None)
+                return tp_reduce(output), None
+
+            qkv.forward = MethodType(te_qkv_forward, qkv)
+            projection.forward = MethodType(te_projection_forward, projection)
+        else:
+            # The local ColumnParallelLinear wrapper already owns TP dgrad.
+            qkv.allreduce_dgrad = False
 
     def column_forward_impl_wrapped(
         instance: Any,
@@ -151,6 +191,36 @@ def _patch_strict_attention_projections(
     row_linear_cls._forward_impl = row_forward_impl_wrapped
 
 
+def _patch_strict_te_rms_norm(rms_norm_cls: type[Any] | None = None) -> None:
+    """Match standalone TE RMSNorm modules to the strict rollout arithmetic."""
+
+    if rms_norm_cls is None:
+        try:
+            from transformer_engine.pytorch import RMSNorm
+        except ImportError:
+            return
+
+        rms_norm_cls = RMSNorm
+    if hasattr(rms_norm_cls, _STRICT_TE_RMS_NORM_PATCH_MARKER):
+        return
+    original = rms_norm_cls.forward
+
+    def wrapped(instance: Any, input_value: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        if args or kwargs:
+            raise RuntimeError("strict TE RMSNorm does not accept extra forward arguments")
+        if bool(getattr(instance, "zero_centered_gamma", False)):
+            raise RuntimeError("strict TE RMSNorm does not support zero-centered gamma")
+        return torch.nn.functional.rms_norm(
+            input_value,
+            (input_value.shape[-1],),
+            instance.weight,
+            float(instance.eps),
+        )
+
+    setattr(rms_norm_cls, _STRICT_TE_RMS_NORM_PATCH_MARKER, original)
+    rms_norm_cls.forward = wrapped
+
+
 def install_megatron_integration(
     plan: IntegrationPlan,
     *,
@@ -167,17 +237,17 @@ def install_megatron_integration(
             raise RuntimeError("Megatron integration is already installed with another plan")
         return existing
 
-    integration = MegatronIntegration(
-        plan,
-        rl_kernel_operators={
-            "attention": MegatronAttentionOperator(),
-            "ffn": MegatronFFNOperator(),
-            "logp": MegatronLogpOperator(
-                _provider_impl,
-                linear_logp=LinearLogpWrapper(),
-            ),
-        },
-    )
+    rl_kernel_operators: dict[str, Any] = {}
+    if plan.implementation_for("attention", "training") is Implementation.RL_KERNEL:
+        rl_kernel_operators["attention"] = MegatronAttentionOperator()
+    if plan.implementation_for("ffn", "training") is Implementation.RL_KERNEL:
+        rl_kernel_operators["ffn"] = MegatronFFNOperator()
+    if plan.implementation_for("logp", "training") is Implementation.RL_KERNEL:
+        rl_kernel_operators["logp"] = MegatronLogpOperator(
+            _provider_impl,
+            linear_logp=LinearLogpWrapper(),
+        )
+    integration = MegatronIntegration(plan, rl_kernel_operators=rl_kernel_operators)
     resolved_attention = _unique_classes(
         _discover_attention_classes() if attention_classes is None else attention_classes
     )
@@ -193,6 +263,8 @@ def install_megatron_integration(
     set_active_integration("megatron", integration)
     if plan.implementation_for("attention", "training") is Implementation.RL_KERNEL:
         _patch_strict_attention_projections()
+        if plan.implementation_for("ffn", "training") is Implementation.RL_KERNEL:
+            _patch_strict_te_rms_norm()
     for cls in resolved_attention:
         _patch_forward(cls, integration=integration, module="attention")
     if resolved_attention:
@@ -207,7 +279,9 @@ def install_megatron_integration(
             "ffn",
             ",".join(f"{cls.__module__}.{cls.__name__}.forward" for cls in resolved_ffn),
         )
-    integration.record_installed_hook("logp", "rl_engine.integrations.vime.linear_logp_provider.provider")
+    integration.record_installed_hook(
+        "logp", "rl_engine.integrations.vime.linear_logp_provider.provider"
+    )
     return integration
 
 
