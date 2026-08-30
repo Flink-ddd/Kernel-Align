@@ -704,6 +704,12 @@ class KernelRegistry:
                 AttentionBackendCapability(
                     backend_id="aiter.rocm.ck_dense_mha",
                     roles=frozenset({AttentionRole.TRAIN, AttentionRole.INFER}),
+                    # DECODE is deliberately absent. StrictRocmAttentionRuntime
+                    # has a paged entry point, but no caller routes to it: the
+                    # Vime request carries no page table and builds its contract
+                    # with kv_cache=None. Declaring the mode before a dispatch
+                    # path reaches it would let the binding layer pass on a
+                    # decode path nothing executes.
                     modes=frozenset({AttentionMode.PREFILL, AttentionMode.CHUNKED_PREFILL}),
                     dtypes=frozenset({AttentionDType.BF16, AttentionDType.FP16}),
                     # The core itself is single-rank arithmetic. CP is supplied

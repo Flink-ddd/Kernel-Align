@@ -208,6 +208,207 @@ class StrictRocmAttentionRuntime:
             },
         )
 
+    def forward_paged_with_lse(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        page_table: torch.Tensor,
+        seqused_k: torch.Tensor,
+        max_seqlen_k: int,
+        scale: float | None,
+        out: torch.Tensor | None = None,
+    ) -> StrictRocmAttentionResult:
+        """Run strict decode Attention over a paged KV cache.
+
+        AITER exposes no paged entry point that this contract can use. Every
+        ``paged_attention_*`` kernel partitions KV and reduces the partials
+        (``partition_size``, ``exp_sums``/``max_logits``/``tmp_out``), so the
+        partition count moves with the cached length; AITER's
+        ``flash_attn_varlen_func`` takes a ``block_table`` but has no
+        ``num_splits`` knob to pin, unlike CUDA's FA4. Either way the strict
+        contract could not prove Split-KV disabled.
+
+        So the pages are gathered into logical KV order and handed to the same
+        dense core the prefill path uses, at the same one-launch-per
+        ``(batch row, KV group)`` granularity. The arithmetic is then identical
+        to a CP=1 prefill over the same logical sequence, which is what makes
+        decode replay comparable against it. The cost is materializing the
+        cached KV; a native paged kernel would avoid that, and can replace this
+        once AITER can pin its split count.
+        """
+
+        self._require_rocm(q)
+        self._validate_paged_inputs(
+            q,
+            k_cache,
+            v_cache,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+        )
+        if out is not None:
+            if out.shape != q.shape:
+                raise ValueError("paged Attention out must have the same shape as q")
+            if out.dtype != q.dtype or out.device != q.device:
+                raise ValueError("paged Attention out must match the Q dtype and device")
+            if not out.is_contiguous():
+                raise ValueError("paged Attention out must be contiguous")
+
+        row_outs: list[torch.Tensor] = []
+        row_lses: list[torch.Tensor] = []
+        core_provenance: dict[str, Any] | None = None
+        launches = 0
+        for row in range(q.size(0)):
+            cached_length = int(seqused_k[row].item())
+            if cached_length <= 0 or cached_length > max_seqlen_k:
+                raise ValueError(
+                    "seqused_k entries must be positive and within max_seqlen_k; "
+                    f"row {row} requested {cached_length}"
+                )
+            k_row, v_row = self._gather_paged_row(
+                k_cache,
+                v_cache,
+                page_table[row],
+                cached_length,
+            )
+            # Decode attends over the whole cached prefix, so the mask is not
+            # causal within this launch. The logical positions are still passed
+            # for provenance-grade auditing of what each launch consumed.
+            key_positions = torch.arange(
+                cached_length,
+                dtype=torch.int64,
+                device=q.device,
+            ).unsqueeze(0)
+            query_positions = key_positions[:, -q.size(2) :]
+            row_out, row_lse, row_provenance, row_launches = self._run_core(
+                q[row : row + 1],
+                k_row,
+                v_row,
+                causal=False,
+                scale=scale,
+                query_position_ids=query_positions,
+                key_position_ids=key_positions,
+                output_dtype=q.dtype,
+            )
+            row_outs.append(row_out)
+            row_lses.append(row_lse)
+            launches += row_launches
+            if core_provenance is None:
+                core_provenance = row_provenance
+
+        if core_provenance is None:
+            raise RuntimeError("strict ROCm paged Attention executed no core launch")
+
+        result_out = torch.cat(row_outs, dim=0)
+        result_lse = torch.cat(row_lses, dim=0)
+        if out is not None:
+            out.copy_(result_out)
+            result_out = out
+        self.communication_executed = False
+
+        backend = (
+            core_provenance.get("attention_backend")
+            or core_provenance.get("actual_backend")
+            or getattr(self._core, "backend_id", None)
+        )
+        return StrictRocmAttentionResult(
+            out=result_out,
+            lse=result_lse,
+            provenance={
+                "strict_core_id": self.core_id,
+                "strict_schedule": self.strict_schedule,
+                "actual_backend": self.backend_id,
+                "communication_backend": "none",
+                "communication_executed": False,
+                "native_attention_arithmetic": True,
+                "production_ready": True,
+                "fallback": False,
+                "fallback_reason": None,
+                "reference_only": False,
+                "split_kv": "disabled",
+                "query_schedule": "paged_single_query_batch",
+                # The dense core runs; the pages are gathered first. Recorded so
+                # a reader never mistakes this for a native paged kernel.
+                "paged_execution": "logical_kv_gather_then_dense_core",
+                "paged_kernel": "none",
+                "launch_granularity": "one_batch_row_one_kv_group",
+                "tp_degree_invariant": True,
+                "invariance_mechanism": "one_kv_group_per_launch",
+                "core_row_count": q.size(0) * q.size(2),
+                "core_launch_count": launches,
+                "core_batch_size": q.size(0),
+                "core_query_length": q.size(2),
+                "core_actual_backends": [] if backend is None else [str(backend)],
+                "core": core_provenance,
+            },
+        )
+
+    @staticmethod
+    def _gather_paged_row(
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_row: torch.Tensor,
+        cached_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Materialize one row's cached KV in logical order as ``[1, H, S, D]``.
+
+        Physical page order never reaches the core: the pages are read through
+        the page table, so the launch sees the same logical sequence a prefill
+        over the same tokens would have seen.
+        """
+
+        page_size = k_cache.size(1)
+        page_count = (cached_length + page_size - 1) // page_size
+        if page_count > page_row.numel():
+            raise ValueError("page_table row is shorter than the cached length requires")
+        pages = page_row[:page_count].to(dtype=torch.int64)
+        if int(pages.min().item()) < 0 or int(pages.max().item()) >= k_cache.size(0):
+            raise ValueError("page_table entries are outside the KV cache")
+
+        def _gather(cache: torch.Tensor) -> torch.Tensor:
+            selected = cache.index_select(0, pages)
+            flat = selected.reshape(page_count * page_size, cache.size(2), cache.size(3))
+            return flat[:cached_length].permute(1, 0, 2).unsqueeze(0).contiguous()
+
+        return _gather(k_cache), _gather(v_cache)
+
+    @staticmethod
+    def _validate_paged_inputs(
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        page_table: torch.Tensor,
+        seqused_k: torch.Tensor,
+        max_seqlen_k: int,
+    ) -> None:
+        if q.ndim != 4:
+            raise ValueError("paged q must use [B, H, S, D]")
+        if k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
+            raise ValueError("paged k/v must use [pages, page_size, H, D]")
+        if q.size(1) % k_cache.size(2) != 0 or q.size(3) != k_cache.size(3):
+            raise ValueError("paged q/k head counts or head dimensions are incompatible")
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("strict paged Attention supports FP16/BF16 only")
+        if k_cache.dtype != q.dtype or v_cache.dtype != q.dtype:
+            raise ValueError("paged q/k/v must share one dtype")
+        if not (q.device == k_cache.device == v_cache.device):
+            raise ValueError("paged q/k/v must be on one ROCm device")
+        if page_table.ndim != 2 or page_table.size(0) != q.size(0):
+            raise ValueError("page_table must be 2-D with one row per query")
+        if page_table.dtype not in (torch.int32, torch.int64):
+            raise ValueError("page_table must be an integer tensor")
+        if seqused_k.shape != (q.size(0),):
+            raise ValueError("seqused_k must carry one cached length per query")
+        if seqused_k.dtype not in (torch.int32, torch.int64):
+            raise ValueError("seqused_k must be an integer tensor")
+        if page_table.device != q.device or seqused_k.device != q.device:
+            raise ValueError("paged Attention metadata must be on the Q device")
+        if max_seqlen_k <= 0 or max_seqlen_k > page_table.size(1) * k_cache.size(1):
+            raise ValueError("max_seqlen_k exceeds the page table capacity")
+
     def _run_core(
         self,
         q: torch.Tensor,
