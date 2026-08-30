@@ -2,6 +2,10 @@
 # This file is a type stub for the compiled C++ extension module.
 import torch
 
+def mhc_pre_h_aggregate(
+    residual: torch.Tensor,
+    pre: torch.Tensor,
+) -> torch.Tensor: ...
 def deterministic_collective_ipc_meta(
     tensor: torch.Tensor,
 ) -> tuple[list[int], int]: ...

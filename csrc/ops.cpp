@@ -164,6 +164,10 @@ int64_t rmsnorm_backward_dw_chunks_cuda(int64_t rows);
 void reduce_rows_fp32_left_fold_cuda(
   torch::Tensor rows,
   torch::Tensor output);
+
+torch::Tensor mhc_pre_h_aggregate_cuda(
+  torch::Tensor residual,
+  torch::Tensor pre);
 #endif
 
 static void rmsnorm_check_input(const torch::Tensor& x, const char* name) {
@@ -491,6 +495,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "reduce_rows_fp32_left_fold",
         &reduce_rows_fp32_left_fold,
         "Ascending-row FP32 left-fold reduction CUDA");
+    m.def(
+        "mhc_pre_h_aggregate",
+        &mhc_pre_h_aggregate_cuda,
+        "Batch-invariant MHC H Aggregate CUDA");
 #endif
 
     // registry SiLU / SwiGLU (elementwise activation)
