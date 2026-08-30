@@ -18,8 +18,11 @@ Two things differ from the CUDA runtime and both are load-bearing:
   to the same shard under a different TP degree. The CUDA FA4 core has no such
   dependence and runs one launch per sequence.
 * RCCL moves tensors but never reduces them. The cross-rank ``(out, lse)``
-  combine order comes from the fixed balanced rank tree in
-  ``_RCCLRankOrderedTransport``, not from RCCL's own algorithm selection.
+  combine order comes from the fixed balanced rank tree in the shared
+  ``RCCLDeterministicCollective``, not from RCCL's own algorithm selection.
+  That is the collective the CUDA runtime also resolves through
+  ``collective_for_group``, so both platforms run one reduction order from
+  one implementation.
 """
 
 from __future__ import annotations

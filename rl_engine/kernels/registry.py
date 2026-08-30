@@ -709,9 +709,9 @@ class KernelRegistry:
                     # The core itself is single-rank arithmetic. CP is supplied
                     # by StrictRocmAttentionRuntime, which wraps this core in
                     # the RCCL AG/RS transport; the sizes mirror the world
-                    # sizes _RCCLRankOrderedTransport accepts. The merge order
-                    # is the transport's fixed balanced rank tree, not RCCL's
-                    # own reduction, so the CP merge is deterministic.
+                    # sizes RCCLDeterministicCollective accepts. The merge
+                    # order is that collective's fixed balanced rank tree, not
+                    # RCCL's own reduction, so the CP merge is deterministic.
                     cp_world_sizes=(1, 2, 4, 8),
                     tp_world_sizes=None,
                     exports_attention_lse=True,
