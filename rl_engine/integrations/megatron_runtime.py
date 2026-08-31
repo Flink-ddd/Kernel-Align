@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 from collections.abc import Callable, Iterable
 from types import MethodType
 from typing import Any
@@ -290,7 +291,48 @@ def initialize_from_environment(_args: Any = None) -> MegatronIntegration:
 
     from rl_engine.integrations.ablation import integration_plan_from_environment
 
-    return install_megatron_integration(integration_plan_from_environment())
+    plan = integration_plan_from_environment()
+    integration = install_megatron_integration(plan)
+    if plan.implementation_for("attention", "training") is Implementation.RL_KERNEL:
+        _precompile_strict_attention_training(_args)
+    return integration
+
+
+def _precompile_strict_attention_training(args: Any) -> None:
+    """Warm FA4 CuTe fwd/bwd JIT outside Vime's actor_train timer."""
+
+    if args is None or torch.version.hip is not None or not torch.cuda.is_available():
+        return
+    if os.getenv("RL_KERNEL_PRECOMPILE_FA4", "1") == "0":
+        return
+
+    from rl_engine.kernels.ops.cuda.attention.flash_attn import StrictFlashAttention4Core
+
+    attention_heads = int(getattr(args, "num_attention_heads", 0) or 0)
+    query_groups = int(getattr(args, "num_query_groups", 0) or attention_heads)
+    tp_size = int(getattr(args, "tensor_model_parallel_size", 1) or 1)
+    head_dim = int(
+        getattr(args, "kv_channels", 0)
+        or (int(getattr(args, "hidden_size", 0) or 0) // attention_heads)
+    )
+    if (
+        attention_heads <= 0
+        or query_groups <= 0
+        or tp_size <= 0
+        or attention_heads % tp_size
+        or query_groups % tp_size
+        or head_dim <= 0
+    ):
+        return
+
+    params_dtype = getattr(args, "params_dtype", None)
+    dtype = params_dtype if params_dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+    StrictFlashAttention4Core.precompile_training(
+        q_heads=attention_heads // tp_size,
+        kv_heads=query_groups // tp_size,
+        head_dim=head_dim,
+        dtype=dtype,
+    )
 
 
 __all__ = ["initialize_from_environment", "install_megatron_integration"]

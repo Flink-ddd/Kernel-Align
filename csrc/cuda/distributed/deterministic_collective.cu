@@ -949,7 +949,10 @@ class DeterministicCollectiveState {
     has_staged_input_ = true;
   }
 
-  void all_reduce(torch::Tensor& output, cudaStream_t stream) {
+  void all_reduce(
+      torch::Tensor& output,
+      cudaStream_t stream,
+      bool allow_owner_path = true) {
     check_tensor(output, "output");
     TORCH_CHECK(has_staged_input_, "stage() must be called before all_reduce()");
     TORCH_CHECK(
@@ -960,7 +963,10 @@ class DeterministicCollectiveState {
         "all-reduce output size must match the staged input size");
 
     const int64_t element_count = output.numel();
-    if (staged_owner_path_) {
+    // Graph-replayed calls must avoid the owner-push branch because it writes
+    // to remote IPC frames. Callers that use the fused ABI pass false here;
+    // direct staged collectives retain the eager owner optimization.
+    if (allow_owner_path && staged_owner_path_) {
       if (rank_ == 0) {
         // Logical rank 0 is the topology-favorable reader in both traced TP
         // engines. It evaluates the original fixed tree exactly once, then
@@ -1019,6 +1025,58 @@ class DeterministicCollectiveState {
         }
         publish_done(stream);
       }
+      return;
+    }
+
+    // Small collectives are launch-bound. The fast kernel folds the peer
+    // stage wait, fixed-tree reduction, and completion publication into one
+    // launch while preserving the exact reduction order.
+    if (staged_fast_path_ && staged_bytes_ <= kSingleBlockFastPathMaxBytes) {
+      if (element_count > 0) {
+        switch (output.scalar_type()) {
+          case at::ScalarType::Float:
+            launch_all_reduce_fast<float>(
+                peers_,
+                local_stage_sequence_,
+                local_done_sequence_,
+                static_cast<float*>(output.data_ptr()),
+                element_count,
+                world_size_,
+                stream);
+            break;
+          case at::ScalarType::Half:
+            launch_all_reduce_fast<half>(
+                peers_,
+                local_stage_sequence_,
+                local_done_sequence_,
+                static_cast<half*>(output.data_ptr()),
+                element_count,
+                world_size_,
+                stream);
+            break;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+          case at::ScalarType::BFloat16:
+            launch_all_reduce_fast<nv_bfloat16>(
+                peers_,
+                local_stage_sequence_,
+                local_done_sequence_,
+                static_cast<nv_bfloat16*>(output.data_ptr()),
+                element_count,
+                world_size_,
+                stream);
+            break;
+#endif
+          default:
+            TORCH_CHECK(
+                false,
+                "deterministic all-reduce supports float32, float16, and bfloat16; got ",
+                output.scalar_type());
+        }
+        AT_CUDA_CHECK(cudaGetLastError());
+      } else {
+        publish_done(stream);
+      }
+      has_staged_input_ = false;
       return;
     }
 
@@ -1090,10 +1148,11 @@ class DeterministicCollectiveState {
         output.numel() == input.numel(),
         "all-reduce output size must match the input size");
 
-    // Route both ABI entry points through the same staged protocol so the
-    // topology-aware owner reduction is always applied.
+    // Use the graph-safe staged protocol for every message size. The fused
+    // two-slot protocol is intentionally kept available in the extension for
+    // experiments, but is not safe to replay across vLLM's many graph shapes.
     stage(input, stream);
-    all_reduce(output, stream);
+    all_reduce(output, stream, /*allow_owner_path=*/false);
   }
 
   void all_gather_fused(
