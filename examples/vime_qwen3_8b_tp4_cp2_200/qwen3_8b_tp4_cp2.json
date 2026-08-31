@@ -1,12 +1,12 @@
 {
-  "schema_version": "rlkernel.vime_qwen3_8b_tp2_cp2.v1",
+  "schema_version": "rlkernel.vime_qwen3_8b_tp4_cp2.v1",
   "model": "Qwen/Qwen3-8B",
   "training": {
     "framework": "megatron",
-    "tensor_model_parallel_size": 2,
+    "tensor_model_parallel_size": 4,
     "context_parallel_size": 2,
     "pipeline_model_parallel_size": 1,
-    "world_size": 4,
+    "world_size": 8,
     "dtype": "bf16"
   },
   "rollout": {
@@ -17,7 +17,7 @@
   "linear_logp_provider": {
     "path": "rl_engine.integrations.vime.linear_logp_provider.provider",
     "mode": "strict",
-    "backend_id": "pytorch-vocab-parallel-logp-ws2",
+    "backend_id": "rlkernel.linear_logp.bitwise.v1",
     "real_vocab_size": 151936,
     "padded_vocab_size": 152064,
     "num_vocab_tiles": 64
@@ -39,5 +39,5 @@
       "status": "not_claimed_without_Megatron_and_vLLM_readback"
     }
   },
-  "vime_script": "scripts/run-qwen3-8B-rlkernel-tp2-cp2.sh"
+  "vime_script": "scripts/run-qwen3-8B-rlkernel-tp4-cp2.sh"
 }

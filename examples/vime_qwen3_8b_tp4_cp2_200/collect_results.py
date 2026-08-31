@@ -230,7 +230,7 @@ def main() -> int:
     _write_csv(args.output_dir / "rounds.csv", rounds)
     _write_csv(args.output_dir / "summary.csv", summaries)
     report = {
-        "schema_version": "rlkernel.vime_qwen3_8b_tp2_cp2_200.results.v1",
+        "schema_version": "rlkernel.vime_qwen3_8b_tp4_cp2_200.results.v1",
         "sealed_run_count": len(runs),
         "round_count": len(rounds),
         "summaries": summaries,

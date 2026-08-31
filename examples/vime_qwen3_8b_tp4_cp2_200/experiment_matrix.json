@@ -1,5 +1,5 @@
 {
-  "schema_version": "rlkernel.vime_qwen3_8b_tp2_cp2_200.matrix.v1",
+  "schema_version": "rlkernel.vime_qwen3_8b_tp4_cp2_200.matrix.v1",
   "groups": {
     "G00": {
       "framework_use_rollout_logprobs": false,

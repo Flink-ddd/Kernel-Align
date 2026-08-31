@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Run and archive the Vime Qwen3-8B TP=2/CP=2 validation entry point.
+"""Run and archive the Vime Qwen3-8B TP=4/CP=2 validation entry point.
 
 This is an integration example, not a synthetic pass generator.  A dry run
 only records the exact launch contract.  ``--run`` executes Vime and records
@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-DEFAULT_CONFIG = Path(__file__).with_name("qwen3_8b_tp2_cp2.json")
+DEFAULT_CONFIG = Path(__file__).with_name("qwen3_8b_tp4_cp2.json")
 PROVIDER_MARKER = "linear_logp provider active"
 FALLBACK_MARKERS = ("using native path", "fallback=True", "fallback=true")
 RUNTIME_EVIDENCE_SCHEMA = "rlkernel.operator_runtime_evidence.v1"
@@ -57,10 +57,10 @@ def validate_config(config: Mapping[str, Any]) -> None:
             "training, rollout, and linear_logp_provider sections are required"
         )
     expected = {
-        "tensor_model_parallel_size": 2,
+        "tensor_model_parallel_size": 4,
         "context_parallel_size": 2,
         "pipeline_model_parallel_size": 1,
-        "world_size": 4,
+        "world_size": 8,
     }
     for name, value in expected.items():
         if training.get(name) != value:
@@ -76,8 +76,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
         != "rl_engine.integrations.vime.linear_logp_provider.provider"
     ):
         raise ValueError("example must use the RL-Kernel Vime provider")
-    if provider.get("backend_id") != "pytorch-vocab-parallel-logp-ws2":
-        raise ValueError("example must pin the WS2 vocab-parallel backend")
+    if provider.get("backend_id") != "rlkernel.linear_logp.bitwise.v1":
+        raise ValueError("example must pin the deterministic vocab-parallel backend")
 
 
 def load_runtime_evidence(path: Path | None) -> dict[str, Any] | None:
@@ -162,7 +162,7 @@ def build_environment(vime_root: Path, rl_kernel_root: Path) -> dict[str, str]:
         existing.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(existing)
     env["RL_KERNEL_ROOT"] = str(rl_kernel_root)
-    env["TP_SIZE"] = "2"
+    env["TP_SIZE"] = "4"
     env["CP_SIZE"] = "2"
     env["ROLLOUT_TOP_P"] = "1.0"
     return env
@@ -205,7 +205,7 @@ def build_report(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": effective_status,
         "claim_boundary": {
-            "qwen3_8b_tp2_cp2_vime_training": strict_provider_passed,
+            "qwen3_8b_tp4_cp2_vime_training": strict_provider_passed,
             "attention_train_infer_consistency": attention_status,
             "ffn_train_infer_consistency": ffn_status,
             "reason": (
@@ -252,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
         default=Path(os.environ.get("RL_KERNEL_ROOT", ".")),
     )
     parser.add_argument(
-        "--output", type=Path, default=Path("qwen3_8b_tp2_cp2.validation.json")
+        "--output", type=Path, default=Path("qwen3_8b_tp4_cp2.validation.json")
     )
     parser.add_argument(
         "--runtime-evidence",

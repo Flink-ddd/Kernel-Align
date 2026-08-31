@@ -46,6 +46,18 @@ ARMS = {
     ),
 }
 
+TOPOLOGY = {
+    "gpus": 8,
+    "actor_gpus": 8,
+    "rollout_gpus": 8,
+    "tp": 4,
+    "cp": 2,
+    "pp": 1,
+    "colocate": True,
+    "rollout_gpus_per_engine": 4,
+    "rollout_engines": 2,
+}
+
 MODEL_ARGS = (
     "--swiglu",
     "--num-layers",
@@ -292,9 +304,10 @@ def main(argv: list[str] | None = None) -> int:
         "--actor-num-nodes",
         "1",
         "--actor-num-gpus-per-node",
-        "4",
+        str(TOPOLOGY["actor_gpus"]),
         "--rollout-num-gpus",
-        "4",
+        str(TOPOLOGY["rollout_gpus"]),
+        "--colocate",
         *MODEL_ARGS,
         "--hf-checkpoint",
         str(model_root),
@@ -330,9 +343,9 @@ def main(argv: list[str] | None = None) -> int:
         str(args.global_batch_size),
         "--balance-data",
         "--tensor-model-parallel-size",
-        "2",
+        str(TOPOLOGY["tp"]),
         "--context-parallel-size",
-        "2",
+        str(TOPOLOGY["cp"]),
         "--cp-comm-type",
         "p2p",
         "--pipeline-model-parallel-size",
@@ -380,7 +393,7 @@ def main(argv: list[str] | None = None) -> int:
         "--router-policy",
         "cache_aware",
         "--rollout-num-gpus-per-engine",
-        "2",
+        str(TOPOLOGY["rollout_gpus_per_engine"]),
         "--vllm-gpu-memory-utilization",
         str(args.vllm_gpu_memory_utilization),
     ]
@@ -417,7 +430,7 @@ def main(argv: list[str] | None = None) -> int:
     ray_command.extend(["--", *train_command])
 
     manifest = {
-        "schema_version": "rlkernel.vime_qwen3_8b_tp2_cp2_200.run.v1",
+        "schema_version": "rlkernel.vime_qwen3_8b_tp4_cp2_200.run.v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "planned" if args.dry_run else "submitting",
         "run_id": run_id,
@@ -426,14 +439,7 @@ def main(argv: list[str] | None = None) -> int:
         "num_rollout": args.num_rollout,
         "seed": args.seed,
         "rollout_seed": args.rollout_seed,
-        "topology": {
-            "gpus": 8,
-            "actor_gpus": 4,
-            "rollout_gpus": 4,
-            "tp": 2,
-            "cp": 2,
-            "pp": 1,
-        },
+        "topology": dict(TOPOLOGY),
         "batching": {
             "rollout_batch_size": args.rollout_batch_size,
             "n_samples_per_prompt": args.n_samples_per_prompt,

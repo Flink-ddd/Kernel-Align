@@ -1,10 +1,10 @@
-# VIME Qwen3-8B TP2/CP2 200-round consistency experiment
+# VIME Qwen3-8B TP4/CP2 200-round consistency experiment
 
 This example measures train/rollout numerical consistency at two independent
 layers: VIME's framework-level reuse of rollout log-probabilities and
 RL-Kernel's operator-level alignment of Attention, dense FFN, and linear logp.
-It is designed for one 8×H100 node with four Megatron training GPUs and four
-vLLM rollout GPUs.
+It is designed for one 8×H100 node. Megatron uses TP4/CP2 across all eight
+GPUs; two TP4 vLLM engines share those GPUs through VIME colocated offload.
 
 The optimization algorithm is explicitly fixed to GRPO with
 `--advantage-estimator grpo`. DAPO-Math-17k is only the prompt/answer dataset;
@@ -27,7 +27,7 @@ steps is present, and vLLM CUDA Graph evidence matches the manifest.
 
 `P/P` selects the production implementation on training and rollout. `R/R`
 selects RL-Kernel on both sides. All four groups use the same prompts, initial
-checkpoint, sampling settings, seeds, TP2/CP2 topology, and batch sizes.
+checkpoint, sampling settings, seeds, TP4/CP2 topology, and batch sizes.
 
 Do not interpret G10/G11 as evidence that train and rollout recomputation is
 bitwise equal: framework reuse changes which stored logp enters the RL loss.
@@ -36,7 +36,8 @@ metrics.
 
 ## Required gates
 
-- NVIDIA H100 × 8; actor GPUs 4; rollout GPUs 4; TP=2; CP=2; PP=1.
+- NVIDIA H100 × 8; colocated actor/rollout GPUs 8; actor TP=4, CP=2, PP=1;
+  two rollout engines with TP=4 each.
 - GRPO, BF16, `top_p=1.0`, temperature 1, no dropout, fixed training and rollout seeds.
 - A 7168-token response budget, one prompt with eight GRPO samples per step,
   and full uniform activation recomputation
@@ -81,7 +82,7 @@ emits VIME `prompt`/`label` JSONL. It deduplicates by `extra_info.index` and
 writes source/output hashes and row counts to a sibling manifest.
 
 ```bash
-python examples/vime_qwen3_8b_tp2_cp2_200/prepare_dapo_data.py \
+python examples/vime_qwen3_8b_tp4_cp2_200/prepare_dapo_data.py \
   --download \
   --source /data/dapo-math-17k.parquet \
   --output /data/dapo-math-17k.vime.jsonl
@@ -97,7 +98,7 @@ Start a Ray cluster appropriate for the host, then invoke `run_arm.py`. The
 example below is schematic; every path is recorded in `manifest.json`.
 
 ```bash
-python examples/vime_qwen3_8b_tp2_cp2_200/run_arm.py \
+python examples/vime_qwen3_8b_tp4_cp2_200/run_arm.py \
   --group G01 \
   --num-rollout 8 \
   --seed 1234 \
@@ -122,7 +123,7 @@ After the Ray job finishes, save its combined log as `run.log` in the run
 directory and validate it:
 
 ```bash
-python examples/vime_qwen3_8b_tp2_cp2_200/validate_run.py \
+python examples/vime_qwen3_8b_tp4_cp2_200/validate_run.py \
   --run-dir /data/vime-200/runs/short/<run-id> \
   --seal
 ```
@@ -133,11 +134,11 @@ Only sealed runs are collected. `collect_results.py` writes one row per run,
 one row per training step, and group-level summaries.
 
 ```bash
-python examples/vime_qwen3_8b_tp2_cp2_200/collect_results.py \
+python examples/vime_qwen3_8b_tp4_cp2_200/collect_results.py \
   --runs-root /data/vime-200/runs \
   --output-dir /data/vime-200/results
 
-python examples/vime_qwen3_8b_tp2_cp2_200/plot_results.py \
+python examples/vime_qwen3_8b_tp4_cp2_200/plot_results.py \
   --rounds-csv /data/vime-200/results/rounds.csv \
   --phase convergence \
   --output-dir /data/vime-200/results/figures

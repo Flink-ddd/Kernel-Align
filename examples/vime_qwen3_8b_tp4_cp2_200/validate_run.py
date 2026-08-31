@@ -22,6 +22,17 @@ from rl_engine.integrations.runtime import _contains_triton, _runtime_platform
 RECORD_RE = re.compile(r"\b(rollout|step|perf)\s+(\d+):\s+(\{.*\})\s*$")
 FRAMEWORKS = (("megatron", "training"), ("vllm", "rollout"))
 MODULES = ("attention", "ffn", "logp")
+EXPECTED_TOPOLOGY = {
+    "gpus": 8,
+    "actor_gpus": 8,
+    "rollout_gpus": 8,
+    "tp": 4,
+    "cp": 2,
+    "pp": 1,
+    "colocate": True,
+    "rollout_gpus_per_engine": 4,
+    "rollout_engines": 2,
+}
 CASE_FIELDS = {
     "attention": "attention_case",
     "ffn": "ffn_case",
@@ -299,6 +310,24 @@ def validate_run(run_dir: Path) -> dict[str, Any]:
         for index in range(max(0, len(train_command) - 1))
     ):
         global_errors.append("train command does not explicitly select GRPO")
+    if manifest.get("topology") != EXPECTED_TOPOLOGY:
+        global_errors.append("manifest does not contain the required TP4/CP2 colocated topology")
+    required_command_pairs = (
+        ("--actor-num-gpus-per-node", "8"),
+        ("--rollout-num-gpus", "8"),
+        ("--tensor-model-parallel-size", "4"),
+        ("--context-parallel-size", "2"),
+        ("--rollout-num-gpus-per-engine", "4"),
+    )
+    if isinstance(train_command, list):
+        for flag, value in required_command_pairs:
+            if not any(
+                train_command[index : index + 2] == [flag, value]
+                for index in range(max(0, len(train_command) - 1))
+            ):
+                global_errors.append(f"train command does not contain {flag} {value}")
+        if "--colocate" not in train_command:
+            global_errors.append("train command does not enable colocated execution")
     expected_recompute = {
         "recompute_granularity": "full",
         "recompute_method": "uniform",
@@ -313,7 +342,7 @@ def validate_run(run_dir: Path) -> dict[str, Any]:
     if "Traceback (most recent call last)" in log_text:
         global_errors.append("run log contains a traceback")
     report = {
-        "schema_version": "rlkernel.vime_qwen3_8b_tp2_cp2_200.validation.v1",
+        "schema_version": "rlkernel.vime_qwen3_8b_tp4_cp2_200.validation.v1",
         "run_id": manifest.get("run_id"),
         "group": arm.get("group"),
         "passed": bool(
@@ -343,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
         report = validate_run(run_dir)
     except Exception as exc:
         report = {
-            "schema_version": "rlkernel.vime_qwen3_8b_tp2_cp2_200.validation.v1",
+            "schema_version": "rlkernel.vime_qwen3_8b_tp4_cp2_200.validation.v1",
             "passed": False,
             "errors": [f"{type(exc).__name__}: {exc}"],
         }
