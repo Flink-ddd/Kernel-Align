@@ -76,6 +76,22 @@ OP_SPECS = {
         },
         grad_input_names=("q", "k", "v"),
     ),
+    "cp_attention": OperatorSpec(
+        name="cp_attention",
+        op_class="attention",
+        gold_path=(
+            "rl_engine.kernels.ops.pytorch.attention.cp_attention."
+            "DeterministicCPAttentionReferenceOp"
+        ),
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": (
+                "rl_engine.kernels.ops.pytorch.attention.cp_attention."
+                "DeterministicCPAttentionReferenceOp"
+            ),
+        },
+        grad_input_names=("q", "k", "v"),
+    ),
     "logp": OperatorSpec(
         name="logp",
         op_class="logprob",
@@ -187,6 +203,8 @@ OP_SPECS = {
             "TritonBatchInvariantLogpOp",
             "cuda-sm90": "rl_engine.kernels.ops.cuda.loss.batch_invariant_logp."
             "BatchInvariantLogpSM90Op",
+            "ascend": "rl_engine.kernels.ops.ascend.loss.batch_invariant_logp."
+            "BatchInvariantLogpAscendOp",
         },
         grad_input_names=("logits",),
     ),

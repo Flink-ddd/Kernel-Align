@@ -100,6 +100,10 @@ class DeterministicAttentionOp:
     so #108 harness can call forward(**inputs) with key_padding_mask.
     """
 
+    core_id = STRICT_ATTENTION_CORE_ID
+    strict_schedule = STRICT_ATTENTION_SCHEDULE_ID
+    backend_id = "rlkernel.cuda.deterministic_attention"
+
     def __init__(self) -> None:
         if not _EXT_AVAILABLE or not hasattr(_C, "deterministic_attention_forward"):
             raise RuntimeError(
@@ -222,8 +226,9 @@ class DeterministicAttentionOp:
 class RLKernelDeterministicAttentionCore:
     """Materializing GPU reference core shared by training and rollout.
 
-    Production uses FA4 CuTe on CUDA and AITER CK dense MHA on ROCm. This core
-    remains useful for correctness and capability-gap diagnosis.
+    This remains useful for correctness and capability-gap diagnosis. The
+    production default is the shared FA4 CuTe core with ``num_splits=1`` on
+    CUDA, and AITER CK dense MHA on ROCm.
     """
 
     core_id = STRICT_ATTENTION_CORE_ID

@@ -3,16 +3,26 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import torch
 
+from rl_engine.distributed import collectives
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     AttentionCPBlockMetadata,
     AttentionCPCommunicationPlan,
     AttentionCPCommunicationUnavailable,
     AttentionParallelSpec,
+    CUDAAGRSAttentionCPCommunication,
     RCCLAGRSAttentionCPCommunication,
 )
+from rl_engine.kernels.registry import KernelRegistry, OpBackend
+
+
+class _FakeDist:
+    class group:
+        WORLD = "world-group"
 
 
 def _plan(*, backend: str = "rccl_ag_rs") -> AttentionCPCommunicationPlan:
@@ -93,3 +103,44 @@ def test_rccl_adapter_rejects_cuda_plan(monkeypatch: pytest.MonkeyPatch) -> None
 
     with pytest.raises(AttentionCPCommunicationUnavailable, match="rccl_ag_rs plan"):
         communication.all_gather_query(torch.zeros(1, 2, 1, 4), _plan(backend="cuda_ag_rs"))
+
+
+def test_rccl_adapter_shares_the_cuda_collective_resolution() -> None:
+    """ROCm must not own a second transport implementation.
+
+    CUDA and ROCm run the same balanced rank tree only because both resolve
+    their collective through ``collective_for_group``. A ROCm-side override
+    would let the two reduction orders drift apart silently, so pin that the
+    two adapters share one implementation.
+    """
+
+    assert (
+        RCCLAGRSAttentionCPCommunication._get_collective
+        is CUDAAGRSAttentionCPCommunication._get_collective
+    )
+
+
+def test_rccl_adapter_resolves_the_shared_deterministic_collective(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = _FakeRCCLTransport()
+    calls: list[Any] = []
+
+    def _fake_collective_for_group(*, group: Any, device: Any) -> Any:
+        calls.append((group, device))
+        return resolved
+
+    monkeypatch.setattr(collectives, "collective_for_group", _fake_collective_for_group)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+
+    communication = RCCLAGRSAttentionCPCommunication(process_group="cp-group")
+    monkeypatch.setattr(communication, "_dist", lambda: _FakeDist())
+
+    assert communication._get_collective(_plan()) is resolved
+    assert calls == [("cp-group", torch.device("cuda", 0))]
+
+
+def test_rccl_adapter_world_sizes_match_the_shared_collective() -> None:
+    capability = KernelRegistry()._attention_capabilities[OpBackend.ROCM_STRICT_ATTENTION]
+
+    assert tuple(capability.cp_world_sizes) == collectives._SUPPORTED_WORLD_SIZES

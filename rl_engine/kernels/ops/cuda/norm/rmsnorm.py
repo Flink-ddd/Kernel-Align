@@ -57,16 +57,18 @@ class RMSNormCuda(torch.autograd.Function):
         """
         Backward:
           dx = CUDA row-wise deterministic kernel
-          dw = CUDA two-pass deterministic kernel
+          dw = FP32 row contributions followed by an ascending-row left fold
         """
         x, weight, rstd, mask = ctx.saved_tensors
         dy = grad_out.contiguous()
 
         dx = _C.rmsnorm_backward_dx(dy, x, weight, rstd)
 
-        # Explicit, shape-independent FP32 left fold. This is slower than
-        # the chunked extension but preserves the C2 Batch/Chunk reduction order.
+        # The shape-independent FP32 left fold preserves the C2 Batch/Chunk
+        # reduction order while the CUDA reducer executes it in one launch.
         rows = rmsnorm_dweight_rows_fp32(x, dy, rstd=rstd)
+        # Multiplication is part of the pre-existing mask contract, including
+        # IEEE propagation for non-finite inactive contributions.
         rows = rows * mask.to(dtype=rows.dtype).unsqueeze(-1)
         dw = reduce_rows_fp32(rows).to(weight.dtype)
         record_backward(

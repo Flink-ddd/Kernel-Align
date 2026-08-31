@@ -440,3 +440,122 @@ def test_qwen3_ffn_refresh_updates_already_captured_cuda_graph():
         after_refresh.view(torch.uint8),
     )
     _assert_same_raw_bytes(after_refresh, expected)
+@requires_cuda_ffn
+def test_qwen_ffn_cuda_train_and_infer_forward_are_bitwise_identical():
+    hidden = _randn((16, 64), seed=30, device="cuda", dtype=torch.bfloat16)
+    gate_weight = _randn((128, 64), seed=31, device="cuda", dtype=torch.bfloat16)
+    up_weight = _randn((128, 64), seed=32, device="cuda", dtype=torch.bfloat16)
+    down_weight = _randn((64, 128), seed=33, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        infer = qwen3_ffn(hidden, gate_weight, up_weight, down_weight)
+    train_hidden = hidden.detach().clone().requires_grad_(True)
+    train = qwen3_ffn(train_hidden, gate_weight, up_weight, down_weight)
+    assert torch.equal(infer, train.detach())
+
+
+@requires_cuda_ffn
+@pytest.mark.parametrize("token_count", _TOKEN_BOUNDARY_COUNTS)
+def test_qwen_ffn_output_and_hidden_grad_are_batch_invariant(token_count):
+    device = torch.device("cuda", 0)
+    gate = _randn((256, _HIDDEN), seed=70, device=device, dtype=torch.bfloat16)
+    up = _randn((256, _HIDDEN), seed=71, device=device, dtype=torch.bfloat16)
+    down = _randn((_HIDDEN, 256), seed=72, device=device, dtype=torch.bfloat16)
+    hidden = _randn((token_count, _HIDDEN), seed=73, device=device, dtype=torch.bfloat16)
+    grad = _randn((token_count, _HIDDEN), seed=74, device=device, dtype=torch.bfloat16)
+
+    full_hidden = hidden.detach().clone().requires_grad_(True)
+    full_output = qwen3_ffn(full_hidden, gate, up, down)
+    full_output.backward(grad)
+    slice_end = min(8, token_count)
+    slice_hidden = hidden[:slice_end].detach().clone().requires_grad_(True)
+    slice_output = qwen3_ffn(slice_hidden, gate, up, down)
+    slice_output.backward(grad[:slice_end])
+
+    assert torch.equal(slice_output, full_output[:slice_end])
+    assert torch.equal(slice_hidden.grad, full_hidden.grad[:slice_end])
+
+
+@requires_cuda_ffn
+def test_qwen_ffn_qwen3_8b_shapes_run_and_are_batch_invariant():
+    device = torch.device("cuda", 0)
+    hidden, gate, up, down, grad = _qwen3_8b_weights(device)
+
+    with torch.no_grad():
+        infer = qwen3_ffn(hidden, gate, up, down)
+    full_hidden = hidden.detach().clone().requires_grad_(True)
+    full_gate = gate.detach().clone().requires_grad_(True)
+    full_up = up.detach().clone().requires_grad_(True)
+    full_down = down.detach().clone().requires_grad_(True)
+    train = qwen3_ffn(full_hidden, full_gate, full_up, full_down)
+    train.backward(grad)
+    assert torch.equal(infer, train.detach())
+
+    slice_hidden = hidden[:4].detach().clone().requires_grad_(True)
+    slice_out = qwen3_ffn(slice_hidden, full_gate, full_up, full_down)
+    slice_out.backward(grad[:4])
+    assert torch.equal(slice_out, train.detach()[:4])
+    assert torch.equal(slice_hidden.grad, full_hidden.grad[:4])
+
+
+@requires_cuda_ffn
+def test_qwen_ffn_sequence_parallel_requires_tensor_parallel_group():
+    device = torch.device("cuda", 0)
+    hidden, gate, up, down = _ffn_tensors(8, device, seed=120, intermediate=128)
+    with pytest.raises(ValueError, match="sequence_parallel requires a tensor-parallel group"):
+        qwen3_ffn(hidden, gate, up, down, sequence_parallel=True)
+
+
+def test_qwen_ffn_tp_correctness_and_batch_invariance():
+    _spawn_nccl_workers(_distributed_ffn_backward_nccl_worker, 2, (1, False), timeout=90)
+
+
+def test_qwen_ffn_tp_sp_correctness_and_batch_invariance():
+    _spawn_nccl_workers(_distributed_ffn_backward_nccl_worker, 2, (1, True), timeout=90)
+
+
+def test_qwen_ffn_tp_cp_correctness_and_batch_invariance():
+    _spawn_nccl_workers(_distributed_ffn_backward_nccl_worker, 4, (2, False), timeout=90)
+
+
+def test_qwen_ffn_tp_cp_sp_correctness_and_batch_invariance():
+    _spawn_nccl_workers(_distributed_ffn_backward_nccl_worker, 4, (2, True), timeout=90)
+
+
+def test_qwen_ffn_tp1_vs_tp2_train_infer_bitwise_identical():
+    _spawn_nccl_workers(_tp1_vs_tpn_train_infer_worker, 2, (True,), timeout=120)
+
+
+def test_qwen_ffn_tp1_vs_tp8_train_infer_bitwise_identical():
+    _spawn_nccl_workers(_tp1_vs_tpn_train_infer_worker, 8, (True,), timeout=120)
+
+
+def test_qwen_ffn_world2_tp_sp_and_cp_match_tp1_cp1_bitwise():
+    _spawn_nccl_workers(_topology_worker, 2, (_WORLD2_CONFIGS,), timeout=120)
+
+
+def test_qwen_ffn_world4_tp_cp_sp_match_tp1_cp1_bitwise():
+    _spawn_nccl_workers(_topology_worker, 4, (_WORLD4_CONFIGS,), timeout=120)
+
+
+def test_qwen_ffn_world8_tp8_and_cp8_match_tp1_cp1_bitwise():
+    _spawn_nccl_workers(_topology_worker, 8, (_WORLD8_WORLD_GROUP_CONFIGS,), timeout=120)
+
+
+def test_qwen_ffn_world8_tp2_cp4_match_tp1_cp1_bitwise():
+    _spawn_nccl_workers(_topology_worker, 8, (_WORLD8_TP2_CP4_CONFIGS,), timeout=120)
+
+
+def test_qwen_ffn_world8_tp4_cp2_match_tp1_cp1_bitwise():
+    _spawn_nccl_workers(_topology_worker, 8, (_WORLD8_TP4_CP2_CONFIGS,), timeout=120)
+
+
+def test_qwen_ffn_collective_cache_growth_preserves_borrowers_and_rebuilds_group():
+    _spawn_nccl_workers(_cache_worker, 2, timeout=120)
+
+
+def test_qwen_ffn_sequence_parallel_rejects_uneven_tokens():
+    _spawn_nccl_workers(_uneven_sp_worker, 2, timeout=90)
+
+
+def test_qwen_ffn_qwen3_8b_shapes_tp2_matches_tp1_bitwise():
+    _spawn_nccl_workers(_qwen3_8b_tp2_worker, 2, timeout=180)

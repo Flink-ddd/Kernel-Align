@@ -23,6 +23,9 @@ from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_SCHEDULE_ID,
     SplitKVSpec,
 )
+from rl_engine.kernels.ops.cuda.attention import (
+    flashinfer_paged_attention as paged_attention_module,
+)
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     AttentionCPBlockMetadata,
     AttentionCPCommunicationPlan,
@@ -36,6 +39,10 @@ from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     sort_attention_cp_partial_states,
 )
 from rl_engine.kernels.ops.cuda.attention.deterministic_attn import DeterministicAttentionCoreResult
+from rl_engine.kernels.ops.cuda.attention.flash_attn import (
+    StrictFlashAttention4Core,
+    StrictFlashAttentionUnavailable,
+)
 from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (
     FlashInferPagedAttentionConfig,
     FlashInferQwen3PagedAttentionOp,
@@ -1802,6 +1809,74 @@ def test_pr7_check_accepts_strict_rocm_production_core():
     assert check_script._acceptance_errors(report, args) == []
 
 
+def test_pr7_check_rejects_reference_core_as_production():
+    args = check_script._parse_args(["--strict", "--device", "cuda"])
+    report = {
+        "device": "cuda:0",
+        "shape": {"q_heads": 16, "kv_heads": 4, "head_dim": 128},
+        "candidate_provenance": {
+            "attention_mode": "decode",
+            "fallback": False,
+            "strict_mode": True,
+            "strict_core_id": STRICT_ATTENTION_CORE_ID,
+            "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
+            "actual_backend": "rlkernel.cuda.deterministic_attention",
+            "native_attention_arithmetic": False,
+            "reference_only": True,
+            "strict_core_row_plans": [{"actual_split_kv_policy": "disabled"}],
+            "rope_backend": "rlkernel.cuda.rope_sm90",
+            "rope_theta": 1_000_000.0,
+            "rotary_dim": 128,
+            "arithmetic_semantics_verified": True,
+        },
+        "drift": {
+            "out": {"max_abs": 0.0},
+            "lse": {"max_abs": 0.0},
+            "dlogp": {"max_abs": 0.0},
+        },
+        "batch_invariant_sweep": {"passed": True},
+        "page_layout_invariant_sweep": {"passed": True},
+    }
+
+    errors = check_script._acceptance_errors(report, args)
+    assert "strict runtime did not execute the native production arithmetic" in errors
+    assert "strict runtime selected the reference core" in errors
+
+
+@pytest.mark.parametrize(
+    ("backend", "rope_backend"),
+    [
+        ("flash_attention_4.cute", "rlkernel.cuda.rope_sm90"),
+        ("aiter.rocm.ck_dense_mha", "rlkernel.rocm.deterministic_rope"),
+    ],
+)
+def test_strict_report_uses_executed_platform_provenance(backend, rope_backend):
+    fields = check_script._strict_execution_report_fields(
+        {
+            "actual_backend": backend,
+            "rope_backend": rope_backend,
+            "rope_fusion": False,
+            "rope_fusion_boundary": "rlkernel_rope_then_attention",
+            "rope_theta": 1_000_000.0,
+            "rotary_dim": 128,
+            "q_rope_state": "post_rope",
+            "k_cache_rope_state": "post_rope",
+        }
+    )
+
+    assert fields["reference_backend"] == backend
+    assert backend in fields["target"]
+    assert fields["rope"] == {
+        "rope_backend": rope_backend,
+        "rope_fusion": False,
+        "rope_fusion_boundary": "rlkernel_rope_then_attention",
+        "rope_theta": 1_000_000.0,
+        "rotary_dim": 128,
+        "q_rope_state": "post_rope",
+        "k_cache_rope_state": "post_rope",
+    }
+
+
 def test_pr7_check_rejects_nonfinite_drift_and_wrong_tp_local_shape():
     args = check_script._parse_args([])
     report = {
@@ -1859,6 +1934,41 @@ def test_strict_shared_core_entrypoint_requires_self_owned_ag_rs():
 
     args = p2p_check_script.parse_args(["--transport", "cuda_ag_rs", "--strict-shared-core"])
     assert args.strict_shared_core is True
+
+
+def test_strict_shared_core_reference_executes_one_logical_row(monkeypatch):
+    calls = []
+
+    class _RowCore:
+        def forward_with_lse(self, q, k, v, **kwargs):
+            calls.append((q.shape[0], kwargs["query_position_ids"].clone()))
+            return types.SimpleNamespace(
+                out=q + k + v,
+                lse=(q + k).sum(dim=-1),
+            )
+
+    monkeypatch.setattr(p2p_check_script, "_strict_attention_core", _RowCore)
+    q = torch.randn(2, 1, 3, 4, requires_grad=True)
+    k = torch.randn(2, 1, 3, 4, requires_grad=True)
+    v = torch.randn(2, 1, 3, 4, requires_grad=True)
+    positions = torch.arange(3).expand(2, -1)
+
+    result = p2p_check_script._strict_attention_reference_rows(
+        q,
+        k,
+        v,
+        positions=positions,
+        output_dtype=q.dtype,
+    )
+
+    assert [batch for batch, _positions in calls] == [1, 1]
+    assert [item.tolist() for _batch, item in calls] == [[[0, 1, 2]], [[0, 1, 2]]]
+    assert torch.equal(result.out, q + k + v)
+    assert torch.equal(result.lse, (q + k).sum(dim=-1))
+    (result.out.sum() + result.lse.sum()).backward()
+    assert q.grad is not None
+    assert k.grad is not None
+    assert v.grad is not None
 
 
 def _strict_acceptance_provenance(**overrides):
@@ -1961,3 +2071,198 @@ def test_p2p_entrypoint_rejects_non_acceptance_arguments(argv, message):
             cp_group=None,
             device=torch.device("cpu"),
         )
+
+
+def test_fa4_core_rejects_api_without_reduction_controls():
+    def legacy_flash_attn(q, k, v, *, causal=False):
+        return q
+
+    with pytest.raises(StrictFlashAttentionUnavailable, match="strict controls"):
+        StrictFlashAttention4Core(_op=legacy_flash_attn)
+
+
+def test_fa4_core_fixes_reduction_controls_and_exports_fp32_lse(monkeypatch):
+    calls = []
+
+    def fake_fa4(
+        q,
+        k,
+        v,
+        *,
+        softmax_scale=None,
+        causal=False,
+        num_splits=0,
+        pack_gqa=None,
+        deterministic=False,
+        return_lse=False,
+    ):
+        calls.append(
+            {
+                "q_shape": tuple(q.shape),
+                "k_shape": tuple(k.shape),
+                "softmax_scale": softmax_scale,
+                "causal": causal,
+                "num_splits": num_splits,
+                "pack_gqa": pack_gqa,
+                "deterministic": deterministic,
+                "return_lse": return_lse,
+            }
+        )
+        return q.clone(), torch.zeros(
+            q.size(0), q.size(2), q.size(1), dtype=torch.float32, device=q.device
+        )
+
+    core = StrictFlashAttention4Core(_op=fake_fa4, _package_version="4.test")
+    monkeypatch.setattr(core, "_validate_inputs", lambda *_args: None)
+    monkeypatch.setattr(core, "_validate_bshd_inputs", lambda *_args: None)
+    q = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
+    k = torch.randn(1, 2, 3, 8, dtype=torch.bfloat16)
+    v = torch.randn(1, 2, 3, 8, dtype=torch.bfloat16)
+    result = core.forward_with_lse(
+        q,
+        k,
+        v,
+        causal=True,
+        scale=0.125,
+        query_position_ids=torch.tensor([[1, 2]]),
+        key_position_ids=torch.tensor([[0, 1, 2]]),
+    )
+
+    assert calls == [
+        {
+            "q_shape": (1, 2, 4, 8),
+            "k_shape": (1, 3, 2, 8),
+            "softmax_scale": 0.125,
+            "causal": True,
+            "num_splits": 1,
+            "pack_gqa": True,
+            "deterministic": True,
+            "return_lse": True,
+        }
+    ]
+    assert result.out.shape == q.shape
+    assert result.lse.shape == q.shape[:3]
+    assert result.lse.dtype is torch.float32
+    assert result.provenance["strict_core_id"] == STRICT_ATTENTION_PRODUCTION_CORE_ID
+    assert result.provenance["strict_schedule"] == STRICT_ATTENTION_FA4_SCHEDULE_ID
+    assert result.provenance["num_splits"] == 1
+    assert result.provenance["dropout_p"] == 0.0
+    assert result.provenance["native_attention_arithmetic"] is True
+    assert result.provenance["production_ready"] is True
+
+
+def test_fa4_core_bshd_entrypoint_preserves_framework_layout(monkeypatch):
+    calls = []
+
+    def fake_fa4(
+        q,
+        k,
+        v,
+        *,
+        softmax_scale=None,
+        causal=False,
+        num_splits=0,
+        pack_gqa=None,
+        deterministic=False,
+        return_lse=False,
+    ):
+        calls.append(
+            {
+                "q_shape": tuple(q.shape),
+                "k_shape": tuple(k.shape),
+                "pack_gqa": pack_gqa,
+                "num_splits": num_splits,
+                "return_lse": return_lse,
+            }
+        )
+        return q.clone(), torch.zeros(
+            q.size(0), q.size(2), q.size(1), dtype=torch.float32, device=q.device
+        )
+
+    core = StrictFlashAttention4Core(_op=fake_fa4, _package_version="4.test")
+    monkeypatch.setattr(core, "_validate_bshd_inputs", lambda *_args: None)
+    q = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+    k = torch.randn(1, 3, 2, 8, dtype=torch.bfloat16)
+    v = torch.randn(1, 3, 2, 8, dtype=torch.bfloat16)
+
+    result = core.forward_bshd_with_lse(
+        q,
+        k,
+        v,
+        causal=False,
+        query_position_ids=torch.tensor([[2, 3]]),
+        key_position_ids=torch.tensor([[0, 1, 2]]),
+    )
+
+    assert calls == [
+        {
+            "q_shape": (1, 2, 4, 8),
+            "k_shape": (1, 3, 2, 8),
+            "pack_gqa": True,
+            "num_splits": 1,
+            "return_lse": True,
+        }
+    ]
+    assert result.out.shape == q.shape
+    assert result.lse.shape == (1, 4, 2)
+    assert result.lse.dtype is torch.float32
+
+
+# FA4 is the CUDA production core. On ROCm the strict default correctly resolves
+# to the AITER CK core instead, so the StrictFlashAttention4Core monkeypatch below
+# is never consulted and the assertions cannot hold there.
+@pytest.mark.cuda_only
+def test_strict_paged_default_selects_fa4_production_core(monkeypatch):
+    core = _RecordingStrictCore()
+    core.core_id = STRICT_ATTENTION_PRODUCTION_CORE_ID
+    core.strict_schedule = STRICT_ATTENTION_FA4_SCHEDULE_ID
+    core.backend_id = "flash_attention_4.cute"
+    core.native_attention_arithmetic = True
+    core.num_splits = 1
+    core.deterministic_backward = True
+    core.production_ready = True
+    core.reference_only = False
+
+    original_forward = core.forward_with_lse
+
+    def production_forward(*args, **kwargs):
+        result = original_forward(*args, **kwargs)
+        result.provenance.update(
+            {
+                "native_attention_arithmetic": True,
+                "production_ready": True,
+                "reference_only": False,
+                "num_splits": 1,
+                "deterministic_backward": True,
+                "fa_api_source": "flash_attn.cute.interface",
+                "fa_package_version": "4.test",
+            }
+        )
+        return result
+
+    core.forward_with_lse = production_forward
+    monkeypatch.setattr(
+        paged_attention_module,
+        "StrictFlashAttention4Core",
+        lambda *, split_kv: core,
+    )
+    q, k, v = (tensor.to(torch.bfloat16) for tensor in _qkv(query_len=1))
+    result = FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())(
+        q,
+        k,
+        v,
+        _metadata(query_len=1),
+        config=FlashInferPagedAttentionConfig(
+            mode="decode",
+            workspace_size_bytes=1024,
+            strict_mode=True,
+            strict_rope_op=_IdentityStrictRoPE(),
+        ),
+    )
+
+    assert len(core.calls) == q.size(0)
+    assert result.provenance["strict_core_id"] == STRICT_ATTENTION_PRODUCTION_CORE_ID
+    assert result.provenance["actual_backend"] == "flash_attention_4.cute"
+    assert result.provenance["num_splits"] == 1
+    assert result.provenance["native_attention_arithmetic"] is True
+    assert result.provenance["reference_only"] is False

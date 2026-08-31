@@ -24,10 +24,15 @@ layout:
 Metadata is validated before attention runs. Missing pages, duplicated active
 pages, non-canonical `-1` page/owner tails, out-of-range positions, mismatched
 RoPE positions, or inconsistent prefix-cache identity fail with an explicit
-error. Prefix identity is verified by recomputing a physical-layout-invariant
+error. Logical positions must be non-negative and strictly increasing, but may
+start at a nonzero global offset (for example after a sliding-window eviction).
+Prefix identity is verified by recomputing a physical-layout-invariant
 SHA-256 fingerprint over logical prefix positions, cached K/V content, storage
 dtypes, and the cache-side RoPE materialization configuration (`theta`, rotary
-dimension, cast boundary, and output dtype). The current reference requires
+dimension, cast boundary, and output dtype). The prefix key and enabled state are
+part of that fingerprint. Every replay report also includes a physical-layout-
+invariant full cache execution fingerprint over logical positions, page size, CP
+ownership, prefix/RoPE identity, dtypes, and active K/V content. The current reference requires
 `rope_cast_at="after_rope"` and `rope_rotary_dim == head_dim`; partial rotary is
 not supported yet. Q and cached K retain separate RoPE output dtype contracts so
 mixed rollout query/KV storage dtypes are represented faithfully.
@@ -70,7 +75,9 @@ The harness models CP block ownership on one device so cache construction,
 logical ordering, RoPE identity, and deterministic merging can be attributed
 without communication. It does not implement P2P NCCL transport, production
 custom CUDA all-gather/reduce-scatter, FlashInfer runtime execution, or training
-backward. A distributed caller can gather the same partial states using the PR3
+backward. Reports explicitly record `single_device_logical_reference`,
+`runtime_verified=false`, `supports_backward=false`, and `communication=none`;
+they are not valid Megatron/vLLM runtime readbacks. A distributed caller can gather the same partial states using the PR3
 transport layer; numerical merging must still happen in the fixed logical order
 described above. This PR targets the shared `test` integration branch and has a
 logical dependency on PR2/#253.

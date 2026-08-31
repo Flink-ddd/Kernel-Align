@@ -93,14 +93,15 @@ def _ratio_kl_bwd_kernel(
     logz_ptr,
     grad_ratio_ptr,
     grad_kl_ptr,
-    grad_policy_ptr,  # [N, V] fp32, pre-zeroed
+    grad_policy_ptr,  # [N, V], pre-zeroed unless WRITE_INACTIVE_ZERO
     V,
     BLOCK_V: tl.constexpr,
+    WRITE_INACTIVE_ZERO: tl.constexpr,
 ):
     row = tl.program_id(0)
+    row_off = row.to(tl.int64) * V
     active = tl.load(mask_ptr + row) != 0
     if active:
-        row_off = row.to(tl.int64) * V
         a = tl.load(action_ptr + row)
         ratio = tl.load(ratio_ptr + row)
         d = tl.load(diff_ptr + row)
@@ -120,6 +121,10 @@ def _ratio_kl_bwd_kernel(
             onehot = tl.where(cols == a, 1.0, 0.0)
             grad = c * (onehot - soft)
             tl.store(grad_policy_ptr + row_off + cols, grad, mask=cmask)
+    elif WRITE_INACTIVE_ZERO:
+        for start in range(0, V, BLOCK_V):
+            cols = start + tl.arange(0, BLOCK_V)
+            tl.store(grad_policy_ptr + row_off + cols, 0.0, mask=cols < V)
 
 
 class _RatioKLFunction(torch.autograd.Function):
@@ -169,13 +174,29 @@ class _RatioKLFunction(torch.autograd.Function):
         n_rows, V = pol.shape
         gr = grad_ratio.contiguous().view(-1).to(torch.float32)
         gk = grad_kl.contiguous().view(-1).to(torch.float32)
-        grad_pol = torch.zeros_like(pol, dtype=torch.float32)
-
-        _ratio_kl_bwd_kernel[(n_rows,)](
-            pol, act, mask, ratio, diff, logz, gr, gk, grad_pol, V, BLOCK_V=ctx.block_v
+        direct_output = torch.version.hip is None and pol.dtype in (torch.float16, torch.bfloat16)
+        grad_pol = (
+            torch.empty_like(pol) if direct_output else torch.zeros_like(pol, dtype=torch.float32)
         )
 
-        grad_pol = grad_pol.view(ctx.policy_shape).to(ctx.policy_dtype)
+        _ratio_kl_bwd_kernel[(n_rows,)](
+            pol,
+            act,
+            mask,
+            ratio,
+            diff,
+            logz,
+            gr,
+            gk,
+            grad_pol,
+            V,
+            BLOCK_V=ctx.block_v,
+            WRITE_INACTIVE_ZERO=direct_output,
+        )
+
+        grad_pol = grad_pol.view(ctx.policy_shape)
+        if not direct_output:
+            grad_pol = grad_pol.to(ctx.policy_dtype)
         # policy_logits, ref_logits, action_ids, attention_mask, old_logps
         return grad_pol, None, None, None, None
 

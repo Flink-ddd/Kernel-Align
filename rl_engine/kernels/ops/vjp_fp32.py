@@ -10,8 +10,11 @@ walk rows in the caller's order so C10 can re-aggregate by logical token.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from math import prod
 
 import torch
+
+from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 
 BACKWARD_IMPL = "row_local_fp32_vjp"
 
@@ -76,11 +79,26 @@ def rmsnorm_dweight_rows_fp32(
 def reduce_rows_fp32(rows: torch.Tensor) -> torch.Tensor:
     """Left-fold dim 0 in FP32. Deterministic for a fixed row order."""
 
-    flat = rows.reshape(rows.shape[0], -1).float()
+    if rows.dim() == 0:
+        raise ValueError("rows must have at least one dimension")
+
+    output_shape = tuple(rows.shape[1:])
+    columns = prod(output_shape)
+    flat = rows.reshape(rows.shape[0], columns).float()
+
+    if (
+        flat.is_cuda
+        and torch.version.hip is None
+        and _EXT_AVAILABLE
+        and hasattr(_C, "reduce_rows_fp32_left_fold")
+    ):
+        reduced = _C.reduce_rows_fp32_left_fold(flat.contiguous())
+        return reduced.reshape(output_shape)
+
     acc = torch.zeros((flat.shape[1],), device=flat.device, dtype=torch.float32)
     for index in range(flat.shape[0]):
         acc = acc + flat[index]
-    return acc.reshape(rows.shape[1:])
+    return acc.reshape(output_shape)
 
 
 def reduce_keyed_rows_fp32(
