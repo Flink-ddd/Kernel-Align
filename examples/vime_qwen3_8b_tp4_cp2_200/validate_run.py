@@ -30,6 +30,8 @@ EXPECTED_TOPOLOGY = {
     "cp": 2,
     "pp": 1,
     "colocate": True,
+    "offload_train": False,
+    "offload_rollout": True,
     "rollout_gpus_per_engine": 4,
     "rollout_engines": 2,
 }
@@ -328,6 +330,10 @@ def validate_run(run_dir: Path) -> dict[str, Any]:
                 global_errors.append(f"train command does not contain {flag} {value}")
         if "--colocate" not in train_command:
             global_errors.append("train command does not enable colocated execution")
+        if "--no-offload-train" not in train_command:
+            global_errors.append("train command does not keep the TP4 actor resident")
+        if "--offload-rollout" not in train_command:
+            global_errors.append("train command does not offload rollout during training")
     expected_recompute = {
         "recompute_granularity": "full",
         "recompute_method": "uniform",

@@ -38,6 +38,9 @@ metrics.
 
 - NVIDIA H100 × 8; colocated actor/rollout GPUs 8; actor TP=4, CP=2, PP=1;
   two rollout engines with TP=4 each.
+- Keep the TP4 Megatron actor resident and offload rollout during training.
+  This avoids remapping live NCCL parameter buffers while still fitting Qwen3-8B
+  on each 80GB H100.
 - GRPO, BF16, `top_p=1.0`, temperature 1, no dropout, fixed training and rollout seeds.
 - A 7168-token response budget, one prompt with eight GRPO samples per step,
   and full uniform activation recomputation

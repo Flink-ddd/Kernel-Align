@@ -54,6 +54,8 @@ TOPOLOGY = {
     "cp": 2,
     "pp": 1,
     "colocate": True,
+    "offload_train": False,
+    "offload_rollout": True,
     "rollout_gpus_per_engine": 4,
     "rollout_engines": 2,
 }
@@ -308,6 +310,8 @@ def main(argv: list[str] | None = None) -> int:
         "--rollout-num-gpus",
         str(TOPOLOGY["rollout_gpus"]),
         "--colocate",
+        "--no-offload-train",
+        "--offload-rollout",
         *MODEL_ARGS,
         "--hf-checkpoint",
         str(model_root),
