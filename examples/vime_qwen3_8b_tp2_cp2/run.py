@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 DEFAULT_CONFIG = Path(__file__).with_name("qwen3_8b_tp2_cp2.json")
-PROVIDER_MARKER = "Selected-logprob provider active"
+PROVIDER_MARKER = "linear_logp provider active"
 FALLBACK_MARKERS = ("using native path", "fallback=True", "fallback=true")
 RUNTIME_EVIDENCE_SCHEMA = "rlkernel.operator_runtime_evidence.v1"
 _OPERATOR_METRICS = {
@@ -41,13 +41,13 @@ def load_config(path: Path) -> dict[str, Any]:
 def validate_config(config: Mapping[str, Any]) -> None:
     training = config.get("training")
     rollout = config.get("rollout")
-    provider = config.get("selected_logprob_provider")
+    provider = config.get("linear_logp_provider")
     if (
         not isinstance(training, Mapping)
         or not isinstance(rollout, Mapping)
         or not isinstance(provider, Mapping)
     ):
-        raise ValueError("training, rollout, and selected_logprob_provider sections are required")
+        raise ValueError("training, rollout, and linear_logp_provider sections are required")
     expected = {
         "tensor_model_parallel_size": 2,
         "context_parallel_size": 2,
@@ -60,8 +60,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if rollout.get("top_p") != 1.0:
         raise ValueError("rollout.top_p must remain 1.0 for the strict provider contract")
     if provider.get("mode") != "strict":
-        raise ValueError("selected_logprob_provider.mode must be strict")
-    if provider.get("path") != "rl_engine.integrations.vime.logp.provider":
+        raise ValueError("linear_logp_provider.mode must be strict")
+    if provider.get("path") != "rl_engine.integrations.vime.linear_logp_provider.provider":
         raise ValueError("example must use the RL-Kernel Vime provider")
     if provider.get("backend_id") != "pytorch-vocab-parallel-logp-ws2":
         raise ValueError("example must pin the WS2 vocab-parallel backend")
@@ -186,9 +186,9 @@ def build_report(
         "config": dict(config),
         "topology": config["training"],
         "provider": {
-            "configured_path": config["selected_logprob_provider"]["path"],
-            "configured_mode": config["selected_logprob_provider"]["mode"],
-            "backend_id": config["selected_logprob_provider"]["backend_id"],
+            "configured_path": config["linear_logp_provider"]["path"],
+            "configured_mode": config["linear_logp_provider"]["mode"],
+            "backend_id": config["linear_logp_provider"]["backend_id"],
             "active_observed": provider_active,
             "fallback_observed": fallback_observed,
         },

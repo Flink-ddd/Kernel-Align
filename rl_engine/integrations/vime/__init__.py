@@ -3,6 +3,6 @@
 
 """Vime adapter entry points without a Vime runtime dependency."""
 
-from .logp import ProviderResult, SelectedLogprobProviderUnavailable, provider
+from .linear_logp_provider import LinearLogpProviderUnavailable, LinearLogpResult, provider
 
-__all__ = ["ProviderResult", "SelectedLogprobProviderUnavailable", "provider"]
+__all__ = ["LinearLogpProviderUnavailable", "LinearLogpResult", "provider"]

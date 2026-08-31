@@ -31,6 +31,7 @@ def make_operator_inputs(
         "matmul": _make_matmul_inputs,
         "det_gemm": _make_det_gemm_inputs,
         "attention": _make_attention_inputs,
+        "cp_attention": _make_cp_attention_inputs,
         "logp": _make_logp_inputs,
         "linear_logp": _make_linear_logp_inputs,
         "batch_invariant_logp": _make_batch_invariant_logp_inputs,
@@ -58,6 +59,7 @@ def operator_shape_name(op_name: str, args: argparse.Namespace) -> str:
         "matmul": f"{batch}x{seq}x{_matmul_k(args)}x{_matmul_n(args)}",
         "det_gemm": f"{batch}x{seq}x{_matmul_k(args)}x{_matmul_n(args)}",
         "attention": f"{batch}x{DEFAULT_N_HEADS}x{seq}x{DEFAULT_HEAD_DIM}",
+        "cp_attention": f"{batch}x{DEFAULT_N_HEADS}x{seq}x{DEFAULT_HEAD_DIM}xcp2",
         "logp": f"{batch}x{seq}x{vocab}",
         "linear_logp": f"{batch}x{seq}x{_normalized_dim(args)}x{vocab}",
         "batch_invariant_logp": f"{batch}x{seq}x{vocab}",
@@ -173,6 +175,26 @@ def _make_attention_inputs(
         inputs["key_padding_mask"] = key_padding_mask
 
     return inputs
+
+
+def _make_cp_attention_inputs(
+    args: argparse.Namespace, dtype: torch.dtype, device: torch.device
+) -> dict[str, Any]:
+    batch, seq = _batch_seq(args)
+    return {
+        "q": _floating_tensor(
+            (batch, DEFAULT_N_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 0
+        ),
+        "k": _floating_tensor(
+            (batch, DEFAULT_N_KV_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 1
+        ),
+        "v": _floating_tensor(
+            (batch, DEFAULT_N_KV_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 2
+        ),
+        "causal": True,
+        "cp_world_size": 2,
+        "kv_chunk_size": max(1, seq // 2),
+    }
 
 
 def _make_logp_inputs(

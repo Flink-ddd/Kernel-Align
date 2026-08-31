@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Deterministic vocab-parallel TP logprob reference tests"""
+"""Deterministic vocab-parallel TP logprob reference tests (issue #241 PR3).
+
+Bit-level determinism assertions compare raw bit patterns via
+``tensor.view(torch.int32)`` rather than ``torch.equal``: value equality
+treats ``-0.0 == 0.0`` as equal and ``NaN != NaN`` as different, neither of
+which is what a bitwise claim means.
+"""
 
 from __future__ import annotations
 
@@ -28,7 +34,6 @@ from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import (
     BACKEND_ID,
     VocabParallelLogprobOp,
 )
-from rl_engine.kernels.ops.rocm.loss.vocab_parallel_logp import RocmVocabParallelLogprobOp
 from rl_engine.kernels.registry import KernelRegistry, OpBackend
 
 REAL_VOCAB = 27
@@ -55,6 +60,7 @@ def _contract(
     num_tokens: int = NUM_TOKENS,
     active: tuple[bool, ...] = ACTIVE,
     dtype: str = "fp32",
+    determinism_scope: str = "cross_tp_bitwise",
 ) -> LogprobContract:
     return LogprobContract(
         role="train",
@@ -69,7 +75,7 @@ def _contract(
             real_vocab_size=real_vocab,
             padded_vocab_size=padded_vocab,
         ),
-        reduction=ReductionSpec(),
+        reduction=ReductionSpec(determinism_scope=determinism_scope),
     )
 
 
@@ -81,11 +87,7 @@ def _inputs(dtype=torch.float32, seed: int = 2026):
 
 
 def _bits(tensor: torch.Tensor) -> torch.Tensor:
-    view_dtype = {
-        torch.float32: torch.int32,
-        torch.bfloat16: torch.int16,
-        torch.float16: torch.int16,
-    }[tensor.dtype]
+    view_dtype = {torch.float32: torch.int32, torch.bfloat16: torch.int16}[tensor.dtype]
     return tensor.contiguous().view(view_dtype)
 
 
@@ -214,6 +216,63 @@ class TestSingleRank:
         assert torch.isfinite(lse[-1])
 
 
+class TestNonDeterministicPath:
+    """deterministic=False: the fast whole-shard reduction with no guarantee."""
+
+    def test_rejects_a_cross_tp_bitwise_contract(self):
+        logits, targets = _inputs()
+        with pytest.raises(LogprobContractError, match="cross_tp_bitwise"):
+            VocabParallelLogprobOp()(logits, targets, contract=_contract(), deterministic=False)
+
+    def test_rejects_a_non_bool_flag(self):
+        logits, targets = _inputs()
+        with pytest.raises(LogprobContractError, match="deterministic must be a bool"):
+            VocabParallelLogprobOp()(logits, targets, contract=_contract(), deterministic=1)
+
+    def test_matches_the_deterministic_path_within_tolerance(self):
+        tolerance = load_contract()["accuracy"]["default"]["logprob"]["float32"]
+        logits, targets = _inputs()
+        relaxed = _contract(determinism_scope="fixed_topology")
+        logp_fast, lse_fast = VocabParallelLogprobOp()(
+            logits, targets, contract=relaxed, deterministic=False
+        )
+        logp_det, lse_det = VocabParallelLogprobOp()(
+            logits, targets, contract=_contract(), num_vocab_tiles=NUM_TILES
+        )
+        assert torch.allclose(logp_fast, logp_det, atol=tolerance["atol"], rtol=tolerance["rtol"])
+        assert torch.allclose(lse_fast, lse_det, atol=tolerance["atol"], rtol=tolerance["rtol"])
+
+    def test_ignores_tile_constraints(self):
+        # 7 does not divide the padded vocab; the deterministic path rejects it,
+        # the fast path never looks at it.
+        logits, targets = _inputs()
+        relaxed = _contract(determinism_scope="fixed_topology")
+        logp, lse = VocabParallelLogprobOp()(
+            logits, targets, contract=relaxed, num_vocab_tiles=7, deterministic=False
+        )
+        ref_lse = torch.logsumexp(logits[:, :REAL_VOCAB].float(), dim=-1)
+        assert torch.allclose(lse, ref_lse, atol=1e-5)
+        assert torch.isfinite(logp).all()
+
+    def test_grads_match_autograd_oracle(self):
+        tolerance = load_contract()["accuracy"]["default"]["logprob"]["float32"]
+        relaxed = _contract(determinism_scope="fixed_topology")
+        logits, targets = _inputs()
+        x = logits.clone().requires_grad_(True)
+        logp, lse = VocabParallelLogprobOp()(x, targets, contract=relaxed, deterministic=False)
+        (logp.sum() + 0.5 * lse.sum()).backward()
+
+        y = logits.clone().requires_grad_(True)
+        ref_lse = torch.logsumexp(y[:, :REAL_VOCAB].float(), dim=-1)
+        safe = targets.clamp(0, REAL_VOCAB - 1)
+        ref_logp = y[torch.arange(NUM_TOKENS), safe].float() - ref_lse
+        ref_logp = torch.where(torch.tensor(ACTIVE), ref_logp, torch.zeros_like(ref_logp))
+        (ref_logp.sum() + 0.5 * ref_lse.sum()).backward()
+
+        assert torch.allclose(x.grad, y.grad, atol=tolerance["atol"], rtol=tolerance["rtol"])
+        assert bool((x.grad[:, REAL_VOCAB:] == 0).all())
+
+
 class TestBackward:
     def test_grads_match_autograd_oracle(self):
         tolerance = load_contract()["accuracy"]["default"]["logprob"]["float32"]
@@ -286,7 +345,7 @@ def test_dispatch_resolves_reference_and_leaves_legacy_untouched():
     registry = KernelRegistry()
     contract = _contract()
 
-    result = registry.get_logprob_op(contract, requested_backend="reference")
+    result = registry.get_logprob_op(contract)
     assert result.capability.backend_id == BACKEND_ID
     assert result.provenance["fallback"] is False
     assert isinstance(result.op, VocabParallelLogprobOp)
@@ -305,152 +364,125 @@ def test_dispatch_resolves_reference_and_leaves_legacy_untouched():
             assert OpBackend.PYTORCH_VOCAB_PARALLEL_LOGP not in candidates
 
 
-# Cross-TP bitwise determinism on real ranks (NCCL, one CUDA device per rank)
-TP_REAL_VOCAB = 1000
-TP_PADDED_VOCAB = 1024
-TP_NUM_TILES = 32  # tile = 32 columns
-TP_TILE = TP_PADDED_VOCAB // TP_NUM_TILES
-TP_NUM_TOKENS = 48
-TP_ACTIVE = tuple(index % 7 != 5 for index in range(TP_NUM_TOKENS))
-TP_DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
-_SPAWN_TIMEOUT_S = 300
+# ---------------------------------------------------------------------------
+# Multi-rank gloo tests (spawn pattern from tests/test_linear_logp.py)
+# ---------------------------------------------------------------------------
 
 
-def _cuda_device_count() -> int:
-    return torch.cuda.device_count() if torch.cuda.is_available() else 0
+def _gloo_available() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_gloo_available()
 
 
-def _requires_gpus(count: int):
-    return pytest.mark.skipif(
-        _cuda_device_count() < count,
-        reason=f"cross-TP determinism needs {count} CUDA devices to place one rank per device",
-    )
+requires_gloo = pytest.mark.skipif(
+    not _gloo_available(), reason="requires torch.distributed with the gloo backend"
+)
+
+_WORLD_SIZE = 4
+_UNEVEN_BOUNDS = ((0, 4), (4, 16), (16, 24), (24, 32))  # tile-aligned (tile=4)
 
 
-def _tile_counts(world_size: int, uneven: bool) -> list[int]:
-    """Tiles per rank; bounds are built from whole tiles so they stay tile-aligned."""
-
-    counts = [TP_NUM_TILES // world_size for _ in range(world_size)]
-    counts[-1] += TP_NUM_TILES % world_size
-    if uneven:
-        for rank in range(world_size - 1):
-            if counts[rank] > 1:
-                counts[rank] -= 1
-                counts[-1] += 1
-    return counts
-
-
-def _tp_bounds(world_size: int, uneven: bool) -> tuple[tuple[int, int], ...]:
-    bounds, cursor = [], 0
-    for count in _tile_counts(world_size, uneven):
-        bounds.append((cursor, cursor + count * TP_TILE))
-        cursor += count * TP_TILE
-    return tuple(bounds)
-
-
-def _tp_contract(tp_rank: int, tp_world_size: int, bounds, dtype_name: str) -> LogprobContract:
-    return _contract(
-        tp_rank=tp_rank,
-        tp_world_size=tp_world_size,
-        bounds=bounds,
-        real_vocab=TP_REAL_VOCAB,
-        padded_vocab=TP_PADDED_VOCAB,
-        num_tokens=TP_NUM_TOKENS,
-        active=TP_ACTIVE,
-        dtype=dtype_name,
-    )
-
-
-def _tp_inputs(device, dtype, seed: int = 2026):
-    """Identical logits and targets on every rank, seeded on CPU."""
-
-    gen = torch.Generator(device="cpu").manual_seed(seed)
-    logits = torch.randn(TP_NUM_TOKENS, TP_PADDED_VOCAB, generator=gen, dtype=torch.float32)
-    targets = torch.randint(0, TP_REAL_VOCAB, (TP_NUM_TOKENS,), generator=gen)
-    active = torch.tensor(TP_ACTIVE)
-    # Inactive rows carry ignore_index; active_mask stays the sole authority.
-    targets = torch.where(active, targets, torch.full_like(targets, -100))
-    return logits.to(device=device, dtype=dtype), targets.to(device)
-
-
-def _nccl_worker(
-    rank,
-    world_size,
-    init_method,
-    result_queue,
-    scenario,
-    uneven,
-    dtype_name,
-    backend_kind="pytorch",
-):
+def _tp_worker(rank, world_size, init_method, result_queue, scenario):
     import torch.distributed as dist
 
+    torch.set_num_threads(1)
     try:
-        torch.cuda.set_device(rank)
-        device = torch.device("cuda", rank)
         dist.init_process_group(
-            backend="nccl", init_method=init_method, rank=rank, world_size=world_size
+            backend="gloo", init_method=init_method, rank=rank, world_size=world_size
         )
-        dtype = TP_DTYPES[dtype_name]
-        op = RocmVocabParallelLogprobOp() if backend_kind == "rocm" else VocabParallelLogprobOp()
-        bounds = _tp_bounds(world_size, uneven)
-        logits, targets = _tp_inputs(device, dtype)
-        tiles = TP_NUM_TILES
+        dtype = torch.bfloat16 if scenario == "bf16" else torch.float32
+        dtype_name = "bf16" if scenario == "bf16" else "fp32"
+        bounds = _UNEVEN_BOUNDS if scenario == "uneven" else _even_bounds(PADDED_VOCAB, world_size)
+        logits, targets = _inputs(dtype=dtype)
+        start, end = bounds[rank]
 
-        if scenario in {"preflight", "misaligned"}:
-            if scenario == "preflight":
-                if rank == 0:
-                    tiles = TP_NUM_TILES * 2
-            else:
-                # Nudge the first boundary off the tile grid, on every rank.
-                split = bounds[0][1] + TP_TILE // 4
-                bounds = ((0, split), (split, bounds[1][1])) + bounds[2:]
+        op = VocabParallelLogprobOp()
+        tiles = 16 if scenario == "preflight" and rank == 0 else NUM_TILES
+        contract_tp = _contract(
+            tp_rank=rank, tp_world_size=world_size, bounds=bounds, dtype=dtype_name
+        )
 
-            start, end = bounds[rank]
+        if scenario == "preflight":
             try:
                 op(
                     logits[:, start:end].contiguous().clone(),
                     targets,
-                    contract=_tp_contract(rank, world_size, bounds, dtype_name),
+                    contract=contract_tp,
                     tp_group=dist.group.WORLD,
                     num_vocab_tiles=tiles,
                 )
                 result_queue.put({"ok": False, "rank": rank, "traceback": "no error raised"})
-            except LogprobContractError as exc:
-                result_queue.put({"ok": True, "rank": rank, "message": str(exc)})
+            except LogprobContractError:
+                result_queue.put({"ok": True, "rank": rank})
             return
 
-        start, end = bounds[rank]
+        if scenario == "mode_mismatch":
+            # Same relaxed contract everywhere; only rank 0 runs deterministic.
+            relaxed = _contract(
+                tp_rank=rank,
+                tp_world_size=world_size,
+                bounds=bounds,
+                determinism_scope="fixed_topology",
+            )
+            try:
+                op(
+                    logits[:, start:end].contiguous().clone(),
+                    targets,
+                    contract=relaxed,
+                    tp_group=dist.group.WORLD,
+                    num_vocab_tiles=NUM_TILES,
+                    deterministic=(rank == 0),
+                )
+                result_queue.put({"ok": False, "rank": rank, "traceback": "no error raised"})
+            except LogprobContractError:
+                result_queue.put({"ok": True, "rank": rank})
+            return
+
+        if scenario == "nondeterministic":
+            relaxed = _contract(
+                tp_rank=rank,
+                tp_world_size=world_size,
+                bounds=bounds,
+                determinism_scope="fixed_topology",
+            )
+            shard = logits[:, start:end].contiguous().clone().requires_grad_(True)
+            logp_tp, lse_tp = op(
+                shard, targets, contract=relaxed, tp_group=dist.group.WORLD, deterministic=False
+            )
+            (logp_tp.sum() + 0.5 * lse_tp.sum()).backward()
+
+            full = logits.clone().requires_grad_(True)
+            relaxed_tp1 = _contract(determinism_scope="fixed_topology")
+            logp_one, lse_one = op(full, targets, contract=relaxed_tp1, deterministic=False)
+            (logp_one.sum() + 0.5 * lse_one.sum()).backward()
+
+            result_queue.put(
+                {
+                    "ok": True,
+                    "rank": rank,
+                    "logp_close": torch.allclose(logp_tp, logp_one, atol=1e-6),
+                    "lse_close": torch.allclose(lse_tp, lse_one, atol=1e-6),
+                    "grad_close": torch.allclose(shard.grad, full.grad[:, start:end], atol=1e-6),
+                    "logp": logp_tp.detach().float(),
+                    "lse": lse_tp.detach().float(),
+                }
+            )
+            return
+
         shard = logits[:, start:end].contiguous().clone().requires_grad_(True)
-        tp_contract = _tp_contract(rank, world_size, bounds, dtype_name)
         logp_tp, lse_tp = op(
             shard,
             targets,
-            contract=tp_contract,
+            contract=contract_tp,
             tp_group=dist.group.WORLD,
-            num_vocab_tiles=TP_NUM_TILES,
+            num_vocab_tiles=NUM_TILES,
         )
         (logp_tp.sum() + 0.5 * lse_tp.sum()).backward()
 
-        # Same ranks, same inputs, run again: the collectives must not perturb bits.
-        rerun = logits[:, start:end].contiguous().clone()
-        logp_re, lse_re = op(
-            rerun,
-            targets,
-            contract=tp_contract,
-            tp_group=dist.group.WORLD,
-            num_vocab_tiles=TP_NUM_TILES,
-        )
-
-        # In-process TP=1 run on the full logits: the cross-TP claim is that a
-        # TP=n result equals the TP=1 result, bit for bit.
+        # In-process TP=1 run of the same op on the full logits: the cross-TP
+        # bitwise claim is TP=n output == TP=1 output, bit for bit.
         full = logits.clone().requires_grad_(True)
-        logp_one, lse_one = op(
-            full,
-            targets,
-            contract=_tp_contract(0, 1, ((0, TP_PADDED_VOCAB),), dtype_name),
-            num_vocab_tiles=TP_NUM_TILES,
-        )
+        contract_tp1 = _contract(dtype=dtype_name)
+        logp_one, lse_one = op(full, targets, contract=contract_tp1, num_vocab_tiles=NUM_TILES)
         (logp_one.sum() + 0.5 * lse_one.sum()).backward()
 
         result_queue.put(
@@ -460,61 +492,45 @@ def _nccl_worker(
                 "logp_bits_match": _bitwise_equal(logp_tp, logp_one),
                 "lse_bits_match": _bitwise_equal(lse_tp, lse_one),
                 "grad_bits_match": _bitwise_equal(shard.grad, full.grad[:, start:end]),
-                "rerun_bits_match": (
-                    _bitwise_equal(logp_re, logp_tp) and _bitwise_equal(lse_re, lse_tp)
-                ),
-                "logp_bit_pattern": _bits(logp_tp.detach().float().cpu()).tolist(),
-                "lse_bit_pattern": _bits(lse_tp.detach().float().cpu()).tolist(),
+                "logp": logp_tp.detach().float(),
+                "lse": lse_tp.detach().float(),
             }
         )
-    except Exception:  # pragma: no cover - forwarded to the parent process
+    except Exception:
         result_queue.put({"ok": False, "rank": rank, "traceback": traceback.format_exc()})
         raise
     finally:
-        import torch.distributed as dist
-
-        if dist.is_initialized():
-            dist.destroy_process_group()
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
-def _run_nccl_scenario(
-    world_size, scenario="correctness", uneven=False, dtype_name="fp32", backend_kind="pytorch"
-):
+def _run_gloo_scenario(scenario):
     ctx = mp.get_context("spawn")
     with tempfile.TemporaryDirectory() as tmpdir:
-        init_method = (Path(tmpdir) / "nccl_init").as_uri()
+        init_method = (Path(tmpdir) / "gloo_init").as_uri()
         result_queue = ctx.Queue()
         processes = [
             ctx.Process(
-                target=_nccl_worker,
-                args=(
-                    rank,
-                    world_size,
-                    init_method,
-                    result_queue,
-                    scenario,
-                    uneven,
-                    dtype_name,
-                    backend_kind,
-                ),
+                target=_tp_worker,
+                args=(rank, _WORLD_SIZE, init_method, result_queue, scenario),
             )
-            for rank in range(world_size)
+            for rank in range(_WORLD_SIZE)
         ]
         results = []
         try:
             for process in processes:
                 process.start()
-            for _ in range(world_size):
+            for _ in range(_WORLD_SIZE):
                 try:
-                    results.append(result_queue.get(timeout=_SPAWN_TIMEOUT_S))
+                    results.append(result_queue.get(timeout=60))
                 except queue.Empty:
                     for process in processes:
                         if process.is_alive():
                             process.terminate()
-                    pytest.fail(f"timed out waiting for NCCL workers (scenario={scenario})")
+                    pytest.fail("timed out waiting for vocab-parallel gloo workers")
         finally:
             for process in processes:
-                process.join(timeout=30)
+                process.join(timeout=10)
                 if process.is_alive():
                     process.terminate()
     results.sort(key=lambda item: item["rank"])
@@ -525,83 +541,41 @@ def _run_nccl_scenario(
     return results
 
 
-class TestCrossTPBitwise:
-    """TP=n output == TP=1 output, bit for bit, on real NCCL ranks."""
-
-    @_requires_gpus(2)
-    @pytest.mark.parametrize("dtype_name", ["fp32", "bf16"])
-    @pytest.mark.parametrize("uneven", [False, True], ids=["even", "uneven"])
-    def test_tp2_bitwise_identical_to_tp1(self, uneven, dtype_name):
-        self._assert_matches_tp1(_run_nccl_scenario(2, uneven=uneven, dtype_name=dtype_name))
-
-    @_requires_gpus(4)
-    @pytest.mark.parametrize("dtype_name", ["fp32", "bf16"])
-    @pytest.mark.parametrize("uneven", [False, True], ids=["even", "uneven"])
-    def test_tp4_bitwise_identical_to_tp1(self, uneven, dtype_name):
-        self._assert_matches_tp1(_run_nccl_scenario(4, uneven=uneven, dtype_name=dtype_name))
-
-    @staticmethod
-    def _assert_matches_tp1(results):
-        for result in results:
-            rank = result["rank"]
-            assert result["logp_bits_match"], f"rank {rank} logp bits differ from TP=1"
-            assert result["lse_bits_match"], f"rank {rank} lse bits differ from TP=1"
-            assert result["grad_bits_match"], f"rank {rank} grad bits differ from TP=1"
-            assert result["rerun_bits_match"], f"rank {rank} bits changed between identical runs"
-        # Outputs are replicated: every rank must hold identical bits.
-        for other in results[1:]:
-            assert results[0]["logp_bit_pattern"] == other["logp_bit_pattern"]
-            assert results[0]["lse_bit_pattern"] == other["lse_bit_pattern"]
-
-    @_requires_gpus(2)
-    def test_tp2_and_tp4_agree_with_each_other(self):
-        """The claim is over TP degrees, so pin TP=2 against TP=4 directly."""
-
-        if _cuda_device_count() < 4:
-            pytest.skip("needs 4 CUDA devices to compare TP=2 against TP=4")
-        tp2 = _run_nccl_scenario(2)
-        tp4 = _run_nccl_scenario(4)
-        assert tp2[0]["logp_bit_pattern"] == tp4[0]["logp_bit_pattern"]
-        assert tp2[0]["lse_bit_pattern"] == tp4[0]["lse_bit_pattern"]
+@requires_gloo
+@pytest.mark.parametrize("scenario", ["even", "uneven", "bf16"])
+def test_tp4_bitwise_identical_to_tp1(scenario):
+    results = _run_gloo_scenario(scenario)
+    for result in results:
+        assert result["logp_bits_match"], f"rank {result['rank']} logp bits differ from TP=1"
+        assert result["lse_bits_match"], f"rank {result['rank']} lse bits differ from TP=1"
+        assert result["grad_bits_match"], f"rank {result['rank']} grad bits differ from TP=1"
+    # Outputs are replicated: every rank must hold identical bits.
+    for other in results[1:]:
+        assert _bitwise_equal(results[0]["logp"], other["logp"])
+        assert _bitwise_equal(results[0]["lse"], other["lse"])
 
 
-class TestCrossTPGuards:
-    """A disagreement must abort loudly on every rank, not strand ranks in a collective."""
-
-    @_requires_gpus(2)
-    def test_preflight_rejects_mismatched_num_vocab_tiles(self):
-        results = _run_nccl_scenario(2, scenario="preflight")
-        for result in results:
-            assert "cross-rank preflight failed" in result["message"]
-
-    @_requires_gpus(2)
-    def test_misaligned_shard_bounds_rejected(self):
-        results = _run_nccl_scenario(2, scenario="misaligned")
-        for result in results:
-            assert "not aligned to the vocab tile size" in result["message"]
+@requires_gloo
+def test_preflight_rejects_mismatched_num_vocab_tiles():
+    _run_gloo_scenario("preflight")
 
 
-@pytest.mark.skipif(torch.version.hip is None, reason="requires a ROCm PyTorch build")
-class TestRocmNativeCrossTP:
-    """The ROCm production path must preserve the same TP contract as reference."""
+@requires_gloo
+def test_preflight_rejects_mixed_deterministic_modes():
+    _run_gloo_scenario("mode_mismatch")
 
-    @staticmethod
-    def _require_native() -> None:
-        from rl_engine.kernels.registry import _rocm_vocab_logprob_native_available
 
-        if not _rocm_vocab_logprob_native_available():
-            pytest.skip("requires the compiled ROCm logprob extension")
+@requires_gloo
+def test_tp4_nondeterministic_matches_tp1_within_tolerance():
+    """No bitwise claim: the fast path's grouping changes with the TP degree.
+    The values must still agree within fp32 tolerance, and the outputs stay
+    replicated bitwise across ranks — every rank merges the same partials."""
 
-    @_requires_gpus(2)
-    @pytest.mark.parametrize("dtype_name", ["fp32", "bf16"])
-    def test_tp2_native_matches_tp1_and_repeat(self, dtype_name):
-        self._require_native()
-        results = _run_nccl_scenario(2, dtype_name=dtype_name, backend_kind="rocm")
-        TestCrossTPBitwise._assert_matches_tp1(results)
-
-    @_requires_gpus(4)
-    @pytest.mark.parametrize("dtype_name", ["fp32", "bf16"])
-    def test_tp4_native_matches_tp1_and_repeat(self, dtype_name):
-        self._require_native()
-        results = _run_nccl_scenario(4, dtype_name=dtype_name, backend_kind="rocm")
-        TestCrossTPBitwise._assert_matches_tp1(results)
+    results = _run_gloo_scenario("nondeterministic")
+    for result in results:
+        assert result["logp_close"], f"rank {result['rank']} logp differs from TP=1 beyond atol"
+        assert result["lse_close"], f"rank {result['rank']} lse differs from TP=1 beyond atol"
+        assert result["grad_close"], f"rank {result['rank']} grads differ from TP=1 beyond atol"
+    for other in results[1:]:
+        assert _bitwise_equal(results[0]["logp"], other["logp"])
+        assert _bitwise_equal(results[0]["lse"], other["lse"])

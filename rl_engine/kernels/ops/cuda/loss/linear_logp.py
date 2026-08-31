@@ -9,9 +9,17 @@ from typing import Any, Optional
 import torch
 
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
+from rl_engine.kernels.ops.cuda.matmul.det_gemm import (
+    det_gemm_linear,
+    det_gemm_linear_input_gradient,
+    det_gemm_linear_weight_gradient,
+)
 from rl_engine.kernels.ops.pytorch.loss.linear_logp import (
+    _assert_global_targets_async,
+    _deterministic_tp_all_reduce_,
     _merge_tp_local_logp,
     _require_distributed_initialized,
+    _validate_even_tp_vocab_partition_local,
     _validate_global_targets,
     _validate_tp_targets_enabled,
     _validate_tp_vocab_partition_cached,
@@ -30,6 +38,15 @@ _SM90_FUSED_BWD_PATH_LOGGED = False
 _SM90_SAVE_PROBS_BF16_PATH_LOGGED = False
 _SM90_SAVE_PROBS_BF16_SKIP_LOGGED = False
 _SM90_FUSED_TILE_BF16_PATH_LOGGED = False
+
+# Frozen reduction contract carried by the SM90 fused kernel. Any change to a
+# bit-relevant constant (vocab tile width, K slab, split policy, reduction
+# trees, transcendental choice, temperature/clamp placement) must bump this.
+SM90_LINEAR_LOGP_CONTRACT_VERSION = "cuda-fused-linear-logp-sm90-contract-v1"
+# Mirror of ``constexpr int N_SPLIT_CONTRACT`` in
+# ``csrc/cuda/fused_linear_logp_sm90.cu``: the vocab-split count is a function
+# of V only, never of batch shape, occupancy, or SM count.
+SM90_N_SPLIT_CONTRACT = 64
 
 
 def _env_disabled(name: str) -> bool:
@@ -973,3 +990,420 @@ class FusedLinearLogpSM90Op:
                 _SM90_FUSED_TILE_BF16_PATH_LOGGED = True
             return _LinearLogpFusedTileBF16Function.apply(hidden, lm_head_weight, target_ids)
         return _FusedLinearLogpSM90Function.apply(hidden, lm_head_weight, bias, target_ids)
+
+
+class _StrictLinearLogpAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden, weight, bias, target, temperature, real_vocab_size):
+        hidden_2d = hidden.reshape(-1, hidden.size(-1)).contiguous()
+        weight = weight.contiguous()
+        target = target.reshape(-1).to(device=hidden.device, dtype=torch.long).contiguous()
+        bias_arg = bias.contiguous() if bias is not None else None
+        logp, lse = _C.fused_linear_logp_sm90(
+            hidden_2d, weight, target, bias_arg, temperature, False, int(real_vocab_size)
+        )
+        ctx.save_for_backward(
+            hidden_2d,
+            weight,
+            bias_arg if bias_arg is not None else hidden_2d.new_empty(0),
+            target,
+            lse,
+            temperature if temperature is not None else hidden_2d.new_empty(0),
+        )
+        ctx.has_bias = bias_arg is not None
+        ctx.real_vocab_size = int(real_vocab_size)
+        ctx.lead_shape = hidden.shape[:-1]
+        ctx.hidden_dtype = hidden.dtype
+        ctx.weight_dtype = weight.dtype
+        ctx.bias_dtype = bias.dtype if bias is not None else None
+        return logp.reshape(ctx.lead_shape), lse.reshape(ctx.lead_shape)
+
+    @staticmethod
+    def backward(ctx, grad_logp, grad_lse):
+        hidden, weight, bias, target, lse, temperature = ctx.saved_tensors
+        if grad_logp is None and grad_lse is None:
+            return (None, None, None, None, None, None)
+        temp = temperature if temperature.numel() else None
+        with torch.no_grad():
+            # Keep the backward GEMMs dtype-consistent. The fused forward
+            # contract is BF16 input/output-weight, while its log-sum-exp
+            # statistics and the autograd upstream are FP32.
+            hidden_f = hidden.float() if hidden.dtype != torch.float32 else hidden
+            weight_f = weight.float() if weight.dtype != torch.float32 else weight
+            bias_f = (
+                bias.float()
+                if ctx.has_bias and bias.dtype != torch.float32
+                else (bias if ctx.has_bias else None)
+            )
+            logits = torch.nn.functional.linear(hidden_f, weight_f, bias_f)
+            if temp is not None:
+                logits = logits / temp.reshape(-1, 1)
+            if ctx.real_vocab_size >= 0 and ctx.real_vocab_size < logits.size(1):
+                columns = torch.arange(logits.size(1), device=logits.device)
+                logits = logits.masked_fill(
+                    columns[None, :] >= ctx.real_vocab_size,
+                    float("-inf"),
+                )
+            probs = torch.exp(logits - lse.reshape(-1, 1).float())
+            logp_grad = (
+                torch.zeros_like(lse) if grad_logp is None else grad_logp.reshape(-1).float()
+            )
+            lse_grad = torch.zeros_like(lse) if grad_lse is None else grad_lse.reshape(-1).float()
+            # d(logp) / d(logits) = onehot(target) - softmax(logits), while
+            # d(lse) / d(logits) = softmax(logits).
+            dlogits = probs * (lse_grad - logp_grad).reshape(-1, 1)
+            rows = torch.arange(target.numel(), device=target.device)
+            dlogits[rows, target] += logp_grad
+            if temp is not None:
+                dlogits = dlogits / temp.reshape(-1, 1)
+            grad_hidden = dlogits.matmul(weight_f)
+            grad_weight = dlogits.transpose(0, 1).matmul(hidden_f)
+            grad_bias = dlogits.sum(0) if ctx.has_bias else None
+        return (
+            grad_hidden.reshape((*tuple(ctx.lead_shape), weight.size(1))).to(ctx.hidden_dtype),
+            grad_weight.to(ctx.weight_dtype),
+            None if grad_bias is None else grad_bias.to(ctx.bias_dtype),
+            None,
+            None,
+            None,
+        )
+
+
+STRICT_LINEAR_LOGP_CONTRACT_VERSION = "cuda-det-gemm-linear-logp-sm90-contract-v2"
+
+
+def _strict_tp_run(
+    hidden,
+    weight,
+    bias,
+    target,
+    *,
+    vocab_start,
+    global_vocab,
+    real_vocab,
+    temperature,
+    tp_group,
+):
+    required = (
+        "linear_logp_local_bf16_forward",
+        "linear_logp_logits_bf16_to_dlogits",
+    )
+    missing = [n for n in required if not (_EXT_AVAILABLE and hasattr(_C, n))]
+    if missing:
+        raise RuntimeError(f"strict TP linear_logp missing CUDA symbols: {missing}")
+    hidden_2d = hidden.reshape(-1, hidden.size(-1)).contiguous()
+    weight = weight.contiguous()
+    target = target.reshape(-1).to(device=hidden.device, dtype=torch.long).contiguous()
+    if hidden_2d.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        raise TypeError("strict TP linear_logp requires BF16 hidden and weight")
+    global_vocab = _validate_even_tp_vocab_partition_local(
+        tp_group=tp_group,
+        vocab_start_index=int(vocab_start),
+        local_vocab_size=weight.size(0),
+        global_vocab_size=int(global_vocab),
+    )
+    if not 0 < int(real_vocab) <= global_vocab:
+        raise ValueError(f"invalid real_vocab_size={real_vocab} for padded vocab={global_vocab}")
+    if _validate_tp_targets_enabled():
+        # Opt-in diagnostics retain the synchronized cross-rank checks. The
+        # cached contiguous [0, V) partition plus a valid target already prove
+        # unique ownership during normal execution.
+        _validate_global_targets(target, int(real_vocab), tp_group)
+        dist = _require_distributed_initialized()
+        owners = ((target >= int(vocab_start)) & (target < int(vocab_start) + weight.size(0))).to(
+            torch.int32
+        )
+        dist.all_reduce(owners, op=dist.ReduceOp.SUM, group=tp_group)
+        if bool((owners != 1).any().item()):
+            raise ValueError("each selected target must have exactly one TP LM-head owner")
+    else:
+        _assert_global_targets_async(target, int(real_vocab))
+    logits = det_gemm_linear(hidden_2d, weight)
+    temp = hidden_2d.new_empty(0, dtype=torch.float32)
+    if bias is not None:
+        logits = (logits.float() + bias.float().reshape(1, -1)).to(torch.bfloat16)
+    if temperature is not None:
+        temp = temperature.to(device=hidden.device, dtype=torch.float32).reshape(-1)
+        if temp.numel() == 1:
+            temp = temp.expand(hidden_2d.size(0)).contiguous()
+        if temp.numel() != hidden_2d.size(0):
+            raise ValueError("temperature must be positive and scalar or per-token")
+        torch._assert_async(
+            (temp > 0).all(),
+            "temperature must be positive and scalar or per-token",
+        )
+        logits = (logits.float() / temp.reshape(-1, 1)).to(torch.bfloat16)
+    local_real = max(0, min(weight.size(0), int(real_vocab) - int(vocab_start)))
+    if local_real < weight.size(0):
+        logits = logits.clone()
+        logits[:, local_real:] = float("-inf")
+    logits = logits.contiguous()
+    local_target, local_lse = _C.linear_logp_local_bf16_forward(logits, target, int(vocab_start))
+    logp, lse = _merge_tp_local_logp(local_lse, local_target, tp_group=tp_group)
+    return logp, lse, hidden_2d, weight, target, logits, temp
+
+
+def sm90_deterministic_logp_from_local_logits_tp(
+    local_logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    *,
+    vocab_start_index: int,
+    global_vocab_size: int,
+    real_vocab_size: int = -1,
+    temperature: Optional[torch.Tensor] = None,
+    tp_group: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge a deterministic TP LM-head result without recomputing its GEMM."""
+
+    required = "linear_logp_local_bf16_forward"
+    if not (_EXT_AVAILABLE and hasattr(_C, required)):
+        raise RuntimeError(f"strict TP logits logp missing CUDA symbol: {required}")
+    if local_logits.ndim != 2 or local_logits.dtype != torch.bfloat16:
+        raise TypeError("strict TP logits logp requires 2-D BF16 local logits")
+    if not local_logits.is_cuda or not local_logits.is_contiguous():
+        raise ValueError("strict TP logits logp requires contiguous CUDA logits")
+
+    vocab_start = int(vocab_start_index)
+    global_vocab = _validate_even_tp_vocab_partition_local(
+        tp_group=tp_group,
+        vocab_start_index=vocab_start,
+        local_vocab_size=local_logits.size(1),
+        global_vocab_size=int(global_vocab_size),
+    )
+    real_vocab = global_vocab if int(real_vocab_size) < 0 else int(real_vocab_size)
+    if not 0 < real_vocab <= global_vocab:
+        raise ValueError(f"invalid real_vocab_size={real_vocab} for padded vocab={global_vocab}")
+    target = target_ids.reshape(-1).to(device=local_logits.device, dtype=torch.long).contiguous()
+    if target.numel() != local_logits.size(0):
+        raise ValueError("target_ids must contain one id per local-logits row")
+    _assert_global_targets_async(target, real_vocab)
+
+    logits = local_logits
+    if temperature is not None:
+        temp = temperature.to(device=logits.device, dtype=torch.float32).reshape(-1)
+        if temp.numel() == 1:
+            temp = temp.expand(logits.size(0)).contiguous()
+        if temp.numel() != logits.size(0):
+            raise ValueError("temperature must be positive and scalar or per-token")
+        torch._assert_async(
+            (temp > 0).all(),
+            "temperature must be positive and scalar or per-token",
+        )
+        logits = (logits.float() / temp.reshape(-1, 1)).to(torch.bfloat16)
+    local_real = max(0, min(logits.size(1), real_vocab - vocab_start))
+    if local_real < logits.size(1):
+        logits = logits.clone()
+        logits[:, local_real:] = float("-inf")
+    logits = logits.contiguous()
+    local_target, local_lse = _C.linear_logp_local_bf16_forward(
+        logits,
+        target,
+        vocab_start,
+    )
+    logp, lse = _merge_tp_local_logp(local_lse, local_target, tp_group=tp_group)
+    lead_shape = target_ids.shape
+    return logp.reshape(lead_shape), lse.reshape(lead_shape)
+
+
+class _StrictTensorParallelLinearLogpAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        hidden,
+        weight,
+        bias,
+        target,
+        vocab_start,
+        global_vocab,
+        real_vocab,
+        temperature,
+        tp_group,
+    ):
+        logp, lse, hidden_2d, weight, target, logits, temp = _strict_tp_run(
+            hidden,
+            weight,
+            bias,
+            target,
+            vocab_start=vocab_start,
+            global_vocab=global_vocab,
+            real_vocab=real_vocab,
+            temperature=temperature,
+            tp_group=tp_group,
+        )
+        ctx.save_for_backward(hidden_2d, weight, target, logits, lse, temp)
+        ctx.vocab_start = int(vocab_start)
+        ctx.tp_group = tp_group
+        ctx.lead_shape = hidden.shape[:-1]
+        ctx.hidden_dtype, ctx.weight_dtype = hidden.dtype, weight.dtype
+        ctx.has_bias = bias is not None
+        ctx.bias_dtype = None if bias is None else bias.dtype
+        return logp.reshape(ctx.lead_shape), lse.reshape(ctx.lead_shape)
+
+    @staticmethod
+    def backward(ctx, grad_logp, grad_lse):
+        hidden, weight, target, logits, lse, temp = ctx.saved_tensors
+        if grad_logp is None and grad_lse is None:
+            return (None, None, None, None, None, None, None, None, None)
+        logp_grad = torch.zeros_like(lse) if grad_logp is None else grad_logp.reshape(-1).float()
+        dlogits = torch.empty_like(logits)
+        _C.linear_logp_logits_bf16_to_dlogits(
+            logits, dlogits, target, logp_grad, lse, ctx.vocab_start
+        )
+        if grad_lse is not None:
+            probs = torch.exp(logits.float() - lse.reshape(-1, 1))
+            dlogits = (dlogits.float() + probs * grad_lse.reshape(-1, 1).float()).to(torch.bfloat16)
+        if temp.numel():
+            dlogits = (dlogits.float() / temp.reshape(-1, 1)).to(torch.bfloat16).contiguous()
+        else:
+            dlogits = dlogits.contiguous()
+        grad_hidden = grad_weight = None
+        if ctx.needs_input_grad[0]:
+            grad_hidden = det_gemm_linear_input_gradient(dlogits, weight)
+            _deterministic_tp_all_reduce_(grad_hidden, ctx.tp_group)
+            grad_hidden = grad_hidden.reshape(ctx.lead_shape + (weight.size(1),)).to(
+                ctx.hidden_dtype
+            )
+        if ctx.needs_input_grad[1]:
+            grad_weight = det_gemm_linear_weight_gradient(hidden, dlogits).to(ctx.weight_dtype)
+        grad_bias = None
+        if ctx.has_bias and ctx.needs_input_grad[2]:
+            grad_bias = dlogits.float().sum(dim=0).to(ctx.bias_dtype)
+        return grad_hidden, grad_weight, grad_bias, None, None, None, None, None, None
+
+
+def sm90_deterministic_linear_logp(
+    hidden: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    target_ids: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    *,
+    temperature: Optional[torch.Tensor] = None,
+    return_logits: bool = False,
+    real_vocab_size: int = -1,
+):
+    """Direct forward entry into the frozen-contract SM90 fused linear_logp.
+
+    This is the strict-mode boundary shared by the training and rollout sides:
+    both engines call this function with byte-identical ``hidden`` /
+    ``lm_head_weight`` / ``target_ids`` / ``temperature`` and the same contract
+    version, and receive bitwise-identical FP32 outputs.
+
+    * ``temperature`` (float32, one value per token, strictly positive) is
+      applied in the kernel epilogue to the streaming-softmax stats and the
+      selected logit — the same rounding point on every caller.
+    * ``return_logits=True`` additionally stores the unscaled FP32 logits row
+      for the sampler (serving entry) without changing the ``logp``/``lse``
+      bytes (trainer entry keeps ``return_logits=False``).
+    * ``real_vocab_size`` normalizes padded training vocab (e.g. 152064) onto
+      the real serving vocab (e.g. 151936): lanes at or beyond it contribute
+      exactly ``-inf``/``0`` to the LSE on every rank. ``-1`` disables masking.
+    """
+    from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
+
+    if not (_EXT_AVAILABLE and hasattr(_C, "fused_linear_logp_sm90")):
+        raise RuntimeError(
+            "fused_linear_logp_sm90 is not compiled into the extension. Rebuild with "
+            "KERNEL_ALIGN_FORCE_SM90=1 on an SM90 (Hopper) device."
+        )
+    if hidden.dim() < 1:
+        raise ValueError("hidden must have at least one dimension")
+    lead_shape = hidden.shape[:-1]
+    hidden_2d = hidden.reshape(-1, hidden.size(-1)).contiguous()
+    weight = lm_head_weight.contiguous()
+    target_1d = target_ids.reshape(-1).to(device=hidden_2d.device, dtype=torch.long).contiguous()
+    if target_1d.numel() != hidden_2d.size(0):
+        raise ValueError("target_ids must have one id per hidden row")
+    real_vocab = weight.size(0) if int(real_vocab_size) < 0 else int(real_vocab_size)
+    if not 0 < real_vocab <= weight.size(0):
+        raise ValueError(f"real_vocab_size must be in [1, {weight.size(0)}], got {real_vocab_size}")
+    if bool(((target_1d < 0) | (target_1d >= real_vocab)).any().item()):
+        target_min = int(target_1d.min().item())
+        target_max = int(target_1d.max().item())
+        raise ValueError(
+            f"target_ids must be in the real vocabulary [0, {real_vocab}), "
+            f"got [{target_min}, {target_max}]"
+        )
+    bias_arg = bias.contiguous() if bias is not None else None
+    temp_arg = None
+    if temperature is not None:
+        temp_arg = temperature.to(device=hidden_2d.device, dtype=torch.float32).reshape(-1)
+        if temp_arg.numel() == 1:
+            temp_arg = temp_arg.expand(hidden_2d.size(0)).contiguous()
+        if temp_arg.numel() != hidden_2d.size(0) or bool((temp_arg <= 0).any().item()):
+            raise ValueError("temperature must be positive and scalar or per-token")
+    if (
+        torch.is_grad_enabled()
+        and (
+            hidden.requires_grad
+            or lm_head_weight.requires_grad
+            or (bias is not None and bias.requires_grad)
+        )
+        and not return_logits
+    ):
+        return _StrictLinearLogpAutograd.apply(
+            hidden, lm_head_weight, bias, target_ids, temp_arg, int(real_vocab_size)
+        )
+    out = _C.fused_linear_logp_sm90(
+        hidden_2d,
+        weight,
+        target_1d,
+        bias_arg,
+        temp_arg,
+        return_logits,
+        int(real_vocab_size),
+    )
+    logp = out[0].reshape(lead_shape)
+    lse = out[1].reshape(lead_shape)
+    if return_logits:
+        logits = out[2].reshape(*lead_shape, weight.size(0))
+        return logp, lse, logits
+    return logp, lse
+
+
+def sm90_deterministic_linear_logp_tp(
+    hidden: torch.Tensor,
+    lm_head_weight_shard: torch.Tensor,
+    target_ids: torch.Tensor,
+    bias_shard: Optional[torch.Tensor] = None,
+    *,
+    vocab_start_index: int,
+    global_vocab_size: Optional[int] = None,
+    real_vocab_size: int = -1,
+    temperature: Optional[torch.Tensor] = None,
+    tp_group: Any = None,
+):
+    """Strict TP selected logprob; the high-performance fused path is unchanged."""
+    if tp_group is None:
+        raise ValueError("strict TP linear_logp requires a TP process group")
+    if global_vocab_size is None:
+        dist = _require_distributed_initialized()
+        global_vocab_size = lm_head_weight_shard.size(0) * dist.get_world_size(tp_group)
+    real_vocab = int(global_vocab_size) if int(real_vocab_size) < 0 else int(real_vocab_size)
+    if torch.is_grad_enabled() and (
+        hidden.requires_grad
+        or lm_head_weight_shard.requires_grad
+        or (bias_shard is not None and bias_shard.requires_grad)
+    ):
+        return _StrictTensorParallelLinearLogpAutograd.apply(
+            hidden,
+            lm_head_weight_shard,
+            bias_shard,
+            target_ids,
+            int(vocab_start_index),
+            int(global_vocab_size),
+            real_vocab,
+            temperature,
+            tp_group,
+        )
+    logp, lse, _hidden, _weight, _target, _logits, _temp = _strict_tp_run(
+        hidden,
+        lm_head_weight_shard,
+        bias_shard,
+        target_ids,
+        vocab_start=int(vocab_start_index),
+        global_vocab=int(global_vocab_size),
+        real_vocab=real_vocab,
+        temperature=temperature,
+        tp_group=tp_group,
+    )
+    return logp.reshape(hidden.shape[:-1]), lse.reshape(hidden.shape[:-1])

@@ -4,6 +4,7 @@
 import sys
 from types import ModuleType
 
+import pytest
 import torch
 
 import rl_engine.platforms.device as device_module
@@ -44,6 +45,81 @@ def test_rocm_attention_native_sdpa_opt_out(monkeypatch):
 
     assert registry._priority_map["rocm"]["attn"][0] == OpBackend.PYTORCH_ATTN
     assert registry._priority_map["rocm"]["attn"][1] == OpBackend.ROCM_FLASH_ATTN
+
+
+class TestMusaPlatform:
+    @staticmethod
+    def _mock_torch_musa_import(monkeypatch):
+        monkeypatch.setattr(
+            device_module.importlib,
+            "import_module",
+            lambda name: object() if name == "torch_musa" else None,
+        )
+
+    @staticmethod
+    def _mock_musa_device(monkeypatch):
+        real_device = device_module.torch.device
+
+        class FakeMusaDevice:
+            type = "musa"
+
+        def fake_device(value):
+            if value == "musa":
+                return FakeMusaDevice()
+            return real_device(value)
+
+        monkeypatch.setattr(device_module.torch, "device", fake_device)
+
+    def test_musa_import_failure_falls_back_to_unavailable(self, monkeypatch):
+        def failing_import(name):
+            if name == "torch_musa":
+                raise RuntimeError("incompatible torch_musa installation")
+
+        monkeypatch.setattr(device_module.importlib, "import_module", failing_import)
+
+        assert device_module.is_musa_available() is False
+
+    def test_musa_runtime_failure_falls_back_to_unavailable(self, monkeypatch):
+        class FailingMusaRuntime:
+            @staticmethod
+            def is_available():
+                raise RuntimeError("driver failure")
+
+        self._mock_torch_musa_import(monkeypatch)
+        monkeypatch.setattr(device_module.torch, "musa", FailingMusaRuntime(), raising=False)
+
+        assert device_module.is_musa_available() is False
+
+    def test_musa_device_context_selects_musa(self, monkeypatch):
+        class AvailableMusaRuntime:
+            @staticmethod
+            def is_available():
+                return True
+
+        self._mock_torch_musa_import(monkeypatch)
+        self._mock_musa_device(monkeypatch)
+        monkeypatch.setattr(device_module.torch, "musa", AvailableMusaRuntime(), raising=False)
+
+        context = device_module.DeviceContext()
+
+        assert context.device_type == "musa"
+        assert context.is_musa is True
+        assert context.device.type == "musa"
+
+    def test_musa_dispatch_uses_only_pytorch_fallbacks(self, monkeypatch):
+        self._mock_musa_device(monkeypatch)
+        registry = KernelRegistry()
+
+        assert registry._platform_for_device("musa") == "musa"
+        for candidates in registry._priority_map["musa"].values():
+            assert all(candidate.name.startswith("PYTORCH_") for candidate in candidates)
+
+    def test_musa_det_gemm_fails_closed(self, monkeypatch):
+        self._mock_musa_device(monkeypatch)
+        registry = KernelRegistry()
+
+        with pytest.raises(RuntimeError, match="No functional backend"):
+            registry.get_op("det_gemm", device="musa")
 
 
 def test_registry_explicit_device_selects_device_platform(monkeypatch):

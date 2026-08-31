@@ -1,14 +1,14 @@
 # Vime Qwen3-8B TP=2 CP=2 validation
 
 This example is the recommended reproducible entry point for the Vime-side
-selected-logprob integration. It keeps framework glue in Vime and keeps the
+linear_logp integration. It keeps framework glue in Vime and keeps the
 numerical provider, contract, provenance, and report in RL-Kernel.
 
 The example is deliberately strict:
 
 - Megatron training uses `TP=2`, `CP=2`, `PP=1`, and four actor ranks.
 - vLLM rollout uses processed logprobs and `top_p=1.0`.
-- Vime must load `rl_engine.integrations.vime.logp.provider` in `strict` mode.
+- Vime must load `rl_engine.integrations.vime.linear_logp_provider.provider` in `strict` mode.
 - A native fallback or a missing provider marker is not reported as a pass.
 - Attention and FFN are not declared consistent from configuration alone. They
   require executed Megatron and vLLM readbacks, so the report marks them
@@ -18,6 +18,13 @@ The example is deliberately strict:
 
 The Vime companion must be installed or checked out separately. This example
 does not modify `vllm-project/vime`.
+
+The executable entry point is the Vime script
+`scripts/run-qwen3-8B-rlkernel-tp2-cp2.sh`. Its default topology is an
+8-GPU H100 node with four Megatron actor GPUs and four vLLM rollout GPUs. The
+script refuses to start on a different GPU count or GPU class. Set
+`COLOCATE=1` only when intentionally testing the colocated path; that mode is
+not the default 8-GPU train/infer split.
 
 ## Dry run
 
@@ -38,6 +45,7 @@ export MODEL_ROOT=/models/Qwen3-8B
 export TORCH_DIST_ROOT=/models/Qwen3-8B_torch_dist
 export PROMPT_DATA=/data/dapo-math-17k.jsonl
 export RL_KERNEL_ROOT=/path/to/RL-Kernel
+export MEGATRON_ROOT=/path/to/Megatron-LM
 
 python examples/vime_qwen3_8b_tp2_cp2/run.py \
   --vime-root /path/to/RL-Align/vime \
@@ -45,6 +53,12 @@ python examples/vime_qwen3_8b_tp2_cp2/run.py \
   --output reports/qwen3_8b_tp2_cp2.validation.json \
   --run
 ```
+
+For a real 8xH100 run, the model, Megatron torch-dist checkpoint, prompt data,
+and Megatron checkout must already exist on the host. The first run can omit
+`VIME_CKPT`; the script will initialize from `TORCH_DIST_ROOT` and save the
+Vime checkpoint there. Use `NUM_ROLLOUT=1` for the integration smoke test and
+increase it only after the provider marker is observed.
 
 When the Megatron/vLLM launch also emits the operator readback artifact, pass
 it explicitly:

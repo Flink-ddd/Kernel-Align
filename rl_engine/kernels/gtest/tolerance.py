@@ -14,6 +14,7 @@ Gates must obtain thresholds only through the resolvers defined here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass
@@ -1000,6 +1001,27 @@ def normalize_dtype_name(dtype: str | Any) -> str:
     raise ContractResolveError(f"unsupported dtype: {dtype!r}")
 
 
+def resolve_logprob_threshold(dtype: Any) -> float:
+    dtype_name = normalize_dtype_name(dtype)
+    try:
+        raw_threshold = load_contract()["accuracy"]["default"]["logprob"][dtype_name]["atol"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"WS1 has no logprob threshold for dtype {dtype_name!r}") from exc
+    if isinstance(raw_threshold, bool) or not isinstance(raw_threshold, (int, float)):
+        raise ValueError(f"invalid WS1 logprob threshold for dtype {dtype_name!r}")
+    threshold = float(raw_threshold)
+    if not math.isfinite(threshold) or threshold < 0.0:
+        raise ValueError(f"invalid WS1 logprob threshold for dtype {dtype_name!r}")
+    return threshold
+
+
+def tolerance_contract_fingerprint() -> str:
+    canonical = json.dumps(
+        load_contract(), ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 # Private compatibility alias for callers outside this package that have not
 # migrated to the public normalizer yet.
 _dtype_name = normalize_dtype_name
@@ -1030,6 +1052,8 @@ __all__ = [
     "resolve_chain_aggregate_thresholds",
     "resolve_comparison_roles",
     "resolve_dtype_policy",
+    "resolve_logprob_threshold",
+    "tolerance_contract_fingerprint",
     "resolve_tolerance",
     "resolve_tolerance_support",
     "validate_backend_provenance",

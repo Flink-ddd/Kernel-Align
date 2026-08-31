@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from rl_engine.kernels.gtest.tolerance import load_contract
+from rl_engine.kernels.ops.base import _C
 from rl_engine.kernels.ops.cuda.matmul import deterministic_gemm
 
 try:
@@ -36,6 +37,99 @@ if _HAS_TRITON:
 
 def _rand(*shape):
     return torch.randn(*shape, device=DEV, dtype=torch.bfloat16)
+
+
+# Matches det_gemm_kernel.cu: mid-split K-tree, FP32 leaf width 32, BF16 internal adds.
+_K_TREE_LEAF = 32
+
+
+def _k_tree_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    a = a.detach().contiguous()
+    b = b.detach().contiguous()
+    k = a.shape[1]
+
+    def rec(lo: int, hi: int) -> torch.Tensor:
+        if hi - lo <= _K_TREE_LEAF:
+            return (a[:, lo:hi].float() @ b[lo:hi, :].float()).to(dtype=torch.bfloat16)
+        mid = lo + (hi - lo) // 2
+        return rec(lo, mid) + rec(mid, hi)
+
+    return rec(0, k)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (128, 128, 128),  # aligned SM90 path
+        (31, 128, 128),  # SM90 M padding
+        (31, 70, 65),  # scalar fallback
+    ],
+)
+def test_rhs_transposed_layout_matches_legacy_forward_bitwise(shape):
+    torch.manual_seed(20)
+    M, K, N = shape
+    a = _rand(M, K)
+    bt = _rand(N, K)
+
+    expected = _C.det_gemm_fwd(a, bt.t().contiguous())
+    actual = _C.det_gemm_fwd_rhs_transposed(a, bt)
+
+    assert actual.is_contiguous()
+    assert tuple(actual.shape) == (M, N)
+    assert torch.equal(actual, expected)
+
+
+def test_rhs_transposed_materializes_unaligned_contiguous_view_for_tma():
+    torch.manual_seed(23)
+    M, K, N = 128, 128, 128
+    a = _rand(M, K)
+    storage = _rand(N * K + 1)
+    bt = storage[1:].view(N, K)
+    assert bt.is_contiguous()
+    assert bt.data_ptr() % 16 != 0
+
+    expected = _C.det_gemm_fwd(a, bt.t().contiguous())
+    actual = _C.det_gemm_fwd_rhs_transposed(a, bt)
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 128, 128),  # short-K tiled backward path
+        (8, 128, 128),  # short-K tiled backward path
+        (128, 128, 128),  # aligned SM90 path
+        (128, 96, 64),  # SM90 logical-M padding and dim-1 crop
+        (31, 70, 65),  # scalar fallback
+    ],
+)
+def test_transposed_db_is_bitwise_and_canonical_contiguous(shape):
+    torch.manual_seed(21)
+    tokens, in_features, out_features = shape
+    a = _rand(tokens, in_features)
+    dc = _rand(tokens, out_features)
+
+    expected = _C.det_gemm_db(a, dc).t().contiguous()
+    actual = _C.det_gemm_db_transposed(a, dc)
+
+    assert tuple(actual.shape) == (out_features, in_features)
+    assert tuple(actual.stride()) == (in_features, 1)
+    assert actual.is_contiguous()
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("shape", [(128, 128, 128), (31, 70, 65)])
+def test_da_physical_transpose_contract_matches_legacy_path_bitwise(shape):
+    torch.manual_seed(22)
+    M, K, N = shape
+    dc = _rand(M, N)
+    b = _rand(K, N)
+
+    expected = _C.det_gemm_fwd(dc, b.t().contiguous())
+    actual = _C.det_gemm_da(dc, b)
+
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize("name,gemm", _BACKENDS)
@@ -81,7 +175,10 @@ def test_forward_correctness(name, gemm):
     M, K, N = 128, 2048, 2048
     a, b = _rand(M, K), _rand(K, N)
     out = gemm(a, b).float()
-    ref = a.float() @ b.float()
+    if name == "cuda":
+        ref = _k_tree_gemm(a, b).float()
+    else:
+        ref = a.float() @ b.float()
     contract = load_contract()
     thresholds = contract["accuracy"]["default"]["reduction"]["bfloat16"]
     torch.testing.assert_close(out, ref, atol=thresholds["atol"], rtol=thresholds["rtol"])
@@ -111,6 +208,18 @@ def test_backward_correctness(name, gemm):
     b = _rand(K, N).requires_grad_(True)
     g = _rand(M, N)
     gemm(a, b).backward(g)
+    if name == "cuda":
+        da = _k_tree_gemm(g, b.t().contiguous())
+        db = _k_tree_gemm(a.detach().t().contiguous(), g)
+        contract = load_contract()
+        thresholds = contract["accuracy"]["default"]["reduction"]["bfloat16"]
+        torch.testing.assert_close(
+            a.grad.float(), da.float(), atol=thresholds["atol"], rtol=thresholds["rtol"]
+        )
+        torch.testing.assert_close(
+            b.grad.float(), db.float(), atol=thresholds["atol"], rtol=thresholds["rtol"]
+        )
+        return
     af = a.detach().float().requires_grad_(True)
     bf = b.detach().float().requires_grad_(True)
     (af @ bf).backward(g.float())

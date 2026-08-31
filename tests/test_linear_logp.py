@@ -589,6 +589,107 @@ def test_sm90_forward_no_bias():
 
 
 @requires_sm90
+def test_sm90_strict_contract_is_bitwise_batch_invariant():
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import (
+        SM90_LINEAR_LOGP_CONTRACT_VERSION,
+        SM90_N_SPLIT_CONTRACT,
+        sm90_deterministic_linear_logp,
+    )
+
+    hidden, weight, target, bias = _sm90_inputs(120)
+    real_vocab = _SM90_V - 27
+    target = target.remainder(real_vocab)
+    temperature = torch.linspace(0.7, 1.3, _SM90_N, device="cuda", dtype=torch.float32)
+
+    full_logp, full_lse = sm90_deterministic_linear_logp(
+        hidden,
+        weight,
+        target,
+        bias,
+        temperature=temperature,
+        real_vocab_size=real_vocab,
+    )
+    row = 37
+    row_logp, row_lse = sm90_deterministic_linear_logp(
+        hidden[row : row + 1],
+        weight,
+        target[row : row + 1],
+        bias,
+        temperature=temperature[row : row + 1],
+        real_vocab_size=real_vocab,
+    )
+
+    assert SM90_LINEAR_LOGP_CONTRACT_VERSION == "cuda-fused-linear-logp-sm90-contract-v1"
+    assert SM90_N_SPLIT_CONTRACT == 64
+    assert torch.equal(full_logp[row : row + 1].view(torch.int32), row_logp.view(torch.int32))
+    assert torch.equal(full_lse[row : row + 1].view(torch.int32), row_lse.view(torch.int32))
+
+
+@requires_sm90
+def test_sm90_strict_contract_logits_return_and_padding_do_not_change_logp_bits():
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import sm90_deterministic_linear_logp
+
+    hidden, weight, target, bias = _sm90_inputs(121)
+    real_vocab = _SM90_V - 27
+    target = target.remainder(real_vocab)
+    temperature = torch.full((_SM90_N,), 0.85, device="cuda", dtype=torch.float32)
+
+    plain_logp, plain_lse = sm90_deterministic_linear_logp(
+        hidden,
+        weight,
+        target,
+        bias,
+        temperature=temperature,
+        real_vocab_size=real_vocab,
+    )
+    logits_logp, logits_lse, logits = sm90_deterministic_linear_logp(
+        hidden,
+        weight,
+        target,
+        bias,
+        temperature=temperature,
+        return_logits=True,
+        real_vocab_size=real_vocab,
+    )
+
+    assert torch.equal(plain_logp.view(torch.int32), logits_logp.view(torch.int32))
+    assert torch.equal(plain_lse.view(torch.int32), logits_lse.view(torch.int32))
+    assert torch.isneginf(logits[:, real_vocab:]).all()
+
+    reference_logits = torch.nn.functional.linear(
+        hidden.float(), weight[:real_vocab].float(), bias[:real_vocab].float()
+    )
+    reference_logp = torch.log_softmax(reference_logits / temperature[:, None], dim=-1)
+    reference_logp = reference_logp.gather(1, target[:, None]).squeeze(1)
+    assert torch.allclose(plain_logp, reference_logp, atol=2e-2, rtol=2e-2)
+
+
+@requires_sm90
+def test_sm90_strict_contract_backward_matches_logp_and_lse_reference():
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import sm90_deterministic_linear_logp
+
+    hidden, weight, target, _ = _sm90_inputs(122, bias=False)
+    hidden = hidden.detach().requires_grad_(True)
+    weight = weight.detach().requires_grad_(True)
+    temperature = torch.full((_SM90_N,), 0.9, device="cuda", dtype=torch.float32)
+    grad_logp = torch.linspace(-0.5, 0.5, _SM90_N, device="cuda")
+    grad_lse = torch.linspace(0.25, -0.25, _SM90_N, device="cuda")
+
+    logp, lse = sm90_deterministic_linear_logp(hidden, weight, target, temperature=temperature)
+    torch.autograd.backward((logp, lse), (grad_logp, grad_lse))
+
+    ref_hidden = hidden.detach().float().requires_grad_(True)
+    ref_weight = weight.detach().float().requires_grad_(True)
+    ref_logits = torch.nn.functional.linear(ref_hidden, ref_weight) / temperature[:, None]
+    ref_lse = torch.logsumexp(ref_logits, dim=-1)
+    ref_logp = ref_logits.gather(1, target[:, None]).squeeze(1) - ref_lse
+    torch.autograd.backward((ref_logp, ref_lse), (grad_logp, grad_lse))
+
+    assert torch.allclose(hidden.grad.float(), ref_hidden.grad, atol=2e-1, rtol=5e-2)
+    assert torch.allclose(weight.grad.float(), ref_weight.grad, atol=2e-1, rtol=5e-2)
+
+
+@requires_sm90
 def test_sm90_save_probs_bf16_output_only_matches_native(monkeypatch):
     from rl_engine.kernels.ops.base import _C
     from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op

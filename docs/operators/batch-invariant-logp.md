@@ -27,7 +27,7 @@ logp = batch_invariant_logp(
     logits,       # [B, T, V] or [N, V], differentiable
     target_ids,   # [B, T] or [N], int
     ignore_index=-100,
-    validate=False,  # Accelerated fast path; use True to check target range
+    validate=False,  # Triton fast path; use True to debug-check target range
 )                # -> [B, T] or [N], float32
 
 logp.sum().backward()  # gradients flow into logits only
@@ -38,7 +38,6 @@ logp.sum().backward()  # gradients flow into logits only
 | Backend | Wrapper | Status |
 | --- | --- | --- |
 | CUDA (SM90 TMA) | `BatchInvariantLogpSM90Op` | Hopper TMA online-softmax forward. |
-| Ascend (CANN) | `BatchInvariantLogpAscendOp` | Ascend C two-pass streaming forward; PyTorch-formula backward. |
 | CUDA / ROCm (Triton) | `TritonBatchInvariantLogpOp` | Triton online-softmax forward and tile-wise backward. Requires a GPU tensor. |
 | PyTorch native | `NativeBatchInvariantLogpOp` | FP32 reference path; CPU fallback and Triton-less fallback. |
 
@@ -47,7 +46,6 @@ Current dispatch:
 ```text
 CUDA (Hopper, SM90 kernel compiled): CUDA (SM90 TMA) -> Triton -> PyTorch
 CUDA / ROCm (otherwise):             Triton -> PyTorch
-Ascend NPU:                          Ascend -> PyTorch
 CPU:                                 PyTorch
 ```
 
@@ -60,10 +58,14 @@ or device, dispatch is unchanged (Triton -> PyTorch).
 
 `VocabParallelLogprobOp`
 (`rl_engine/kernels/ops/pytorch/loss/vocab_parallel_logp.py`)
-defines a cross-TP bitwise contract for TP=1, TP=2, and TP=4 when
-`num_vocab_tiles` is fixed and every vocabulary-shard boundary is tile-aligned.
-The complete BF16 CUDA/NCCL validation matrix for this contract is tracked by
-issue #241 PR4.
+**TP=1, TP=2, and TP=4 produce bit-identical results.**
+
+The backends above are single-shard (TP=1) references and do not yet export vocab-domain
+LSE or carry vocab-shard metadata, so they are declared incompatible with strict WS2
+requests instead of being selected as a silent fallback. The contract objects are
+documented in `rl_engine.kernels.logprob_contract`.
+
+The TP-aware implementation uses the following fixed-order construction:
 
 1. Split the padded vocabulary into `num_vocab_tiles` fixed tiles.
 2. Each rank computes fp32 `(max, sumexp)` for the tiles it owns. Every tile
@@ -91,8 +93,8 @@ The optional Vime adapter is owned by RL-Kernel and can be selected without
 patching Megatron or vLLM:
 
 ```text
---selected-logprob-provider rl_engine.integrations.vime.logp.provider
---selected-logprob-provider-mode strict
+--linear-logp-provider rl_engine.integrations.vime.linear_logp_provider.provider
+--linear-logp-provider-mode strict
 ```
 
 Vime passes the local `[T, V_local]` logits, shifted targets, TP subgroup,
@@ -107,28 +109,19 @@ The provider fails closed for undeclared real/padded vocabulary sizes, TP/CP
 metadata mismatches, unsupported top-p replay masks, and backend fallback.
 `auto` mode may then use Vime's native path; `strict` mode reports the
 configuration error. This adapter does not import Vime.
-The Ascend backend lives on the `npu` platform key and is available when the
-extension exposes `_C_npu.batch_invariant_logp_ascend` (built with
-`KERNEL_ALIGN_FORCE_ASCEND=1` on a CANN + torch_npu host; `npu-arch` defaults
-to `dav-2201`, override with `KERNEL_ALIGN_ASCEND_ARCH`). When the extension is
-not compiled, instantiation fails and dispatch falls through to PyTorch native.
-bf16/fp32 NPU tensors run the Ascend C kernel; anything else (e.g. fp16)
-silently falls back to the native op.
 
 ## Benchmarks
 
-`benchmarks/benchmark_batch_invariant_logp.py` compares Native, Triton when
-available, and the active device's CUDA SM90 or Ascend backend (forward latency
-and peak device memory across a vocab sweep, bf16):
+`benchmarks/benchmark_batch_invariant_logp.py` compares Native, Triton, and the
+CUDA SM90 backend (forward latency and peak VRAM across a vocab sweep, bf16):
 
 ```bash
 python benchmarks/benchmark_batch_invariant_logp.py
 python benchmarks/benchmark_batch_invariant_logp.py --configs "4096,128256;8192,151936"
 ```
 
-The hardware-specific column is shown only when the matching kernel for the
-active device is compiled in. An NPU run never selects a CUDA kernel, even on a
-host where both device types are visible.
+The CUDA column is only shown when the SM90 kernel is compiled in; otherwise the
+benchmark reports Native vs Triton only.
 
 ### Measured results
 
@@ -204,11 +197,10 @@ grad_logits[row, :] = 0.0
 Non-ignored target ids outside `[0, V)` are invalid. In particular,
 `target=-1` is invalid unless `ignore_index=-1`.
 
-The PyTorch native backend validates target ranges by default. Accelerated
-backends default to `validate=False` to avoid device synchronization in training
-hot paths. With validation disabled, every non-ignored target must already be in
-`[0, V)`; violating this precondition has undefined results and may fail during
-backward. Use `validate=True` during debugging or with untrusted targets.
+The PyTorch native backend validates target ranges by default. The Triton
+backend defaults to `validate=False` to avoid CUDA stream synchronization in
+training hot paths. Use `validate=True` during debugging or in tests when
+calling the Triton backend with untrusted targets.
 
 ## Batch-Invariance
 
@@ -223,10 +215,6 @@ The operator is designed so each row is computed independently:
 - Triton backward uses `grid=(num_tokens, vocab_tiles)` and writes one row tile
   per program. It reuses the forward-saved per-row `lse`, so no backward
   reduction crosses row boundaries.
-- The Ascend forward strides rows across blocks, so one AI core block owns
-  exactly one row; the vocab is scanned left-to-right in fixed
-  `TILE_LENGTH=4096` tiles with a two-pass (max, then sum-exp) fixed-order
-  reduction.
 - No atomic writes are used.
 
 These constraints ensure the result for a row depends only on that row's logits
@@ -246,160 +234,6 @@ fp16/bf16 backward: checked against fp32 reference with relaxed tolerance
 
 CPU-vs-CUDA comparisons use tolerance-based checks; batch-invariance checks
 within the same backend use exact equality where appropriate.
-
-## TP=1 Comparison Harness
-
-The single-GPU comparison harness is the TP=1 registration and regression guard
-for issue #241. It uses the batch-invariant PyTorch implementation as the
-reference and compares exact `pytorch`, `triton`, or `cuda-sm90` backends before
-distributed communication is introduced.
-
-Each backend exposes a diagnostic-only entry point while the production contract
-remains unchanged:
-
-```text
-op(logits, target_ids)                  -> logp
-op.forward_with_lse(logits, target_ids) -> (logp, lse)
-```
-
-The harness reports LSE drift over every logical token row and selected-logprob
-drift over active response/action tokens only. Drift summaries contain max,
-mean, p95, p99, and the number of compared values. Reports also record requested
-and actual backends, implementation, direct-LSE provenance, input shape and
-dtype, `tp_world=1`, and `communication=none`.
-
-Backend selection is exact and does not use registry fallback. In particular,
-an explicit `cuda-sm90` comparison fails unless the compiled SM90 extension,
-Hopper hardware, input dtype, and vocab row stride satisfy the kernel contract.
-
-Run the PyTorch TP=1 guard directly from the kernel-specific testing module:
-
-```bash
-python rl_engine/testing/logprob_comparison.py \
-  --candidate pytorch \
-  --device cpu \
-  --dtype fp32 \
-  --batch 2 \
-  --seq 16 \
-  --vocab 257
-```
-
-On a GPU, repeat `--candidate` to compare multiple exact backends:
-
-```bash
-python rl_engine/testing/logprob_comparison.py \
-  --candidate triton \
-  --candidate cuda-sm90 \
-  --device cuda \
-  --dtype bf16 \
-  --batch 2 \
-  --seq 16 \
-  --vocab 151936
-```
-
-The command writes structured JSON to stdout and routes backend diagnostics to
-stderr. The harness does not implement vocab sharding, collective communication,
-cross-rank LSE merging, or CP reconstruction.
-
-### SM90 validation
-
-SM90 validation requires a Hopper GPU, CUDA-enabled PyTorch, and an `nvcc`
-toolkit matching `torch.version.cuda`. Build the extension with:
-
-```bash
-export FORCE_CUDA=1
-export KERNEL_ALIGN_FORCE_SM90=1
-export TORCH_CUDA_ARCH_LIST="9.0+PTX"
-
-python -m pip install --no-build-isolation --no-deps -e .
-```
-
-Run the focused harness tests, the complete operator suite, and an explicit
-SM90 comparison:
-
-```bash
-python -m pytest \
-  tests/test_logprob_comparison.py \
-  tests/test_operator_inputs.py \
-  tests/test_op_checks.py -q
-
-python -m pytest tests/test_batch_invariant_logp.py -q
-
-python rl_engine/testing/logprob_comparison.py \
-  --candidate cuda-sm90 \
-  --device cuda \
-  --dtype bf16 \
-  --batch 2 \
-  --seq 16 \
-  --vocab 151936 \
-  --prompt-tokens 8 \
-  --seed 241
-```
-
-The PR2 path was validated on an NVIDIA H800 PCIe with PyTorch 2.11.0+cu128,
-CUDA 12.8, and Triton 3.6.0. The focused tests passed 41 cases and the complete
-batch-invariant suite passed 67 cases. For BF16 shape `[2, 16, 151936]`, both
-LSE and active-token dlogp had maximum absolute drift
-`9.5367431640625e-07` against the PyTorch reference, with no backend fallback.
-
-## Distributed WS2 Drift Report
-
-The issue #241 PR4 runner materializes one TP/CP topology per `torchrun`
-invocation. TP partitions the vocabulary and is the only numerical merge axis;
-CP partitions token rows and is recorded in provenance without participating in
-the vocab-domain LSE merge. For global rank `r`:
-
-```text
-tp_rank = r % tp_world_size
-cp_rank = r // tp_world_size
-```
-
-Every case generates the same seeded FP32 logical logits, targets, and active
-mask. The candidate receives a BF16 token/vocab shard through the explicit
-`pytorch-vocab-parallel-logp-ws2` backend, while the independent oracle computes
-`torch.logsumexp` over the complete real-vocab FP32 token slice. Distributed
-dispatch rejects `auto`, capability fallback, topology mismatches, non-tileable
-vocabularies, and incomplete materialization.
-
-Reports follow the issue #116 fields and contain per-rank and aggregate LSE and
-active-token dlogp summaries: max/mean/p95/p99 absolute drift, max relative
-drift, worst global token position, target id, target owner rank, #108 tolerance,
-and pass/fail. Provenance includes TP/CP topology, dtype, shard bounds, backend
-capability, contract fingerprint, reduction spec, merge order, transport, and
-the exact launch command. Replicated TP outputs are checked bitwise before one
-representative per CP shard is included in aggregate statistics.
-
-Print the scoped TP=1/2/4 x CP=1/2 launch matrix without starting workers:
-
-```bash
-python rl_engine/testing/distributed_logprob_comparison.py \
-  --plan \
-  --device cuda \
-  --dtype bf16 \
-  --output artifacts/ws2-logprob/report.json
-```
-
-Run one TP=2, CP=2 Qwen3-vocab case on four local GPUs:
-
-```bash
-torchrun --standalone --nproc-per-node=4 \
-  rl_engine/testing/distributed_logprob_comparison.py \
-  --tp 2 \
-  --cp 2 \
-  --dtype bf16 \
-  --backend pytorch-vocab-parallel-logp-ws2 \
-  --real-vocab 151936 \
-  --padded-vocab 151936 \
-  --num-vocab-tiles 64 \
-  --batch 2 \
-  --seq 16 \
-  --prompt-tokens 8 \
-  --output artifacts/ws2-logprob/tp2-cp2.json
-```
-
-The full matrix requires up to eight ranks for TP=4, CP=2. CPU/Gloo cases are
-available for topology and artifact validation; the scoped numerical gate is
-BF16 on CUDA/NCCL.
 
 ## Minimal Example
 
@@ -428,47 +262,23 @@ out.sum().backward()
 python -m pytest tests/test_batch_invariant_logp.py -q -rs
 ```
 
-All production backends are tested in a single file. Coverage includes
+All backends (Native, Triton) are tested in a single file. Coverage includes:
 correctness, leading-shape preservation, batch-invariance (bitwise), validation,
 ignore-index behavior, backward correctness, CUDA smoke cases, registry
 dispatch, and Triton-specific fp32/fp16/bf16 correctness, large vocab, backward
-gradient batch-invariance, and ignored-row zero gradients. The focused
-`tests/test_logprob_comparison.py` suite covers TP=1 bitwise regression, direct
-LSE identity, active-token drift statistics, structured serialization, exact
-backend diagnostics, and fail-closed provenance.
-`tests/test_distributed_logprob_comparison.py` covers topology planning, TP/CP
-rank mapping, token/vocab sharding, explicit backend materialization, #116 JSON
-artifacts, and a real four-process TP=2, CP=2 Gloo smoke case.
-All backends (Native, Triton, SM90, and Ascend) are tested in a single file.
-Coverage includes correctness, empty batches, leading-shape preservation,
-batch-invariance (bitwise), validation, ignore-index behavior, backward
-correctness, registry dispatch, and dtype- and backend-specific smoke cases.
-The focused `tests/test_logprob_comparison.py` suite covers TP=1 bitwise
-regression, direct LSE identity, active-token drift statistics, structured
-serialization, exact backend diagnostics, and fail-closed provenance.
-`tests/test_distributed_logprob_comparison.py` covers topology planning, TP/CP
-rank mapping, token/vocab sharding, explicit backend materialization, #116 JSON
-artifacts, and a real four-process TP=2, CP=2 Gloo smoke case.
+gradient batch-invariance, and ignored-row zero gradients.
 
-Triton tests skip when Triton or CUDA is unavailable. SM90 tests skip without a
-Hopper build; Ascend tests skip without an NPU + `_C_npu` build. On Windows, run
-via WSL/Linux with CUDA.
+Triton tests skip when Triton or CUDA is unavailable. On Windows, run via
+WSL/Linux with CUDA.
 
 ## Implementation Files
 
 - `rl_engine/kernels/ops/pytorch/loss/batch_invariant_logp.py`
 - `rl_engine/kernels/ops/triton/loss/batch_invariant_logp.py`
 - `rl_engine/kernels/ops/cuda/loss/batch_invariant_logp.py`
-- `rl_engine/kernels/ops/ascend/loss/batch_invariant_logp.py`
 - `csrc/cuda/batch_invariant_logp_kernel_sm90.cu`
-- `csrc/ascend/batch_invariant_logp_ascend.asc`
 - `rl_engine/kernels/registry.py`
-- `rl_engine/platforms/device.py`
 - `tests/test_batch_invariant_logp.py`
-- `tests/test_logprob_comparison.py`
-- `rl_engine/testing/logprob_drift.py`
-- `rl_engine/testing/distributed_logprob_comparison.py`
-- `tests/test_distributed_logprob_comparison.py`
 - `benchmarks/benchmark_batch_invariant_logp.py`
 - `rl_engine/kernels/ops/pytorch/loss/vocab_parallel_logp.py`
 - `rl_engine/kernels/logprob_contract.py`
