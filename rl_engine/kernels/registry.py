@@ -10,16 +10,6 @@ from typing import Any, Dict, Optional, Set, Type
 
 import torch
 
-
-def _rocm_vocab_logprob_native_available() -> bool:
-    if torch.version.hip is None:
-        return False
-    try:
-        from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
-    except ImportError:
-        return False
-    return bool(_EXT_AVAILABLE and hasattr(_C, "deterministic_logp_tile_stats"))
-
 from rl_engine.kernels.attention_contract import (
     AttentionBackendCapability,
     AttentionContract,
@@ -48,6 +38,18 @@ from rl_engine.kernels.semantic_registry import (
 )
 from rl_engine.platforms.device import device_ctx
 from rl_engine.utils.logger import logger
+
+
+def _rocm_vocab_logprob_native_available() -> bool:
+    """Return whether the strict ROCm tile kernel is actually loadable."""
+
+    if torch.version.hip is None:
+        return False
+    try:
+        from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
+    except ImportError:
+        return False
+    return bool(_EXT_AVAILABLE and hasattr(_C, "deterministic_logp_tile_stats"))
 
 
 class _KernelEnumMeta(EnumMeta):
@@ -123,6 +125,13 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     )
     ROCM_VOCAB_PARALLEL_LOGP = (
         "rl_engine.kernels.ops.rocm.loss.vocab_parallel_logp.RocmVocabParallelLogprobOp"
+    )
+    TRITON_VOCAB_PARALLEL_LOGP = (
+        "rl_engine.kernels.ops.triton.loss.vocab_parallel_logp.TritonVocabParallelLogprobOp"
+    )
+    # Deterministic GRPO loss on the TP-aware logprob path (WS2 #241 PR5)
+    PYTORCH_DISTRIBUTED_GRPO_LOSS = (
+        "rl_engine.kernels.ops.pytorch.loss.distributed_grpo_loss.DistributedGRPOLossOp"
     )
 
     # RMSNorm(pre-norm / QK-Norm) - pure Pytorch reference(ws1 ground-truth)
@@ -310,6 +319,18 @@ def _default_semantic_descriptors() -> tuple[OperatorBackendDescriptor, ...]:
             version_or_build_fingerprint="runtime-native-ffn-unresolved-v1",
         ),
     )
+
+
+def _triton_vocab_logprob_available() -> bool:
+    """Return whether the Triton WS2 vocab-parallel kernels can run here."""
+
+    if not torch.cuda.is_available():
+        return False
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def resolve_logp_op_type(
@@ -680,7 +701,33 @@ class KernelRegistry:
                 prepend=True,
             )
 
-        rocm_capability = LogprobBackendCapability(
+        # Triton WS2 vocab-parallel production backend: one source for CUDA and
+        # ROCm, registered ahead of the reference wherever Triton can run.
+        triton_vocab_logprob_capability = LogprobBackendCapability(
+            backend_id="triton-vocab-parallel-logp-ws2",
+            roles=common_logprob_roles,
+            dtypes=common_logprob_dtypes,
+            tp_world_sizes=None,
+            cp_world_sizes=None,
+            supports_vocab_padding=True,
+            mask_modes=frozenset({MaskMode.EXPLICIT_ACTIVE_MASK, MaskMode.IGNORE_INDEX}),
+            exports_vocab_lse=True,
+            determinism_scopes=frozenset(
+                {DeterminismScope.CROSS_TP_BITWISE, DeterminismScope.FIXED_TOPOLOGY}
+            ),
+            implementation_kind="production",
+        )
+        if _triton_vocab_logprob_available():
+            for triton_platform in ("cuda", "rocm"):
+                if triton_platform in self._priority_map:
+                    self.register_logprob_backend(
+                        OpBackend.TRITON_VOCAB_PARALLEL_LOGP,
+                        triton_vocab_logprob_capability,
+                        platform=triton_platform,
+                        prepend=True,
+                    )
+
+        rocm_vocab_logprob_capability = LogprobBackendCapability(
             backend_id="rocm-vocab-parallel-logp-ws2",
             roles=common_logprob_roles,
             dtypes=common_logprob_dtypes,
@@ -697,7 +744,7 @@ class KernelRegistry:
         if _rocm_vocab_logprob_native_available():
             self.register_logprob_backend(
                 OpBackend.ROCM_VOCAB_PARALLEL_LOGP,
-                rocm_capability,
+                rocm_vocab_logprob_capability,
                 platform="rocm",
                 prepend=True,
             )
