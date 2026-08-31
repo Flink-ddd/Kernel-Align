@@ -15,6 +15,7 @@ from typing import Any
 
 
 COLORS = {"G00": "#6b7280", "G10": "#2563eb", "G01": "#dc2626", "G11": "#059669"}
+MARKERS = {"G00": "o", "G10": "x", "G01": "D", "G11": "+"}
 LABELS = {
     "G00": "G00: production",
     "G10": "G10: framework",
@@ -76,7 +77,13 @@ def _plot_series(axis, rows, metric, title, *, moving_average=1, symlog=False):
         centers = _moving_average(values, moving_average)
         color = COLORS.get(group)
         axis.plot(
-            steps, centers, label=LABELS.get(group, group), color=color, linewidth=2
+            steps,
+            centers,
+            label=LABELS.get(group, group),
+            color=color,
+            linewidth=2,
+            marker=MARKERS.get(group, "o"),
+            markersize=5,
         )
         if any(spreads):
             lower = [
