@@ -12,6 +12,12 @@ import torch
 
 from rl_engine.integrations import framework_operators
 from rl_engine.integrations.framework_operators import MegatronLogpOperator
+from rl_engine.integrations.ablation import IntegrationPlan
+from rl_engine.integrations.megatron import MegatronIntegration
+from rl_engine.integrations.state import (
+    clear_active_integration,
+    set_active_integration,
+)
 from rl_engine.integrations.vime.linear_logp_provider import (
     LinearLogpProviderUnavailable,
     LinearLogpResult,
@@ -95,7 +101,9 @@ def test_provider_entropy_preserves_vime_semantics_and_autograd():
     result = provider(request)
     reference_logits = request.logits.detach().clone().requires_grad_(True)
     log_probs = torch.log_softmax(reference_logits[:, :7], dim=-1)
-    reference_logp = log_probs[torch.arange(reference_logits.size(0)), request.target_ids]
+    reference_logp = log_probs[
+        torch.arange(reference_logits.size(0)), request.target_ids
+    ]
     reference_entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
 
     torch.testing.assert_close(result.logp.squeeze(-1), reference_logp)
@@ -123,7 +131,9 @@ def test_provider_structural_path_returns_linear_logp_result(monkeypatch):
 
     import rl_engine.integrations.vime.linear_logp_provider as provider_module
 
-    monkeypatch.setattr(provider_module, "_default_strict_linear_logp", lambda: FakeLinearLogp())
+    monkeypatch.setattr(
+        provider_module, "_default_strict_linear_logp", lambda: FakeLinearLogp()
+    )
     request = _structural_request()
     result = provider(request)
 
@@ -148,7 +158,9 @@ def test_megatron_adapter_forwards_structured_context(monkeypatch):
         )
 
     wrapper = SimpleNamespace(backend_id="fake-linear-logp", provenance={})
-    monkeypatch.setattr(framework_operators, "_require_nvidia_cuda", lambda *_args: None)
+    monkeypatch.setattr(
+        framework_operators, "_require_nvidia_cuda", lambda *_args: None
+    )
     result = MegatronLogpOperator(provider, linear_logp=wrapper)(request)
 
     assert observed["context"] is request.context
@@ -169,3 +181,23 @@ def test_provider_rejects_local_vocab_metadata_that_cannot_describe_tp_ownership
 
     with pytest.raises(LinearLogpProviderUnavailable, match="cover padded_vocab_size"):
         provider(request)
+
+
+def test_production_provider_records_execution_in_active_integration(monkeypatch):
+    monkeypatch.setenv("RL_KERNEL_LOGP_CASE", "P/P")
+    integration = MegatronIntegration(
+        IntegrationPlan.from_case_ids(logp="P/P"),
+        rl_kernel_operators={},
+    )
+    clear_active_integration("megatron")
+    set_active_integration("megatron", integration)
+    try:
+        result = provider(_request())
+    finally:
+        clear_active_integration("megatron")
+
+    assert result.logp.shape == (3, 1)
+    readback = integration.readback()["operators"]["logp"]
+    assert readback["implementation"] == "production"
+    assert readback["call_count"] == 1
+    assert readback["provenance"]["runtime_platform"] == "cpu"

@@ -1,0 +1,39 @@
+{
+  "schema_version": "rlkernel.vime_qwen3_8b_tp2_cp2_200.matrix.v1",
+  "groups": {
+    "G00": {
+      "framework_use_rollout_logprobs": false,
+      "attention_case": "P/P",
+      "ffn_case": "P/P",
+      "logp_case": "P/P",
+      "description": "native VIME baseline"
+    },
+    "G10": {
+      "framework_use_rollout_logprobs": true,
+      "attention_case": "P/P",
+      "ffn_case": "P/P",
+      "logp_case": "P/P",
+      "description": "VIME framework-level consistency only"
+    },
+    "G01": {
+      "framework_use_rollout_logprobs": false,
+      "attention_case": "R/R",
+      "ffn_case": "R/R",
+      "logp_case": "R/R",
+      "description": "RL-Kernel operator-level consistency only"
+    },
+    "G11": {
+      "framework_use_rollout_logprobs": true,
+      "attention_case": "R/R",
+      "ffn_case": "R/R",
+      "logp_case": "R/R",
+      "description": "framework-level and operator-level consistency"
+    }
+  },
+  "phases": {
+    "smoke": {"num_rollout": 1, "seeds": [1234]},
+    "short": {"num_rollout": 8, "seeds": [1234]},
+    "precision": {"num_rollout": 30, "seeds": [1234, 2345, 3456]},
+    "convergence": {"num_rollout": 200, "seeds": [1234, 2345, 3456]}
+  }
+}

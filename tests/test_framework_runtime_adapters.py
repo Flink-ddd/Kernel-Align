@@ -47,12 +47,17 @@ from rl_engine.kernels.attention_contract import (
     ReductionSpec,
     ShardingSpec,
 )
-from rl_engine.kernels.ops.cuda.attention.strict_runtime import StrictCUDAAttentionRuntime
+from rl_engine.kernels.ops.cuda.attention.strict_runtime import (
+    StrictCUDAAttentionRuntime,
+)
 
 
 def test_framework_adapters_do_not_construct_registered_kernels_directly():
     source_path = (
-        Path(__file__).parents[1] / "rl_engine" / "integrations" / "framework_operators.py"
+        Path(__file__).parents[1]
+        / "rl_engine"
+        / "integrations"
+        / "framework_operators.py"
     )
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
     forbidden = {
@@ -218,8 +223,12 @@ def test_megatron_packed_attention_runs_each_sequence_in_thd_order(monkeypatch):
         get_tensor_model_parallel_rank=lambda: 0,
         get_context_parallel_group=lambda: "cp-group",
     )
-    monkeypatch.setattr(framework_operators, "_megatron_parallel_state", lambda: parallel_state)
-    monkeypatch.setattr(framework_operators, "_require_nvidia_cuda", lambda tensor, module: None)
+    monkeypatch.setattr(
+        framework_operators, "_megatron_parallel_state", lambda: parallel_state
+    )
+    monkeypatch.setattr(
+        framework_operators, "_require_nvidia_cuda", lambda tensor, module: None
+    )
     packed = SimpleNamespace(
         qkv_format="thd",
         cu_seqlens_q=torch.tensor([0, 8, 16], dtype=torch.int32),
@@ -519,3 +528,43 @@ def test_strict_readback_accepts_cuda_without_triton():
     integration.execute("attention", lambda value: value, "x")
 
     integration.assert_strict_ready()
+
+
+def test_production_readback_infers_platform_from_real_execution_tensors():
+    plan = IntegrationPlan.from_case_ids(attention="P/P")
+    integration = FrameworkOperatorIntegration(
+        framework="megatron",
+        target="training",
+        plan=plan,
+        rl_kernel_operators={},
+    )
+    value = torch.zeros(2)
+
+    integration.execute("attention", lambda tensor: tensor + 1, value)
+
+    readback = integration.readback()["operators"]["attention"]
+    assert readback["implementation"] == "production"
+    assert readback["provenance"]["runtime_platform"] == "cpu"
+
+
+def test_production_readback_uses_structural_result_provenance():
+    plan = IntegrationPlan.from_case_ids(logp="P/P")
+    integration = FrameworkOperatorIntegration(
+        framework="megatron",
+        target="training",
+        plan=plan,
+        rl_kernel_operators={},
+    )
+    request = SimpleNamespace(logits=torch.zeros(2, 4), target_ids=torch.zeros(2))
+
+    def native(actual_request):
+        return SimpleNamespace(
+            logp=actual_request.logits[:, :1],
+            provenance={"actual_backend": "production.logp.test"},
+        )
+
+    integration.execute("logp", native, request)
+
+    provenance = integration.readback()["operators"]["logp"]["provenance"]
+    assert provenance["actual_backend"] == "production.logp.test"
+    assert provenance["runtime_platform"] == "cpu"
