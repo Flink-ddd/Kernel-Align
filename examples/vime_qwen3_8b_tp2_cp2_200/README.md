@@ -6,6 +6,11 @@ RL-Kernel's operator-level alignment of Attention, dense FFN, and linear logp.
 It is designed for one 8×H100 node with four Megatron training GPUs and four
 vLLM rollout GPUs.
 
+The optimization algorithm is explicitly fixed to GRPO with
+`--advantage-estimator grpo`. DAPO-Math-17k is only the prompt/answer dataset;
+it does not select the DAPO training algorithm. The rule reward is computed by
+VIME's `deepscaler` reward implementation.
+
 The experiment is fail-closed. A run is accepted only when its Ray job
 succeeds, every expected operator route has CUDA execution readback, no
 fallback or Triton route is observed for an R/R arm, the requested number of
@@ -32,7 +37,7 @@ metrics.
 ## Required gates
 
 - NVIDIA H100 × 8; actor GPUs 4; rollout GPUs 4; TP=2; CP=2; PP=1.
-- BF16, `top_p=1.0`, temperature 1, no dropout, fixed training and rollout seeds.
+- GRPO, BF16, `top_p=1.0`, temperature 1, no dropout, fixed training and rollout seeds.
 - vLLM CUDA Graph mode `FULL_DECODE_ONLY`, not eager, with exact capture sizes
   `1..(rollout_batch_size × n_samples_per_prompt)`.
 - Megatron and vLLM readbacks for Attention, FFN, and logp, with positive call

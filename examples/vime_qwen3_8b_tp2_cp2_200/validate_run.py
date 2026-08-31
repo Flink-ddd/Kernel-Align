@@ -286,6 +286,19 @@ def validate_run(run_dir: Path) -> dict[str, Any]:
         require_zero,
     )
     global_errors = []
+    algorithm = manifest.get("algorithm", {})
+    if (
+        not isinstance(algorithm, Mapping)
+        or algorithm.get("advantage_estimator") != "grpo"
+    ):
+        global_errors.append("manifest does not explicitly select GRPO")
+    train_command = manifest.get("train_command", [])
+    expected_algorithm_pair = ["--advantage-estimator", "grpo"]
+    if not isinstance(train_command, list) or not any(
+        train_command[index : index + 2] == expected_algorithm_pair
+        for index in range(max(0, len(train_command) - 1))
+    ):
+        global_errors.append("train command does not explicitly select GRPO")
     if re.search(r"fallback=true", log_text, re.IGNORECASE):
         global_errors.append("run log contains fallback=true")
     if "Traceback (most recent call last)" in log_text:

@@ -178,8 +178,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout-batch-size", type=int, default=4)
     parser.add_argument("--n-samples-per-prompt", type=int, default=2)
     parser.add_argument("--global-batch-size", type=int, default=8)
-    parser.add_argument("--max-response-len", type=int, default=512)
-    parser.add_argument("--max-tokens-per-gpu", type=int, default=2048)
+    parser.add_argument("--max-response-len", type=int, default=4096)
+    parser.add_argument("--max-tokens-per-gpu", type=int, default=4096)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.4)
     parser.add_argument("--extra-pythonpath", action="append", default=[])
     parser.add_argument(
@@ -312,6 +312,8 @@ def main(argv: list[str] | None = None) -> int:
         "--rollout-shuffle",
         "--rm-type",
         "deepscaler",
+        "--advantage-estimator",
+        "grpo",
         "--num-rollout",
         str(args.num_rollout),
         "--rollout-batch-size",
@@ -431,6 +433,11 @@ def main(argv: list[str] | None = None) -> int:
             "n_samples_per_prompt": args.n_samples_per_prompt,
             "global_batch_size": args.global_batch_size,
             "max_response_len": args.max_response_len,
+            "max_tokens_per_gpu": args.max_tokens_per_gpu,
+        },
+        "algorithm": {
+            "advantage_estimator": "grpo",
+            "reward_model": "deepscaler",
         },
         "vllm_execution": {
             "cudagraph_required": True,
