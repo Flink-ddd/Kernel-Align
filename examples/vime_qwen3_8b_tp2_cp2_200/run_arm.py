@@ -178,7 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout-batch-size", type=int, default=1)
     parser.add_argument("--n-samples-per-prompt", type=int, default=8)
     parser.add_argument("--global-batch-size", type=int, default=8)
-    parser.add_argument("--max-response-len", type=int, default=8192)
+    parser.add_argument("--max-response-len", type=int, default=7168)
     parser.add_argument("--max-tokens-per-gpu", type=int, default=4096)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.4)
     parser.add_argument("--extra-pythonpath", action="append", default=[])

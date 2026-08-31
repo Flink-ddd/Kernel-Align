@@ -38,7 +38,7 @@ metrics.
 
 - NVIDIA H100 × 8; actor GPUs 4; rollout GPUs 4; TP=2; CP=2; PP=1.
 - GRPO, BF16, `top_p=1.0`, temperature 1, no dropout, fixed training and rollout seeds.
-- An 8192-token response budget, one prompt with eight GRPO samples per step,
+- A 7168-token response budget, one prompt with eight GRPO samples per step,
   and full uniform activation recomputation
   (`recompute-num-layers=1`). Do not enable expandable CUDA allocator segments:
   deterministic TP collectives require CUDA IPC-capable staging allocations.
