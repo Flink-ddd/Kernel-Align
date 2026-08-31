@@ -230,6 +230,7 @@ class TritonVocabParallelLogprobOp(VocabParallelLogprobOp):
 
     op_class = "logprob"
     is_batch_invariant = True
+    backend_id = BACKEND_ID
     use_native_tile_stats = staticmethod(_entropy_tile_stats)
 
     def apply(
@@ -241,7 +242,18 @@ class TritonVocabParallelLogprobOp(VocabParallelLogprobOp):
         tp_group: Any = None,
         num_vocab_tiles: int = DEFAULT_NUM_VOCAB_TILES,
         validate: bool = True,
+        deterministic: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not deterministic:
+            return super().apply(
+                local_logits,
+                target_ids,
+                contract=contract,
+                tp_group=tp_group,
+                num_vocab_tiles=num_vocab_tiles,
+                validate=validate,
+                deterministic=False,
+            )
         return apply_with_kernels(
             local_logits,
             target_ids,

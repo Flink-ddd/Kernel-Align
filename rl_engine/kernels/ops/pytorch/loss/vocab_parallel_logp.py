@@ -41,7 +41,12 @@ from typing import Any, Callable, Protocol
 
 import torch
 
-from rl_engine.kernels.logprob_contract import LogprobContract, LogprobContractError, LogprobDType
+from rl_engine.kernels.logprob_contract import (
+    DeterminismScope,
+    LogprobContract,
+    LogprobContractError,
+    LogprobDType,
+)
 
 BACKEND_ID = "pytorch-vocab-parallel-logp-ws2"
 DEFAULT_NUM_VOCAB_TILES = 64
@@ -158,12 +163,20 @@ def _validate_active_targets(
 
 
 def _preflight_cross_rank_agreement(
-    contract: LogprobContract, tp_group: Any, num_vocab_tiles: int
+    contract: LogprobContract,
+    tp_group: Any,
+    num_vocab_tiles: int,
+    deterministic: bool,
 ) -> None:
-    """All-gather (fingerprint, backend id, tile count) and abort on mismatch."""
+    """All-gather the numerical mode and abort before mismatched collectives."""
 
     dist = _require_distributed_initialized()
-    payload = (contract.cross_rank_fingerprint(), BACKEND_ID, int(num_vocab_tiles))
+    payload = (
+        contract.cross_rank_fingerprint(),
+        BACKEND_ID,
+        int(num_vocab_tiles) if deterministic else None,
+        bool(deterministic),
+    )
     world = dist.get_world_size(group=tp_group)
     gathered: list[Any] = [None] * world
     dist.all_gather_object(gathered, payload, group=tp_group)
@@ -173,8 +186,8 @@ def _preflight_cross_rank_agreement(
         raise LogprobContractError(
             "cross-rank preflight failed: rank "
             f"{contract.sharding.tp_rank} has {payload} but rank {rank} has {other}; "
-            "all TP ranks must agree on the contract fingerprint, backend id, and "
-            "num_vocab_tiles before any collective"
+            "all TP ranks must agree on the contract fingerprint, backend id, "
+            "num_vocab_tiles, and deterministic mode before any collective"
         )
 
 
@@ -252,12 +265,14 @@ def _gather_tile_stats(
     local_s: torch.Tensor,
     contract: LogprobContract,
     tp_group: Any,
-    tile: int,
+    tile_counts: int | list[int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Assemble all ``num_vocab_tiles`` partials in global tile order."""
+    """Assemble partials in global shard and tile order."""
 
     sharding = contract.sharding
-    tile_counts = [(end - start) // tile for start, end in sharding.vocab_shard_bounds]
+    if isinstance(tile_counts, int):
+        tile = tile_counts
+        tile_counts = [(end - start) // tile for start, end in sharding.vocab_shard_bounds]
     if sharding.tp_world_size == 1:
         return local_m.contiguous(), local_s.contiguous()
 
@@ -373,7 +388,10 @@ class _VocabParallelLogprobFunction(torch.autograd.Function):
 
         safe_target = torch.where(active_mask, target_1d, torch.zeros_like(target_1d))
 
-        if use_native_tile_stats:
+        if tile is None:
+            local_m, local_s = _local_tile_stats(z_masked, z_masked.shape[1])
+            tile_counts = [1] * sharding.tp_world_size
+        elif use_native_tile_stats:
             # A backend may pass its own tile-stats callable (same signature as
             # _native_rocm_tile_stats); ``True`` selects the ROCm extension kernel.
             tile_stats_fn = (
@@ -387,9 +405,11 @@ class _VocabParallelLogprobFunction(torch.autograd.Function):
                 vocab_start=sharding.local_vocab_start,
                 real_vocab_size=sharding.real_vocab_size,
             )
+            tile_counts = [(end - start) // tile for start, end in sharding.vocab_shard_bounds]
         else:
             local_m, local_s = _local_tile_stats(z_masked, tile)
-        m_all, s_all = _gather_tile_stats(local_m, local_s, contract, tp_group, tile)
+            tile_counts = [(end - start) // tile for start, end in sharding.vocab_shard_bounds]
+        m_all, s_all = _gather_tile_stats(local_m, local_s, contract, tp_group, tile_counts)
         target_logit = _gather_target_logit(z_masked, safe_target, contract, tp_group)
         lse = _merge_tile_partials(m_all, s_all)
 
@@ -587,7 +607,7 @@ def apply_with_kernels(
     if validate:
         _validate_active_targets(target_1d, active_mask, contract.sharding.real_vocab_size)
         if contract.sharding.tp_world_size > 1:
-            _preflight_cross_rank_agreement(contract, tp_group, num_vocab_tiles)
+            _preflight_cross_rank_agreement(contract, tp_group, num_vocab_tiles, True)
 
     selected_logp, lse = _KernelVocabParallelLogprobFunction.apply(
         local_logits, target_1d, active_mask, contract, tp_group, tile, kernels
@@ -606,6 +626,7 @@ class VocabParallelLogprobOp:
 
     op_class = "logprob"
     is_batch_invariant = True
+    backend_id = BACKEND_ID
     # False: PyTorch tile loop. True: ROCm extension kernel. A callable with the
     # _native_rocm_tile_stats signature: backend-specific tile statistics.
     use_native_tile_stats: bool | Callable[..., tuple[torch.Tensor, torch.Tensor]] = False
@@ -622,6 +643,7 @@ class VocabParallelLogprobOp:
         tp_group: Any = None,
         num_vocab_tiles: int = DEFAULT_NUM_VOCAB_TILES,
         validate: bool = True,
+        deterministic: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.apply(
             local_logits,
@@ -630,6 +652,7 @@ class VocabParallelLogprobOp:
             tp_group=tp_group,
             num_vocab_tiles=num_vocab_tiles,
             validate=validate,
+            deterministic=deterministic,
         )
 
     def apply(
@@ -641,6 +664,7 @@ class VocabParallelLogprobOp:
         tp_group: Any = None,
         num_vocab_tiles: int = DEFAULT_NUM_VOCAB_TILES,
         validate: bool = True,
+        deterministic: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         selected_logp, lse, _ = self._apply(
             local_logits,
@@ -649,6 +673,7 @@ class VocabParallelLogprobOp:
             tp_group=tp_group,
             num_vocab_tiles=num_vocab_tiles,
             validate=validate,
+            deterministic=deterministic,
             with_entropy=False,
             with_entropy_grad=False,
             use_native_tile_stats=self.use_native_tile_stats,
@@ -665,6 +690,7 @@ class VocabParallelLogprobOp:
         num_vocab_tiles: int = DEFAULT_NUM_VOCAB_TILES,
         validate: bool = True,
         with_entropy_grad: bool = True,
+        deterministic: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return selected logprob, vocabulary LSE, and full-vocabulary entropy.
 
@@ -679,6 +705,7 @@ class VocabParallelLogprobOp:
             tp_group=tp_group,
             num_vocab_tiles=num_vocab_tiles,
             validate=validate,
+            deterministic=deterministic,
             with_entropy=True,
             with_entropy_grad=with_entropy_grad,
             use_native_tile_stats=self.use_native_tile_stats,
@@ -693,13 +720,25 @@ class VocabParallelLogprobOp:
         tp_group: Any,
         num_vocab_tiles: int,
         validate: bool,
+        deterministic: bool,
         with_entropy: bool,
         with_entropy_grad: bool,
         use_native_tile_stats: bool | Callable[..., tuple[torch.Tensor, torch.Tensor]],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not isinstance(contract, LogprobContract):
             raise LogprobContractError("contract must be a LogprobContract")
-        tile = _tile_size(contract, num_vocab_tiles)
+        if not isinstance(deterministic, bool):
+            raise LogprobContractError(f"deterministic must be a bool; got {deterministic!r}")
+        if deterministic:
+            tile = _tile_size(contract, num_vocab_tiles)
+        elif contract.reduction.determinism_scope is DeterminismScope.CROSS_TP_BITWISE:
+            raise LogprobContractError(
+                "deterministic=False cannot honor determinism_scope=cross_tp_bitwise: "
+                "keep deterministic=True or relax the contract to "
+                "determinism_scope=fixed_topology"
+            )
+        else:
+            tile = None
         _validate_invocation(local_logits, target_ids, contract, tp_group)
 
         target_1d = target_ids.reshape(-1).to(device=local_logits.device, dtype=torch.long)
@@ -709,7 +748,7 @@ class VocabParallelLogprobOp:
         if validate:
             _validate_active_targets(target_1d, active_mask, contract.sharding.real_vocab_size)
             if contract.sharding.tp_world_size > 1:
-                _preflight_cross_rank_agreement(contract, tp_group, num_vocab_tiles)
+                _preflight_cross_rank_agreement(contract, tp_group, num_vocab_tiles, deterministic)
 
         selected_logp, lse, entropy = _VocabParallelLogprobFunction.apply(
             local_logits,
@@ -720,7 +759,7 @@ class VocabParallelLogprobOp:
             tile,
             with_entropy,
             with_entropy_grad,
-            use_native_tile_stats,
+            use_native_tile_stats if deterministic else False,
         )
 
         if validate and bool((~torch.isfinite(lse) & active_mask).any().item()):

@@ -74,6 +74,7 @@ class RocmVocabParallelLogprobOp(VocabParallelLogprobOp):
 
     op_class = "logprob"
     is_batch_invariant = True
+    backend_id = BACKEND_ID
     use_native_tile_stats = True
 
     def apply(
@@ -85,7 +86,18 @@ class RocmVocabParallelLogprobOp(VocabParallelLogprobOp):
         tp_group: Any = None,
         num_vocab_tiles: int = DEFAULT_NUM_VOCAB_TILES,
         validate: bool = True,
+        deterministic: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not deterministic:
+            return super().apply(
+                local_logits,
+                target_ids,
+                contract=contract,
+                tp_group=tp_group,
+                num_vocab_tiles=num_vocab_tiles,
+                validate=validate,
+                deterministic=False,
+            )
         if not _native_backward_available():
             raise RuntimeError(
                 f"{BACKEND_ID} requires rl_engine._C built with a ROCm toolchain "
