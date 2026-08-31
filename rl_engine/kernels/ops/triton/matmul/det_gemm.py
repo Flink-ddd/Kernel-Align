@@ -65,6 +65,24 @@ _GFX942_QWEN_WGRAD_LEAF_CONFIGS = {
 _QWEN_FORWARD_GEMM_SHAPES = {(4096, 12288), (12288, 4096)}
 _QWEN_WGRAD_OUTPUT_SHAPES = {(4096, 12288), (12288, 4096)}
 
+# Qwen3-8B TP2 local shards. TP4/8 candidates improved isolated leaves but did
+# not clear the distributed end-to-end promotion threshold, so they deliberately
+# retain the fallback. These entries were swept independently from the TP1 table
+# because smaller local N/K changes both grid occupancy and the
+# point where tree-reduction launch cost dominates leaf time. Keep the key
+# exact: nearby shapes and non-target token counts retain the established
+# fallback instead of inheriting a configuration from a different TP graph.
+_GFX942_QWEN_TP_SHARD_FORWARD_LEAF_CONFIGS = {
+    (16, 4096, 6144): _TreeLeafConfig(8, 64, 1, True),
+    (16, 6144, 4096): _TreeLeafConfig(8, 64, 1, True),
+    (32, 4096, 6144): _TreeLeafConfig(32, 128, 4, True),
+    (32, 6144, 4096): _TreeLeafConfig(32, 128, 4, True),
+}
+_GFX942_QWEN_TP_SHARD_WGRAD_LEAF_CONFIGS = {
+    (4096, 32, 6144): _TreeLeafConfig(128, 64, 2, True),
+    (6144, 32, 4096): _TreeLeafConfig(128, 64, 2, True),
+}
+
 
 def _gfx942_qwen_tree_leaf_config(
     m_size: int,
@@ -74,6 +92,7 @@ def _gfx942_qwen_tree_leaf_config(
     transpose_output: bool,
     preserve_a_strides: bool,
 ) -> _TreeLeafConfig:
+    logical_shape = (m_size, k_size, n_size)
     if (
         not transpose_output
         and not preserve_a_strides
@@ -83,6 +102,11 @@ def _gfx942_qwen_tree_leaf_config(
             m_size,
             _DEFAULT_TREE_LEAF_CONFIG,
         )
+    if not transpose_output and not preserve_a_strides:
+        return _GFX942_QWEN_TP_SHARD_FORWARD_LEAF_CONFIGS.get(
+            logical_shape,
+            _DEFAULT_TREE_LEAF_CONFIG,
+        )
     if (
         transpose_output
         and preserve_a_strides
@@ -90,6 +114,11 @@ def _gfx942_qwen_tree_leaf_config(
     ):
         return _GFX942_QWEN_WGRAD_LEAF_CONFIGS.get(
             k_size,
+            _DEFAULT_TREE_LEAF_CONFIG,
+        )
+    if transpose_output and preserve_a_strides:
+        return _GFX942_QWEN_TP_SHARD_WGRAD_LEAF_CONFIGS.get(
+            logical_shape,
             _DEFAULT_TREE_LEAF_CONFIG,
         )
     return _DEFAULT_TREE_LEAF_CONFIG

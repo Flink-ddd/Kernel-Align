@@ -71,30 +71,70 @@ class LeafCase:
     transpose_output: bool = False
 
 
-_CASES = {
-    case.name: case
-    for token_count in (1, 8, 32)
-    for case in (
-        LeafCase(f"fwd_gate_m{token_count}", token_count, 4096, 12288),
-        LeafCase(f"fwd_down_m{token_count}", token_count, 12288, 4096),
-        LeafCase(
-            f"wgrad_gate_m{token_count}",
-            4096,
-            token_count,
-            12288,
-            transposed_a=True,
-            transpose_output=True,
-        ),
-        LeafCase(
-            f"wgrad_down_m{token_count}",
-            12288,
-            token_count,
-            4096,
-            transposed_a=True,
-            transpose_output=True,
-        ),
-    )
-}
+def _leaf_cases() -> dict[str, LeafCase]:
+    cases: list[LeafCase] = []
+    for token_count in (1, 8, 16, 32):
+        cases.extend(
+            (
+                LeafCase(f"fwd_gate_m{token_count}", token_count, 4096, 12288),
+                LeafCase(f"fwd_down_m{token_count}", token_count, 12288, 4096),
+                LeafCase(
+                    f"wgrad_gate_m{token_count}",
+                    4096,
+                    token_count,
+                    12288,
+                    transposed_a=True,
+                    transpose_output=True,
+                ),
+                LeafCase(
+                    f"wgrad_down_m{token_count}",
+                    12288,
+                    token_count,
+                    4096,
+                    transposed_a=True,
+                    transpose_output=True,
+                ),
+            )
+        )
+        for tp_size in (2, 4, 8):
+            local_intermediate = 12288 // tp_size
+            suffix = f"tp{tp_size}_m{token_count}"
+            cases.extend(
+                (
+                    LeafCase(
+                        f"fwd_gate_{suffix}",
+                        token_count,
+                        4096,
+                        local_intermediate,
+                    ),
+                    LeafCase(
+                        f"fwd_down_{suffix}",
+                        token_count,
+                        local_intermediate,
+                        4096,
+                    ),
+                    LeafCase(
+                        f"wgrad_gate_{suffix}",
+                        4096,
+                        token_count,
+                        local_intermediate,
+                        transposed_a=True,
+                        transpose_output=True,
+                    ),
+                    LeafCase(
+                        f"wgrad_down_{suffix}",
+                        local_intermediate,
+                        token_count,
+                        4096,
+                        transposed_a=True,
+                        transpose_output=True,
+                    ),
+                )
+            )
+    return {case.name: case for case in cases}
+
+
+_CASES = _leaf_cases()
 
 _BASELINE = LeafConfig(64, 64, 4)
 

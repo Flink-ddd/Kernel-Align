@@ -21,6 +21,8 @@ try:
     from rl_engine.kernels.ops.triton.matmul.det_gemm import (
         _DEFAULT_TREE_LEAF_CONFIG,
         _GFX942_QWEN_FORWARD_LEAF_CONFIGS,
+        _GFX942_QWEN_TP_SHARD_FORWARD_LEAF_CONFIGS,
+        _GFX942_QWEN_TP_SHARD_WGRAD_LEAF_CONFIGS,
         _GFX942_QWEN_WGRAD_LEAF_CONFIGS,
         _det_gemm_tree_leaf_kernel,
         _device_tree_plan,
@@ -181,6 +183,19 @@ def _balanced_tree_sum(parts: list[torch.Tensor]) -> torch.Tensor:
         ((32, 4096, 4096), False, False, (64, 64, 4, False)),
         ((4096, 16, 12288), True, True, (64, 64, 4, False)),
         ((4096, 8, 12288), True, False, (64, 64, 4, False)),
+        ((32, 4096, 6144), False, False, (32, 128, 4, True)),
+        ((32, 6144, 4096), False, False, (32, 128, 4, True)),
+        ((16, 4096, 6144), False, False, (8, 64, 1, True)),
+        ((16, 6144, 4096), False, False, (8, 64, 1, True)),
+        ((32, 4096, 3072), False, False, (64, 64, 4, False)),
+        ((32, 3072, 4096), False, False, (64, 64, 4, False)),
+        ((32, 4096, 1536), False, False, (64, 64, 4, False)),
+        ((32, 1536, 4096), False, False, (64, 64, 4, False)),
+        ((4096, 32, 6144), True, True, (128, 64, 2, True)),
+        ((6144, 32, 4096), True, True, (128, 64, 2, True)),
+        ((4096, 32, 3072), True, True, (64, 64, 4, False)),
+        ((3072, 32, 4096), True, True, (64, 64, 4, False)),
+        ((4096, 16, 6144), True, True, (64, 64, 4, False)),
     ),
 )
 def test_gfx942_qwen_leaf_config_table_is_exact(
@@ -215,6 +230,8 @@ def test_gfx942_leaf_configs_preserve_special_value_workspace_raw_bytes(k_size):
         dict.fromkeys(
             (
                 *_GFX942_QWEN_FORWARD_LEAF_CONFIGS.values(),
+                *_GFX942_QWEN_TP_SHARD_FORWARD_LEAF_CONFIGS.values(),
+                *_GFX942_QWEN_TP_SHARD_WGRAD_LEAF_CONFIGS.values(),
                 *_GFX942_QWEN_WGRAD_LEAF_CONFIGS.values(),
             )
         )
@@ -239,6 +256,8 @@ def test_gfx942_leaf_configs_preserve_transposed_a_workspace_raw_bytes():
         dict.fromkeys(
             (
                 *_GFX942_QWEN_FORWARD_LEAF_CONFIGS.values(),
+                *_GFX942_QWEN_TP_SHARD_FORWARD_LEAF_CONFIGS.values(),
+                *_GFX942_QWEN_TP_SHARD_WGRAD_LEAF_CONFIGS.values(),
                 *_GFX942_QWEN_WGRAD_LEAF_CONFIGS.values(),
             )
         )
