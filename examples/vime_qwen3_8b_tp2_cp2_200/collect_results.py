@@ -90,6 +90,7 @@ def _run_rows(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
                 "rollout_kl": _value(rollout, "rollout/kl"),
                 "train_loss": _value(step, "train/loss"),
                 "pg_loss": _value(step, "train/pg_loss"),
+                "pg_clipfrac": _value(step, "train/pg_clipfrac"),
                 "entropy": _value(step, "train/entropy_loss"),
                 "ppo_kl": _value(step, "train/ppo_kl"),
                 "grad_norm": _value(step, "train/grad_norm"),
@@ -167,6 +168,11 @@ def _summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "max_abs_dlogp": max(_finite(items, "max_abs_dlogp"), default=None),
                 "reward_mean": (
                     mean(_finite(items, "reward")) if _finite(items, "reward") else None
+                ),
+                "raw_reward_mean": (
+                    mean(_finite(items, "raw_reward"))
+                    if _finite(items, "raw_reward")
+                    else None
                 ),
                 "truncated_ratio_mean": (
                     mean(_finite(items, "truncated_ratio"))

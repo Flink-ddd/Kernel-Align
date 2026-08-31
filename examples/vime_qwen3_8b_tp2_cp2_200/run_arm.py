@@ -175,10 +175,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--ray-address",
         default=os.environ.get("RAY_API_SERVER_ADDRESS", "http://127.0.0.1:8265"),
     )
-    parser.add_argument("--rollout-batch-size", type=int, default=4)
-    parser.add_argument("--n-samples-per-prompt", type=int, default=2)
+    parser.add_argument("--rollout-batch-size", type=int, default=1)
+    parser.add_argument("--n-samples-per-prompt", type=int, default=8)
     parser.add_argument("--global-batch-size", type=int, default=8)
-    parser.add_argument("--max-response-len", type=int, default=4096)
+    parser.add_argument("--max-response-len", type=int, default=8192)
     parser.add_argument("--max-tokens-per-gpu", type=int, default=4096)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.4)
     parser.add_argument("--extra-pythonpath", action="append", default=[])

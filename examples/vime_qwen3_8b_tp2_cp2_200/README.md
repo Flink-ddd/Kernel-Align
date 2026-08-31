@@ -38,7 +38,8 @@ metrics.
 
 - NVIDIA H100 × 8; actor GPUs 4; rollout GPUs 4; TP=2; CP=2; PP=1.
 - GRPO, BF16, `top_p=1.0`, temperature 1, no dropout, fixed training and rollout seeds.
-- A 4096-token response budget with full uniform activation recomputation
+- An 8192-token response budget, one prompt with eight GRPO samples per step,
+  and full uniform activation recomputation
   (`recompute-num-layers=1`). Do not enable expandable CUDA allocator segments:
   deterministic TP collectives require CUDA IPC-capable staging allocations.
 - vLLM CUDA Graph mode `FULL_DECODE_ONLY`, not eager, with exact capture sizes
@@ -62,17 +63,16 @@ The phase definitions are frozen in `experiment_matrix.json`.
 
 | Phase | Steps | Seeds | Decision |
 |---|---:|---|---|
-| smoke | 1 | 1234 | Validate launch, routes, CUDA Graph, and artifacts |
 | short | 8 | 1234 | Catch state transition, weight-update, and cache issues |
 | precision | 30 | 1234, 2345, 3456 | Estimate drift distribution before the long run |
-| convergence | 200 | 1234, 2345, 3456 | Primary PR evidence and learning/performance curves |
+| convergence | 200 | 1234 | Primary PR evidence and learning/performance curves |
 
-Use 200 steps for the main claim. One seed is enough to demonstrate a strict
-bitwise invariant, but three paired seeds are recommended for reward,
-throughput, and overhead claims. Run groups in the same seed order and compare
-paired seeds; report the mean and a 95% confidence interval. Never merge runs
-from different code revisions, checkpoints, prompt hashes, or CUDA Graph
-settings in one estimate.
+Use the paired 200-step runs for the main claim. A bitwise invariant does not
+need seed averaging; the three paired 30-step seeds test repeatability and
+provide uncertainty estimates for reward, throughput, and overhead. Run groups
+in the same seed order and compare paired seeds; report the mean and a 95%
+confidence interval. Never merge runs from different code revisions,
+checkpoints, prompt hashes, or CUDA Graph settings in one estimate.
 
 ## Prepare DAPO-Math-17k
 
@@ -88,8 +88,8 @@ python examples/vime_qwen3_8b_tp2_cp2_200/prepare_dapo_data.py \
 ```
 
 The converter requires `pyarrow`. The small
-`qwen3_8b_multiround_math.jsonl` fixture is for smoke testing only and must not
-be used for convergence or reward claims.
+`qwen3_8b_multiround_math.jsonl` file is a developer fixture and must not be
+used for experiment or reward claims.
 
 ## Run one arm
 
@@ -149,6 +149,8 @@ The plotting step requires Matplotlib. It produces:
   mismatch count per step;
 - `learning.png`: raw reward with moving average, PPO KL, entropy, and response
   truncation ratio;
+- `optimization.png`: GRPO policy-gradient loss, clipped ratio fraction, PPO
+  KL, and gradient norm;
 - `performance.png`: end-to-end step time, rollout time, and actor throughput.
 
 The summary table also reports total active-token exposure, cumulative

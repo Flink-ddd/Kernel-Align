@@ -164,6 +164,22 @@ def _save_learning(rows, output, dpi, window):
     plt.close(figure)
 
 
+def _save_optimization(rows, output, dpi):
+    import matplotlib.pyplot as plt
+
+    figure, axes = plt.subplots(2, 2, figsize=(13, 8), constrained_layout=True)
+    _plot_series(
+        axes[0, 0], rows, "pg_loss", "GRPO policy-gradient loss", symlog=True
+    )
+    _plot_series(axes[0, 1], rows, "pg_clipfrac", "Policy ratio clipped fraction")
+    _plot_series(axes[1, 0], rows, "ppo_kl", "Training PPO KL", symlog=True)
+    _plot_series(axes[1, 1], rows, "grad_norm", "Gradient norm", symlog=True)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    figure.legend(handles, labels, loc="outside upper center", ncol=max(1, len(labels)))
+    figure.savefig(output / "optimization.png", dpi=dpi)
+    plt.close(figure)
+
+
 def _save_performance(rows, output, dpi):
     import matplotlib.pyplot as plt
 
@@ -191,6 +207,7 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     _save_consistency(rows, args.output_dir, args.dpi)
     _save_learning(rows, args.output_dir, args.dpi, args.moving_average)
+    _save_optimization(rows, args.output_dir, args.dpi)
     _save_performance(rows, args.output_dir, args.dpi)
     return 0
 
