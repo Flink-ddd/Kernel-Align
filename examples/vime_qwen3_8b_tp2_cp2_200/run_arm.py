@@ -256,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
         "LD_LIBRARY_PATH": args.ld_library_path,
         "PYTHONUNBUFFERED": "1",
         "PYTHONHASHSEED": str(args.seed),
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         "NCCL_ALGO": "Ring",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
@@ -344,6 +345,12 @@ def main(argv: list[str] | None = None) -> int:
         "--use-dynamic-batch-size",
         "--max-tokens-per-gpu",
         str(args.max_tokens_per_gpu),
+        "--recompute-granularity",
+        "full",
+        "--recompute-method",
+        "uniform",
+        "--recompute-num-layers",
+        "1",
         "--custom-megatron-init-path",
         "rl_engine.integrations.megatron_runtime.initialize_from_environment",
         "--save-debug-train-data",
@@ -438,6 +445,12 @@ def main(argv: list[str] | None = None) -> int:
         "algorithm": {
             "advantage_estimator": "grpo",
             "reward_model": "deepscaler",
+        },
+        "training_memory": {
+            "recompute_granularity": "full",
+            "recompute_method": "uniform",
+            "recompute_num_layers": 1,
+            "pytorch_cuda_alloc_conf": "expandable_segments:True",
         },
         "vllm_execution": {
             "cudagraph_required": True,

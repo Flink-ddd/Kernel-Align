@@ -299,6 +299,16 @@ def validate_run(run_dir: Path) -> dict[str, Any]:
         for index in range(max(0, len(train_command) - 1))
     ):
         global_errors.append("train command does not explicitly select GRPO")
+    expected_recompute = {
+        "recompute_granularity": "full",
+        "recompute_method": "uniform",
+        "recompute_num_layers": 1,
+        "pytorch_cuda_alloc_conf": "expandable_segments:True",
+    }
+    if manifest.get("training_memory") != expected_recompute:
+        global_errors.append(
+            "manifest does not contain the required recompute configuration"
+        )
     if re.search(r"fallback=true", log_text, re.IGNORECASE):
         global_errors.append("run log contains fallback=true")
     if "Traceback (most recent call last)" in log_text:
