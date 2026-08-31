@@ -6,9 +6,12 @@ from .flash_attn import (
     StrictRocmAiterCKAttentionCore,
     StrictRocmAttentionUnavailable,
 )
+from .strict_runtime import StrictRocmAttentionResult, StrictRocmAttentionRuntime
 
 __all__ = [
     "RocmFlashAttentionOp",
     "StrictRocmAiterCKAttentionCore",
+    "StrictRocmAttentionRuntime",
+    "StrictRocmAttentionResult",
     "StrictRocmAttentionUnavailable",
 ]

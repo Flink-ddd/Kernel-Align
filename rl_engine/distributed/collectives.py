@@ -29,7 +29,7 @@ _ROCM_IPC_ALL_GATHER_MAX_BYTES = 256 * 1024
 _COLLECTIVE_STAGING_FRAMES = 3
 _COLLECTIVE_FRAME_METADATA_BYTES = 3 * 8
 _REDUCTION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
-_COLLECTIVES: dict[tuple[int, int, int, int], DeterministicCollective] = {}
+_COLLECTIVES: dict[tuple[int, int, int, int], Any] = {}
 DETERMINISTIC_ALL_REDUCE_OP = "rl_kernel::deterministic_all_reduce_"
 
 
@@ -286,6 +286,7 @@ class DeterministicCollective:
         inputs: tuple[torch.Tensor, ...] | list[torch.Tensor],
         *,
         outs: tuple[torch.Tensor, ...] | list[torch.Tensor] | None = None,
+        validate_signature: bool = True,
     ) -> tuple[torch.Tensor, ...]:
         """Compatibility fallback for CUDA IPC collectives.
 
@@ -301,7 +302,11 @@ class DeterministicCollective:
         if outs is not None and len(outs) != len(values):
             raise ValueError("reduce_scatter_many outs must match the number of inputs")
         results = tuple(
-            self.reduce_scatter(value, out=None if outs is None else outs[index])
+            self.reduce_scatter(
+                value,
+                out=None if outs is None else outs[index],
+                validate_signature=validate_signature,
+            )
             for index, value in enumerate(values)
         )
         return results
@@ -674,6 +679,7 @@ class TorchDistributedDeterministicCollective:
         inputs: tuple[torch.Tensor, ...] | list[torch.Tensor],
         *,
         outs: tuple[torch.Tensor, ...] | list[torch.Tensor] | None = None,
+        validate_signature: bool = True,
     ) -> tuple[torch.Tensor, ...]:
         """Reduce-scatter independent tensors in one fixed-tree collective.
 
@@ -696,6 +702,7 @@ class TorchDistributedDeterministicCollective:
                 self.reduce_scatter(
                     values[0],
                     out=None if outs is None else outs[0],
+                    validate_signature=validate_signature,
                 ),
             )
 
@@ -749,10 +756,11 @@ class TorchDistributedDeterministicCollective:
             )
             with self._lock:
                 self._check_open()
-                self._validate_matching_signature(
-                    f"reduce_scatter_many:{lane_sizes}",
-                    first,
-                )
+                if validate_signature:
+                    self._validate_matching_signature(
+                        f"reduce_scatter_many:{lane_sizes}",
+                        first,
+                    )
                 if self._direct_reduce_scatter_many(values, direct_outputs):
                     return direct_outputs
 
@@ -765,6 +773,7 @@ class TorchDistributedDeterministicCollective:
                 self.reduce_scatter(
                     value,
                     out=None if outs is None else outs[index],
+                    validate_signature=validate_signature,
                 )
                 for index, value in enumerate(values)
             )
@@ -786,10 +795,11 @@ class TorchDistributedDeterministicCollective:
             # alone do not guarantee that every rank will split the result the
             # same way, which could silently associate gradients with the
             # wrong lane.
-            self._validate_matching_signature(
-                f"reduce_scatter_many:{lane_sizes}",
-                packed,
-            )
+            if validate_signature:
+                self._validate_matching_signature(
+                    f"reduce_scatter_many:{lane_sizes}",
+                    packed,
+                )
             if self._direct_reduce_scatter(packed, packed_out):
                 pieces = tuple(packed_out.split(tuple(value.size(-1) for value in values), dim=-1))
                 if outs is None:
@@ -1228,8 +1238,9 @@ def create_deterministic_collective(
 
     CUDA uses the native ``DeterministicCollective`` implementation. ROCm uses
     HIP IPC or RCCL for rank-ordered transport while preserving the fixed local
-    reduction tree. The returned object has independent ownership; callers may
-    cache it and must close an entry before replacing it.
+    reduction tree. The returned object has independent ownership. Shared caches
+    may replace an entry without closing it immediately because active autograd
+    contexts can retain the previous instance until their work completes.
     """
 
     if getattr(torch.version, "hip", None) is not None:
@@ -1279,6 +1290,9 @@ def collective_for_group(
     cached = _COLLECTIVES.get(key)
     if cached is not None and cached.max_size_bytes >= min_size_bytes:
         return cached
+    # Borrowers such as Attention autograd contexts can outlive this cache
+    # entry. Replacing an undersized entry must not invalidate those live
+    # references; normal Python ownership closes it after the last borrower.
 
     collective = create_deterministic_collective(
         group=group,

@@ -295,6 +295,81 @@ def test_forward_matches_balanced_contiguous_k_shards_bitwise(tp_size):
     )
 
 
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (128, 128, 128),  # aligned SM90 path
+        (31, 128, 128),  # SM90 M padding
+        (31, 70, 65),  # scalar fallback
+    ],
+)
+def test_rhs_transposed_layout_matches_legacy_forward_bitwise(shape):
+    torch.manual_seed(20)
+    M, K, N = shape
+    a = _rand(M, K)
+    bt = _rand(N, K)
+
+    expected = _C.det_gemm_fwd(a, bt.t().contiguous())
+    actual = _C.det_gemm_fwd_rhs_transposed(a, bt)
+
+    assert actual.is_contiguous()
+    assert tuple(actual.shape) == (M, N)
+    assert torch.equal(actual, expected)
+
+
+def test_rhs_transposed_materializes_unaligned_contiguous_view_for_tma():
+    torch.manual_seed(23)
+    M, K, N = 128, 128, 128
+    a = _rand(M, K)
+    storage = _rand(N * K + 1)
+    bt = storage[1:].view(N, K)
+    assert bt.is_contiguous()
+    assert bt.data_ptr() % 16 != 0
+
+    expected = _C.det_gemm_fwd(a, bt.t().contiguous())
+    actual = _C.det_gemm_fwd_rhs_transposed(a, bt)
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 128, 128),  # short-K tiled backward path
+        (8, 128, 128),  # short-K tiled backward path
+        (128, 128, 128),  # aligned SM90 path
+        (128, 96, 64),  # SM90 logical-M padding and dim-1 crop
+        (31, 70, 65),  # scalar fallback
+    ],
+)
+def test_transposed_db_is_bitwise_and_canonical_contiguous(shape):
+    torch.manual_seed(21)
+    tokens, in_features, out_features = shape
+    a = _rand(tokens, in_features)
+    dc = _rand(tokens, out_features)
+
+    expected = _C.det_gemm_db(a, dc).t().contiguous()
+    actual = _C.det_gemm_db_transposed(a, dc)
+
+    assert tuple(actual.shape) == (out_features, in_features)
+    assert tuple(actual.stride()) == (in_features, 1)
+    assert actual.is_contiguous()
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("shape", [(128, 128, 128), (31, 70, 65)])
+def test_da_physical_transpose_contract_matches_legacy_path_bitwise(shape):
+    torch.manual_seed(22)
+    M, K, N = shape
+    dc = _rand(M, N)
+    b = _rand(K, N)
+
+    expected = _C.det_gemm_fwd(dc, b.t().contiguous())
+    actual = _C.det_gemm_da(dc, b)
+
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize("name,gemm", _BACKENDS)
 def test_forward_batch_invariance(name, gemm):
     # A row's output must not change when other rows join the batch.

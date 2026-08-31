@@ -257,6 +257,9 @@ class AttentionCPCommunicationPlan:
                 if self.backend == "rccl_ag_rs"
                 else "nccl" if self.backend in {"cuda_ag_rs", "p2p_nccl_reference"} else "local"
             ),
+            # The ROCm path intentionally transports tensors and performs the
+            # arithmetic in the deterministic core; only the CUDA IPC path
+            # owns a numeric collective reduction kernel.
             "cp_comm_attention_numeric_reduction": self.backend == "cuda_ag_rs",
             "cp_comm_expected_kv_token_range": (
                 None if self.expected_kv_token_range is None else list(self.expected_kv_token_range)
@@ -356,6 +359,8 @@ class _RootReduceScatterSequence(torch.autograd.Function):
         ctx.full_shape = tuple(packed.shape)
         if ctx.rank != ctx.root:
             packed = torch.zeros_like(packed)
+        # The ROCm transport adapter exposes an explicit root-owned scatter;
+        # CUDA's IPC collective keeps the historical reduce_scatter entrypoint.
         scatter = getattr(collective, "scatter", None)
         local = scatter(packed) if callable(scatter) else collective.reduce_scatter(packed)
         return local.movedim(0, ctx.sequence_dim).contiguous()
@@ -376,6 +381,7 @@ class CUDAAGRSAttentionCPCommunication:
     """Deterministic CUDA AG/RS adapter backed by PR311/PR312."""
 
     backend_id = "cuda_ag_rs"
+    collective_label = "self-owned CUDA AG/RS"
     supports_autograd = True
 
     def __init__(self, *, process_group: Any = None, collective: Any = None) -> None:
@@ -389,7 +395,7 @@ class CUDAAGRSAttentionCPCommunication:
             from rl_engine.distributed.collectives import collective_for_group
         except ImportError as exc:
             raise AttentionCPCommunicationUnavailable(
-                "self-owned CUDA AG/RS requires PR311/PR312 DeterministicCollective"
+                f"{self.collective_label} requires PR311/PR312 DeterministicCollective"
             ) from exc
         try:
             dist = self._dist()
@@ -402,7 +408,7 @@ class CUDAAGRSAttentionCPCommunication:
                 raise RuntimeError("the CP process group is unavailable")
         except (RuntimeError, ValueError, TypeError) as exc:
             raise AttentionCPCommunicationUnavailable(
-                f"self-owned CUDA AG/RS is unavailable: {exc}"
+                f"{self.collective_label} is unavailable: {exc}"
             ) from exc
         if self._collective.world_size != plan.parallel.cp_world_size:
             raise AttentionCPCommunicationUnavailable(
@@ -584,7 +590,7 @@ class CUDAAGRSAttentionCPCommunication:
 
 
 class _RCCLRankOrderedTransport:
-    """RCCL transport with rank-ordered AG and root-owned scatter.
+    """RCCL transport with rank-ordered all-gather and root-owned scatter.
 
     The scatter half deliberately performs no floating-point reduction. The
     strict Attention arithmetic remains entirely in the deterministic core.
@@ -683,6 +689,7 @@ class RCCLAGRSAttentionCPCommunication(CUDAAGRSAttentionCPCommunication):
     """ROCm AG/RS adapter using RCCL only as rank-ordered tensor transport."""
 
     backend_id = "rccl_ag_rs"
+    collective_label = "self-owned RCCL AG/RS"
     supports_autograd = True
     transport_only = True
     supports_async_overlap = False

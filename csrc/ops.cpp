@@ -93,8 +93,9 @@ torch::Tensor deterministic_logp_forward_fp32(torch::Tensor logits, torch::Tenso
 torch::Tensor deterministic_logp_forward_indexed_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices, torch::Tensor output);
 torch::Tensor deterministic_logp_forward_indexed_fp32(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices);
 
-#if !defined(USE_ROCM)
-// Single-node TP=8 deterministic CUDA collectives.
+#if !defined(USE_ROCM) && !defined(KERNEL_ALIGN_WITH_ROCM)
+// Single-node TP=8 deterministic CUDA IPC collectives. ROCm uses the
+// rank-ordered RCCL transport in rl_engine.distributed.collectives.
 std::tuple<std::vector<int64_t>, int64_t> deterministic_collective_ipc_meta(
     torch::Tensor& tensor);
 int64_t deterministic_collective_create(
@@ -483,8 +484,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deterministic_logp_forward_indexed_out", &deterministic_logp_forward_indexed_out, "Batch-invariant deterministic logp indexed out");
     m.def("deterministic_logp_forward_indexed_fp32", &deterministic_logp_forward_indexed_fp32, "Batch-invariant deterministic logp indexed fp32");
 
-#if !defined(USE_ROCM)
-    // Single-node TP=8 fixed-tree CUDA collectives.
+#if !defined(USE_ROCM) && !defined(KERNEL_ALIGN_WITH_ROCM)
+    // Single-node TP=8 fixed-tree CUDA IPC collectives. ROCm dispatches to
+    // the Python RCCL transport implementation instead.
     m.def(
         "deterministic_collective_ipc_meta",
         &deterministic_collective_ipc_meta,
@@ -521,9 +523,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "deterministic_collective_all_gather_fused",
         &deterministic_collective_all_gather_fused,
         "Run a fused small-message deterministic rank-ordered all-gather");
-
-    // registry Prefix-Shared Attention
-    m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
 #endif
 
 #if defined(KERNEL_ALIGN_WITH_ROCM)
@@ -574,6 +573,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deterministic_collective_rocm_ipc_all_gather_input",
           &deterministic_collective_rocm_ipc_all_gather_input,
           "Stage and run a direct ROCm IPC rank-ordered all-gather");
+#endif
+
+#if !defined(USE_ROCM)
+    // Prefix-shared attention uses NVIDIA PTX; the declaration above carries the
+    // same guard, so the registration must repeat it or a ROCm build fails on an
+    // undeclared identifier.
+    m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
 #endif
 
     // registry Batch-Invariant Deterministic GEMM

@@ -1927,6 +1927,7 @@ __all__ = [
     "AttentionPartialState",
     "AttentionRingBlock",
     "AttentionRingSchedule",
+    "AttentionSavedForwardState",
     "build_reference_split_kv_runtime_plan_set",
     "CPAttentionReferenceOp",
     "DeterministicAttentionCore",

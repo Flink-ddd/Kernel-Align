@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""PR7 FlashInfer RoPE-fused paged attention validation entry point.
+"""PR7 strict paged-layout Attention validation entry point.
 
-The default dry-run mode is CI/local friendly: it builds the FlashInfer page plan
-and provenance without importing FlashInfer or requiring CUDA.  On a CUDA host
-with FlashInfer installed, omit ``--dry-run`` to run the opt-in PR7 candidate and
-compare it with the PR6 full logical KV reference.
+The default dry-run mode is CI/local friendly: it builds the paged-KV plan and
+provenance without requiring a GPU vendor backend. On a GPU host, omit
+``--dry-run`` to run the platform production core and its strict reference.
 """
 
 from __future__ import annotations
@@ -70,7 +69,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report: dict[str, Any] = {
         "status": "dry_run" if args.dry_run else "executed",
         "pr": "PR7",
-        "target": "Qwen3-8B TP-local FlashInfer candidate; CP transport validated separately",
+        "target": "Qwen3-8B TP-local paged Attention; CP transport validated separately",
         "mode": config.mode,
         "device": str(device),
         "shape": {
@@ -99,11 +98,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         | {"cp_comm_required": config.require_cp_comm},
         "paged_kv_plan": plan.provenance(),
         "tests_expected": [
-            "FlashInfer ROPE_LLAMA vs NativeRoPEOp + full logical KV reference",
+            "platform production core vs direct same-core reference",
             "split-K disabled/fixed policy drift",
             "batch composition/position invariant sweep",
             "attention-domain LSE export drift",
-            "strict shared CUDA core with separate multi-rank AG/RS forward/backward evidence",
+            "strict platform core with separate multi-rank AG/RS forward/backward evidence",
         ],
         "thresholds": {
             "out_max_abs": args.out_atol,
@@ -153,7 +152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     pytorch_reference = run_decode_full_prefill_reference(reference_inputs)
     reference = (
-        _run_strict_cuda_reference(inputs, config, plan)
+        _run_strict_platform_reference(inputs, config, plan)
         if config.strict_mode
         else pytorch_reference
     )
@@ -181,12 +180,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "lse": lse_stats,
         "dlogp": dlogp_stats,
     }
-    report["reference_backend"] = (
-        "rlkernel.cuda.deterministic_attention"
-        if config.strict_mode
-        else "rlkernel.pytorch.full_logical_kv_reference"
-    )
+    report["reference_backend"] = "rlkernel.pytorch.full_logical_kv_reference"
     if config.strict_mode:
+        report.update(_strict_execution_report_fields(candidate.provenance))
         report["diagnostic_drift_vs_pytorch"] = {
             "out": _drift_stats(candidate.out, pytorch_reference.out),
             "lse": _drift_stats(candidate.lse, pytorch_reference.lse),
@@ -392,7 +388,7 @@ def _make_inputs(args: argparse.Namespace, device: torch.device) -> DecodeAttent
     return DecodeAttentionInputs(q=q, k_cache=k_cache, v_cache=v_cache, metadata=metadata)
 
 
-def _run_strict_cuda_reference(
+def _run_strict_platform_reference(
     inputs: DecodeAttentionInputs,
     config: FlashInferPagedAttentionConfig,
     paged_plan: Any,
@@ -439,6 +435,28 @@ def _run_strict_cuda_reference(
             "split_kv_policy": "disabled",
         },
     )
+
+
+def _strict_execution_report_fields(provenance: dict[str, Any]) -> dict[str, Any]:
+    """Describe the backend that actually executed, independent of the host running tests."""
+
+    backend = provenance.get("actual_backend", "unknown")
+    return {
+        "target": (
+            f"Qwen3-8B TP-local {backend} strict production core; "
+            "CP transport validated separately"
+        ),
+        "reference_backend": backend,
+        "rope": {
+            "rope_backend": provenance.get("rope_backend"),
+            "rope_fusion": provenance.get("rope_fusion"),
+            "rope_fusion_boundary": provenance.get("rope_fusion_boundary"),
+            "rope_theta": provenance.get("rope_theta"),
+            "rotary_dim": provenance.get("rotary_dim"),
+            "q_rope_state": provenance.get("q_rope_state"),
+            "k_cache_rope_state": provenance.get("k_cache_rope_state"),
+        },
+    }
 
 
 def _run_batch_invariance_sweep(

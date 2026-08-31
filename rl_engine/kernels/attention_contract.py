@@ -11,6 +11,8 @@ an incompatible backend before any numerically different path is launched.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable, TypeVar
@@ -19,6 +21,9 @@ _EnumT = TypeVar("_EnumT", bound=Enum)
 
 
 # Stable identities for Attention arithmetic shared by training and rollout.
+# The FA4 core is the strict production path on CUDA; AITER/CK dense MHA is its
+# ROCm counterpart. The materializing RL-Kernel core remains available as an
+# explicit reference and capability-gap fallback.
 STRICT_ATTENTION_PRODUCTION_CORE_ID = "rlkernel.attention.flash_attention4.num_splits1.v1"
 STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID = "rlkernel.attention.rocm.aiter_ck_dense_mha.v1"
 STRICT_ATTENTION_REFERENCE_CORE_ID = "rlkernel.attention.deterministic_core.v1"
@@ -592,6 +597,61 @@ def validate_split_kv_alignment(
         raise AttentionContractError(
             "training/rollout Split-KV execution plans differ: " + ", ".join(mismatches)
         )
+
+
+# What a bitwise cross-config comparison actually requires.
+#
+# TP degree and batch size are deliberately absent.  The qualified ROCm vendor
+# core (AITER/CK dense MHA) has a launch-shape-dependent reduction order, so
+# both would otherwise change the bits.  Measured on MI300X (BF16, Hq=32/
+# Hkv=8/D=128, causal), raw AITER differs by up to 1.5625e-02 between a batch
+# and its rows submitted singly, and by up to 7.8125e-03 between TP degrees.
+# The Vime provider removes the dependence by pinning every launch to one batch
+# row and one KV group, at roughly 3x forward time, so a head shard's result no
+# longer depends on the batch size or TP degree that produced it.  Requiring
+# those to match would therefore reject comparisons that are in fact bitwise
+# equal.  What remains here is the set that genuinely changes the arithmetic.
+CROSS_CONFIG_BOUND_FIELDS = ("dtype", "head_dim", "causal", "export_lse")
+
+
+def validate_cross_config_alignment(
+    training: "AttentionContract",
+    rollout: "AttentionContract",
+) -> None:
+    """Fail closed unless both sides describe one comparable attention invocation.
+
+    Names the field that diverged, so a cross-config drift investigation does
+    not start from one opaque fingerprint mismatch.
+    """
+
+    if not isinstance(training, AttentionContract) or not isinstance(rollout, AttentionContract):
+        raise AttentionContractError("both sides must be AttentionContract instances")
+
+    layout_mismatches = [
+        name
+        for name in ("global_q_heads", "global_kv_heads")
+        if getattr(training.sharding, name) != getattr(rollout.sharding, name)
+    ]
+    if layout_mismatches:
+        raise AttentionContractError(
+            "training and rollout describe different global head layouts: "
+            + ", ".join(layout_mismatches)
+        )
+
+    scalar_mismatches = [
+        name
+        for name in CROSS_CONFIG_BOUND_FIELDS
+        if getattr(training, name) != getattr(rollout, name)
+    ]
+    if scalar_mismatches:
+        raise AttentionContractError(
+            "training and rollout attention contracts differ: " + ", ".join(scalar_mismatches)
+        )
+
+    if training.split_kv != rollout.split_kv:
+        raise AttentionContractError("training and rollout Split-KV policies differ")
+    if training.reduction != rollout.reduction:
+        raise AttentionContractError("training and rollout reduction specs differ")
 
 
 @dataclass(frozen=True, order=True)
@@ -1504,6 +1564,41 @@ class AttentionContract:
             "projections": projections,
         }
 
+    def cross_rank_fingerprint(self) -> str:
+        """Rank-independent identity for preflight agreement across ranks.
+
+        Excludes ``tp_rank``/``cp_rank`` and the local head/sequence bounds they
+        derive, so every rank of one logical attention invocation computes the
+        same value.  All-gathering this fingerprint together with the resolved
+        backend id and aborting on mismatch is the documented preflight for
+        distributed dispatch; ``requested_backend="auto"`` is not
+        distributed-safe without it.
+        """
+
+        payload = self.to_dict()
+        payload["sharding"] = {
+            key: value
+            for key, value in payload["sharding"].items()
+            if key
+            not in {
+                "tp_rank",
+                "cp_rank",
+                "local_q_head_start",
+                "local_q_heads",
+                "local_kv_head_start",
+                "local_kv_heads",
+                "local_sequence_length",
+                "global_block_indices",
+                "global_block_token_starts",
+                "local_block_offsets",
+            }
+        }
+        # Note: Any future extensions to this payload MUST maintain strict JSON
+        # serialization determinism across environments to prevent cross-rank
+        # hashing mismatches.
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
 
 @dataclass(frozen=True)
 class AttentionBackendCapability:
@@ -1687,6 +1782,8 @@ __all__ = [
     "STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID",
     "STRICT_ATTENTION_ROCM_SCHEDULE_ID",
     "STRICT_ATTENTION_SCHEDULE_ID",
+    "CROSS_CONFIG_BOUND_FIELDS",
+    "validate_cross_config_alignment",
     "validate_split_kv_alignment",
     "validate_split_kv_plan_set_alignment",
 ]

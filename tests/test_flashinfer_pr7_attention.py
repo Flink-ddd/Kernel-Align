@@ -1809,6 +1809,74 @@ def test_pr7_check_accepts_strict_rocm_production_core():
     assert check_script._acceptance_errors(report, args) == []
 
 
+def test_pr7_check_rejects_reference_core_as_production():
+    args = check_script._parse_args(["--strict", "--device", "cuda"])
+    report = {
+        "device": "cuda:0",
+        "shape": {"q_heads": 16, "kv_heads": 4, "head_dim": 128},
+        "candidate_provenance": {
+            "attention_mode": "decode",
+            "fallback": False,
+            "strict_mode": True,
+            "strict_core_id": STRICT_ATTENTION_CORE_ID,
+            "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
+            "actual_backend": "rlkernel.cuda.deterministic_attention",
+            "native_attention_arithmetic": False,
+            "reference_only": True,
+            "strict_core_row_plans": [{"actual_split_kv_policy": "disabled"}],
+            "rope_backend": "rlkernel.cuda.rope_sm90",
+            "rope_theta": 1_000_000.0,
+            "rotary_dim": 128,
+            "arithmetic_semantics_verified": True,
+        },
+        "drift": {
+            "out": {"max_abs": 0.0},
+            "lse": {"max_abs": 0.0},
+            "dlogp": {"max_abs": 0.0},
+        },
+        "batch_invariant_sweep": {"passed": True},
+        "page_layout_invariant_sweep": {"passed": True},
+    }
+
+    errors = check_script._acceptance_errors(report, args)
+    assert "strict runtime did not execute the native production arithmetic" in errors
+    assert "strict runtime selected the reference core" in errors
+
+
+@pytest.mark.parametrize(
+    ("backend", "rope_backend"),
+    [
+        ("flash_attention_4.cute", "rlkernel.cuda.rope_sm90"),
+        ("aiter.rocm.ck_dense_mha", "rlkernel.rocm.deterministic_rope"),
+    ],
+)
+def test_strict_report_uses_executed_platform_provenance(backend, rope_backend):
+    fields = check_script._strict_execution_report_fields(
+        {
+            "actual_backend": backend,
+            "rope_backend": rope_backend,
+            "rope_fusion": False,
+            "rope_fusion_boundary": "rlkernel_rope_then_attention",
+            "rope_theta": 1_000_000.0,
+            "rotary_dim": 128,
+            "q_rope_state": "post_rope",
+            "k_cache_rope_state": "post_rope",
+        }
+    )
+
+    assert fields["reference_backend"] == backend
+    assert backend in fields["target"]
+    assert fields["rope"] == {
+        "rope_backend": rope_backend,
+        "rope_fusion": False,
+        "rope_fusion_boundary": "rlkernel_rope_then_attention",
+        "rope_theta": 1_000_000.0,
+        "rotary_dim": 128,
+        "q_rope_state": "post_rope",
+        "k_cache_rope_state": "post_rope",
+    }
+
+
 def test_pr7_check_rejects_nonfinite_drift_and_wrong_tp_local_shape():
     args = check_script._parse_args([])
     report = {
@@ -1866,6 +1934,41 @@ def test_strict_shared_core_entrypoint_requires_self_owned_ag_rs():
 
     args = p2p_check_script.parse_args(["--transport", "cuda_ag_rs", "--strict-shared-core"])
     assert args.strict_shared_core is True
+
+
+def test_strict_shared_core_reference_executes_one_logical_row(monkeypatch):
+    calls = []
+
+    class _RowCore:
+        def forward_with_lse(self, q, k, v, **kwargs):
+            calls.append((q.shape[0], kwargs["query_position_ids"].clone()))
+            return types.SimpleNamespace(
+                out=q + k + v,
+                lse=(q + k).sum(dim=-1),
+            )
+
+    monkeypatch.setattr(p2p_check_script, "_strict_attention_core", _RowCore)
+    q = torch.randn(2, 1, 3, 4, requires_grad=True)
+    k = torch.randn(2, 1, 3, 4, requires_grad=True)
+    v = torch.randn(2, 1, 3, 4, requires_grad=True)
+    positions = torch.arange(3).expand(2, -1)
+
+    result = p2p_check_script._strict_attention_reference_rows(
+        q,
+        k,
+        v,
+        positions=positions,
+        output_dtype=q.dtype,
+    )
+
+    assert [batch for batch, _positions in calls] == [1, 1]
+    assert [item.tolist() for _batch, item in calls] == [[[0, 1, 2]], [[0, 1, 2]]]
+    assert torch.equal(result.out, q + k + v)
+    assert torch.equal(result.lse, (q + k).sum(dim=-1))
+    (result.out.sum() + result.lse.sum()).backward()
+    assert q.grad is not None
+    assert k.grad is not None
+    assert v.grad is not None
 
 
 def _strict_acceptance_provenance(**overrides):
@@ -2105,6 +2208,10 @@ def test_fa4_core_bshd_entrypoint_preserves_framework_layout(monkeypatch):
     assert result.lse.dtype is torch.float32
 
 
+# FA4 is the CUDA production core. On ROCm the strict default correctly resolves
+# to the AITER CK core instead, so the StrictFlashAttention4Core monkeypatch below
+# is never consulted and the assertions cannot hold there.
+@pytest.mark.cuda_only
 def test_strict_paged_default_selects_fa4_production_core(monkeypatch):
     core = _RecordingStrictCore()
     core.core_id = STRICT_ATTENTION_PRODUCTION_CORE_ID
