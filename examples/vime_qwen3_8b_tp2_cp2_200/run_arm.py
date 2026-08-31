@@ -256,7 +256,6 @@ def main(argv: list[str] | None = None) -> int:
         "LD_LIBRARY_PATH": args.ld_library_path,
         "PYTHONUNBUFFERED": "1",
         "PYTHONHASHSEED": str(args.seed),
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         "NCCL_ALGO": "Ring",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
@@ -450,7 +449,6 @@ def main(argv: list[str] | None = None) -> int:
             "recompute_granularity": "full",
             "recompute_method": "uniform",
             "recompute_num_layers": 1,
-            "pytorch_cuda_alloc_conf": "expandable_segments:True",
         },
         "vllm_execution": {
             "cudagraph_required": True,

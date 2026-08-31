@@ -303,7 +303,6 @@ def validate_run(run_dir: Path) -> dict[str, Any]:
         "recompute_granularity": "full",
         "recompute_method": "uniform",
         "recompute_num_layers": 1,
-        "pytorch_cuda_alloc_conf": "expandable_segments:True",
     }
     if manifest.get("training_memory") != expected_recompute:
         global_errors.append(

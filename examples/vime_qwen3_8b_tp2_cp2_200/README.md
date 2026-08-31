@@ -39,7 +39,8 @@ metrics.
 - NVIDIA H100 × 8; actor GPUs 4; rollout GPUs 4; TP=2; CP=2; PP=1.
 - GRPO, BF16, `top_p=1.0`, temperature 1, no dropout, fixed training and rollout seeds.
 - A 4096-token response budget with full uniform activation recomputation
-  (`recompute-num-layers=1`) and expandable CUDA allocator segments.
+  (`recompute-num-layers=1`). Do not enable expandable CUDA allocator segments:
+  deterministic TP collectives require CUDA IPC-capable staging allocations.
 - vLLM CUDA Graph mode `FULL_DECODE_ONLY`, not eager, with exact capture sizes
   `1..(rollout_batch_size × n_samples_per_prompt)`.
 - Megatron and vLLM readbacks for Attention, FFN, and logp, with positive call
