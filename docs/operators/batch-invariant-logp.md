@@ -54,6 +54,62 @@ CUDA priority list when the extension exposes `_C.batch_invariant_logp_sm90`
 (built with `KERNEL_ALIGN_FORCE_SM90=1`) on an SM90 device. On any other build
 or device, dispatch is unchanged (Triton -> PyTorch).
 
+## Tensor Parallel
+
+`VocabParallelLogprobOp`
+(`rl_engine/kernels/ops/pytorch/loss/vocab_parallel_logp.py`)
+**TP=1, TP=2, and TP=4 produce bit-identical results.**
+
+The backends above are single-shard (TP=1) references and do not yet export vocab-domain
+LSE or carry vocab-shard metadata, so they are declared incompatible with strict WS2
+requests instead of being selected as a silent fallback. The contract objects are
+documented in `rl_engine.kernels.logprob_contract`.
+
+The TP-aware implementation uses the following fixed-order construction:
+
+1. Split the padded vocabulary into `num_vocab_tiles` fixed tiles.
+2. Each rank computes fp32 `(max, sumexp)` for the tiles it owns. Every tile
+   is reduced as the same contiguous `[n, tile]` shape, on any rank.
+3. All tile partials are shared with `all_gather`. The collective only moves
+   bytes; it never does math, so it cannot round anything.
+4. Every rank merges all tiles in the same fixed order, over the same
+   `[n, num_vocab_tiles]` shape. `LSE = M + log(sum(s_t * exp(m_t - M)))`.
+5. The target logit is copied from the rank that owns it (never summed).
+6. `logp = target_logit - LSE`. Inactive rows become `0.0`.
+
+Usage goes through the contract-aware entry point:
+
+```python
+from rl_engine.kernels.registry import kernel_registry
+
+result = kernel_registry.get_logprob_op(contract)   # LogprobContract from
+op = result.op                                      # rl_engine.kernels.logprob_contract
+logp, lse = op(local_logits, target_ids, contract=contract, tp_group=tp_group)
+```
+
+### Vime CP=2 runtime provider
+
+The optional Vime adapter is owned by RL-Kernel and can be selected without
+patching Megatron or vLLM:
+
+```text
+--linear-logp-provider rl_engine.integrations.vime.linear_logp_provider.provider
+--linear-logp-provider-mode strict
+```
+
+Vime passes the local `[T, V_local]` logits, shifted targets, TP subgroup,
+and CP row-ownership metadata. The provider builds the same `LogprobContract`
+used by the distributed report, dispatches the explicit
+`pytorch-vocab-parallel-logp-ws2` backend, and returns selected logp as `[T, 1]`.
+When entropy is requested, it uses the same fixed TP-rank order and returns
+full-vocabulary entropy for the existing loss surface. CP rank/layout are
+recorded in provenance and never participate in the vocabulary LSE merge.
+
+The provider fails closed for undeclared real/padded vocabulary sizes, TP/CP
+metadata mismatches, unsupported top-p replay masks, and backend fallback.
+`auto` mode may then use Vime's native path; `strict` mode reports the
+configuration error. This adapter does not import Vime.
+
 ## Benchmarks
 
 `benchmarks/benchmark_batch_invariant_logp.py` compares Native, Triton, and the
@@ -224,3 +280,6 @@ WSL/Linux with CUDA.
 - `rl_engine/kernels/registry.py`
 - `tests/test_batch_invariant_logp.py`
 - `benchmarks/benchmark_batch_invariant_logp.py`
+- `rl_engine/kernels/ops/pytorch/loss/vocab_parallel_logp.py`
+- `rl_engine/kernels/logprob_contract.py`
+- `tests/test_vocab_parallel_logp.py`

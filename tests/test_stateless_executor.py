@@ -172,6 +172,90 @@ def test_executor_runs_full_sequence_forward_with_use_cache_false_and_detaches_o
     assert not hasattr(model.generation_config, "attn_implementation")
 
 
+def test_executor_exact_selected_logprob_callable_is_optional_and_injected():
+    inputs = _inputs()
+    logits = _logits_for(inputs)
+    calls = []
+
+    def selected_logprob_fn(
+        shifted_logits,
+        shifted_labels,
+        *,
+        mask,
+        temperature,
+        output_dtype,
+    ):
+        calls.append((shifted_logits, shifted_labels, mask, temperature, output_dtype))
+        reference = selected_logprobs_reference(
+            shifted_logits,
+            shifted_labels,
+            mask=mask,
+            temperature=temperature,
+            output_dtype=output_dtype,
+        )
+        return reference + mask.to(dtype=output_dtype) * 0.25
+
+    default = StatelessForwardExecutor(
+        FakeReferenceModel(logits),
+        StatelessForwardConfig(mode="reference"),
+    ).score(inputs)
+    injected = StatelessForwardExecutor(
+        FakeReferenceModel(logits),
+        StatelessForwardConfig(mode="reference"),
+        selected_logprob_fn=selected_logprob_fn,
+    ).score(inputs)
+
+    assert default.reference_logps is not None
+    assert injected.reference_logps is not None
+    assert len(calls) == 1
+    assert torch.equal(calls[0][2], inputs.completion_mask[:, 1:])
+    torch.testing.assert_close(
+        injected.reference_logps[inputs.completion_mask],
+        default.reference_logps[inputs.completion_mask] + 0.25,
+    )
+    assert torch.equal(
+        injected.reference_logps[~inputs.completion_mask],
+        torch.zeros_like(injected.reference_logps[~inputs.completion_mask]),
+    )
+
+
+def test_executor_uses_eval_no_grad_and_restores_mixed_module_modes_read_only():
+    inputs = _inputs()
+
+    class ReadOnlyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(2.0))
+            self.register_buffer("counter", torch.tensor(3.0))
+            self.child = torch.nn.Linear(1, 1)
+
+        def forward(self, input_ids, attention_mask=None, use_cache=None):
+            del attention_mask
+            assert self.training is False
+            assert self.child.training is False
+            assert torch.is_grad_enabled() is False
+            assert use_cache is False
+            batch, sequence = input_ids.shape
+            logits = torch.zeros(batch, sequence, 8)
+            return {"logits": logits + self.weight * 0.0 + self.counter * 0.0}
+
+    model = ReadOnlyModel()
+    model.train()
+    model.child.eval()
+    state_before = {name: value.detach().clone() for name, value in model.state_dict().items()}
+
+    result = StatelessForwardExecutor(
+        model,
+        StatelessForwardConfig(mode="reference", attention_backend="eager"),
+    ).score(inputs)
+
+    assert result.reference_logps is not None
+    assert result.metrics["model_eval_during_forward"] is True
+    assert model.training is True
+    assert model.child.training is False
+    assert all(torch.equal(state_before[name], value) for name, value in model.state_dict().items())
+
+
 def test_executor_falls_back_for_models_without_use_cache_argument():
     inputs = _inputs()
     executor = StatelessForwardExecutor(

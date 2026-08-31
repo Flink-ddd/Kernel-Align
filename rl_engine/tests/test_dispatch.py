@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
+import sys
+from types import ModuleType
+
+import pytest
 import torch
 
+import rl_engine.platforms.device as device_module
 from rl_engine.executors.rollout import RolloutExecutor
 from rl_engine.kernels.registry import KernelRegistry, OpBackend, kernel_registry
 from rl_engine.platforms.device import device_ctx
@@ -42,6 +47,81 @@ def test_rocm_attention_native_sdpa_opt_out(monkeypatch):
     assert registry._priority_map["rocm"]["attn"][1] == OpBackend.ROCM_FLASH_ATTN
 
 
+class TestMusaPlatform:
+    @staticmethod
+    def _mock_torch_musa_import(monkeypatch):
+        monkeypatch.setattr(
+            device_module.importlib,
+            "import_module",
+            lambda name: object() if name == "torch_musa" else None,
+        )
+
+    @staticmethod
+    def _mock_musa_device(monkeypatch):
+        real_device = device_module.torch.device
+
+        class FakeMusaDevice:
+            type = "musa"
+
+        def fake_device(value):
+            if value == "musa":
+                return FakeMusaDevice()
+            return real_device(value)
+
+        monkeypatch.setattr(device_module.torch, "device", fake_device)
+
+    def test_musa_import_failure_falls_back_to_unavailable(self, monkeypatch):
+        def failing_import(name):
+            if name == "torch_musa":
+                raise RuntimeError("incompatible torch_musa installation")
+
+        monkeypatch.setattr(device_module.importlib, "import_module", failing_import)
+
+        assert device_module.is_musa_available() is False
+
+    def test_musa_runtime_failure_falls_back_to_unavailable(self, monkeypatch):
+        class FailingMusaRuntime:
+            @staticmethod
+            def is_available():
+                raise RuntimeError("driver failure")
+
+        self._mock_torch_musa_import(monkeypatch)
+        monkeypatch.setattr(device_module.torch, "musa", FailingMusaRuntime(), raising=False)
+
+        assert device_module.is_musa_available() is False
+
+    def test_musa_device_context_selects_musa(self, monkeypatch):
+        class AvailableMusaRuntime:
+            @staticmethod
+            def is_available():
+                return True
+
+        self._mock_torch_musa_import(monkeypatch)
+        self._mock_musa_device(monkeypatch)
+        monkeypatch.setattr(device_module.torch, "musa", AvailableMusaRuntime(), raising=False)
+
+        context = device_module.DeviceContext()
+
+        assert context.device_type == "musa"
+        assert context.is_musa is True
+        assert context.device.type == "musa"
+
+    def test_musa_dispatch_uses_only_pytorch_fallbacks(self, monkeypatch):
+        self._mock_musa_device(monkeypatch)
+        registry = KernelRegistry()
+
+        assert registry._platform_for_device("musa") == "musa"
+        for candidates in registry._priority_map["musa"].values():
+            assert all(candidate.name.startswith("PYTORCH_") for candidate in candidates)
+
+    def test_musa_det_gemm_fails_closed(self, monkeypatch):
+        self._mock_musa_device(monkeypatch)
+        registry = KernelRegistry()
+
+        with pytest.raises(RuntimeError, match="No functional backend"):
+            registry.get_op("det_gemm", device="musa")
+
+
 def test_registry_explicit_device_selects_device_platform(monkeypatch):
     registry = KernelRegistry()
     loaded = []
@@ -62,6 +142,42 @@ def test_registry_explicit_device_selects_device_platform(monkeypatch):
         OpBackend.ROCM_AITER if torch.version.hip is not None else OpBackend.CUDA_FUSED_LOGP_GENERIC
     )
     assert loaded[0] == expected
+
+
+def test_npu_registry_preserves_per_operator_cpu_fallbacks(monkeypatch):
+    registry = KernelRegistry()
+    loaded = []
+
+    class DummyOp:
+        pass
+
+    def fake_load_backend(backend):
+        loaded.append(backend)
+        return DummyOp
+
+    monkeypatch.setattr(registry, "_load_backend", fake_load_backend)
+    monkeypatch.setattr(device_ctx, "device_type", "npu")
+
+    registry.get_op("rms_norm")
+
+    assert registry._priority_map["npu"].keys() == registry._priority_map["cpu"].keys()
+    assert loaded[0] == OpBackend.PYTORCH_NATIVE_RMS_NORM
+    assert registry._priority_map["npu"]["batch_invariant_logp"] == [
+        OpBackend.ASCEND_BATCH_INVARIANT_LOGP,
+        OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
+    ]
+
+
+def test_npu_available_handles_runtime_failure(monkeypatch):
+    class BrokenNPU:
+        @staticmethod
+        def is_available():
+            raise RuntimeError("driver unavailable")
+
+    monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
+    monkeypatch.setattr(device_module.torch, "npu", BrokenNPU(), raising=False)
+
+    assert device_module._npu_available() is False
 
 
 def test_executor_flow():

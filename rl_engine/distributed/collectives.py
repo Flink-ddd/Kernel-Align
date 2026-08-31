@@ -26,7 +26,39 @@ _PACKED_REDUCE_SCATTER_MAX_BYTES = 8 * 1024 * 1024
 _ROCM_IPC_DIRECT_ALL_REDUCE_MAX_BYTES = 768 * 1024
 _ROCM_IPC_SHARDED_ALL_REDUCE_MIN_BYTES = 2176 * 1024
 _ROCM_IPC_ALL_GATHER_MAX_BYTES = 256 * 1024
+_COLLECTIVE_STAGING_FRAMES = 3
+_COLLECTIVE_FRAME_METADATA_BYTES = 3 * 8
 _REDUCTION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+_COLLECTIVES: dict[tuple[int, int, int, int], DeterministicCollective] = {}
+DETERMINISTIC_ALL_REDUCE_OP = "rl_kernel::deterministic_all_reduce_"
+
+
+@torch.library.custom_op(DETERMINISTIC_ALL_REDUCE_OP, mutates_args={"input"})
+def _deterministic_all_reduce_(input: torch.Tensor, collective_handle: int) -> None:
+    """Expose the stateful IPC reduction as an explicit graph mutation."""
+
+    from rl_engine import _C
+
+    _C.deterministic_collective_all_reduce_fused(collective_handle, input, input)
+
+
+@_deterministic_all_reduce_.register_fake
+def _deterministic_all_reduce_fake(
+    input: torch.Tensor,
+    collective_handle: int,
+) -> None:
+    del input, collective_handle
+
+
+def deterministic_all_reduce_inplace(
+    input: torch.Tensor,
+    *,
+    collective_handle: int,
+) -> torch.Tensor:
+    """Run the graph-visible deterministic all-reduce in place."""
+
+    _deterministic_all_reduce_(input, collective_handle)
+    return input
 
 
 class DeterministicCollective:
@@ -39,9 +71,9 @@ class DeterministicCollective:
     node evaluates the lower logical subtree before the higher one.
 
     One instance owns a symmetric CUDA IPC staging buffer. All ranks must call
-    its methods in the same order with matching shapes and dtypes. Calls are
-    host-synchronizing by design; the first version prioritizes determinism and
-    lifetime safety over overlap or throughput.
+    its methods in the same order with matching shapes and dtypes. Device-side
+    IPC sequence fences order staging and payload access without a steady-state
+    host barrier and advance correctly during CUDA Graph replay.
     """
 
     def __init__(
@@ -96,8 +128,10 @@ class DeterministicCollective:
             "deterministic_collective_destroy",
             "deterministic_collective_stage",
             "deterministic_collective_all_reduce",
+            "deterministic_collective_all_reduce_fused",
             "deterministic_collective_reduce_scatter",
             "deterministic_collective_all_gather",
+            "deterministic_collective_all_gather_fused",
         )
         missing = [name for name in required_symbols if not hasattr(_C, name)]
         if missing:
@@ -111,8 +145,9 @@ class DeterministicCollective:
         self._extension = _C
         self._lock = threading.Lock()
         self._handle = 0
-        self._staging = torch.empty(
-            self.max_size_bytes,
+        self._validated_signatures: set[tuple[Any, ...]] = set()
+        self._staging = torch.zeros(
+            _COLLECTIVE_STAGING_FRAMES * (self.max_size_bytes + _COLLECTIVE_FRAME_METADATA_BYTES),
             dtype=torch.uint8,
             device=self.device,
         )
@@ -151,6 +186,7 @@ class DeterministicCollective:
         input: torch.Tensor,
         *,
         out: torch.Tensor | None = None,
+        validate_signature: bool = True,
     ) -> torch.Tensor:
         """Return the TBIK-compatible fixed-tree sum on every rank.
 
@@ -166,11 +202,9 @@ class DeterministicCollective:
         self._validate_output(out, input)
 
         with self._lock:
-            self._validate_matching_signature("all_reduce", input)
-            self._extension.deterministic_collective_stage(self._handle, input)
-            self._synchronize_ranks()
-            self._extension.deterministic_collective_all_reduce(self._handle, out)
-            self._synchronize_ranks()
+            if validate_signature:
+                self._validate_matching_signature("all_reduce", input)
+            self._extension.deterministic_collective_all_reduce_fused(self._handle, input, out)
         return out
 
     def all_gather(
@@ -178,6 +212,7 @@ class DeterministicCollective:
         input: torch.Tensor,
         *,
         out: torch.Tensor | None = None,
+        validate_signature: bool = True,
     ) -> torch.Tensor:
         """Gather rank-ordered input bit patterns along dimension 0.
 
@@ -193,18 +228,31 @@ class DeterministicCollective:
         self._validate_sharded_output(out, input, output_shape)
 
         with self._lock:
-            self._validate_matching_signature("all_gather", input)
-            self._extension.deterministic_collective_stage(self._handle, input)
-            self._synchronize_ranks()
-            self._extension.deterministic_collective_all_gather(self._handle, out)
-            self._synchronize_ranks()
+            if validate_signature:
+                self._validate_matching_signature("all_gather", input)
+            self._extension.deterministic_collective_all_gather_fused(self._handle, input, out)
         return out
+
+    def all_gather_many(
+        self,
+        inputs: tuple[torch.Tensor, ...],
+        *,
+        validate_signature: bool = True,
+    ) -> tuple[torch.Tensor, ...]:
+        """Gather several tensors through the available single-tensor ABI."""
+
+        if not inputs:
+            raise ValueError("all_gather_many requires at least one input")
+        return tuple(
+            self.all_gather(input, validate_signature=validate_signature) for input in inputs
+        )
 
     def reduce_scatter(
         self,
         input: torch.Tensor,
         *,
         out: torch.Tensor | None = None,
+        validate_signature: bool = True,
     ) -> torch.Tensor:
         """TBIK-compatible fixed-tree sum, then a rank-ordered dimension-0 scatter.
 
@@ -227,11 +275,10 @@ class DeterministicCollective:
         self._validate_sharded_output(out, input, output_shape)
 
         with self._lock:
-            self._validate_matching_signature("reduce_scatter", input)
+            if validate_signature:
+                self._validate_matching_signature("reduce_scatter", input)
             self._extension.deterministic_collective_stage(self._handle, input)
-            self._synchronize_ranks()
             self._extension.deterministic_collective_reduce_scatter(self._handle, out)
-            self._synchronize_ranks()
         return out
 
     def reduce_scatter_many(
@@ -347,11 +394,43 @@ class DeterministicCollective:
 
     def _validate_matching_signature(self, op_name: str, input: torch.Tensor) -> None:
         signature = (op_name, tuple(input.shape), str(input.dtype), input.numel())
+        if signature in self._validated_signatures:
+            return
         signatures: list[tuple[Any, ...] | None] = [None] * self.world_size
         dist.all_gather_object(signatures, signature, group=self.group)
         if any(peer_signature != signature for peer_signature in signatures):
             raise ValueError(
                 f"all ranks must call {op_name} with matching shapes and dtypes; got {signatures}"
+            )
+        self._validated_signatures.add(signature)
+
+    def _validate_matching_many_signature(
+        self,
+        op_name: str,
+        inputs: tuple[torch.Tensor, ...],
+    ) -> None:
+        signature = (
+            op_name,
+            tuple((tuple(input.shape), str(input.dtype), input.numel()) for input in inputs),
+        )
+        if signature in self._validated_signatures:
+            return
+        signatures: list[tuple[Any, ...] | None] = [None] * self.world_size
+        dist.all_gather_object(signatures, signature, group=self.group)
+        if any(peer_signature != signature for peer_signature in signatures):
+            raise ValueError(
+                f"all ranks must call {op_name} with matching tensors; got {signatures}"
+            )
+        self._validated_signatures.add(signature)
+
+    def _validate_many_capacity(self, inputs: tuple[torch.Tensor, ...]) -> None:
+        total_bytes = 0
+        for input in inputs:
+            total_bytes = (total_bytes + 15) & ~15
+            total_bytes += input.numel() * input.element_size()
+        if total_bytes > self.max_size_bytes:
+            raise ValueError(
+                f"inputs require {total_bytes} bytes but max_size_bytes={self.max_size_bytes}"
             )
 
     def _synchronize_ranks(self) -> None:
@@ -472,6 +551,7 @@ class TorchDistributedDeterministicCollective:
         input: torch.Tensor,
         *,
         out: torch.Tensor | None = None,
+        validate_signature: bool = True,
     ) -> torch.Tensor:
         """Return the fixed balanced-tree sum on every rank."""
 
@@ -486,7 +566,8 @@ class TorchDistributedDeterministicCollective:
 
         with self._lock:
             self._check_open()
-            self._validate_matching_signature("all_reduce", input)
+            if validate_signature:
+                self._validate_matching_signature("all_reduce", input)
             if self._direct_all_reduce(input, out):
                 return out
             rank_inputs = self._all_gather_transport(input)
@@ -504,6 +585,7 @@ class TorchDistributedDeterministicCollective:
         input: torch.Tensor,
         *,
         out: torch.Tensor | None = None,
+        validate_signature: bool = True,
     ) -> torch.Tensor:
         """Gather rank-ordered input bit patterns along dimension 0."""
 
@@ -519,17 +601,35 @@ class TorchDistributedDeterministicCollective:
 
         with self._lock:
             self._check_open()
-            self._validate_matching_signature("all_gather", input)
+            if validate_signature:
+                self._validate_matching_signature("all_gather", input)
             if self._direct_all_gather(input, out):
                 return out
             self._all_gather_transport(input, gathered_flat=out.view(-1))
         return out
+
+    def all_gather_many(
+        self,
+        inputs: tuple[torch.Tensor, ...] | list[torch.Tensor],
+        *,
+        validate_signature: bool = True,
+    ) -> tuple[torch.Tensor, ...]:
+        """Gather several tensors through the platform transport."""
+
+        values = tuple(inputs)
+        if not values:
+            raise ValueError("all_gather_many requires at least one input")
+        return tuple(
+            self.all_gather(value, validate_signature=validate_signature)
+            for value in values
+        )
 
     def reduce_scatter(
         self,
         input: torch.Tensor,
         *,
         out: torch.Tensor | None = None,
+        validate_signature: bool = True,
     ) -> torch.Tensor:
         """Fixed-tree sum followed by rank-ordered dimension-0 slicing."""
 
@@ -553,7 +653,8 @@ class TorchDistributedDeterministicCollective:
 
         with self._lock:
             self._check_open()
-            self._validate_matching_signature("reduce_scatter", input)
+            if validate_signature:
+                self._validate_matching_signature("reduce_scatter", input)
             if self._direct_reduce_scatter(input, out):
                 return out
             rank_inputs = self._all_gather_transport(input)
@@ -1145,9 +1246,55 @@ def create_deterministic_collective(
     )
 
 
+def collective_for_group(
+    group: dist.ProcessGroup | None,
+    *,
+    min_size_bytes: int = 0,
+    minimum_capacity_bytes: int = _DEFAULT_MAX_SIZE_BYTES,
+    device: torch.device | str | int | None = None,
+) -> Any | None:
+    """Return the process-local platform collective shared by hot-path ops."""
+
+    if group is None:
+        return None
+    if min_size_bytes < 0:
+        raise ValueError("min_size_bytes must be non-negative")
+    if minimum_capacity_bytes <= 0:
+        raise ValueError("minimum_capacity_bytes must be positive")
+
+    rank = int(dist.get_rank(group=group))
+    world_size = int(dist.get_world_size(group=group))
+    if device is None:
+        device_index = torch.cuda.current_device()
+    else:
+        normalized_device = (
+            torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
+        )
+        device_index = (
+            torch.cuda.current_device()
+            if normalized_device.index is None
+            else normalized_device.index
+        )
+    key = (id(group), rank, world_size, device_index)
+    cached = _COLLECTIVES.get(key)
+    if cached is not None and cached.max_size_bytes >= min_size_bytes:
+        return cached
+
+    collective = create_deterministic_collective(
+        group=group,
+        device=device_index,
+        max_size_bytes=max(minimum_capacity_bytes, min_size_bytes),
+    )
+    _COLLECTIVES[key] = collective
+    return collective
+
+
 __all__ = [
+    "DETERMINISTIC_ALL_REDUCE_OP",
     "DeterministicCollective",
     "RCCLDeterministicCollective",
     "TorchDistributedDeterministicCollective",
+    "collective_for_group",
     "create_deterministic_collective",
+    "deterministic_all_reduce_inplace",
 ]

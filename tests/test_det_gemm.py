@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from rl_engine.kernels.gtest.tolerance import load_contract
+from rl_engine.kernels.ops.base import _C
 from rl_engine.kernels.ops.cuda.matmul import deterministic_gemm
 
 try:

@@ -85,6 +85,32 @@ Calling it (`__call__` -> `forward(...)`) computes in the input dtype; `forward_
 the explicit fp32 golden path (NativeAttentionOp only). The production `"attn"` op_type
 (SDPA-based `PYTORCH_ATTN`, FlashAttention, etc.) is a separate dispatch chain and is unaffected.
 
+### WS2 CP-aware dispatch
+
+WS2 distributed callers use a separate contract-aware entry point,
+`kernel_registry.get_attention_op(contract)`. It validates explicit TP/CP ownership, fixed
+`(out, lse)` merge semantics, causal or packed-sequence offsets, and decode KV-cache identity
+before selecting a backend. Legacy `get_op("attention")` behavior remains unchanged.
+
+Existing WS1 implementations do not yet export attention-domain LSE or implement deterministic
+CP merge, so they are declared incompatible with strict WS2 requests instead of being selected as
+a silent fallback. See [WS2 CP-aware Attention contract](../design/ws2-cp-attention-contract.md).
+
+Split-KV is part of that contract rather than a recorded backend extra. Strict runs allow
+`disabled` or a fixed logical KV chunk size, and must export the actual per-CP-owner block
+boundaries, FP32 `(out, lse)` merge order, final downcast point, backend, and fallback reason.
+Runtime-selected `auto` plans are diagnostic only unless both training and rollout export and
+validate the same actual plan.
+
+The rank-aware drift benchmark can emit a CPU smoke artifact or a torchrun-friendly GPU report:
+
+```bash
+python benchmarks/benchmark_ws2_cp_attention_drift.py --smoke --json
+python benchmarks/benchmark_ws2_cp_attention_drift.py --smoke --tp-world-sizes 2 \
+  --cp-world-sizes 2 --kv-chunk-sizes none,1 --include-backward \
+  --output artifacts/ws2-cp-attention-drift.json
+```
+
 ## Accuracy
 
 Reference semantics (`forward_fp32`, fp32 accumulation, TF32/autocast disabled):
@@ -137,6 +163,7 @@ memory.
 
 ```bash
 python -m pytest tests/test_attention.py -v
+python -m pytest tests/test_cp_attention.py -v
 ```
 
 Covers: `forward_fp32` vs an independent fp32 reference (bitwise), strict-fp32 under hostile
@@ -194,6 +221,14 @@ Hooks:
 - `forward(q, k, v, ...)` — main path (registry, #108 harness). Differentiable.
 - `forward_with_lse(q, k, v, ...)` — returns `(out, lse)` for LSE verification, debugging,
   and future KV-cache / training integration.
+- `save_forward_state(q, k, v, ...)` captures FP32 `out/lse`, masks, position metadata,
+  topology, Split-KV boundaries, and content fingerprints for the exact forward invocation.
+- `backward_reference(q, k, v, dout, ..., saved_forward_state=state)` consumes that saved
+  state in canonical global KV-block order. It fails closed if Q/K/V, saved tensors, masks,
+  offsets, topology, or Split-KV metadata changed, and returns `dq`, `dk`, `dv`, `out`, `lse`,
+  and provenance.
+- `compare_cp_attention_backward(q, k, v, dout, ...)` — compares CP=1 backward against
+  CP/chunked-prefill backward and emits whole-tensor plus per-logical-rank drift stats.
 
 ## Tolerance
 

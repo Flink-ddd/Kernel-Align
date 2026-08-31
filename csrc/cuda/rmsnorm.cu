@@ -1,5 +1,9 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#if !defined(USE_ROCM)
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#endif
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -70,6 +74,29 @@ static int choose_threads(int H) {
 
 constexpr int RMSNORM_DW_ROWS_PER_CHUNK = 256;
 constexpr int RMSNORM_DW_H_TILE = 128;
+
+#if !defined(USE_ROCM)
+constexpr int FP32_LEFT_FOLD_THREADS = 256;
+
+__global__ void reduce_rows_fp32_left_fold_kernel(
+    const float* __restrict__ rows,
+    float* __restrict__ output,
+    int64_t row_count,
+    int64_t columns
+) {
+    int64_t column = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (column >= columns) {
+        return;
+    }
+
+    float acc = 0.0f;
+#pragma unroll 1
+    for (int64_t row = 0; row < row_count; ++row) {
+        acc = __fadd_rn(acc, rows[row * columns + column]);
+    }
+    output[column] = acc;
+}
+#endif
 
 int64_t rmsnorm_backward_dw_chunks_cuda(int64_t rows) {
     return (rows + RMSNORM_DW_ROWS_PER_CHUNK - 1) / RMSNORM_DW_ROWS_PER_CHUNK;
@@ -330,3 +357,23 @@ void rmsnorm_backward_reduce_dw_cuda(
         H
     );
 }
+
+#if !defined(USE_ROCM)
+void reduce_rows_fp32_left_fold_cuda(
+    torch::Tensor rows,
+    torch::Tensor output
+) {
+    const c10::cuda::CUDAGuard device_guard(rows.device());
+    int64_t columns = rows.size(1);
+    int64_t blocks = (columns + FP32_LEFT_FOLD_THREADS - 1) / FP32_LEFT_FOLD_THREADS;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    reduce_rows_fp32_left_fold_kernel<<<blocks, FP32_LEFT_FOLD_THREADS, 0, stream>>>(
+        rows.data_ptr<float>(),
+        output.data_ptr<float>(),
+        rows.size(0),
+        columns
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+#endif

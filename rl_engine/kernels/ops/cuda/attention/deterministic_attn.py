@@ -100,6 +100,10 @@ class DeterministicAttentionOp:
     so #108 harness can call forward(**inputs) with key_padding_mask.
     """
 
+    core_id = STRICT_ATTENTION_CORE_ID
+    strict_schedule = STRICT_ATTENTION_SCHEDULE_ID
+    backend_id = "rlkernel.cuda.deterministic_attention"
+
     def __init__(self) -> None:
         if not _EXT_AVAILABLE or not hasattr(_C, "deterministic_attention_forward"):
             raise RuntimeError(

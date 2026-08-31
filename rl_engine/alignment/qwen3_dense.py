@@ -21,6 +21,7 @@ import torch
 from rl_engine.kernels.gtest.gradient_adapters import resolve_profile_candidate
 from rl_engine.kernels.gtest.operator_specs import OP_SPECS, _load_object
 from rl_engine.kernels.ops.canonical_backward import active_session
+from rl_engine.kernels.ops.canonical_embedding import canonical_embedding
 from rl_engine.kernels.ops.canonical_linear import canonical_linear_fp32
 from rl_engine.kernels.ops.canonical_lm_head import (
     canonical_cuda_lm_head_fp32,
@@ -793,7 +794,7 @@ class Qwen3DenseBIModel:
             q_parts: list[torch.Tensor] = []
             k_parts: list[torch.Tensor] = []
             v_parts: list[torch.Tensor] = []
-            for hidden, (start, end) in zip(hidden_parts, chunks):
+            for hidden, (start, end) in zip(hidden_parts, chunks, strict=True):
                 self._current_logical_keys = logical_keys[:, start:end]
                 normed = self._rms(
                     hidden.to(dtype=self.execution_dtype),
@@ -845,7 +846,7 @@ class Qwen3DenseBIModel:
             self._record(f"{prefix}.attn", attn_public)
 
             next_hidden_parts: list[torch.Tensor] = []
-            for hidden, (start, end) in zip(hidden_parts, chunks):
+            for hidden, (start, end) in zip(hidden_parts, chunks, strict=True):
                 self._current_logical_keys = logical_keys[:, start:end]
                 attn = attn_all[:, :, start:end, :]
                 attn_merged = (
@@ -905,7 +906,7 @@ class Qwen3DenseBIModel:
         hidden_outputs: list[torch.Tensor] = []
         lm_head_op = self.profile_ops.get("lm_head")
         lm_family = self.profile_ops.provenance["lm_head"]["actual_backend"]
-        for hidden, (start, end) in zip(hidden_parts, chunks):
+        for hidden, (start, end) in zip(hidden_parts, chunks, strict=True):
             keys = logical_keys[:, start:end]
             self._current_logical_keys = keys
             final_hidden = self._rms(
@@ -1006,7 +1007,19 @@ class Qwen3DenseBIModel:
 
     def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         op = self.profile_ops.get("embedding")
-        out = op.forward(input_ids, self.weights["embed_tokens.weight"])
+        weight = self.weights["embed_tokens.weight"]
+        keys = getattr(self, "_current_logical_keys", None)
+        if torch.is_grad_enabled() and active_session() is not None and keys is not None:
+            family = self.profile_ops.provenance["embedding"]["actual_backend"]
+            out = canonical_embedding(
+                input_ids,
+                weight,
+                keys,
+                forward_op=op.forward,
+                family=family,
+            )
+        else:
+            out = op.forward(input_ids, weight)
         self.profile_ops.observe("embedding", out)
         return self._record("embedding", out)
 

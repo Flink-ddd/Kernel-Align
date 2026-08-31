@@ -11,6 +11,19 @@ logical type, and the registry selects the first available backend for the curre
 4. Cache successfully constructed operator instances.
 5. Skip backends that already failed in the current process.
 
+WS2 Attention uses the stricter `KernelRegistry.get_attention_op(contract)` path. In addition to
+platform priority, this path requires a backend capability descriptor and checks the requested
+role, mode, dtype, TP/CP layout, LSE export, deterministic merge, packed varlen, and KV-cache
+semantics. Incompatible candidates produce explicit rejection reasons and are never used as an
+undeclared fallback. See [WS2 CP-aware Attention contract](ws2-cp-attention-contract.md).
+WS2 TP-aware logprob uses the stricter `KernelRegistry.get_logprob_op(contract)` path. In
+addition to platform priority, this path requires a backend capability descriptor and checks
+the requested role, dtype, TP/CP layout, padded-vs-real vocab masking, inactive-token
+support, vocab-domain LSE export, and deterministic TP merge semantics. Incompatible
+candidates produce explicit rejection reasons and are never used as an undeclared fallback.
+The contract objects and their normative reduction semantics are documented in
+`rl_engine.kernels.logprob_contract`.
+
 ## LogP Priority
 
 | Platform | Priority |
