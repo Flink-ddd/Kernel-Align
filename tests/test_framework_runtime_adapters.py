@@ -28,6 +28,7 @@ from rl_engine.integrations.framework_operators import (
     _vllm_kv_cache_views,
 )
 from rl_engine.integrations.megatron_runtime import (
+    _deterministic_reduce_from_tensor_model_parallel_region,
     _patch_strict_attention_projections,
     install_megatron_integration,
 )
@@ -310,6 +311,72 @@ def test_megatron_strict_attention_projections_install_without_debug_environment
     assert torch.equal(projection, qkv)
     assert torch.equal(native, torch.full((1, 3), -1.0))
     assert attention.linear_qkv.allreduce_dgrad is False
+
+
+def test_megatron_te_attention_projection_uses_injected_strict_tp_reduce():
+    calls: list[torch.Tensor] = []
+
+    class ColumnLinear:
+        def __init__(self):
+            self.layer_norm_weight = torch.ones(2)
+            self.weight = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+        def _forward_impl(self, input, weight, *args, **kwargs):
+            del args, kwargs
+            return input @ weight.t()
+
+    class RowLinear:
+        def __init__(self):
+            self.weight = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+        def _forward_impl(self, input, weight, *args, **kwargs):
+            del args, kwargs
+            return input @ weight.t()
+
+    class SelfAttention:
+        def __init__(self):
+            self.linear_qkv = ColumnLinear()
+            self.linear_proj = RowLinear()
+
+    def reduce_from_tp(value: torch.Tensor) -> torch.Tensor:
+        calls.append(value)
+        return value * 4
+
+    _patch_strict_attention_projections(
+        self_attention_cls=SelfAttention,
+        column_linear_cls=ColumnLinear,
+        row_linear_cls=RowLinear,
+        det_gemm=lambda lhs, rhs: lhs @ rhs,
+        copy_to_tp=lambda value: value,
+        reduce_from_tp=reduce_from_tp,
+    )
+    attention = SelfAttention()
+    value = torch.tensor([[1.0, 2.0]])
+
+    output, bias = attention.linear_proj.forward(value)
+
+    assert bias is None
+    assert len(calls) == 1
+    assert torch.equal(calls[0], value)
+    assert torch.equal(output, value * 4)
+
+
+def test_megatron_deterministic_tp_reduce_keeps_identity_backward(monkeypatch):
+    class Collective:
+        def all_reduce(self, value):
+            return value * 4
+
+    monkeypatch.setattr(
+        "rl_engine.distributed.collectives.collective_for_group",
+        lambda group, min_size_bytes: Collective(),
+    )
+    value = torch.tensor([1.0, 2.0], requires_grad=True)
+
+    output = _deterministic_reduce_from_tensor_model_parallel_region(value, object())
+    output.sum().backward()
+
+    assert torch.equal(output, value.detach() * 4)
+    assert torch.equal(value.grad, torch.ones_like(value))
 
 
 def test_vllm_qwen3_strict_model_installs_without_debug_environment(monkeypatch):

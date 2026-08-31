@@ -31,6 +31,37 @@ _STRICT_ATTENTION_PROJECTION_MARKER = "__rl_kernel_strict_attention_projection__
 _STRICT_TE_RMS_NORM_PATCH_MARKER = "__rl_kernel_original_strict_rms_norm_forward__"
 
 
+class _DeterministicTensorParallelReduce(torch.autograd.Function):
+    """Megatron ``reduce_from_tp`` semantics with the shared fixed tree."""
+
+    @staticmethod
+    def forward(ctx: Any, input_value: torch.Tensor, tp_group: Any) -> torch.Tensor:
+        del ctx
+        from rl_engine.distributed.collectives import collective_for_group
+
+        collective = collective_for_group(
+            tp_group,
+            min_size_bytes=input_value.numel() * input_value.element_size(),
+        )
+        if collective is None:
+            return input_value
+        return collective.all_reduce(input_value.contiguous())
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        del ctx
+        # ``reduce_from_tensor_model_parallel_region`` is an all-reduce in the
+        # forward pass and identity in the backward pass.
+        return grad_output, None
+
+
+def _deterministic_reduce_from_tensor_model_parallel_region(
+    input_value: torch.Tensor,
+    tp_group: Any,
+) -> torch.Tensor:
+    return _DeterministicTensorParallelReduce.apply(input_value, tp_group)
+
+
 def _optional_class(path: str) -> type[Any] | None:
     module_name, _, class_name = path.rpartition(".")
     try:
@@ -125,6 +156,17 @@ def _patch_strict_attention_projections(
             reduce_from_tensor_model_parallel_region,
         )
 
+    def strict_tp_reduce(input_value: torch.Tensor) -> torch.Tensor:
+        if reduce_from_tp is not None:
+            return reduce_from_tp(input_value)
+        from megatron.core import parallel_state
+
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        return _deterministic_reduce_from_tensor_model_parallel_region(
+            input_value,
+            tp_group,
+        )
+
     def deterministic_projection(
         input_value: torch.Tensor,
         weight: torch.Tensor,
@@ -147,7 +189,7 @@ def _patch_strict_attention_projections(
         setattr(qkv, _STRICT_ATTENTION_PROJECTION_MARKER, "qkv")
         setattr(projection, _STRICT_ATTENTION_PROJECTION_MARKER, "o_proj")
         if hasattr(qkv, "layer_norm_weight"):
-            tp_copy, tp_reduce = tp_mappings()
+            tp_copy, _native_tp_reduce = tp_mappings()
 
             def te_qkv_forward(module: Any, input_value: torch.Tensor) -> Any:
                 normalized = _fused_rms_norm_input(module, input_value, "linear_qkv")
@@ -156,7 +198,7 @@ def _patch_strict_attention_projections(
 
             def te_projection_forward(module: Any, input_value: torch.Tensor) -> Any:
                 output = deterministic_projection(input_value, module.weight, None)
-                return tp_reduce(output), None
+                return strict_tp_reduce(output), None
 
             qkv.forward = MethodType(te_qkv_forward, qkv)
             projection.forward = MethodType(te_projection_forward, projection)

@@ -637,6 +637,9 @@ class MegatronAttentionOperator:
             "tp_world_size": tp_world,
             "runtime_platform": "cuda",
             "triton_used": False,
+            "tp_output_projection_collective": (
+                "deterministic_all_reduce.ipc_localized_fixed_tree.v1"
+            ),
             **execution_provenance,
         }
         return output
