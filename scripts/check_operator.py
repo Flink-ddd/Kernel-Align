@@ -35,12 +35,23 @@ def _parse_dtype(value: str) -> torch.dtype:
     raise ValueError(f"unsupported dtype: {value}")
 
 
+def _npu_available() -> bool:
+    """torch.npu only exists after torch_npu is imported; probe defensively."""
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
 def _select_device(value: str) -> torch.device:
     if value == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(value)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device cuda was requested, but CUDA is not available")
+    if device.type == "npu" and not _npu_available():
+        raise RuntimeError("--device npu was requested, but no Ascend NPU is available")
     return device
 
 
@@ -73,7 +84,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--candidate",
         default="pytorch",
-        help="Candidate backend to validate, for example pytorch, cuda, cuda-sm90, triton.",
+        help="Candidate backend to validate, for example pytorch, cuda, cuda-sm90, triton, "
+        "ascend.",
     )
     parser.add_argument("--dtype", choices=("fp32", "bf16", "fp16"), default="fp32")
     parser.add_argument("--device", default="auto")
