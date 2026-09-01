@@ -64,6 +64,9 @@ TOPOLOGY = {
 # Pinning the choice keeps the production arms independent of host-specific
 # backend auto-selection.
 MEGATRON_ATTENTION_BACKEND = "fused"
+RL_KERNEL_LINEAR_LOGP_PROVIDER = (
+    "rl_engine.integrations.vime.linear_logp_provider.provider"
+)
 
 MODEL_ARGS = (
     "--swiglu",
@@ -93,6 +96,22 @@ MODEL_ARGS = (
     "--qk-layernorm",
     "--untie-embeddings-and-output-weights",
 )
+
+
+def _linear_logp_provider_args(arm: Arm) -> tuple[str, ...]:
+    """Install the RL-Kernel provider only on a training-side R route."""
+
+    training_side, _rollout_side = arm.logp_case.split("/", 1)
+    if training_side == "P":
+        return ()
+    if training_side == "R":
+        return (
+            "--linear-logp-provider",
+            RL_KERNEL_LINEAR_LOGP_PROVIDER,
+            "--linear-logp-provider-mode",
+            "strict",
+        )
+    raise ValueError(f"unsupported training logp route: {arm.logp_case!r}")
 
 
 def _path(value: str | None, label: str) -> Path:
@@ -382,10 +401,7 @@ def main(argv: list[str] | None = None) -> int:
         "disk",
         "--update-weight-disk-dir",
         str(run_dir / "weight-updates"),
-        "--linear-logp-provider",
-        "rl_engine.integrations.vime.linear_logp_provider.provider",
-        "--linear-logp-provider-mode",
-        "strict",
+        *_linear_logp_provider_args(arm),
         "--no-save-optim",
         "--attention-dropout",
         "0.0",

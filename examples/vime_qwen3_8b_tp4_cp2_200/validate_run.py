@@ -40,6 +40,14 @@ CASE_FIELDS = {
     "ffn": "ffn_case",
     "logp": "logp_case",
 }
+RL_KERNEL_LINEAR_LOGP_PROVIDER = (
+    "rl_engine.integrations.vime.linear_logp_provider.provider"
+)
+VIME_NATIVE_LINEAR_LOGP_MARKER = (
+    "linear_logp native active: "
+    "backend_id=vime.utils.ppo_utils.calculate_log_probs_and_entropy "
+    "contract_id=vime.native.linear_logp.v1 route=unconfigured device=cuda"
+)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -108,8 +116,21 @@ def _load_readbacks(directory: Path) -> list[dict[str, Any]]:
     return values
 
 
+def _reported_backend_ids(value: Any) -> set[str]:
+    backend_ids: set[str] = set()
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if key in {"actual_backend", "backend_id"} and isinstance(nested, str):
+                backend_ids.add(nested)
+            backend_ids.update(_reported_backend_ids(nested))
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            backend_ids.update(_reported_backend_ids(nested))
+    return backend_ids
+
+
 def _validate_readbacks(
-    readbacks: list[dict[str, Any]], arm: Mapping[str, Any]
+    readbacks: list[dict[str, Any]], arm: Mapping[str, Any], log_text: str
 ) -> dict[str, Any]:
     errors: list[str] = []
     frameworks: dict[str, Any] = {}
@@ -148,6 +169,39 @@ def _validate_readbacks(
                 {str(record.get("backend_id", "")) for record in records}
             )
             case_ids = sorted({str(record.get("case_id", "")) for record in records})
+            native_megatron_logp = (
+                framework == "megatron"
+                and target == "training"
+                and module == "logp"
+                and expected == "production"
+            )
+            if native_megatron_logp:
+                marker_present = VIME_NATIVE_LINEAR_LOGP_MARKER in log_text
+                if installed_count:
+                    errors.append(
+                        f"{label} production logp unexpectedly installed an RL-Kernel hook"
+                    )
+                if records:
+                    errors.append(
+                        f"{label} production logp unexpectedly entered provider readback"
+                    )
+                if not marker_present:
+                    errors.append(
+                        f"{label} production logp did not report Vime's native backend marker"
+                    )
+                module_summary[module] = {
+                    "case_id": case_id,
+                    "expected_implementation": expected,
+                    "installed_processes": installed_count,
+                    "call_count": call_count,
+                    "implementations": implementations,
+                    "backend_ids": backend_ids,
+                    "native_marker_present": marker_present,
+                    "native_backend_id": (
+                        "vime.utils.ppo_utils.calculate_log_probs_and_entropy"
+                    ),
+                }
+                continue
             if installed_count == 0:
                 errors.append(f"{label} {module} hook was not installed")
             if call_count == 0:
@@ -169,6 +223,26 @@ def _validate_readbacks(
                     record.get("backend_id", "")
                 ).startswith("rlkernel."):
                     errors.append(f"{label} {module} did not use an RL-Kernel backend")
+                provenance = record.get("provenance", {})
+                reported_backend_ids = _reported_backend_ids(record)
+                strict_execution = (
+                    isinstance(provenance, Mapping)
+                    and (
+                        provenance.get("deterministic_linear_logp") is True
+                        or (
+                            isinstance(provenance.get("execution"), Mapping)
+                            and provenance["execution"].get("strict_backend") is True
+                        )
+                    )
+                )
+                if expected == "production" and (
+                    any(value.startswith("rlkernel.") for value in reported_backend_ids)
+                    or strict_execution
+                ):
+                    errors.append(
+                        f"{label} {module} production route executed an RL-Kernel backend: "
+                        f"{sorted(reported_backend_ids)!r}"
+                    )
             module_summary[module] = {
                 "case_id": case_id,
                 "expected_implementation": expected,
@@ -291,7 +365,9 @@ def validate_run(run_dir: Path) -> dict[str, Any]:
     records = _parse_runtime_records(log_text)
     require_zero = all(str(arm[CASE_FIELDS[module]]) == "R/R" for module in MODULES)
     cudagraph = _validate_cudagraph(log_text, manifest)
-    readbacks = _validate_readbacks(_load_readbacks(run_dir / "readbacks"), arm)
+    readbacks = _validate_readbacks(
+        _load_readbacks(run_dir / "readbacks"), arm, log_text
+    )
     logprobs = _validate_runtime_logprobs(
         records["step"],
         int(manifest["num_rollout"]),
@@ -334,6 +410,30 @@ def validate_run(run_dir: Path) -> dict[str, Any]:
             global_errors.append("train command does not keep the TP4 actor resident")
         if "--offload-rollout" not in train_command:
             global_errors.append("train command does not offload rollout during training")
+        training_logp_implementation = _side(str(arm["logp_case"]), "training")
+        provider_pair = ["--linear-logp-provider", RL_KERNEL_LINEAR_LOGP_PROVIDER]
+        strict_mode_pair = ["--linear-logp-provider-mode", "strict"]
+        has_provider = any(
+            train_command[index : index + 2] == provider_pair
+            for index in range(max(0, len(train_command) - 1))
+        )
+        has_strict_mode = any(
+            train_command[index : index + 2] == strict_mode_pair
+            for index in range(max(0, len(train_command) - 1))
+        )
+        if training_logp_implementation == "production":
+            if "--linear-logp-provider" in train_command:
+                global_errors.append(
+                    "production Megatron logp must not configure a linear_logp provider"
+                )
+            if "--linear-logp-provider-mode" in train_command:
+                global_errors.append(
+                    "production Megatron logp must not configure provider mode"
+                )
+        elif not has_provider or not has_strict_mode:
+            global_errors.append(
+                "RL-Kernel Megatron logp must configure the strict RL-Kernel provider"
+            )
     expected_recompute = {
         "recompute_granularity": "full",
         "recompute_method": "uniform",

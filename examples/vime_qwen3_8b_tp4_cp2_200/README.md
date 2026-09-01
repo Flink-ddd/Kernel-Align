@@ -12,7 +12,7 @@ it does not select the DAPO training algorithm. The rule reward is computed by
 VIME's `deepscaler` reward implementation.
 
 The experiment is fail-closed. A run is accepted only when its Ray job
-succeeds, every expected operator route has CUDA execution readback, no
+succeeds, every expected operator route has runtime execution evidence, no
 fallback or Triton route is observed for an R/R arm, the requested number of
 steps is present, and vLLM CUDA Graph evidence matches the manifest.
 
@@ -25,8 +25,11 @@ steps is present, and vLLM CUDA Graph evidence matches the manifest.
 | G01 | off | R/R | RL-Kernel operator-level consistency only |
 | G11 | on | R/R | Framework-level plus operator-level consistency |
 
-`P/P` selects the production implementation on training and rollout. `R/R`
-selects RL-Kernel on both sides. All four groups use the same prompts, initial
+`P/P` selects the production implementation on training and rollout. For
+Megatron linear logp this means that no external provider is configured and
+VIME calls its native `calculate_log_probs_and_entropy` implementation
+directly. `R/R` selects RL-Kernel on both sides and installs the strict
+RL-Kernel linear-logp provider. All four groups use the same prompts, initial
 checkpoint, sampling settings, seeds, TP4/CP2 topology, and batch sizes.
 
 Do not interpret G10/G11 as evidence that train and rollout recomputation is
@@ -53,8 +56,12 @@ metrics.
   deterministic TP collectives require CUDA IPC-capable staging allocations.
 - vLLM CUDA Graph mode `FULL_DECODE_ONLY`, not eager, with exact capture sizes
   `1..(rollout_batch_size × n_samples_per_prompt)`.
-- Megatron and vLLM readbacks for Attention, FFN, and logp, with positive call
-  counts and the expected case/implementation.
+- Megatron and vLLM integration readbacks with positive call counts for every
+  configured route. A production Megatron logp route instead requires VIME's
+  native-backend runtime marker and rejects any provider hook or provider
+  readback.
+- Production routes reject provenance whose actual backend is RL-Kernel, even
+  if an outer integration layer labeled the call as production.
 - R/R runs must report zero bitwise mismatches, zero max absolute logp
   difference, CUDA execution, and no fallback or Triton provenance.
 - Append-only run directories. A passing validator creates `COMPLETE`; failed

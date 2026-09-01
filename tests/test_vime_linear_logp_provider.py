@@ -25,6 +25,11 @@ from rl_engine.integrations.vime.linear_logp_provider import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _select_rlkernel_logp_route(monkeypatch):
+    monkeypatch.setenv("RL_KERNEL_LOGP_CASE", "R/R")
+
+
 def _request(*, cp_rank: int = 0, with_entropy: bool = False, keep_mask=None):
     logits = torch.tensor(
         [[0.25, -0.5, 1.0, 0.1, -0.3, 0.6, -0.7, 0.4] for _ in range(3)],
@@ -183,7 +188,7 @@ def test_provider_rejects_local_vocab_metadata_that_cannot_describe_tp_ownership
         provider(request)
 
 
-def test_production_provider_records_execution_in_active_integration(monkeypatch):
+def test_production_route_rejects_rlkernel_provider_configuration(monkeypatch):
     monkeypatch.setenv("RL_KERNEL_LOGP_CASE", "P/P")
     integration = MegatronIntegration(
         IntegrationPlan.from_case_ids(logp="P/P"),
@@ -192,12 +197,9 @@ def test_production_provider_records_execution_in_active_integration(monkeypatch
     clear_active_integration("megatron")
     set_active_integration("megatron", integration)
     try:
-        result = provider(_request())
+        with pytest.raises(RuntimeError, match="omit --linear-logp-provider"):
+            provider(_request())
     finally:
         clear_active_integration("megatron")
 
-    assert result.logp.shape == (3, 1)
-    readback = integration.readback()["operators"]["logp"]
-    assert readback["implementation"] == "production"
-    assert readback["call_count"] == 1
-    assert readback["provenance"]["runtime_platform"] == "cpu"
+    assert "logp" not in integration.readback()["operators"]

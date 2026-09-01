@@ -412,14 +412,18 @@ def provider(request: Any) -> LinearLogpResult:
     """Route Vime training logp through the active Megatron integration."""
 
     case = operator_ablation_case("logp", os.getenv("RL_KERNEL_LOGP_CASE", "P/P"))
+    if case.training is Implementation.PRODUCTION:
+        raise RuntimeError(
+            "the RL-Kernel linear_logp provider must not be configured for a "
+            "production Megatron logp route; omit --linear-logp-provider so "
+            "Vime executes calculate_log_probs_and_entropy directly"
+        )
+
     from rl_engine.integrations.state import get_active_integration
 
     integration = get_active_integration("megatron")
     if integration is None:
         return _provider_impl(request)
-
-    if case.training is Implementation.PRODUCTION:
-        return integration.execute("logp", _provider_impl, request)
 
     def native_unavailable(_request: Any) -> LinearLogpResult:
         raise RuntimeError(
