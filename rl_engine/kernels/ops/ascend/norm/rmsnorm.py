@@ -66,10 +66,9 @@ def _rms_norm_backward(
 
 
 class _RMSNormAscendFunction(torch.autograd.Function):
-    # Autograd wrapper: Ascend C forward + PyTorch-formula backward.
-    # The CUDA op reuses a dedicated dw/dx kernel; here the backward uses the
-    # same fp32 VJP formula as the PyTorch reference, reusing the
-    # forward-saved rstd.
+    # Autograd wrapper: reference-formula rstd + Ascend C fused scale/cast
+    # forward, and the PyTorch-formula backward reusing the forward-saved
+    # rstd (same fp32 VJP as the PyTorch reference, like the CUDA op).
 
     @staticmethod
     def forward(ctx, x, weight, eps):
@@ -78,7 +77,18 @@ class _RMSNormAscendFunction(torch.autograd.Function):
 
         x_2d = x.reshape(-1, hidden).contiguous()
 
-        y, rstd = _C_npu.rmsnorm_ascend(x_2d, weight, float(eps))
+        # rstd is computed with the exact torch ops of the PyTorch reference
+        # (rl_engine/kernels/ops/pytorch/norm/rms_norm.py): fp32 mean of
+        # squares + torch.rsqrt. The Ascend C kernel then only performs the
+        # elementwise y = x * rstd * w scale and the round-to-nearest-even
+        # cast, which are order-free IEEE ops — this makes the fused output
+        # bitwise identical to NativeRMSNormOp instead of approximating its
+        # sum-of-squares/rsqrt arithmetic in-kernel.
+        x_f = x_2d.float()
+        var = x_f.pow(2).mean(dim=-1)
+        rstd = torch.rsqrt(var + eps).contiguous()
+
+        y = _C_npu.rmsnorm_ascend(x_2d, weight, rstd)
 
         ctx.save_for_backward(x_2d, weight, rstd)
         ctx.eps = eps

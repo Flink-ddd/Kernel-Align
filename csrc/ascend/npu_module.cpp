@@ -14,9 +14,9 @@ std::vector<torch::Tensor> batch_invariant_logp_ascend_forward(torch::Tensor log
                                                                torch::Tensor target,
                                                                int64_t ignore_index);
 
-std::vector<torch::Tensor> rmsnorm_ascend_forward(torch::Tensor x,
-                                                  torch::Tensor weight,
-                                                  double eps);
+torch::Tensor rmsnorm_ascend_forward(torch::Tensor x,
+                                     torch::Tensor weight,
+                                     torch::Tensor rstd);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -25,5 +25,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           "Batch-invariant selected-token log-probability (Ascend C forward)");
     m.def("rmsnorm_ascend",
           &rmsnorm_ascend_forward,
-          "Batch-invariant RMSNorm (Ascend C forward)");
+          "Batch-invariant RMSNorm (Ascend C forward, rstd precomputed)");
 }

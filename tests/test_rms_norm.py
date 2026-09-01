@@ -476,6 +476,35 @@ def test_ascend_rms_norm_forward_matches_manual_reference(hidden, dtype):
 
 
 @requires_ascend_rmsnorm
+@pytest.mark.parametrize("hidden", [_HIDDEN, _HEAD_DIM, 1000, 12288])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("rows", [1, 7, 64, 257])
+def test_ascend_rms_norm_bitwise_identical_to_native(hidden, dtype, rows):
+    """Ascend forward must be bitwise identical to the PyTorch reference.
+
+    The row scale rstd is computed with the exact reference torch ops
+    (fp32 mean of squares + torch.rsqrt), so the fused kernel — which only
+    performs order-free elementwise multiplies and an RNE cast — must match
+    NativeRMSNormOp bit-for-bit on every dtype, including the H > tile and
+    H % 8 != 0 paths.
+    """
+    from rl_engine.kernels.ops.ascend.norm.rmsnorm import RMSNormAscendOp
+
+    torch.manual_seed(0)
+    op = RMSNormAscendOp()
+    native = NativeRMSNormOp()
+
+    x = torch.randn((rows, hidden), device="npu", dtype=torch.float32).to(dtype)
+    w = torch.randn((hidden,), device="npu", dtype=torch.float32).to(dtype)
+
+    y_ascend = op(x, w, eps=_EPS)
+    y_native = native(x, w, eps=_EPS)
+
+    assert y_ascend.dtype == y_native.dtype == dtype
+    assert torch.equal(y_ascend, y_native)
+
+
+@requires_ascend_rmsnorm
 @pytest.mark.parametrize("hidden", [_HIDDEN, _HEAD_DIM, 12288])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_ascend_rms_norm_backward_matches_native(hidden, dtype):

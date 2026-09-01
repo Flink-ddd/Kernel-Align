@@ -11,5 +11,5 @@ def batch_invariant_logp_ascend(
 def rmsnorm_ascend(
     x: torch.Tensor,
     weight: torch.Tensor,
-    eps: float,
-) -> list[torch.Tensor]: ...
+    rstd: torch.Tensor,
+) -> torch.Tensor: ...
