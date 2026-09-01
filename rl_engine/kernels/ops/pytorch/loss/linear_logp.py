@@ -105,6 +105,12 @@ def _validate_tp_vocab_partition(
     local_vocab_size: int,
     global_vocab_size: Optional[int],
 ) -> int:
+    if local_vocab_size <= 0:
+        raise ValueError(
+            "lm_head_weight must contain at least one vocab row per TP rank; got "
+            f"local_vocab_size={local_vocab_size} (shard "
+            f"[{vocab_start_index}, {vocab_start_index + local_vocab_size}))."
+        )
     dist = _require_distributed_initialized()
     local_end = vocab_start_index + local_vocab_size
     local_range = torch.tensor([vocab_start_index, local_end], device=device, dtype=torch.long)
