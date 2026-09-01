@@ -8,3 +8,9 @@ def batch_invariant_logp_ascend(
     target: torch.Tensor,
     ignore_index: int,
 ) -> list[torch.Tensor]: ...
+def fused_linear_logp_ascend(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    target: torch.Tensor,
+) -> torch.Tensor: ...

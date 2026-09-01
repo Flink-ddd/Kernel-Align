@@ -166,6 +166,10 @@ def test_npu_registry_preserves_per_operator_cpu_fallbacks(monkeypatch):
         OpBackend.ASCEND_BATCH_INVARIANT_LOGP,
         OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
     ]
+    assert registry._priority_map["npu"]["linear_logp"] == [
+        OpBackend.ASCEND_FUSED_LINEAR_LOGP,
+        OpBackend.PYTORCH_LINEAR_LOGP,
+    ]
 
 
 def test_npu_available_handles_runtime_failure(monkeypatch):
