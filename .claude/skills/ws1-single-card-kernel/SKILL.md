@@ -47,13 +47,13 @@ fixed, as are the registration and PR deliverable requirements.
 - Branch off `upstream/test` (NOT `main`): `git checkout -b feat/ascend-deterministic-<op> upstream/test`.
 - PR base = `test`; title format: `[WS1][Ascend] [Qwen3-8b] <Op> ops` (e.g.
   `[WS1][Ascend] [Qwen3-8b] Fused logp ops`).
-- Pushing: the `gh` CLI is authenticated (`gh auth setup-git` configured); when a
-  direct connection to github.com is flaky, use the ghfast proxy (token as the proxy
-  host's userinfo). `gh pr edit --base` hits a GraphQL classic-projects deprecation
-  error — use `gh api -X PATCH repos/RL-Align/RL-Kernel/pulls/<n> -f base=test`
-  instead.
-- PR description drafts go in `/home/ma-user/work/z84450661/rl_kernel_pr/` (template
-  below).
+- Pushing: authenticate `gh` (`gh auth login --with-token`, then
+  `gh auth setup-git`); if direct github.com connectivity is flaky, push through
+  the ghfast proxy (token as the proxy host's userinfo). `gh pr edit --base` hits a
+  GraphQL classic-projects deprecation error — use
+  `gh api -X PATCH repos/RL-Align/RL-Kernel/pulls/<n> -f base=test` instead.
+- PR description drafts: keep a scratch directory OUTSIDE the repo for
+  `PR_DESCRIPTION_*.md` drafts (template below).
 
 ### Implementation checklist (file level)
 
@@ -86,7 +86,7 @@ The complete landing list for a new Ascend op:
 Build and smoke test:
 
 ```bash
-KERNEL_ALIGN_FORCE_ASCEND=1 pip install -e . --no-build-isolation   # use venv310 on this box
+KERNEL_ALIGN_FORCE_ASCEND=1 pip install -e . --no-build-isolation
 ```
 
 ### Bitwise-consistency rules (mandatory; must be stated clearly in the PR)
@@ -210,7 +210,7 @@ Test bugs already hit (check before writing new tests):
 
 ### PR description template
 
-Structure (see `/home/ma-user/work/z84450661/rl_kernel_pr/PR_DESCRIPTION_*.md`):
+Structure (mirror the wording of previous Ascend PR descriptions):
 
 ```markdown
 ## Latest Status [date]
@@ -238,6 +238,6 @@ python -m pytest rl_engine/tests/test_dispatch.py -q      # regression
 ## Notes
 ```
 
-Must include: environment (Ascend 910 / CANN version / torch+torch_npu versions),
-per-dtype gtest output and pytest results, bitwise-invariance conclusions,
-regression results, pre-commit status.
+Must include: the actual test environment (NPU model, CANN version, torch +
+torch_npu versions), per-dtype gtest output and pytest results,
+bitwise-invariance conclusions, regression results, pre-commit status.
