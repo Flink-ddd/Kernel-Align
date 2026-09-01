@@ -233,6 +233,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout-batch-size", type=int, default=1)
     parser.add_argument("--n-samples-per-prompt", type=int, default=8)
     parser.add_argument("--global-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--use-kl-loss",
+        action="store_true",
+        help="Load the reference checkpoint and add a KL term to the policy loss.",
+    )
+    parser.add_argument(
+        "--kl-loss-coef",
+        type=float,
+        default=0.0,
+        help="Reference-model KL loss coefficient; requires --use-kl-loss.",
+    )
     parser.add_argument("--max-response-len", type=int, default=7168)
     parser.add_argument("--max-tokens-per-gpu", type=int, default=4096)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.4)
@@ -268,6 +279,20 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.num_rollout <= 0:
         raise ValueError("--num-rollout must be positive")
+    trajectories_per_rollout = (
+        args.rollout_batch_size * args.n_samples_per_prompt
+    )
+    if args.global_batch_size != trajectories_per_rollout:
+        raise ValueError(
+            "--global-batch-size must equal --rollout-batch-size * "
+            "--n-samples-per-prompt for an exact per-step comparison "
+            f"({args.global_batch_size} != {trajectories_per_rollout})"
+        )
+    if args.use_kl_loss != (args.kl_loss_coef > 0.0):
+        raise ValueError(
+            "--use-kl-loss requires a positive --kl-loss-coef, and a positive "
+            "coefficient requires --use-kl-loss"
+        )
     arm = ARMS[args.group]
 
     script_dir = Path(__file__).resolve().parent
@@ -452,6 +477,10 @@ def main(argv: list[str] | None = None) -> int:
     ]
     if arm.framework_use_rollout_logprobs:
         train_command.append("--use-rollout-logprobs")
+    if args.use_kl_loss:
+        train_command.extend(
+            ["--use-kl-loss", "--kl-loss-coef", str(args.kl_loss_coef)]
+        )
     if {arm.attention_case, arm.ffn_case, arm.logp_case} == {"R/R"}:
         train_command.extend(
             [
@@ -503,6 +532,18 @@ def main(argv: list[str] | None = None) -> int:
         "algorithm": {
             "advantage_estimator": "grpo",
             "reward_model": "deepscaler",
+            "reference_model": {
+                "enabled": args.use_kl_loss,
+                "mode": "kl_loss" if args.use_kl_loss else None,
+                "coefficient": args.kl_loss_coef,
+            },
+        },
+        "snapshotting": {
+            "train_data_every_step": True,
+            "template": str(
+                run_dir / "train-data" / "{rollout_id}.rank{rank}.pt"
+            ),
+            "full_model_checkpoint_every_step": False,
         },
         "rollout_routing": {
             "router_policy": args.router_policy,
