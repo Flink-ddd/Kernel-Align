@@ -839,6 +839,31 @@ class VllmAttentionOperator:
                 "metadata_source": "vllm_gpu",
             }
 
+        max_seq_len = int(getattr(attn_metadata, "max_seq_len", block_table.size(1) * block_size))
+        page_count = min(block_table.size(1), (max_seq_len + block_size - 1) // block_size)
+        cache_key = (
+            _tensor_cache_token(query_starts_source),
+            _tensor_cache_token(seq_lens_source),
+            _tensor_cache_token(block_table),
+            query.device.type,
+            query.device.index,
+            num_actual,
+            block_size,
+            page_count,
+        )
+        owner_id = id(cache_owner) if cache_owner is not None else None
+        # Resolve the cross-layer cache before scheduling any GPU metadata work.
+        # Repeating an owner still forces the first layer of the next forward to miss.
+        if (
+            owner_id is not None
+            and self._metadata_cache_key == cache_key
+            and owner_id not in self._metadata_cache_owners
+            and self._metadata_cache_value is not None
+        ):
+            self._metadata_cache_owners.add(owner_id)
+            groups, cached_summary = self._metadata_cache_value
+            return groups, {**cached_summary, "metadata_reused_across_layers": True}
+
         query_starts = query_starts_source.to(device=query.device, dtype=torch.int32)
         seq_lens = seq_lens_source.to(device=query.device, dtype=torch.int32)
         query_indices = torch.arange(num_actual, dtype=torch.int32, device=query.device)
@@ -856,29 +881,6 @@ class VllmAttentionOperator:
             seqused_k,
             torch.ones_like(seqused_k),
         )
-
-        max_seq_len = int(getattr(attn_metadata, "max_seq_len", block_table.size(1) * block_size))
-        page_count = min(block_table.size(1), (max_seq_len + block_size - 1) // block_size)
-        cache_key = (
-            _tensor_cache_token(query_starts_source),
-            _tensor_cache_token(seq_lens_source),
-            _tensor_cache_token(block_table),
-            query.device.type,
-            query.device.index,
-            num_actual,
-            block_size,
-            page_count,
-        )
-        owner_id = id(cache_owner) if cache_owner is not None else None
-        if (
-            owner_id is not None
-            and self._metadata_cache_key == cache_key
-            and owner_id not in self._metadata_cache_owners
-            and self._metadata_cache_value is not None
-        ):
-            self._metadata_cache_owners.add(owner_id)
-            groups, cached_summary = self._metadata_cache_value
-            return groups, {**cached_summary, "metadata_reused_across_layers": True}
 
         pages = (
             block_table.index_select(0, request_indices)[:, :page_count]

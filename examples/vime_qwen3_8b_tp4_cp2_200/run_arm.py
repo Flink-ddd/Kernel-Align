@@ -98,6 +98,23 @@ MODEL_ARGS = (
 )
 
 
+def _max_engine_decode_batch(
+    rollout_batch_size: int, n_samples_per_prompt: int, router_policy: str
+) -> int:
+    """Largest decode batch one vLLM engine can hold under the active router.
+
+    round_robin is the only supported policy that guarantees an even split for
+    this finite request burst. cache_aware can pin a shared prefix and random
+    can produce an uneven split, so both must graph the full concurrency.
+    """
+
+    concurrency = rollout_batch_size * n_samples_per_prompt
+    engines = TOPOLOGY["rollout_gpus"] // TOPOLOGY["rollout_gpus_per_engine"]
+    if router_policy == "round_robin" and engines > 1:
+        return -(-concurrency // engines)  # ceil
+    return concurrency
+
+
 def _linear_logp_provider_args(arm: Arm) -> tuple[str, ...]:
     """Install the RL-Kernel provider only on a training-side R route."""
 
@@ -219,6 +236,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-response-len", type=int, default=7168)
     parser.add_argument("--max-tokens-per-gpu", type=int, default=4096)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.4)
+    parser.add_argument(
+        "--router-policy",
+        choices=("round_robin", "random", "cache_aware"),
+        default="round_robin",
+        help=(
+            "vLLM router policy. cache_aware pins every sample of one prompt to "
+            "a single engine, which idles the other engine when the concurrent "
+            "request count stays below router_balance_abs_threshold."
+        ),
+    )
     parser.add_argument("--extra-pythonpath", action="append", default=[])
     parser.add_argument(
         "--ld-library-path", default=os.environ.get("LD_LIBRARY_PATH", "")
@@ -287,6 +314,9 @@ def main(argv: list[str] | None = None) -> int:
             item for item in os.environ["PYTHONPATH"].split(os.pathsep) if item
         )
 
+    max_engine_decode_batch = _max_engine_decode_batch(
+        args.rollout_batch_size, args.n_samples_per_prompt, args.router_policy
+    )
     env_vars = {
         "RL_KERNEL_ROOT": str(rl_kernel_root),
         "RL_KERNEL_REAL_PYTHON": str(python),
@@ -310,9 +340,7 @@ def main(argv: list[str] | None = None) -> int:
         "RL_KERNEL_VLLM_REAL_VOCAB_SIZE": "151936",
         "RL_KERNEL_VLLM_PADDED_VOCAB_SIZE": "152064",
         "RL_KERNEL_VLLM_TEMPERATURE": "1.0",
-        "RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE": str(
-            args.rollout_batch_size * args.n_samples_per_prompt
-        ),
+        "RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE": str(max_engine_decode_batch),
         "RL_KERNEL_SEED": str(args.seed),
         "RL_KERNEL_ROLLOUT_SEED": str(args.rollout_seed),
         "RL_KERNEL_RUN_ID": run_id,
@@ -416,7 +444,7 @@ def main(argv: list[str] | None = None) -> int:
         "--attention-backend",
         MEGATRON_ATTENTION_BACKEND,
         "--router-policy",
-        "cache_aware",
+        args.router_policy,
         "--rollout-num-gpus-per-engine",
         str(TOPOLOGY["rollout_gpus_per_engine"]),
         "--vllm-gpu-memory-utilization",
@@ -476,6 +504,9 @@ def main(argv: list[str] | None = None) -> int:
             "advantage_estimator": "grpo",
             "reward_model": "deepscaler",
         },
+        "rollout_routing": {
+            "router_policy": args.router_policy,
+        },
         "training_memory": {
             "recompute_granularity": "full",
             "recompute_method": "uniform",
@@ -484,9 +515,7 @@ def main(argv: list[str] | None = None) -> int:
         "vllm_execution": {
             "cudagraph_required": True,
             "cudagraph_mode": "FULL_DECODE_ONLY",
-            "capture_sizes": list(
-                range(1, args.rollout_batch_size * args.n_samples_per_prompt + 1)
-            ),
+            "capture_sizes": list(range(1, max_engine_decode_batch + 1)),
             "enforce_eager": False,
         },
         "paths": {
