@@ -2,6 +2,9 @@
 # Copyright (c) 2026 RL-Kernel Contributors
 
 from dataclasses import asdict
+import os
+from pathlib import Path
+import subprocess
 
 from examples.vime_qwen3_8b_tp4_cp2_200.run_arm import (
     ARMS,
@@ -57,6 +60,43 @@ def _production_readbacks() -> list[dict]:
 
 def test_tp4_formal_matrix_pins_the_vime_qwen3_attention_backend():
     assert MEGATRON_ATTENTION_BACKEND == "fused"
+
+
+def test_launcher_forces_cuda_graph_without_a_logp_provider():
+    root = Path(__file__).parents[1]
+    launcher = (
+        root
+        / "examples"
+        / "vime_qwen3_8b_tp4_cp2_200"
+        / "aligned_python_entrypoint.sh"
+    )
+    env = os.environ.copy()
+    env.update(
+        RL_KERNEL_REAL_PYTHON="/bin/echo",
+        RL_KERNEL_ROOT=str(root),
+        RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE="8",
+    )
+
+    result = subprocess.run(
+        [
+            str(launcher),
+            "train.py",
+            "--rollout-batch-size",
+            "1",
+            "--n-samples-per-prompt",
+            "8",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert "--linear-logp-provider" not in result.stdout
+    assert "--vllm-optimization-level 0" in result.stdout
+    assert '"cudagraph_mode":"FULL_DECODE_ONLY"' in result.stdout
+    assert '"cudagraph_capture_sizes":[1,2,3,4,5,6,7,8]' in result.stdout
+    assert "required vLLM full-decode CUDA Graph capture sizes" in result.stderr
 
 
 def test_production_arms_do_not_install_the_rlkernel_logp_provider():

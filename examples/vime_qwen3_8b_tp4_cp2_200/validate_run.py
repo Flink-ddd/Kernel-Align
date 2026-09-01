@@ -48,6 +48,10 @@ VIME_NATIVE_LINEAR_LOGP_MARKER = (
     "backend_id=vime.utils.ppo_utils.calculate_log_probs_and_entropy "
     "contract_id=vime.native.linear_logp.v1 route=unconfigured device=cuda"
 )
+CUDA_GRAPH_LAUNCHER_MARKERS = (
+    "required vLLM full-decode CUDA Graph capture sizes",
+    "strict vLLM full-decode CUDA Graph capture sizes",
+)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -83,8 +87,10 @@ def _validate_cudagraph(log_text: str, manifest: Mapping[str, Any]) -> dict[str,
     )
     compact_sizes = "[" + ",".join(str(value) for value in capture_sizes) + "]"
     checks = {
-        "launcher_marker": f"strict vLLM full-decode CUDA Graph capture sizes: {compact_sizes}"
-        in log_text,
+        "launcher_marker": any(
+            f"{marker}: {compact_sizes}" in log_text
+            for marker in CUDA_GRAPH_LAUNCHER_MARKERS
+        ),
         "engine_mode": bool(re.search(r"cudagraph_mode.*FULL_DECODE_ONLY", log_text)),
         "not_eager": "enforce_eager=False" in log_text,
         "capture_sizes": (

@@ -42,7 +42,7 @@ if [[ "${1:-}" == "train.py" || "${1:-}" == */train.py ]]; then
     previous_arg="${current_arg}"
   done
 
-  strict_cudagraph_args=()
+  required_cudagraph_args=()
   if [[ "${strict_linear_logp}" == "1" ]]; then
     export RL_KERNEL_VLLM_INTEGRATION="${RL_KERNEL_VLLM_INTEGRATION:-1}"
     export RL_KERNEL_CUDA_ONLY="${RL_KERNEL_CUDA_ONLY:-1}"
@@ -50,41 +50,40 @@ if [[ "${1:-}" == "train.py" || "${1:-}" == */train.py ]]; then
     export RL_KERNEL_ATTENTION_CASE="${RL_KERNEL_ATTENTION_CASE:-R/R}"
     export RL_KERNEL_FFN_CASE="${RL_KERNEL_FFN_CASE:-R/R}"
     export RL_KERNEL_LOGP_CASE="${RL_KERNEL_LOGP_CASE:-R/R}"
+  fi
 
-    # Strict rollout kernels preserve their arithmetic order under CUDA Graph.
-    # Capturing the complete decode graph removes the per-layer host-launch
-    # gaps that otherwise dominate small decode batches. Capture every exact
-    # batch size: padding a strict custom kernel to a larger sparse graph can
-    # access invalid slots and, more importantly, changes the tested contract.
-    # Explicit vLLM execution flags always win so callers can opt out.
-    if [[ "${explicit_vllm_execution_config}" == "0" ]]; then
-      if [[ "${rollout_batch_size}" =~ ^[1-9][0-9]*$ && "${n_samples_per_prompt}" =~ ^[1-9][0-9]*$ ]]; then
-        max_capture_size=$((rollout_batch_size * n_samples_per_prompt))
-        if [[ -n "${RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE:-}" ]]; then
-          max_capture_size="${RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE}"
-        fi
-        if ! [[ "${max_capture_size}" =~ ^[1-9][0-9]*$ ]]; then
-          echo "RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE must be a positive integer" >&2
-          exit 2
-        fi
-
-        capture_sizes="["
-        for ((batch_size = 1; batch_size <= max_capture_size; batch_size++)); do
-          if ((batch_size > 1)); then
-            capture_sizes+=","
-          fi
-          capture_sizes+="${batch_size}"
-        done
-        capture_sizes+="]"
-        compilation_config="{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":${capture_sizes},\"max_cudagraph_capture_size\":${max_capture_size}}"
-        strict_cudagraph_args=(
-          --vllm-optimization-level 0
-          --vllm-compilation-config "${compilation_config}"
-        )
-        echo "[RL-Kernel] strict vLLM full-decode CUDA Graph capture sizes: ${capture_sizes}" >&2
-      else
-        echo "[RL-Kernel] strict CUDA Graph disabled: rollout batch size is unavailable" >&2
+  # CUDA Graph is a frozen matrix setting, independent of the linear-logp
+  # provider route. Capturing the complete decode graph removes per-layer
+  # host-launch gaps and keeps P/P and R/R performance comparisons aligned.
+  # Capture every exact batch size; explicit execution flags still win.
+  if [[ "${explicit_vllm_execution_config}" == "0" ]]; then
+    if [[ "${rollout_batch_size}" =~ ^[1-9][0-9]*$ && "${n_samples_per_prompt}" =~ ^[1-9][0-9]*$ ]]; then
+      max_capture_size=$((rollout_batch_size * n_samples_per_prompt))
+      if [[ -n "${RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE:-}" ]]; then
+        max_capture_size="${RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE}"
       fi
+      if ! [[ "${max_capture_size}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE must be a positive integer" >&2
+        exit 2
+      fi
+
+      capture_sizes="["
+      for ((batch_size = 1; batch_size <= max_capture_size; batch_size++)); do
+        if ((batch_size > 1)); then
+          capture_sizes+=","
+        fi
+        capture_sizes+="${batch_size}"
+      done
+      capture_sizes+="]"
+      compilation_config="{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":${capture_sizes},\"max_cudagraph_capture_size\":${max_capture_size}}"
+      required_cudagraph_args=(
+        --vllm-optimization-level 0
+        --vllm-compilation-config "${compilation_config}"
+      )
+      echo "[RL-Kernel] required vLLM full-decode CUDA Graph capture sizes: ${capture_sizes}" >&2
+    else
+      echo "[RL-Kernel] required CUDA Graph configuration lacks rollout batch sizes" >&2
+      exit 2
     fi
   fi
   exec "${REAL_PYTHON}" "$@" \
@@ -95,7 +94,7 @@ if [[ "${1:-}" == "train.py" || "${1:-}" == */train.py ]]; then
     --vllm-disable-custom-all-reduce \
     --deterministic-mode \
     --accumulate-allreduce-grads-in-fp32 \
-    "${strict_cudagraph_args[@]}"
+    "${required_cudagraph_args[@]}"
 fi
 
 exec "${REAL_PYTHON}" "$@"
