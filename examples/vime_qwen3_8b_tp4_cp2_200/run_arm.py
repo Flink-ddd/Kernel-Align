@@ -60,10 +60,10 @@ TOPOLOGY = {
     "rollout_engines": 2,
 }
 
-# Match the upstream VIME Qwen3 recipes explicitly. Leaving this as ``auto``
-# makes the production arms host-dependent because Transformer Engine may pick
-# either FlashAttention or cuDNN fused attention.
-MEGATRON_ATTENTION_BACKEND = "flash"
+# CP2/P2P requires Transformer Engine's fused attention on this topology.
+# Pinning the choice keeps the production arms independent of host-specific
+# backend auto-selection.
+MEGATRON_ATTENTION_BACKEND = "fused"
 
 MODEL_ARGS = (
     "--swiglu",
