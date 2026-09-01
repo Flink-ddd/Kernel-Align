@@ -75,6 +75,13 @@ def _find_ascend_home() -> str:
     candidates.append("/usr/local/Ascend/ascend-toolkit/latest")
     for cand in candidates:
         if cand and (Path(cand) / "bin" / "bisheng").is_file():
+            # The bisheng driver and its Ascend C plugin resolve toolkit data
+            # (impl include dirs, stub JSON generation) through these env
+            # vars. Without ASCEND_HOME_PATH the plugin crashes (segfault)
+            # while compiling any kernel TU, so export them for the compiler
+            # subprocesses once we know where the toolkit lives.
+            os.environ["ASCEND_HOME_PATH"] = cand
+            os.environ.setdefault("ASCEND_TOOLKIT_HOME", cand)
             return cand
     raise RuntimeError(
         "KERNEL_ALIGN_FORCE_ASCEND=1 was requested but no CANN toolkit with bin/bisheng "
