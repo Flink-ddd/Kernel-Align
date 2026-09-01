@@ -3,10 +3,13 @@
 
 import importlib.util
 import os
+import platform
+import subprocess
+import sysconfig
 import warnings
 from pathlib import Path
 
-from setuptools import find_packages, setup
+from setuptools import Extension, find_packages, setup
 
 
 def _load_envs_module():
@@ -56,6 +59,110 @@ def _cuda_define_from_env(name: str, macro: str) -> list[str]:
     if parsed <= 0:
         raise ValueError(f"{name} must be positive, got {value!r}")
     return [f"-D{macro}={parsed}"]
+
+
+_ASCEND_EXTENSION_NAME = "rl_engine._C_npu"
+_ASCEND_CPU_DIRS = {"aarch64": "aarch64-linux", "x86_64": "x86_64-linux"}
+
+
+def _find_ascend_home() -> str:
+    """Locate the CANN toolkit root (must contain bin/bisheng)."""
+    candidates = [
+        os.environ.get("ASCEND_HOME_PATH"),
+        os.environ.get("ASCEND_TOOLKIT_HOME"),
+    ]
+    candidates += [str(p) for p in sorted(Path.home().glob("Ascend/cann-*"), reverse=True)]
+    candidates.append("/usr/local/Ascend/ascend-toolkit/latest")
+    for cand in candidates:
+        if cand and (Path(cand) / "bin" / "bisheng").is_file():
+            return cand
+    raise RuntimeError(
+        "KERNEL_ALIGN_FORCE_ASCEND=1 was requested but no CANN toolkit with bin/bisheng "
+        "was found. Set ASCEND_HOME_PATH to the toolkit root."
+    )
+
+
+def _ascend_extension_spec() -> Extension:
+    sources = ["csrc/ascend/npu_module.cpp"]
+    sources += sorted(str(p) for p in Path("csrc/ascend").glob("*.asc"))
+    ext = Extension(name=_ASCEND_EXTENSION_NAME, sources=sources)
+    ext._rl_kernel_ascend = True  # intercepted by the custom build_ext below
+    return ext
+
+
+def _compile_ascend_extension(build_ext, ext) -> None:
+    """Compile the Ascend C extension with bisheng (torch's BuildExtension
+    does not know the .asc language, so we drive the compiler directly)."""
+    torch, _, _ = _load_torch_extension_tools()
+    try:
+        import torch_npu
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "KERNEL_ALIGN_FORCE_ASCEND=1 requires torch_npu. Install a matching "
+            "torch_npu build first."
+        ) from exc
+
+    ascend_home = _find_ascend_home()
+    cpu_dir = _ASCEND_CPU_DIRS.get(platform.machine())
+    if cpu_dir is None:
+        raise RuntimeError(f"unsupported Ascend host architecture: {platform.machine()}")
+    arch = os.environ.get(envs.KERNEL_ALIGN_ASCEND_ARCH, "dav-c220")
+
+    bisheng = os.path.join(ascend_home, "bin", "bisheng")
+    torch_dir = os.path.dirname(torch.__file__)
+    tnpu_dir = os.path.dirname(torch_npu.__file__)
+
+    includes = [
+        f"-I{os.path.join(ascend_home, cpu_dir, 'asc', 'include')}",
+        f"-I{os.path.join(torch_dir, 'include')}",
+        f"-I{os.path.join(torch_dir, 'include', 'torch', 'csrc', 'api', 'include')}",
+        f"-I{os.path.join(tnpu_dir, 'include')}",
+        f"-I{sysconfig.get_paths()['include']}",
+    ]
+    defines = [f"-DTORCH_EXTENSION_NAME={_ASCEND_EXTENSION_NAME.rsplit('.', 1)[-1]}"]
+
+    build_temp = os.path.join(build_ext.build_temp, "ascend")
+    os.makedirs(build_temp, exist_ok=True)
+
+    objects = []
+    for src in ext.sources:
+        obj = os.path.join(build_temp, Path(src).name + ".o")
+        cmd = [bisheng, "-std=c++17", "-O2", "-fPIC", "-c"]
+        if src.endswith(".asc"):
+            cmd += ["-x", "asc", f"--cce-aicore-arch={arch}"]
+        cmd += includes + defines + [src, "-o", obj]
+        subprocess.check_call(cmd)
+        objects.append(obj)
+
+    out_path = build_ext.get_ext_fullpath(ext.name)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    link = [bisheng, "-shared", *objects]
+    for lib_dir, libs in (
+        (os.path.join(torch_dir, "lib"), ["torch", "torch_cpu", "torch_python", "c10"]),
+        (os.path.join(tnpu_dir, "lib"), ["torch_npu"]),
+        (os.path.join(ascend_home, "runtime", "lib64"), ["ascendcl"]),
+        (os.path.join(ascend_home, cpu_dir, "lib64"), ["runtime"]),
+    ):
+        link.append(f"-L{lib_dir}")
+        link += [f"-l{name}" for name in libs]
+    link += [
+        f"-Wl,-rpath,{os.path.join(torch_dir, 'lib')}",
+        f"-Wl,-rpath,{os.path.join(tnpu_dir, 'lib')}",
+        "-o",
+        out_path,
+    ]
+    subprocess.check_call(link)
+
+
+def _make_build_extension(BuildExtension):
+    class AscendAwareBuildExtension(BuildExtension):
+        def build_extension(self, ext):
+            if getattr(ext, "_rl_kernel_ascend", False):
+                _compile_ascend_extension(self, ext)
+                return
+            super().build_extension(ext)
+
+    return AscendAwareBuildExtension
 
 
 _ROCM_UNSUPPORTED_NVCC_FLAG_PREFIXES = (
@@ -266,6 +373,9 @@ def get_extensions():
             )
         )
 
+    if envs.env_flag(envs.KERNEL_ALIGN_FORCE_ASCEND):
+        extensions.append(_ascend_extension_spec())
+
     if _native_extension_required() and not extensions:
         raise RuntimeError(
             "rl_engine._C was requested but no CUDA/ROCm build environment is available. "
@@ -280,7 +390,7 @@ def get_cmdclass():
     _, BuildExtension, _ = _load_torch_extension_tools()
     if BuildExtension is None:
         return {}
-    return {"build_ext": BuildExtension}
+    return {"build_ext": _make_build_extension(BuildExtension)}
 
 
 setup(
