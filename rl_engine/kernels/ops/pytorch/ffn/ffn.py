@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -11,7 +12,12 @@ import torch
 from torch import Tensor
 
 from rl_engine.distributed.collectives import _COLLECTIVES as _SHARED_COLLECTIVES
-from rl_engine.distributed.collectives import collective_for_group, deterministic_all_reduce_inplace
+from rl_engine.distributed.collectives import (
+    collective_for_group,
+    deterministic_all_reduce_inplace,
+    deterministic_all_reduce_staged,
+    deterministic_staging_reserve,
+)
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 from rl_engine.kernels.ops.cuda.matmul.det_gemm import (
     det_gemm_linear,
@@ -93,6 +99,44 @@ def _qwen3_ffn_packed_inference_fake(
     return rmsnorm_output.new_empty((*rmsnorm_output.shape[:-1], down_weight.shape[0]))
 
 
+@torch.library.custom_op(
+    "rl_kernel::qwen3_ffn_packed_inference_to_staging",
+    mutates_args={"output"},
+)
+def _qwen3_ffn_packed_inference_to_staging(
+    rmsnorm_output: Tensor,
+    fused_gate_up_weight: Tensor,
+    down_weight: Tensor,
+    output: Tensor,
+) -> None:
+    """Run strict FFN compute with the down projection targeting IPC staging."""
+
+    _notify_packed_inference_observers()
+    hidden_2d = rmsnorm_output.reshape(-1, rmsnorm_output.shape[-1]).contiguous()
+    gate_up = det_gemm_linear(
+        hidden_2d,
+        fused_gate_up_weight,
+        native_op=_C.det_gemm_fwd_rhs_transposed,
+    )
+    activated = _C.swiglu_packed_forward(gate_up)
+    det_gemm_linear(
+        activated,
+        down_weight,
+        native_op=_C.det_gemm_fwd_rhs_transposed,
+        out=output,
+    )
+
+
+@_qwen3_ffn_packed_inference_to_staging.register_fake
+def _qwen3_ffn_packed_inference_to_staging_fake(
+    rmsnorm_output: Tensor,
+    fused_gate_up_weight: Tensor,
+    down_weight: Tensor,
+    output: Tensor,
+) -> None:
+    del rmsnorm_output, fused_gate_up_weight, down_weight, output
+
+
 def qwen3_ffn_packed_inference(
     rmsnorm_output: Tensor,
     fused_gate_up_weight: Tensor,
@@ -100,18 +144,49 @@ def qwen3_ffn_packed_inference(
     *,
     collective_handle: int = 0,
     tp_world_size: int = 1,
+    collective: Any | None = None,
 ) -> Tensor:
     """Inference-only packed FFN entry compatible with torch.compile."""
 
+    if tp_world_size <= 1:
+        return _qwen3_ffn_packed_inference(
+            rmsnorm_output,
+            fused_gate_up_weight,
+            down_weight,
+        )
+    if collective_handle <= 0:
+        raise RuntimeError("packed rollout FFN requires a bound TP collective")
+    input_shape = rmsnorm_output.shape
+    output_shape_2d = (
+        rmsnorm_output.numel() // input_shape[-1],
+        down_weight.shape[0],
+    )
+    direct_output = (
+        None
+        if collective is None
+        else collective.direct_staging_view(output_shape_2d, dtype=rmsnorm_output.dtype)
+    )
+    if direct_output is not None:
+        deterministic_staging_reserve(
+            direct_output,
+            collective_handle=collective_handle,
+        )
+        _qwen3_ffn_packed_inference_to_staging(
+            rmsnorm_output,
+            fused_gate_up_weight,
+            down_weight,
+            direct_output,
+        )
+        reduced = deterministic_all_reduce_staged(
+            direct_output,
+            collective_handle=collective_handle,
+        )
+        return reduced.reshape(*input_shape[:-1], down_weight.shape[0])
     output = _qwen3_ffn_packed_inference(
         rmsnorm_output,
         fused_gate_up_weight,
         down_weight,
     )
-    if tp_world_size <= 1:
-        return output
-    if collective_handle <= 0:
-        raise RuntimeError("packed rollout FFN requires a bound TP collective")
     return deterministic_all_reduce_inplace(
         output,
         collective_handle=collective_handle,
@@ -644,6 +719,13 @@ class Qwen3FFNOp:
             tp_group,
             min_size_bytes=min_size_bytes,
         )
+        max_capture = int(os.getenv("RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE", "0"))
+        if max_capture <= 0:
+            raise RuntimeError("packed rollout FFN requires a positive graph capture size")
+        collective.prepare_direct_staging_views(
+            ((batch, int(down_weight.shape[0])) for batch in range(1, max_capture + 1)),
+            dtype=down_weight.dtype,
+        )
         collective_handle = int(collective._handle)
         self._packed_inference_collectives[collective_handle] = collective
         return collective_handle, tp_world_size
@@ -663,6 +745,7 @@ class Qwen3FFNOp:
             down_weight,
             collective_handle=collective_handle,
             tp_world_size=tp_world_size,
+            collective=self._packed_inference_collectives.get(collective_handle),
         )
 
     def __call__(
