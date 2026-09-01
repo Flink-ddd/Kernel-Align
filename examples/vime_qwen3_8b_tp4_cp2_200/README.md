@@ -109,8 +109,11 @@ used for experiment or reward claims.
 
 ## Run one arm
 
-Start a Ray cluster appropriate for the host, then invoke `run_arm.py`. The
-example below is schematic; every path is recorded in `manifest.json`.
+The complete host setup, data and checkpoint preparation, exact historical
+revision table, formal 200-step launch commands, Ray log capture, validation,
+and performance-analysis commands are recorded in
+[`REPRODUCTION.md`](REPRODUCTION.md). The short example below is schematic;
+every expanded path and command is recorded in `manifest.json`.
 
 ```bash
 python examples/vime_qwen3_8b_tp4_cp2_200/run_arm.py \
@@ -184,3 +187,8 @@ G00 and G01 were paused, so the publication is explicitly a two-arm interim
 result rather than a completed four-arm ablation. Performance is omitted
 because the immutable G11 and final G10 runs used different repository and
 Transformer Engine revisions.
+
+The diagnostic (non-causal) stage-timing comparison can be regenerated from
+the two sealed `run.log` files with
+[`analyze_performance.py`](analyze_performance.py), following the commands in
+[`REPRODUCTION.md`](REPRODUCTION.md#performance-analysis-commands).
