@@ -174,3 +174,13 @@ bitwise mismatch count, token-weighted mean absolute difference, maximum
 absolute difference, reward, truncation, step time, and throughput. For R/R,
 the strongest claim is `mismatch_count = 0` over the stated token exposure;
 reward and speed are secondary quality and cost measurements.
+
+## Published convergence results
+
+The sealed 200-step G10/G11 results, per-step data, reproducible plotting
+script, and consistency figures are published in
+[`results/convergence_s1234_g10_g11`](results/convergence_s1234_g10_g11/README.md).
+G00 and G01 were paused, so the publication is explicitly a two-arm interim
+result rather than a completed four-arm ablation. Performance is omitted
+because the immutable G11 and final G10 runs used different repository and
+Transformer Engine revisions.
