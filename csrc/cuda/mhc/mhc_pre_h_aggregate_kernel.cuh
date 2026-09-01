@@ -7,9 +7,23 @@
 
 namespace rl_kernel::mhc {
 
+constexpr int64_t kMhcPreHcMult = 4;
+constexpr int64_t kMhcPreHiddenSize = 4096;
+constexpr int kMhcWarpSize = 32;
 constexpr int kMhcPreHAggregateDecodeThreads = 1024;
 constexpr int kMhcPreHAggregateBatchThreads = 512;
 constexpr int kMhcPreHAggregateBackwardThreads = 256;
+constexpr int kMhcPreHAggregateBackwardWarps =
+    kMhcPreHAggregateBackwardThreads / kMhcWarpSize;
+
+static_assert(kMhcPreHAggregateBackwardThreads % kMhcWarpSize == 0,
+              "MHC H Aggregate backward requires complete warps");
+static_assert(kMhcPreHiddenSize % kMhcPreHAggregateBackwardThreads == 0,
+              "each backward thread must reduce a fixed number of elements");
+static_assert(kMhcPreHAggregateBackwardThreads <= 1024,
+              "MHC H Aggregate backward exceeds the CUDA block limit");
+static_assert(kMhcPreHAggregateBackwardWarps <= kMhcWarpSize,
+              "warp 0 must be able to reduce all per-warp partial sums");
 
 __global__ void mhc_pre_h_aggregate_kernel(__nv_bfloat16 const* residual,
                                            float const* pre,
@@ -93,15 +107,14 @@ __device__ __forceinline__ float mhc_warp_sum(float value) {
 
 __global__ void mhc_pre_h_aggregate_backward_kernel(
     __nv_bfloat16 const* grad_output, __nv_bfloat16 const* residual,
-    float const* pre, __nv_bfloat16* grad_residual, float* grad_pre,
+    float const* pre, float* grad_residual, float* grad_pre,
     int64_t hidden_size) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   cudaGridDependencySynchronize();
 #endif
 
-  constexpr int kWarpSize = 32;
-  constexpr int kNumWarps = kMhcPreHAggregateBackwardThreads / kWarpSize;
-  __shared__ float warp_sums[4][kNumWarps];
+  __shared__ float
+      warp_sums[kMhcPreHcMult][kMhcPreHAggregateBackwardWarps];
 
   int64_t const token = static_cast<int64_t>(blockIdx.x);
   int64_t const output_offset = token * hidden_size;
@@ -132,18 +145,17 @@ __global__ void mhc_pre_h_aggregate_backward_kernel(
     sum_2 = __fadd_rn(sum_2, __fmul_rn(dy, residual_2));
     sum_3 = __fadd_rn(sum_3, __fmul_rn(dy, residual_3));
 
-    grad_residual[residual_offset + hidden] =
-        __float2bfloat16_rn(__fmul_rn(dy, weight_0));
+    grad_residual[residual_offset + hidden] = __fmul_rn(dy, weight_0);
     grad_residual[residual_offset + hidden_size + hidden] =
-        __float2bfloat16_rn(__fmul_rn(dy, weight_1));
+        __fmul_rn(dy, weight_1);
     grad_residual[residual_offset + 2 * hidden_size + hidden] =
-        __float2bfloat16_rn(__fmul_rn(dy, weight_2));
+        __fmul_rn(dy, weight_2);
     grad_residual[residual_offset + 3 * hidden_size + hidden] =
-        __float2bfloat16_rn(__fmul_rn(dy, weight_3));
+        __fmul_rn(dy, weight_3);
   }
 
-  int const lane = threadIdx.x & (kWarpSize - 1);
-  int const warp = threadIdx.x / kWarpSize;
+  int const lane = threadIdx.x & (kMhcWarpSize - 1);
+  int const warp = threadIdx.x / kMhcWarpSize;
   sum_0 = mhc_warp_sum(sum_0);
   sum_1 = mhc_warp_sum(sum_1);
   sum_2 = mhc_warp_sum(sum_2);
@@ -157,10 +169,14 @@ __global__ void mhc_pre_h_aggregate_backward_kernel(
   __syncthreads();
 
   if (warp == 0) {
-    sum_0 = lane < kNumWarps ? warp_sums[0][lane] : 0.0f;
-    sum_1 = lane < kNumWarps ? warp_sums[1][lane] : 0.0f;
-    sum_2 = lane < kNumWarps ? warp_sums[2][lane] : 0.0f;
-    sum_3 = lane < kNumWarps ? warp_sums[3][lane] : 0.0f;
+    sum_0 = lane < kMhcPreHAggregateBackwardWarps ? warp_sums[0][lane]
+                                                   : 0.0f;
+    sum_1 = lane < kMhcPreHAggregateBackwardWarps ? warp_sums[1][lane]
+                                                   : 0.0f;
+    sum_2 = lane < kMhcPreHAggregateBackwardWarps ? warp_sums[2][lane]
+                                                   : 0.0f;
+    sum_3 = lane < kMhcPreHAggregateBackwardWarps ? warp_sums[3][lane]
+                                                   : 0.0f;
     sum_0 = mhc_warp_sum(sum_0);
     sum_1 = mhc_warp_sum(sum_1);
     sum_2 = mhc_warp_sum(sum_2);
@@ -202,7 +218,7 @@ inline cudaError_t launch_mhc_pre_h_aggregate(
 
 inline cudaError_t launch_mhc_pre_h_aggregate_backward(
     __nv_bfloat16 const* grad_output, __nv_bfloat16 const* residual,
-    float const* pre, __nv_bfloat16* grad_residual, float* grad_pre,
+    float const* pre, float* grad_residual, float* grad_pre,
     int64_t num_tokens, int64_t hidden_size, cudaStream_t stream,
     bool enable_pdl) {
   cudaLaunchConfig_t config{};

@@ -507,7 +507,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "mhc_pre_h_aggregate_backward",
         &mhc_pre_h_aggregate_backward_cuda,
-        "Batch-invariant MHC H Aggregate backward CUDA");
+        "Batch-invariant MHC H Aggregate backward CUDA (FP32 dR and dPRE)");
 #endif
 
     // registry SiLU / SwiGLU (elementwise activation)

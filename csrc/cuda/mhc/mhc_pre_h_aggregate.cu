@@ -24,9 +24,12 @@ torch::Tensor mhc_pre_h_aggregate_cuda(torch::Tensor residual,
               "residual must be bfloat16");
   TORCH_CHECK(pre.scalar_type() == torch::kFloat32,
               "pre must be float32");
-  TORCH_CHECK(residual.dim() == 3 && residual.size(1) == 4,
-              "residual must have shape [num_tokens, 4, hidden_size]");
-  TORCH_CHECK(pre.dim() == 2 && pre.size(1) == 4,
+  TORCH_CHECK(residual.dim() == 3 &&
+                  residual.size(1) == rl_kernel::mhc::kMhcPreHcMult &&
+                  residual.size(2) == rl_kernel::mhc::kMhcPreHiddenSize,
+              "residual must have shape [num_tokens, 4, 4096]");
+  TORCH_CHECK(pre.dim() == 2 &&
+                  pre.size(1) == rl_kernel::mhc::kMhcPreHcMult,
               "pre must have shape [num_tokens, 4]");
   TORCH_CHECK(residual.size(0) == pre.size(0),
               "residual and pre must have the same num_tokens");
@@ -76,14 +79,17 @@ std::vector<torch::Tensor> mhc_pre_h_aggregate_backward_cuda(
                   residual.scalar_type() == torch::kBFloat16,
               "grad_output and residual must be bfloat16");
   TORCH_CHECK(pre.scalar_type() == torch::kFloat32, "pre must be float32");
-  TORCH_CHECK(residual.dim() == 3 && residual.size(1) == 4,
-              "residual must have shape [num_tokens, 4, hidden_size]");
-  TORCH_CHECK(pre.dim() == 2 && pre.size(1) == 4,
+  TORCH_CHECK(residual.dim() == 3 &&
+                  residual.size(1) == rl_kernel::mhc::kMhcPreHcMult &&
+                  residual.size(2) == rl_kernel::mhc::kMhcPreHiddenSize,
+              "residual must have shape [num_tokens, 4, 4096]");
+  TORCH_CHECK(pre.dim() == 2 &&
+                  pre.size(1) == rl_kernel::mhc::kMhcPreHcMult,
               "pre must have shape [num_tokens, 4]");
   TORCH_CHECK(grad_output.dim() == 2 &&
                   grad_output.size(0) == residual.size(0) &&
-                  grad_output.size(1) == residual.size(2),
-              "grad_output must have shape [num_tokens, hidden_size]");
+                  grad_output.size(1) == rl_kernel::mhc::kMhcPreHiddenSize,
+              "grad_output must have shape [num_tokens, 4096]");
   TORCH_CHECK(pre.size(0) == residual.size(0),
               "residual and pre must have the same num_tokens");
 
@@ -92,7 +98,8 @@ std::vector<torch::Tensor> mhc_pre_h_aggregate_backward_cuda(
   TORCH_CHECK(num_tokens <= std::numeric_limits<unsigned int>::max(),
               "num_tokens exceeds the CUDA grid limit");
 
-  auto grad_residual = torch::empty_like(residual);
+  auto grad_residual = torch::empty(
+      residual.sizes(), residual.options().dtype(torch::kFloat32));
   auto grad_pre = torch::zeros_like(pre);
   if (num_tokens == 0 || hidden_size == 0) {
     return {grad_residual, grad_pre};
@@ -112,8 +119,7 @@ std::vector<torch::Tensor> mhc_pre_h_aggregate_backward_cuda(
   auto const* residual_ptr = reinterpret_cast<__nv_bfloat16 const*>(
       residual.data_ptr<at::BFloat16>());
   auto const* pre_ptr = pre.data_ptr<float>();
-  auto* grad_residual_ptr = reinterpret_cast<__nv_bfloat16*>(
-      grad_residual.data_ptr<at::BFloat16>());
+  auto* grad_residual_ptr = grad_residual.data_ptr<float>();
   auto* grad_pre_ptr = grad_pre.data_ptr<float>();
 
   cudaError_t const status =

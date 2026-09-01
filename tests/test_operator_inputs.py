@@ -79,11 +79,11 @@ def test_mhc_pre_h_aggregate_inputs_match_mixed_precision_contract():
     args = _args(input_mode="constant", batch=2, seq=3, normalized_dim=128)
     inputs = make_operator_inputs("mhc_pre_h_aggregate", args, torch.bfloat16, torch.device("cpu"))
 
-    assert inputs["residual"].shape == (6, 4, 128)
+    assert inputs["residual"].shape == (6, 4, 4096)
     assert inputs["residual"].dtype is torch.bfloat16
     assert inputs["pre"].shape == (6, 4)
     assert inputs["pre"].dtype is torch.float32
-    assert operator_shape_name("mhc_pre_h_aggregate", args) == "6x4x128"
+    assert operator_shape_name("mhc_pre_h_aggregate", args) == "6x4x4096"
 
 
 def test_mhc_pre_h_aggregate_operator_spec_registers_both_gradients():
