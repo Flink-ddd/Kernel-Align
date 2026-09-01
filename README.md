@@ -14,7 +14,7 @@
   <a href="./docs/community/wechat.md"><img src="https://img.shields.io/badge/WeChat-Join%20Group-07C160?logo=wechat&logoColor=white" alt="WeChat"></a>
   <a href="./docs/assets/whatsapp-group.png"><img src="https://img.shields.io/badge/WhatsApp-Join%20Group-25D366?logo=whatsapp&logoColor=white" alt="WhatsApp"></a>
   <a href="https://deepwiki.com/RL-Align/RL-Kernel"><img src="https://img.shields.io/badge/Ask-DeepWiki-7B3FE4" alt="Ask DeepWiki"></a>
-  <a href="https://github.com/RL-Align/RL-Kernel"><img src="https://img.shields.io/badge/Hardware-NVIDIA%20CUDA%20%7C%20AMD%20ROCm-orange" alt="Hardware"></a>
+  <a href="https://github.com/RL-Align/RL-Kernel"><img src="https://img.shields.io/badge/Hardware-NVIDIA%20CUDA%20%7C%20AMD%20ROCm%20%7C%20HUAWEI%20Ascend-orange" alt="Hardware"></a>
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
 </p>
 
@@ -27,10 +27,10 @@
 # Our Core Philosophy
 
 **1. Operator-Level Train-Inference Consistency**
-The biggest hidden barrier in large-scale RL is the subtle numerical divergence between rollout engines (e.g., vLLM) and training engines (e.g., Megatron/DeepSpeed). RL-Kernel provides mathematically rigorous, fused operators that lock down the computational graph. By guaranteeing absolute numerical consistency and deterministic reduction orders across the entire RL loop, we prevent reward hacking and distribution drift at the operator level.
+The biggest hidden barrier in large-scale RL is the subtle numerical divergence between rollout engines (e.g., vLLM) and training engines (e.g., Megatron/DeepSpeed). RL-Kernel implements deterministic operators for dense-model workloads to align numerical behavior between rollout and training paths. By pinning computational graphs and reduction orders at the operator level, it helps prevent reward hacking and distribution drift caused by numerical divergence.
 
 **2. Extreme Memory & Compute Efficiency**
-We replace naive PyTorch paths—which suffer from $O(G \cdot L \cdot V)$ memory explosion—with specialized industrial-grade kernels (like `prefix_shared_attention` and `fused_logp`). This reduces VRAM consumption by up to 10x, unlocking massive batch sizes for GRPO workloads without triggering Out-Of-Memory (OOM) errors.
+We replace naive PyTorch paths—which suffer from $O(G \cdot L \cdot V)$ memory explosion—with specialized industrial-grade kernels (like `prefix_shared_attention` and `fused_logp`). This reduces VRAM consumption and supports larger batch sizes for GRPO workloads.
 
 ---
 
@@ -42,70 +42,21 @@ RL-Kernel sits strictly at the operator layer, acting as a non-intrusive bridge 
   <img src="docs/assets/RL-Kernel underlying operator library technical architecture.png" alt="RL-Kernel Global Architecture" width="800">
 </p>
 
-*Note: RL-Kernel integrates natively into Rollout Engines (vLLM, sglang, LMDeploy) and Training Engines (Megatron, DeepSpeed) via non-intrusive custom operator hooks, powered by underlying CUDA, Triton, and ROCm backends.*
+*Note: RL-Kernel integrates natively into Rollout Engines (vLLM, sglang, LMDeploy) and Training Engines (Megatron, DeepSpeed) via non-intrusive custom operator hooks, powered by CUDA, Triton, and ROCm backends, with an Ascend CANN backend for batch-invariant logprob.*
 
 ---
 
-# Performance Benchmarks: Breaking the Memory Wall
-
-RL-Kernel is designed to solve the $O(G \cdot L \cdot V)$ memory explosion in DeepSeek-style **GRPO** training. A typical scenario is as follows:
-
-### 1. Logprob Computation (Training Stability)
-By implementing **Pre-allocated Chunking**, RL-Kernel maintains constant additional VRAM overhead regardless of the group size ($G$).
-
-**Testbed**: NVIDIA A100 80GB | **Model**: Llama-3-8B | **Vocab**: 128,256 | **SeqLen**: 512
-
-| Group Size ($G$) | TRL (Standard) | PyTorch Native | **RL-Kernel (Ours)** | Status |
-| :--- | :--- | :--- | :--- | :--- |
-| **G = 64** | OOM | 15.66 GB | **16.15 GB** | Success |
-| **G = 128** | OOM | 31.31 GB | **31.80 GB** | Success |
-| **G = 256** | **FAILED (OOM)** | 62.63 GB | **63.12 GB** | **Optimized** |
-
-*Note: RL-Kernel is the only solution that successfully scales G=256 on a single A100 by keeping extra VRAM usage to a constant ~0.5GB.*
-
-
-<p align="center">
-  <img src="docs/assets/1. VRAM Saving.png" alt="Logprob VRAM Benchmark">
-</p>
-
-### 2. Sampling Latency (Rollout Speed)
-Integrating **FlashInfer** fused kernels to accelerate the bottleneck of RL training: the sampling phase.
-
-| Batch Size ($G$) | Native PyTorch | **RL-Kernel (Fused)** | **Speedup** |
-| :--- | :--- | :--- | :--- |
-| 32 | 176.79 ms | **1.08 ms** | **163x** |
-| 64 | 10.54 ms | **1.31 ms** | **8x** |
-| 128 | 18.89 ms | **1.86 ms** | **10x** |
-| 256 | 36.23 ms | **2.94 ms** | **12x** |
-
-
-<p align="center">
-  <img src="docs/assets/2. sampling latency.png" alt="Sampling Latency Benchmark">
-</p>
-
-### 3. Real Model Validation (Qwen3-30B-A3B MoE)
-
-**Testbed**: NVIDIA A100 80GB | **Model**: Qwen3-30B-A3B | **Vocab**: 151,936 | **dtype**: fp16
-
-Model weights consume 56.9 GB — only 23 GB headroom remaining for training computation.
-
-
-<p align="center">
-  <img src="docs/assets/3. moe .png" alt="Real Model MoE Benchmark">
-</p>
-
 # Key Features
 
-- **Zero-Growth Memory Pool**: Uses pre-allocated buffers and micro-chunking to prevent VRAM spikes during advantage calculation.
-- **Fused Sampling Pipeline**: Direct integration with **FlashInfer** and **vLLM** backends for sub-2ms sampling latency.
-- **Universal Backend Abstraction**: Unified API supporting both **NVIDIA (CUDA/FlashInfer)** and **AMD (ROCm/AITER)**.
-- **Post-Training Ready**: Drop-in replacement for standard sampling and logprob operators in TRL or DeepSpeed-Chat.
+- **Dense-Model Train–Inference Consistency**: Implements operator-level consistency for dense-model workloads, validated end to end on Qwen3-8B Dense.
+- **Multi-Platform Accelerator Support**: Supports **NVIDIA CUDA** and **AMD ROCm**, with **HUAWEI Ascend (NPU/CANN)** support for batch-invariant logprob.
+- **Hardware Roadmap**: Broader support is planned for **MetaX**, **Cambricon**, **Moore Threads**, and more.
 
 ---
 
 # Architecture
 
-RL-Kernel sits between high-level alignment libraries and low-level GPU kernels, ensuring maximum throughput without sacrificing flexibility.
+RL-Kernel sits between high-level alignment libraries and low-level accelerator kernels, ensuring maximum throughput without sacrificing flexibility.
 
 ---
 
@@ -151,7 +102,7 @@ Featured docs:
 
 RL-Kernel builds on the shoulders of excellent open-source projects:
 
-- **[FlashInfer](https://github.com/flashinfer-ai/flashinfer)** — We integrate FlashInfer's fused sampling kernels as the NVIDIA backend for our sampling pipeline. The sub-2ms sampling latency results are enabled by FlashInfer's highly optimized CUDA operators.
+- **[FlashInfer](https://github.com/flashinfer-ai/flashinfer)** — We integrate FlashInfer's fused sampling kernels as an NVIDIA backend for sampling workloads.
 - **[vLLM](https://github.com/vllm-project/vllm)** — Inspired by vLLM's kernel design philosophy and hardware-aware scheduling approach.
 - **[DeepSpeed](https://github.com/microsoft/DeepSpeed)** — Inspired by DeepSpeed's approach to memory-efficient training infrastructure.
 
