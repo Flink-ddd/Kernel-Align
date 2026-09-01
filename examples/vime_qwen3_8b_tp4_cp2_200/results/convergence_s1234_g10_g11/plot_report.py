@@ -25,7 +25,7 @@ BAR_ORANGE_EDGE = "#D66A27"
 GRID = "#D7DCE2"
 TEXT = "#20242A"
 GROUP_ORDER = ("G11", "G10")
-LABELS = {"G11": "G11 strict RL-Kernel", "G10": "G10 VIME-native"}
+LABELS = {"G11": "G11 strict RL-Kernel", "G10": "G10 VIME-native baseline"}
 
 
 def _parse(value: str) -> Any:
@@ -92,6 +92,20 @@ def save(figure, output_dir: Path, stem: str) -> None:
     figure.savefig(output_dir / f"{stem}.pdf", bbox_inches="tight", facecolor="white")
 
 
+def add_report_header(figure, title: str, subtitle: str) -> None:
+    """Place a non-overlapping title/subtitle pair at the top of a report figure."""
+    figure.suptitle(title, fontsize=19, fontweight="bold", y=0.99)
+    figure.text(
+        0.5,
+        0.945,
+        subtitle,
+        ha="center",
+        va="top",
+        fontsize=11.5,
+        color="#4A515A",
+    )
+
+
 def plot_pair(axis, steps, strict_values, native_values) -> None:
     axis.plot(steps, strict_values, color=LIGHT_BLUE, linewidth=1.0, alpha=0.78)
     axis.plot(steps, trailing_ma(strict_values), color=BLUE, linewidth=2.35)
@@ -104,17 +118,11 @@ def consistency_trajectories(rows, output_dir: Path) -> None:
     from matplotlib.lines import Line2D
 
     steps = list(range(200))
-    fig, axes = plt.subplots(3, 1, figsize=(14.5, 10.2), sharex=True)
-    fig.suptitle(
-        "VIME · Qwen3-8B · 200-step GRPO (8×H100, TP4/CP2)", fontsize=19, fontweight="bold", y=0.982
-    )
-    fig.text(
-        0.5,
-        0.949,
-        "Consistency dynamics: G11 strict RL-Kernel vs G10 VIME-native production",
-        ha="center",
-        fontsize=11.5,
-        color="#4A515A",
+    fig, axes = plt.subplots(3, 1, figsize=(14.5, 10.8), sharex=True)
+    add_report_header(
+        fig,
+        "VIME · Qwen3-8B · 200-step GRPO (8×H100, TP4/CP2)",
+        "Consistency dynamics: G11 strict RL-Kernel vs G10 VIME-native baseline",
     )
     panels = (
         ("mean_abs_dlogp", r"Mean absolute $\Delta\log p$", "Mean |Δ logp|"),
@@ -129,23 +137,14 @@ def consistency_trajectories(rows, output_dir: Path) -> None:
         axis.set_ylabel(ylabel, fontsize=11.5)
         upper = max(native_values)
         axis.set_ylim(-0.025 * upper, 1.08 * upper)
-    mismatch = {
-        group: [
-            100.0 * count / tokens
-            for count, tokens in zip(
-                series(rows[group], "mismatch_count"),
-                series(rows[group], "active_token_count"),
-                strict=True,
-            )
-        ]
-        for group in GROUP_ORDER
-    }
+    mismatch = {group: series(rows[group], "mismatch_count") for group in GROUP_ORDER}
     style_axis(axes[2])
     plot_pair(axes[2], steps, mismatch["G11"], mismatch["G10"])
-    axes[2].set_title("Bitwise log-probability mismatch rate", fontsize=12.5, pad=8)
-    axes[2].set_ylabel("Mismatch rate (%)", fontsize=11.5)
+    axes[2].set_title("Bitwise log-probability mismatch count per step", fontsize=12.5, pad=8)
+    axes[2].set_ylabel("Mismatch count", fontsize=11.5)
     axes[2].set_xlabel("Training Step", fontsize=12)
-    axes[2].set_ylim(-2, min(100, 1.08 * max(mismatch["G10"])))
+    mismatch_upper = max(mismatch["G10"])
+    axes[2].set_ylim(-0.025 * mismatch_upper, 1.08 * mismatch_upper)
     axes[2].set_xlim(0, 199)
     axes[2].set_xticks(range(0, 200, 25))
     fig.legend(
@@ -155,14 +154,14 @@ def consistency_trajectories(rows, output_dir: Path) -> None:
             Line2D([0], [0], color=BLUE, linewidth=1.9, label="G11 strict (exact zero)"),
         ],
         loc="upper left",
-        bbox_to_anchor=(0.095, 0.932),
+        bbox_to_anchor=(0.095, 0.905),
         ncol=3,
         frameon=True,
         facecolor="white",
         edgecolor="#C9CDD2",
         fontsize=10.5,
     )
-    fig.tight_layout(rect=(0.025, 0.03, 0.99, 0.915), h_pad=1.15)
+    fig.tight_layout(rect=(0.025, 0.03, 0.99, 0.845), h_pad=1.15)
     save(fig, output_dir, "consistency-trajectories")
     plt.close(fig)
 
@@ -177,9 +176,9 @@ def consistency_summary(rows, output_dir: Path) -> None:
         tokens = series(rows[group], "active_token_count")
         summaries[group] = {
             "agreement": 100.0 * (1.0 - sum(mismatches) / sum(tokens)),
+            "mismatch_count": sum(mismatches),
             "mean_abs": mean(series(rows[group], "mean_abs_dlogp")),
             "p95_max": percentile(series(rows[group], "max_abs_dlogp"), 0.95),
-            "ppo_kl": mean(series(rows[group], "ppo_kl")),
         }
     panels: tuple[tuple[str, str, str, Callable[[float], str]], ...] = (
         ("agreement", "Bitwise agreement", "%", lambda value: f"{value:.2f}%"),
@@ -196,26 +195,17 @@ def consistency_summary(rows, output_dir: Path) -> None:
             lambda value: "0" if value == 0 else f"{value:.4f}",
         ),
         (
-            "ppo_kl",
-            "Mean train PPO KL",
-            "PPO KL",
-            lambda value: "0" if value == 0 else f"{value:.2e}",
+            "mismatch_count",
+            "Total bitwise mismatches",
+            "Mismatch count",
+            lambda value: f"{value:,.0f}",
         ),
     )
-    fig, axes = plt.subplots(2, 2, figsize=(13.5, 8.1))
-    fig.suptitle(
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 8.7))
+    add_report_header(
+        fig,
         "VIME Consistency Summary · Qwen3-8B · 200-step GRPO",
-        fontsize=18,
-        fontweight="bold",
-        y=0.98,
-    )
-    fig.text(
-        0.5,
-        0.94,
-        "G11 strict RL-Kernel vs G10 VIME-native production",
-        ha="center",
-        fontsize=11.5,
-        color="#4A515A",
+        "G11 strict RL-Kernel vs G10 VIME-native baseline",
     )
     for axis, (key, title, ylabel, formatter) in zip(axes.flat, panels, strict=True):
         style_axis(axis)
@@ -232,6 +222,10 @@ def consistency_summary(rows, output_dir: Path) -> None:
         axis.set_ylabel(ylabel, fontsize=11)
         axis.set_xticks([0, 1], ["G11 strict", "G10 native"])
         axis.grid(False, axis="x")
+        if key == "mismatch_count":
+            from matplotlib.ticker import StrMethodFormatter
+
+            axis.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
         upper = max(values)
         axis.set_ylim(0, 1.18 * upper if upper else 1)
         for bar, value, edge in zip(bars, values, [BAR_BLUE_EDGE, BAR_ORANGE_EDGE], strict=True):
@@ -250,7 +244,7 @@ def consistency_summary(rows, output_dir: Path) -> None:
             Patch(facecolor=BAR_ORANGE, edgecolor=BAR_ORANGE_EDGE, label=LABELS["G10"]),
         ],
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.915),
+        bbox_to_anchor=(0.5, 0.895),
         ncol=2,
         frameon=True,
         facecolor="white",
@@ -261,12 +255,12 @@ def consistency_summary(rows, output_dir: Path) -> None:
         0.5,
         0.022,
         "Agreement = 1 − total bitwise mismatches / total active tokens; "
-        "error statistics span all 200 training steps.",
+        "mismatch-count bars span all 200 training steps.",
         ha="center",
         fontsize=9.5,
         color="#606872",
     )
-    fig.tight_layout(rect=(0.03, 0.055, 0.99, 0.885), h_pad=2.1, w_pad=2.0)
+    fig.tight_layout(rect=(0.03, 0.06, 0.99, 0.825), h_pad=2.1, w_pad=2.0)
     save(fig, output_dir, "consistency-summary")
     plt.close(fig)
 
@@ -283,17 +277,11 @@ def training_dynamics(rows, output_dir: Path) -> None:
         ("ppo_kl", "Train PPO KL", "PPO KL", True),
         ("pg_clipfrac", "PPO policy-ratio clip fraction", "Clip fraction", True),
     )
-    fig, axes = plt.subplots(4, 1, figsize=(14.5, 13.4), sharex=True)
-    fig.suptitle(
-        "VIME · Qwen3-8B · 200-step GRPO (8×H100, TP4/CP2)", fontsize=19, fontweight="bold", y=0.988
-    )
-    fig.text(
-        0.5,
-        0.962,
-        "Training dynamics: G11 strict RL-Kernel vs G10 VIME-native production",
-        ha="center",
-        fontsize=11.5,
-        color="#4A515A",
+    fig, axes = plt.subplots(4, 1, figsize=(14.5, 14.0), sharex=True)
+    add_report_header(
+        fig,
+        "VIME · Qwen3-8B · 200-step GRPO (8×H100, TP4/CP2)",
+        "Training dynamics: G11 strict RL-Kernel vs G10 VIME-native baseline",
     )
     for axis, (metric, title, ylabel, zero_line) in zip(axes, panels, strict=True):
         style_axis(axis)
@@ -323,7 +311,7 @@ def training_dynamics(rows, output_dir: Path) -> None:
             Line2D([0], [0], color=RED, linewidth=2.5, label="G10 10-step MA"),
         ],
         loc="upper left",
-        bbox_to_anchor=(0.095, 0.947),
+        bbox_to_anchor=(0.095, 0.905),
         ncol=4,
         frameon=True,
         facecolor="white",
@@ -333,7 +321,7 @@ def training_dynamics(rows, output_dir: Path) -> None:
     fig.text(
         0.986, 0.015, "Ratio metric: train/pg_clipfrac", ha="right", fontsize=9.3, color="#68717C"
     )
-    fig.tight_layout(rect=(0.025, 0.028, 0.99, 0.925), h_pad=1.1)
+    fig.tight_layout(rect=(0.025, 0.028, 0.99, 0.85), h_pad=1.1)
     save(fig, output_dir, "training-dynamics")
     plt.close(fig)
 

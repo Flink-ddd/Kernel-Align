@@ -15,7 +15,7 @@ with capture sizes 1 through 8 and found no fallback or runtime-route error.
 | Group | Runtime route | Active tokens | Bitwise mismatches | Mismatch rate | Token-weighted mean abs dlogp | Max abs dlogp | Mean raw reward |
 |---|---|---:|---:|---:|---:|---:|---:|
 | G11 | strict RL-Kernel R/R | 9,806,995 | 0 | 0 | 0 | 0 | 0.3950 |
-| G10 | VIME-native P/P | 9,927,045 | 5,764,529 | 58.0689% | 0.012567 | 1.191781 | 0.3794 |
+| G10 | VIME-native P/P baseline | 9,927,045 | 5,764,529 | 58.0689% | 0.012567 | 1.191781 | 0.3794 |
 
 G11 therefore satisfies the strongest claim supported by this experiment:
 zero runtime bitwise train/rollout log-probability mismatches over 9.81 million
@@ -37,6 +37,10 @@ difference is descriptive rather than a statistical quality claim.
 ![Consistency summary](figures/consistency-summary.png)
 
 ![Reward and optimization dynamics](figures/training-dynamics.png)
+
+The trajectory figure compares per-step mismatch counts directly. The summary
+figure reports the cumulative comparison: 0 mismatches for G11 strict
+RL-Kernel versus 5,764,529 for the G10 VIME-native baseline.
 
 The near-zero G11 scalar training loss and PPO KL do not mean that gradients
 were absent. With rollout log-probability reuse, the pre-update policy ratio is
