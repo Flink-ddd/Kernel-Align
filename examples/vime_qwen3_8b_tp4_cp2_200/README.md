@@ -41,6 +41,9 @@ metrics.
 - Keep the TP4 Megatron actor resident and offload rollout during training.
   This avoids remapping live NCCL parameter buffers while still fitting Qwen3-8B
   on each 80GB H100.
+- Pin Megatron's production attention backend to `flash`, matching the upstream
+  VIME Qwen3 recipes. Backend auto-selection is host-dependent and would make
+  G00/G10 incomparable across environments.
 - GRPO, BF16, `top_p=1.0`, temperature 1, no dropout, fixed training and rollout seeds.
 - A 7168-token response budget, one prompt with eight GRPO samples per step,
   and full uniform activation recomputation

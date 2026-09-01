@@ -60,6 +60,11 @@ TOPOLOGY = {
     "rollout_engines": 2,
 }
 
+# Match the upstream VIME Qwen3 recipes explicitly. Leaving this as ``auto``
+# makes the production arms host-dependent because Transformer Engine may pick
+# either FlashAttention or cuDNN fused attention.
+MEGATRON_ATTENTION_BACKEND = "flash"
+
 MODEL_ARGS = (
     "--swiglu",
     "--num-layers",
@@ -393,7 +398,7 @@ def main(argv: list[str] | None = None) -> int:
         "--no-rope-fusion",
         "--attention-softmax-in-fp32",
         "--attention-backend",
-        "auto",
+        MEGATRON_ATTENTION_BACKEND,
         "--router-policy",
         "cache_aware",
         "--rollout-num-gpus-per-engine",
