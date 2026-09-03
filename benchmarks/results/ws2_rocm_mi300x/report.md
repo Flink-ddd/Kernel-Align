@@ -280,4 +280,3 @@ Schedule: all-gather Q/K/V and the position ids over the CP group, run the stric
 ![TP-degree invariance](tp_degree_invariance.png)
 
 ![Distributed CP latency](distributed_cp_latency.png)
-

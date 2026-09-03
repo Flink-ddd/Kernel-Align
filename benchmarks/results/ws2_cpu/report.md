@@ -147,4 +147,3 @@ A head shard computed under TP=N versus the same slice of an unsharded run. TP p
 ![Bitwise exactness matrix](exactness_matrix.png)
 
 ![TP-degree invariance](tp_degree_invariance.png)
-

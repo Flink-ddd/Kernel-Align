@@ -109,6 +109,82 @@ class StrictFlashAttention4Core:
         self._op = op
         self._paged_op = paged_op
 
+    @classmethod
+    def precompile_training(
+        cls,
+        *,
+        q_heads: int,
+        kv_heads: int,
+        head_dim: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+        sequence_length: int = 512,
+    ) -> None:
+        """Compile strict training FA4 forward/backward before timing.
+
+        FA4 CuTe compiles its forward kernel on the first invocation and its
+        deterministic backward kernel on the first autograd backward.  A
+        one-step RL workload would otherwise charge both compilations to
+        Vime's ``actor_train`` timer.  These isolated tensors exercise the
+        same Qwen-style GQA and multi-block shape class without touching model
+        tensors, RNG state, or distributed collectives.
+        """
+        if torch.version.hip is not None:
+            raise StrictFlashAttentionUnavailable(
+                "FA4 CUDA precompile is unavailable on ROCm"
+            )
+        if not torch.cuda.is_available():
+            raise StrictFlashAttentionUnavailable(
+                "FA4 CUDA precompile requires an available CUDA device"
+            )
+        if dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("strict FA4 training precompile requires FP16 or BF16")
+        if q_heads <= 0 or kv_heads <= 0 or q_heads % kv_heads != 0:
+            raise ValueError("Q/KV head counts must be positive and GQA-compatible")
+        if head_dim <= 0 or sequence_length <= 0:
+            raise ValueError("head_dim and sequence_length must be positive")
+
+        target = (
+            torch.device("cuda", torch.cuda.current_device())
+            if device is None
+            else device
+        )
+        if target.type != "cuda":
+            raise ValueError("strict FA4 training precompile requires a CUDA device")
+
+        core = cls()
+        # Zeros deliberately avoid consuming RNG state.  The tensors are
+        # independent from the model and only populate FA4's process-local
+        # JIT caches.
+        q = torch.zeros(
+            (1, sequence_length, q_heads, head_dim),
+            dtype=dtype,
+            device=target,
+            requires_grad=True,
+        )
+        k = torch.zeros(
+            (1, sequence_length, kv_heads, head_dim),
+            dtype=dtype,
+            device=target,
+            requires_grad=True,
+        )
+        v = torch.zeros_like(k, requires_grad=True)
+        positions = torch.arange(sequence_length, dtype=torch.int64, device=target).expand(1, -1)
+        with torch.enable_grad():
+            result = core.forward_bshd_with_lse(
+                q,
+                k,
+                v,
+                causal=True,
+                scale=head_dim**-0.5,
+                query_position_ids=positions,
+                key_position_ids=positions,
+                output_dtype=dtype,
+            )
+            result.out.sum().backward()
+        torch.cuda.synchronize(target)
+        del result, q, k, v, positions, core
+
     @staticmethod
     def _validate_api(op: Callable[..., Any]) -> None:
         try:

@@ -1046,23 +1046,35 @@ class KernelRegistry:
         platform = self._platform()
         candidates = self._priority_map.get(platform, {}).get("ws2_attention", [])
         rejected: list[str] = []
+        # A candidate skipped only because it does not satisfy the caller's
+        # explicit backend/policy request is not a fallback. Count only an
+        # otherwise eligible candidate that failed capability or loading.
+        capability_rejections = 0
 
         for backend in candidates:
             capability = self._attention_capabilities.get(backend)
             if capability is None:
                 rejected.append(f"{backend.name}: no AttentionBackendCapability declared")
+                capability_rejections += 1
                 continue
-            incompatibilities = list(capability.incompatibilities(contract))
             policy_mismatch = self._attention_policy_mismatch(requested_backend, capability)
+            incompatibilities = list(capability.incompatibilities(contract))
             if policy_mismatch is not None:
+                # Still report capability details for diagnostics, but this
+                # candidate was excluded by the caller's policy, so those
+                # details must not turn the selected backend into a fallback.
                 incompatibilities.append(policy_mismatch)
+                rejected.append(f"{backend.name}: " + "; ".join(incompatibilities))
+                continue
             if incompatibilities:
                 rejected.append(f"{backend.name}: " + "; ".join(incompatibilities))
+                capability_rejections += 1
                 continue
 
             op = self._get_or_create_backend(backend)
             if op is None:
                 rejected.append(f"{backend.name}: backend could not be loaded or instantiated")
+                capability_rejections += 1
                 continue
 
             return AttentionDispatchResult(
@@ -1073,7 +1085,7 @@ class KernelRegistry:
                     "actual_backend": capability.backend_id,
                     "backend_enum": backend.name,
                     "platform": platform,
-                    "fallback": bool(rejected),
+                    "fallback": capability_rejections > 0,
                     "prior_rejections": list(rejected),
                     "contract": contract.to_dict(),
                     "capability": capability.to_dict(),

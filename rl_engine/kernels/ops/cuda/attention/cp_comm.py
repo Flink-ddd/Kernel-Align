@@ -589,14 +589,104 @@ class CUDAAGRSAttentionCPCommunication:
             raise AttentionCPCommunicationUnavailable("self-owned CUDA AG/RS requires CUDA")
 
 
-class RCCLAGRSAttentionCPCommunication(CUDAAGRSAttentionCPCommunication):
-    """ROCm AG/RS adapter using RCCL only as rank-ordered tensor transport.
+class _RCCLRankOrderedTransport:
+    """RCCL transport with rank-ordered all-gather and root-owned scatter.
 
-    The transport itself is the shared :func:`collective_for_group` collective,
-    which resolves to ``RCCLDeterministicCollective`` on ROCm. CUDA and ROCm
-    therefore evaluate one balanced rank tree from one implementation rather
-    than two copies that can silently drift apart.
+    The scatter half deliberately performs no floating-point reduction. The
+    strict Attention arithmetic remains entirely in the deterministic core.
     """
+
+    def __init__(self, *, process_group: Any, root: int) -> None:
+        import torch.distributed as dist
+
+        if not dist.is_available() or not dist.is_initialized():
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned RCCL AG/RS requires initialized torch.distributed"
+            )
+        backend = str(dist.get_backend(process_group)).lower()
+        if "nccl" not in backend or torch.version.hip is None:
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned RCCL AG/RS requires the PyTorch NCCL API on ROCm"
+            )
+        self.group = process_group
+        self.rank = int(dist.get_rank(process_group))
+        self.world_size = int(dist.get_world_size(process_group))
+        self.root = int(root)
+        if self.root < 0 or self.root >= self.world_size:
+            raise AttentionCPCommunicationUnavailable("RCCL scatter root is outside the group")
+
+    def all_gather(self, local: torch.Tensor) -> torch.Tensor:
+        import torch.distributed as dist
+
+        if not local.is_cuda or not local.is_contiguous():
+            raise AttentionCPCommunicationUnavailable(
+                "RCCL AllGather requires a contiguous ROCm tensor"
+            )
+        shape = (self.world_size * local.size(0), *local.shape[1:])
+        gathered = torch.empty(shape, dtype=local.dtype, device=local.device)
+        dist.all_gather_into_tensor(gathered, local, group=self.group)
+        return gathered
+
+    def scatter(self, full: torch.Tensor) -> torch.Tensor:
+        import torch.distributed as dist
+
+        if not full.is_cuda or not full.is_contiguous():
+            raise AttentionCPCommunicationUnavailable(
+                "RCCL ReduceScatter transport requires a contiguous ROCm tensor"
+            )
+        if full.size(0) % self.world_size:
+            raise AttentionCPCommunicationUnavailable(
+                "RCCL scatter leading dimension must divide the CP world size"
+            )
+        # Leading-dimension chunks are already contiguous. Avoid materializing
+        # copies for every rank; non-root ranks do not need a scatter list.
+        local_shape = (full.size(0) // self.world_size, *full.shape[1:])
+        local = torch.empty(local_shape, dtype=full.dtype, device=full.device)
+        if self.world_size == 1:
+            local.copy_(full)
+            return local
+        global_root = self.root
+        if self.group is not None:
+            get_global_rank = getattr(dist, "get_global_rank", None)
+            if callable(get_global_rank):
+                global_root = int(get_global_rank(self.group, self.root))
+            else:
+                global_root = int(dist.get_process_group_ranks(self.group)[self.root])
+        scatter_list = list(full.chunk(self.world_size, dim=0)) if self.rank == self.root else None
+        dist.scatter(local, scatter_list=scatter_list, src=global_root, group=self.group)
+        return local
+
+    def reduce_scatter(self, full: torch.Tensor) -> torch.Tensor:
+        """Deterministic rank-order sum followed by local scatter.
+
+        RCCL is used for point-to-point transport. The floating-point sum is
+        performed locally in source-rank order, so collective reduction order
+        is not delegated to RCCL.
+        """
+        if not full.is_cuda or not full.is_contiguous():
+            raise AttentionCPCommunicationUnavailable(
+                "RCCL ReduceScatter requires a contiguous ROCm tensor"
+            )
+        if full.size(0) % self.world_size:
+            raise AttentionCPCommunicationUnavailable(
+                "RCCL ReduceScatter leading dimension must divide the CP world size"
+            )
+        chunks = tuple(chunk.contiguous() for chunk in full.chunk(self.world_size, dim=0))
+        gathered = self.all_gather(full)
+        local = gathered[
+            self.rank * chunks[self.rank].size(0) : (self.rank + 1) * chunks[self.rank].size(0)
+        ].clone()
+        chunk_rows = chunks[self.rank].size(0)
+        # Start with source rank 0, then add the remaining source ranks in
+        # ascending order. This avoids counting source 0 twice.
+        for source in range(1, self.world_size):
+            source_full = gathered[source * full.size(0) : (source + 1) * full.size(0)]
+            local.add_(source_full[self.rank * chunk_rows : (self.rank + 1) * chunk_rows])
+        return local
+
+
+class RCCLAGRSAttentionCPCommunication(CUDAAGRSAttentionCPCommunication):
+    """ROCm AG/RS adapter using RCCL only as rank-ordered tensor transport."""
 
     backend_id = "rccl_ag_rs"
     collective_label = "self-owned RCCL AG/RS"
@@ -604,6 +694,18 @@ class RCCLAGRSAttentionCPCommunication(CUDAAGRSAttentionCPCommunication):
     transport_only = True
     supports_async_overlap = False
     supports_compute_communication_fusion = False
+
+    def _get_collective(self, plan: AttentionCPCommunicationPlan):
+        if self._collective is None:
+            self._collective = _RCCLRankOrderedTransport(
+                process_group=self._process_group,
+                root=plan.merge_root_cp_rank,
+            )
+        if self._collective.world_size != plan.parallel.cp_world_size:
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned RCCL world size does not match the CP plan"
+            )
+        return self._collective
 
     def _dist(self):
         import torch.distributed as dist

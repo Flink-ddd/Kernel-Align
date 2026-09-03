@@ -615,16 +615,18 @@ class TorchDistributedDeterministicCollective:
 
     def all_gather_many(
         self,
-        inputs: tuple[torch.Tensor, ...],
+        inputs: tuple[torch.Tensor, ...] | list[torch.Tensor],
         *,
         validate_signature: bool = True,
     ) -> tuple[torch.Tensor, ...]:
-        """Gather several tensors through the single-tensor transport ABI."""
+        """Gather several tensors through the platform transport."""
 
-        if not inputs:
+        values = tuple(inputs)
+        if not values:
             raise ValueError("all_gather_many requires at least one input")
         return tuple(
-            self.all_gather(input, validate_signature=validate_signature) for input in inputs
+            self.all_gather(value, validate_signature=validate_signature)
+            for value in values
         )
 
     def reduce_scatter(
@@ -1262,7 +1264,7 @@ def collective_for_group(
     minimum_capacity_bytes: int = _DEFAULT_MAX_SIZE_BYTES,
     device: torch.device | str | int | None = None,
 ) -> Any | None:
-    """Return the process-local RL-Kernel collective shared by hot-path ops."""
+    """Return the process-local platform collective shared by hot-path ops."""
 
     if group is None:
         return None
@@ -1271,8 +1273,8 @@ def collective_for_group(
     if minimum_capacity_bytes <= 0:
         raise ValueError("minimum_capacity_bytes must be positive")
 
-    rank = dist.get_rank(group=group)
-    world_size = dist.get_world_size(group=group)
+    rank = int(dist.get_rank(group=group))
+    world_size = int(dist.get_world_size(group=group))
     if device is None:
         device_index = torch.cuda.current_device()
     else:

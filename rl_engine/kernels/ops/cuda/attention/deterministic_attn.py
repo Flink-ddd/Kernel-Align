@@ -226,9 +226,8 @@ class DeterministicAttentionOp:
 class RLKernelDeterministicAttentionCore:
     """Materializing GPU reference core shared by training and rollout.
 
-    This remains useful for correctness and capability-gap diagnosis. The
-    production default is the shared FA4 CuTe core with ``num_splits=1`` on
-    CUDA, and AITER CK dense MHA on ROCm.
+    Production uses FA4 CuTe on CUDA and AITER CK dense MHA on ROCm. This core
+    remains useful for correctness and capability-gap diagnosis.
     """
 
     core_id = STRICT_ATTENTION_CORE_ID

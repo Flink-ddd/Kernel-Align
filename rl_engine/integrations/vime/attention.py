@@ -365,12 +365,6 @@ def attention_provider(request: Any) -> AttentionProviderResult:
     """
 
     contract, scale, query, key, value, key_positions = _contract_for_request(request)
-
-    dispatch = kernel_registry.get_attention_op(contract, requested_backend=BACKEND_ID)
-    if dispatch.provenance["actual_backend"] != BACKEND_ID or dispatch.provenance["fallback"]:
-        raise RuntimeError("explicit strict attention dispatch changed during materialization")
-
-    query_len = query.shape[2]
     cp_world_size = contract.sharding.cp_world_size
     if cp_world_size > 1:
         cp_group = getattr(request, "context_parallel_group", None)
@@ -381,6 +375,12 @@ def attention_provider(request: Any) -> AttentionProviderResult:
             )
     else:
         cp_group = None
+
+    dispatch = kernel_registry.get_attention_op(contract, requested_backend=BACKEND_ID)
+    if dispatch.provenance["actual_backend"] != BACKEND_ID or dispatch.provenance["fallback"]:
+        raise RuntimeError("explicit strict attention dispatch changed during materialization")
+
+    query_len = query.shape[2]
 
     # One runtime owns the launch schedule for both CP degrees, so the
     # per-(batch row, KV group) launch loop that makes the result TP-degree

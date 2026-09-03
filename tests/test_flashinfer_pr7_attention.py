@@ -2243,8 +2243,8 @@ def test_strict_paged_default_selects_fa4_production_core(monkeypatch):
     core.forward_with_lse = production_forward
     monkeypatch.setattr(
         paged_attention_module,
-        "StrictFlashAttention4Core",
-        lambda *, split_kv: core,
+        "_resolve_strict_core",
+        lambda _config: core,
     )
     q, k, v = (tensor.to(torch.bfloat16) for tensor in _qkv(query_len=1))
     result = FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())(
