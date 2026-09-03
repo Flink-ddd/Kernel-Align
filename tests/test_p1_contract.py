@@ -52,6 +52,15 @@ def test_frozen_constants_cannot_be_overridden() -> None:
             LayerContract(**kwargs).validate()
 
 
+def test_default_contract_is_the_canonical_unfused_mode() -> None:
+    """Train/infer byte-equality is the goal, so unfused is what you get unless
+    an engine explicitly declares it cannot expose the intermediate."""
+    from rl_engine.mhc.contract import CANONICAL_FUSION_MODE
+
+    assert LayerContract().fusion_mode == CANONICAL_FUSION_MODE == "unfused"
+    assert LayerContract().trainability == "full"
+
+
 def test_unknown_modes_fail_closed() -> None:
     for kwargs in (
         {"fusion_mode": "fused-everything"},

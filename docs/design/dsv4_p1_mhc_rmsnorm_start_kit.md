@@ -16,7 +16,7 @@ Issue: [DSV4][P1/7] mHC 与 RMSNorm 确定性前向/反向 (#2).
 | `P1-D2` | `fp32_gemm_rms` (controller projection + controller RMS, fwd + bwd) |
 | `P1-D3` | `mhc_post` (fwd + `dR_old`/`dy`/`dC`/`dPOST`) |
 | `P1-D4` | `mhc_pre` / `h_aggregate` + the TE/Megatron/Miles provider adapter |
-| `P1-D5` | `rmsnorm_residual` (fwd + `dX`/`dGamma`) |
+| `P1-D5` | `rmsnorm_residual` (fwd + `dX`/`dGamma`), unfused; TE fast path only once proven byte-equal |
 | `P1-D6` | Fixed-K / batch-invariant GEMM reference + equivalence harness |
 | `P1-R0` | Review, package the P1 provider artifact, GPU CI |
 
@@ -53,6 +53,50 @@ order that varies with batch size, token count, SM count or any other runtime
 condition. `tests/test_p1_reduction.py` pins both trees with cases where the
 alternatives visibly disagree.
 
+## What Megatron actually does — and why it is not the byte reference
+
+#2 says to prefer Megatron's implementation over vLLM's. Reading the source
+(`megatron/core/transformer/hyper_connection.py`,
+`megatron/core/fusions/fused_mhc_kernels.py`, both on `dev`) shows what that
+can and cannot mean.
+
+**Megatron's own two paths do not agree with each other.** `config.use_fused_mhc`
+selects between a native path and a fused Triton/cuTile path:
+
+| | native | fused |
+| --- | --- | --- |
+| controller RMS | `norm = x.norm(-1)`; `r = 1/(norm/sqrt(K) + eps)` | `r_val = sqrt(sum_sq / K)`; `1/(r_val + eps)` |
+| controller GEMM | `torch.matmul`, FP32 | `ct.mma(..., tfloat32)` — **TF32** |
+| K reduction | whatever Inductor emits (`@torch.compile`) | **`split_k = 16` when `K >= 16384`**, and also runtime-autotuned |
+| 4-stream mix | `torch.bmm` (cuBLAS) | Triton kernel |
+| softmax | `torch.softmax` (`exp`) | `tl.exp2(x * log2e)` |
+
+The `sqrt(s)/sqrt(K)` vs `sqrt(s/K)` split is ~1 ulp; TF32 in the fused MMA is
+~1e-3 relative. The authors are aware of this class of difference and manage it
+as a tolerance budget — there is a comment in the fused kernel reading *"Square
+in fp32: a bf16 square/reduction loses ~2e-3 relative on the RMS scale, which
+native (fp32) does not."*
+
+Three of #2's explicit bans are violated by Megatron's fused path **at exactly
+the production shape**: Split-K is on (`K = 16384` selects `split_k = 16`),
+TF32 is on, and the reduction order is autotuned per machine per run. Measured
+separately: eager `.sum(-1)` on CUDA is **not batch-invariant** — rows `0:8`
+produce different bytes inside a 64-row batch than in an 8-row batch. On CPU it
+happens to be invariant.
+
+None of that is a defect in Megatron. It is a correct set of performance
+choices for a framework that never promised bit-exactness. But it means:
+
+> **"参考 Megatron" can only mean its formulas and constants — never its
+> reduction order.** Reproducing Megatron's bytes is not a goal that can be
+> held, because Megatron does not reproduce its own.
+
+What the source *does* settle, and this kit adopts verbatim: the affine
+association `h = r * proj * alpha_ + bias`; the Sinkhorn schedule and its axis
+convention; the max-shift before `exp`; the FP32 controller path
+(`mark_keep_in_fp32` on the projection weight, alphas and bias); the three
+scalar alphas; and the module decomposition that leaves the sublayer outside.
+
 ## Frozen numeric contract (recap of #2 + decisions made here)
 
 From the issue:
@@ -76,14 +120,14 @@ them means regenerating the manifest and bumping the schema/profile id):
 
 | # | Decision | Rationale |
 | --- | --- | --- |
-| D1 | **`q = sqrt(s) / sqrt(K)`, not `sqrt(s / K)`.** The issue's forward text says `norm/sqrt(16384)` while its backward text says `q = sqrt(s/N)`; those differ in FP32. The forward wording wins, and backward reuses the saved `q`. | The two forms are not bit-equal; the forward is the authoritative statement. **Please confirm in review.** |
+| D1 | **`q = sqrt(s) / sqrt(K)`, not `sqrt(s / K)`**, with `s` from our own fixed-tree sum-of-squares (*not* `torch.norm`, which is not bit-equal to `sqrt(x.square().sum())` on either device). Backward reuses the saved `q`. | #2 states both forms because **Megatron states both**: `native_proj_rms` computes `norm/sqrt(K)` while the fused kernel computes `sqrt(s/K)` under a comment that says `norm/sqrt(K)`. The native path is the semantic reference, so it wins. |
 | D2 | **Sinkhorn `sum_row(M)[i] = Σ_j M[i,j]` (row sums, broadcast along j) and `sum_col(M)[j] = Σ_i M[i,j]`.** Schedule is literal: `softmax_row(L)+eps`, one column normalize, then 19×(row, column) — 20 column normalizations, 39 in total. | The issue names the steps but not the axis convention; this is the reading that makes rows/columns each sum to 1. |
 | D3 | **`softmax_row` subtracts the row max before `exp`**, with the max taken on the same balanced 4-way tree. | Unshifted `exp` overflows on the saturating-logit fixture; the shift has to be pinned rather than left to the kernel. |
 | D4 | **Sinkhorn backward walks the recorded 39 normalizations in reverse, one VJP per step.** No fixed-point / implicit-differentiation shortcut, no fused simplification. | #2 forbids "mathematically equivalent but differently associated" forms. Cross-checked against autograd in `test_p1_oracle.py`. |
 | D5 | **Numeric profile `oracle-fp32-mhc-v1`**: FP32, the two trees above, mul-then-add (**no FMA fusion**). A strict CUDA kernel matches with `__fmul_rn`/`__fadd_rn` or registers its own profile. | Byte-equality needs the rounding points pinned, not just the order. |
-| D6 | **`alpha` and `bias` are FP32 `[24]` vectors**, applied per controller output. | The general case; a scalar `alpha` is the broadcast special case and stays representable. |
+| D6 | **`alpha` is three learnable FP32 scalars** (`alpha_pre`, `alpha_post`, `alpha_res`) broadcast over the PRE / POST / COMB segments; `bias` is a `[24]` vector. Backward returns three scalars, each a pinned segment fold on top of the token fold. | Matches Megatron exactly (`alpha_pre/post/res` are `nn.Parameter(torch.full((1,), ...))`, cat-expanded in `_compute_h`). Forward is identical to a `[24]` gain, but backward is not — a `[24]` `dAlpha` would leave the segment reduction order unpinned. |
 | D7 | **The transformer sublayer is external to P1.** `y_sublayer` enters the block as data and `d_normalized` / `d_residual` enter the backward as data; `dy_sublayer` is an output boundary. | This is what makes P1 acceptance runnable with no P2–P7 code in the loop, exactly as the issue requires. |
-| D8 | **The fused pre+norm boundary is defined as the unfused composition**, byte for byte. | Miles/XoRL fuse pre-mix and normalize into one launch. Defining the fused boundary this way turns "fused equals unfused" into a test rather than an assumption; a kernel whose fused residual store changes the reduction layout must register a different profile instead of presenting itself as the same kernel. |
+| D8 | **`unfused` is canonical and the default**, and v1 does not reuse TE's `TEFusedResidualRMSNorm`. `fused-pre-norm` stays supported as the exception for an engine that physically cannot expose the intermediate. Fusion itself is not banned — changing the reduction layout or moving a downcast point is. | Train/infer byte-equality is the goal, and only the unfused decomposition lets every boundary be hashed separately, so a divergence localizes to one operator instead of one megakernel. TE's fused module *refuses* to expose the intermediate — it raises on any forward hook — which would collapse two boundaries into one. The extra pass is worth it; a fused fast path can be swapped back through the provider hook once proven byte-equal. |
 | D9 | **`trainability='mixer-frozen'` returns `None` for `d_controller_weight`/`d_alpha`/`d_bias`**, not zeros. | #2: a stop-grad mixer must not leak `dMixWeight`. `None` cannot be silently summed into an optimizer; a zero tensor can. |
 | D10 | **Gradients are returned FP32** (the accumulator dtype); rounding to BF16 happens only at an outer block edge. | Consistent with "FP32 reductions, BF16 boundaries". |
 
@@ -141,17 +185,23 @@ python -m rl_engine.mhc.fixtures --write-manifest
 
 ## Open questions for review
 
-- **D1** — `sqrt(s)/sqrt(K)` vs `sqrt(s/K)` in the controller RMS. The issue
-  text says both; the kit takes the forward wording. One line of Miles/Megatron
-  source settles it.
+- **Miles must also run unfused** (D8). #2 records that Miles/XoRL fuse the
+  mHC pre-mix and RMSNorm into a single launch. If that kernel keeps the same
+  reduction layout and downcast points it can stay and still be byte-equal;
+  if it does not, the inference side has to unfuse for v1. **This decision
+  moves cost onto the Miles side and needs their sign-off.**
 - **Sinkhorn iteration detail** — #2 notes that TogetherAI never published the
   per-round detail and that the checkpoint plus the Miles implementation are
-  the only reference. The kit implements the schedule exactly as written in
-  the issue; if Miles differs, D2/D4 change and the manifest is regenerated.
-- **D8** — whether Miles can expose the pre-fusion intermediate at all. If it
-  cannot, `fused-pre-norm` becomes the only boundary for the inference side
-  and `unfused` stays the training-side definition, with the equivalence case
-  as the bridge.
+  the only reference. Megatron's two implementations agree with each other and
+  with the issue text, and the kit matches both; if Miles differs, D2/D4 change
+  and the manifest is regenerated.
+- **Upstream nit worth raising (not a bug report)** — `fused_mhc_kernels.py`
+  computes `sqrt(sum_sq / K)` under a comment reading
+  `# 2. Compute r = norm / sqrt(K)`. Which is the intent? A one-line answer
+  confirms D1 from the other direction.
+- **`dAlpha` consumers** — the three scalar gradients are DP-reduced by the
+  outer DDP, but any consumer that currently expects a `[24]` `dAlpha` needs
+  updating (D6).
 
 ## Non-goals of the kit
 

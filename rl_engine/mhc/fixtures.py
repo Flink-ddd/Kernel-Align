@@ -86,7 +86,9 @@ def make_batch(name: str) -> ResidualBatch:
         y_sublayer=_randn(g, t, d).to(torch.bfloat16),
         controller=ControllerParams(
             weight=_randn(g, n, k, scale=1.0 / float(k) ** 0.5),
-            alpha=_randn(g, n, scale=0.5),
+            alpha_pre=_randn(g, 1, scale=0.5),
+            alpha_post=_randn(g, 1, scale=0.5),
+            alpha_res=_randn(g, 1, scale=0.5),
             bias=_randn(g, n, scale=0.1),
         ),
         norm=NormParams(gamma=(1.0 + _randn(g, d, scale=0.05)).to(torch.bfloat16)),

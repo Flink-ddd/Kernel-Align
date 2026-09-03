@@ -291,7 +291,12 @@ def h_aggregate_bwd(
 def _controller_affine(
     p: torch.Tensor, r: torch.Tensor, alpha: torch.Tensor, bias: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``h = ((r * P) * alpha) + bias``. Returns ``(h, m)`` with ``m = r * P``."""
+    """``h = ((r * P) * alpha) + bias``. Returns ``(h, m)`` with ``m = r * P``.
+
+    ``alpha`` is the [24] broadcast of the three learnable scalars; the
+    association ``((r * P) * alpha) + bias`` is Megatron's
+    ``h = r * proj * alpha_ + self.bias``.
+    """
     m = r.unsqueeze(1) * p
     return (m * alpha.unsqueeze(0)) + bias.unsqueeze(0), m
 
@@ -310,7 +315,8 @@ def mhc_pre_fwd(
     contract = batch.contract
     x_flat = _f32(batch.r_old).reshape(batch.tokens, contract.flat_k)
     p, r, gemm_saved = ops.fp32_gemm_rms_fwd(x_flat, batch.controller.weight, contract.mhc_eps)
-    h, m = _controller_affine(p, r, batch.controller.alpha, batch.controller.bias)
+    alpha = batch.controller.expanded_alpha(contract)
+    h, m = _controller_affine(p, r, alpha, batch.controller.bias)
     pre, post, c, sink_saved = ops.hc_split_sinkhorn_fwd(h, contract)
     hidden = ops.h_aggregate_fwd(pre, batch.r_old)
     saved = {
@@ -349,10 +355,16 @@ def mhc_pre_bwd(
     dr_aggregate, dpre = ops.h_aggregate_bwd(dhidden, saved["pre"], batch.r_old)
     dh = ops.hc_split_sinkhorn_bwd(dpre, dpost, dc, saved["sinkhorn"])
 
-    alpha = batch.controller.alpha
+    alpha = batch.controller.expanded_alpha(contract)
     m, p, r = saved["m"], saved["p"], saved["r"]
     dbias = fixed_sum(dh, dim=0)
-    dalpha = fixed_sum(dh * m, dim=0)
+    # dAlpha is three scalars, not 24: each learnable alpha is broadcast over
+    # its segment, so its gradient is a reduction over that segment on top of
+    # the token reduction. Both folds are the pinned ascending order.
+    dalpha_per_n = fixed_sum(dh * m, dim=0)  # [24]
+    dalpha_pre = fixed_sum(dalpha_per_n[PRE_SLICE], dim=0).reshape(1)
+    dalpha_post = fixed_sum(dalpha_per_n[POST_SLICE], dim=0).reshape(1)
+    dalpha_res = fixed_sum(dalpha_per_n[COMB_SLICE], dim=0).reshape(1)
     dm = dh * alpha.unsqueeze(0)
     dp = dm * r.unsqueeze(1)
     dr_scale = fixed_sum(dm * p, dim=1)  # [T], over the 24 controller values
@@ -367,7 +379,9 @@ def mhc_pre_bwd(
     return {
         "d_r_old": d_r_old,
         "d_controller_weight": None if frozen else dweight,
-        "d_alpha": None if frozen else dalpha,
+        "d_alpha_pre": None if frozen else dalpha_pre,
+        "d_alpha_post": None if frozen else dalpha_post,
+        "d_alpha_res": None if frozen else dalpha_res,
         "d_bias": None if frozen else dbias,
     }
 
@@ -453,6 +467,13 @@ def rmsnorm_residual_fwd(
     ``rsqrt`` is mandatory here -- mixing in ``1 / sqrt(...)`` changes bytes,
     and the controller RMS in :func:`fp32_gemm_rms_fwd` uses that other form
     on purpose. The residual fork keeps the original BF16 bytes untouched.
+
+    v1 does **not** reuse TE's ``TEFusedResidualRMSNorm``. That module fuses the
+    fork and the norm and refuses to expose the intermediate (it raises on any
+    forward hook), which would collapse two hashable boundaries into one and
+    leave a divergence unlocalizable. Keeping the two boundaries separate is
+    worth the extra pass; a TE fast path can be swapped back in later through
+    the provider hook once it is proven byte-equal.
     """
     x32 = _f32(x)
     d = x32.shape[1]
@@ -629,7 +650,9 @@ def mhc_block_backward(
         "d_c": dc,
         "d_post": dpost,
         "d_controller_weight": pre_grads["d_controller_weight"],
-        "d_alpha": pre_grads["d_alpha"],
+        "d_alpha_pre": pre_grads["d_alpha_pre"],
+        "d_alpha_post": pre_grads["d_alpha_post"],
+        "d_alpha_res": pre_grads["d_alpha_res"],
         "d_bias": pre_grads["d_bias"],
     }
     if trace is not None:

@@ -35,7 +35,18 @@ PLACEMENTS = ("replicated", "tp-sharded", "cp-token-sharded")
 ROW_GEOMETRIES = ("one-row", "packed")
 
 # Modes the kit defines. Anything else must fail closed (acceptance 4).
+#
+# ``unfused`` is CANONICAL and the default. Train/infer byte-equality is the
+# goal, and the unfused decomposition is the only one where every operator
+# boundary can be hashed and compared on its own, so a divergence localizes to
+# one operator instead of one megakernel. ``fused-pre-norm`` exists for an
+# inference engine that physically cannot expose the pre-normalization
+# intermediate (TE's ``TEFusedResidualRMSNorm`` refuses to: it raises if you
+# hook it). Fusion is not forbidden -- what is forbidden is a fused kernel that
+# changes the reduction layout or moves a downcast point. Such a kernel must
+# register its own numeric profile rather than claim to be the same operator.
 FUSION_MODES = ("unfused", "fused-pre-norm")
+CANONICAL_FUSION_MODE = "unfused"
 TRAINABILITY_MODES = ("full", "mixer-frozen")
 
 
@@ -143,27 +154,68 @@ class ControllerParams:
     """
 
     weight: torch.Tensor  # FP32 [controller_n, K]
-    alpha: torch.Tensor  # FP32 [controller_n]
+    alpha_pre: torch.Tensor  # FP32 scalar [1]
+    alpha_post: torch.Tensor  # FP32 scalar [1]
+    alpha_res: torch.Tensor  # FP32 scalar [1]
     bias: torch.Tensor  # FP32 [controller_n]
 
+    @property
+    def alphas(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (self.alpha_pre, self.alpha_post, self.alpha_res)
+
+    def expanded_alpha(self, contract: LayerContract) -> torch.Tensor:
+        """``cat([alpha_pre.expand(n), alpha_post.expand(n), alpha_res.expand(n*n)])``.
+
+        Megatron holds three learnable *scalars* and broadcasts them across the
+        PRE / POST / COMB segments (``hyper_connection.py`` ``_compute_h``); it
+        does not hold 24 independent gains. Forward is identical either way,
+        but backward is not: ``dAlpha`` is three numbers, each a reduction over
+        its segment, so the segment reduction has to be pinned like any other.
+        """
+        n = contract.hc_mult
+        return torch.cat(
+            [
+                self.alpha_pre.expand(n),
+                self.alpha_post.expand(n),
+                self.alpha_res.expand(n * n),
+            ],
+            dim=-1,
+        )
+
     def validate(self, contract: LayerContract) -> None:
-        for name, t in (("weight", self.weight), ("alpha", self.alpha), ("bias", self.bias)):
+        named = (
+            ("weight", self.weight),
+            ("alpha_pre", self.alpha_pre),
+            ("alpha_post", self.alpha_post),
+            ("alpha_res", self.alpha_res),
+            ("bias", self.bias),
+        )
+        for name, t in named:
             if t.dtype != torch.float32:
                 raise TypeError(f"controller {name} must be FP32, got {t.dtype}")
         n, k = contract.controller_n, contract.flat_k
         if tuple(self.weight.shape) != (n, k):
             raise ValueError(f"controller weight {tuple(self.weight.shape)} != {(n, k)}")
-        if tuple(self.alpha.shape) != (n,) or tuple(self.bias.shape) != (n,):
-            raise ValueError("controller alpha/bias must have shape [controller_n]")
+        if tuple(self.bias.shape) != (n,):
+            raise ValueError(f"controller bias {tuple(self.bias.shape)} != {(n,)}")
+        for name, t in named[1:4]:
+            if tuple(t.shape) != (1,):
+                raise ValueError(f"controller {name} must be a scalar [1], got {tuple(t.shape)}")
 
     def fingerprint(self) -> str:
         h = hashlib.sha256()
-        for t in (self.weight, self.alpha, self.bias):
+        for t in (self.weight, self.alpha_pre, self.alpha_post, self.alpha_res, self.bias):
             h.update(tensor_bytes(t))
         return h.hexdigest()
 
     def to(self, device: torch.device | str) -> "ControllerParams":
-        return ControllerParams(self.weight.to(device), self.alpha.to(device), self.bias.to(device))
+        return ControllerParams(
+            self.weight.to(device),
+            self.alpha_pre.to(device),
+            self.alpha_post.to(device),
+            self.alpha_res.to(device),
+            self.bias.to(device),
+        )
 
 
 @dataclass(frozen=True)
@@ -313,6 +365,7 @@ class GradBoundary:
 
 
 __all__ = [
+    "CANONICAL_FUSION_MODE",
     "COMB_SLICE",
     "FUSION_MODES",
     "MHC_EPS",

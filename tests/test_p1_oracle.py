@@ -282,7 +282,9 @@ def _block_autograd(batch: ResidualBatch, grads):
     r = batch.r_old.float().requires_grad_(True)
     y = batch.y_sublayer.float().requires_grad_(True)
     w = batch.controller.weight.clone().requires_grad_(True)
-    alpha = batch.controller.alpha.clone().requires_grad_(True)
+    a_pre = batch.controller.alpha_pre.clone().requires_grad_(True)
+    a_post = batch.controller.alpha_post.clone().requires_grad_(True)
+    a_res = batch.controller.alpha_res.clone().requires_grad_(True)
     bias = batch.controller.bias.clone().requires_grad_(True)
     gamma = batch.norm.gamma.float().requires_grad_(True)
 
@@ -290,6 +292,7 @@ def _block_autograd(batch: ResidualBatch, grads):
     p = x_flat @ w.t()
     k = batch.contract.flat_k
     scale = 1.0 / (torch.sqrt((x_flat * x_flat).sum(dim=1)) / math.sqrt(k) + EPS)
+    alpha = torch.cat([a_pre.expand(4), a_post.expand(4), a_res.expand(16)], dim=-1)
     h = (scale.unsqueeze(1) * p) * alpha + bias
     pre, post, c = _sinkhorn_autograd(h)
 
@@ -309,7 +312,9 @@ def _block_autograd(batch: ResidualBatch, grads):
         "d_r_old": r.grad,
         "dy_sublayer": y.grad,
         "d_controller_weight": w.grad,
-        "d_alpha": alpha.grad,
+        "d_alpha_pre": a_pre.grad,
+        "d_alpha_post": a_post.grad,
+        "d_alpha_res": a_res.grad,
         "d_bias": bias.grad,
         "d_gamma": gamma.grad,
     }
@@ -327,8 +332,12 @@ def test_block_backward_matches_autograd(case: str) -> None:
 
 
 def test_fused_equals_unfused_bytes() -> None:
-    """Miles fuses pre-mix and normalize into one launch; the kit's fused
-    boundary must be the same arithmetic, not merely the same math."""
+    """The fused boundary is *defined* as the unfused composition, so this test
+    proves the oracle is self-consistent -- it does not prove that any real
+    fused kernel matches. That obligation lands on the kernel: a fused
+    implementation is byte-equal only if it keeps the same reduction layout and
+    the same downcast points. P1-D5 owns proving it for a TE-backed provider.
+    """
     unfused = fixtures.make_batch("packed_t16")
     fused = dataclasses.replace(
         unfused, contract=dataclasses.replace(unfused.contract, fusion_mode="fused-pre-norm")
@@ -345,7 +354,7 @@ def test_mixer_frozen_leaks_no_controller_gradient() -> None:
     grads = fixtures.make_grads("mixer_frozen", batch)
     _, saved = oracle.mhc_block_forward(batch)
     out = oracle.mhc_block_backward(batch, saved, grads)
-    for key in ("d_controller_weight", "d_alpha", "d_bias"):
+    for key in ("d_controller_weight", "d_alpha_pre", "d_alpha_post", "d_alpha_res", "d_bias"):
         assert out[key] is None, f"stop-grad mixer leaked {key}"
     assert out["d_r_old"] is not None and torch.isfinite(out["d_r_old"]).all()
 
