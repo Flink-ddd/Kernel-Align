@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import math
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ import torch
 
 ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "benchmarks" / "benchmark_rocm_attention_ablation.py"
+CHECKED_IN_RESULT = ROOT / "benchmarks" / "results" / "pr230_rocm_mi300x_ablation" / "results.json"
 SPEC = importlib.util.spec_from_file_location("rocm_attention_ablation", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -297,3 +299,11 @@ def test_payload_validator_rejects_incomplete_or_fabricated_evidence(mutate, mes
 def test_repository_provenance_rejects_unbacked_hashes():
     with pytest.raises(ValueError, match="not backed"):
         MODULE.validate_repository_provenance(_valid_payload())
+
+
+def test_checked_in_mi300x_matrix_is_complete_and_source_backed():
+    payload = json.loads(CHECKED_IN_RESULT.read_text(encoding="utf-8"))
+
+    MODULE.validate_payload(payload)
+    MODULE.validate_repository_provenance(payload)
+    assert all(row["passed"] for row in payload["matrix"])
