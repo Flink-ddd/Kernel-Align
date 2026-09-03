@@ -216,3 +216,10 @@ _dev_notes/
 
 # Local C8 execute dumps; default output is under TMPDIR.
 ws1-c8-ci.json
+
+# hipify outputs generated during ROCm builds (sources live in csrc/*.cu, csrc/cuda/, csrc/hip/hip_*.hip)
+csrc/*.hip
+csrc/*_hip.cpp
+csrc/hip/**
+!csrc/hip/hip_*.hip
+csrc/hip/*_hip.hip

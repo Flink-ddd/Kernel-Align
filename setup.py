@@ -3,10 +3,13 @@
 
 import importlib.util
 import os
+import sysconfig
 import warnings
+from distutils.errors import CompileError
+from distutils.spawn import find_executable
 from pathlib import Path
 
-from setuptools import find_packages, setup
+from setuptools import Extension, find_packages, setup
 
 
 def _load_envs_module():
@@ -139,9 +142,20 @@ def get_extensions():
             "csrc/cuda/rmsnorm.cu",
             "csrc/cuda/activation.cu",
             "csrc/cuda/attention/deterministic_attention.cu",
-            "csrc/cuda/distributed/deterministic_collective.cu",
         ]
-        if not is_rocm:
+        if is_rocm:
+            # ROCm-tuned WS2 vocab-parallel logprob kernels; the shared
+            # deterministic_logp_kernel.cu keeps the SM90-tuned CUDA path.
+            cuda_sources.extend(
+                [
+                    "csrc/hip/hip_deterministic_logp_kernel.hip",
+                    "csrc/rocm/distributed/deterministic_collective.hip",
+                ]
+            )
+        else:
+            # CUDA IPC and the fixed-tree collective implementation are not
+            # part of the ROCm extension.
+            cuda_sources.append("csrc/cuda/distributed/deterministic_collective.cu")
             # This source contains NVIDIA PTX (cp.async, ldmatrix, and mma.sync).
             # The ROCm dispatcher falls back to PyTorch SDPA for this operator.
             cuda_sources.append("csrc/cuda/attention/prefix_shared_attention.cu")
@@ -201,6 +215,23 @@ def get_extensions():
                 "FUSED_LOGP_ONLINE_MIN_BLOCKS_PER_SM",
             )
         )
+        if is_rocm:
+            for tile_knob in (
+                "DETERMINISTIC_LOGP_TILE_BLOCK_SIZE",
+                "DETERMINISTIC_LOGP_TILE_VECTOR_ELEMENTS",
+                "DETERMINISTIC_LOGP_BACKWARD_BLOCK_SIZE",
+            ):
+                nvcc_flags.extend(_cuda_define_from_env(tile_knob, tile_knob))
+        else:
+            # Same idea for the CUDA tile-stats kernel: the defaults are tuned for
+            # sm_90, and a different architecture or vocabulary split may prefer
+            # another block size or vector width.
+            for tile_knob in (
+                "DETERMINISTIC_LOGP_TILE_BLOCK_SIZE_NARROW",
+                "DETERMINISTIC_LOGP_TILE_BLOCK_SIZE_WIDE",
+                "DETERMINISTIC_LOGP_TILE_VECTOR_BYTES",
+            ):
+                nvcc_flags.extend(_cuda_define_from_env(tile_knob, tile_knob))
         if not is_rocm and envs.env_flag(envs.KERNEL_ALIGN_NCU_LINEINFO):
             nvcc_flags.append("-lineinfo")
         if (
@@ -211,7 +242,8 @@ def get_extensions():
             nvcc_flags.append("-allow-unsupported-compiler")
             nvcc_flags.append("-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH")
 
-        cxx_flags = ["-O3", "-std=c++17", "-DKERNEL_ALIGN_WITH_CUDA"]
+        platform_define = "-DKERNEL_ALIGN_WITH_ROCM" if is_rocm else "-DKERNEL_ALIGN_WITH_CUDA"
+        cxx_flags = ["-O3", "-std=c++17", platform_define]
         extra_link_args = list(torch_rpath)
         if os.name != "nt" and not is_rocm:
             # CUDA IPC metadata queries use the driver API (cuPointerGetAttribute).

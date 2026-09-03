@@ -33,19 +33,11 @@ The selected logprob is zero-filled at inactive rows (``MaskSpec.active_mask``
 is the sole authority; with validation enabled an active row can never legally
 hold ``ignore_index``).  The vocab-domain LSE is returned for every row and is
 differentiable everywhere, including inactive rows.
-
-``deterministic=False`` trades the guarantee for speed: each rank reduces its
-whole shard in one pass and the per-shard partials are merged in shard order,
-so the floating-point grouping changes with the TP degree and nothing is
-promised about reproducibility.  ``num_vocab_tiles`` is ignored (no tile
-alignment is required), and a contract declaring
-``determinism_scope=cross_tp_bitwise`` is rejected loudly — the fast path
-cannot honor it.  Batch invariance is unaffected: rows never mix either way.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable, Protocol
 
 import torch
 
@@ -171,15 +163,12 @@ def _validate_active_targets(
 
 
 def _preflight_cross_rank_agreement(
-    contract: LogprobContract, tp_group: Any, num_vocab_tiles: int, deterministic: bool
+    contract: LogprobContract,
+    tp_group: Any,
+    num_vocab_tiles: int,
+    deterministic: bool,
 ) -> None:
-    """All-gather (fingerprint, backend id, tile count, mode) and abort on mismatch.
-
-    The tile count travels as ``None`` when ``deterministic=False``: the fast
-    path never uses it, so ranks must not fail preflight over an irrelevant
-    value — but they must never disagree on the mode itself, or they would
-    issue different collectives.
-    """
+    """All-gather the numerical mode and abort before mismatched collectives."""
 
     dist = _require_distributed_initialized()
     payload = (
@@ -226,20 +215,64 @@ def _local_tile_stats(z_masked: torch.Tensor, tile: int) -> tuple[torch.Tensor, 
     return torch.stack(m_parts, dim=1), torch.stack(s_parts, dim=1)
 
 
+def _native_rocm_tile_stats(
+    z_masked: torch.Tensor,
+    tile: int,
+    *,
+    vocab_start: int,
+    real_vocab_size: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Use the HIP-compatible local partial kernel when the extension has it.
+
+    TP transport and the global merge deliberately stay in Python.  That keeps
+    the issue #241 reduction contract identical across CUDA, ROCm, and the
+    reference implementation while making the large local vocab scan native.
+    """
+
+    if torch.version.hip is None or not z_masked.is_cuda:
+        raise RuntimeError("ROCm native tile stats require a HIP CUDA tensor")
+    try:
+        from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
+
+        if not _EXT_AVAILABLE or not hasattr(_C, "deterministic_logp_tile_stats"):
+            raise RuntimeError(
+                "ROCm vocab-parallel logprob native extension is unavailable; "
+                "build rl_engine._C with a ROCm toolchain"
+            )
+        local_tiles = z_masked.shape[1] // tile
+        if local_tiles <= 0:
+            raise RuntimeError("ROCm native tile stats require at least one local vocab tile")
+        # The ROCm build also ships a gfx942-tuned kernel with the same contract;
+        # one kernel serves every ROCm entry point so their partials stay bitwise equal.
+        tile_stats = getattr(
+            _C, "hip_deterministic_logp_tile_stats", _C.deterministic_logp_tile_stats
+        )
+        return tuple(
+            tensor.contiguous()
+            for tensor in tile_stats(
+                z_masked,
+                int(vocab_start),
+                int(real_vocab_size),
+                int(local_tiles),
+            )
+        )
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError("ROCm vocab-parallel logprob native extension is unavailable") from exc
+
+
 def _gather_tile_stats(
     local_m: torch.Tensor,
     local_s: torch.Tensor,
     contract: LogprobContract,
     tp_group: Any,
-    tile_counts: list[int],
+    tile_counts: int | list[int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Assemble every rank's partials in global shard order.
-
-    ``tile_counts`` holds each rank's partial count: one per tile on the
-    deterministic path, exactly one per shard on the fast path.
-    """
+    """Assemble partials in global shard and tile order."""
 
     sharding = contract.sharding
+    if isinstance(tile_counts, int):
+        tile = tile_counts
+        tile_counts = [(end - start) // tile for start, end in sharding.vocab_shard_bounds]
     if sharding.tp_world_size == 1:
         return local_m.contiguous(), local_s.contiguous()
 
@@ -342,6 +375,7 @@ class _VocabParallelLogprobFunction(torch.autograd.Function):
         tile,
         with_entropy,
         with_entropy_grad,
+        use_native_tile_stats,
     ):
         z_masked = local_logits.float()
         sharding = contract.sharding
@@ -354,14 +388,27 @@ class _VocabParallelLogprobFunction(torch.autograd.Function):
 
         safe_target = torch.where(active_mask, target_1d, torch.zeros_like(target_1d))
 
-        if tile is not None:
-            local_m, local_s = _local_tile_stats(z_masked, tile)
-            tile_counts = [(end - start) // tile for start, end in sharding.vocab_shard_bounds]
-        else:
-            # Fast path: one (max, sumexp) partial over the whole shard. The
-            # grouping now depends on the shard layout, so no cross-TP claim.
+        if tile is None:
             local_m, local_s = _local_tile_stats(z_masked, z_masked.shape[1])
             tile_counts = [1] * sharding.tp_world_size
+        elif use_native_tile_stats:
+            # A backend may pass its own tile-stats callable (same signature as
+            # _native_rocm_tile_stats); ``True`` selects the ROCm extension kernel.
+            tile_stats_fn = (
+                use_native_tile_stats
+                if callable(use_native_tile_stats)
+                else _native_rocm_tile_stats
+            )
+            local_m, local_s = tile_stats_fn(
+                z_masked,
+                tile,
+                vocab_start=sharding.local_vocab_start,
+                real_vocab_size=sharding.real_vocab_size,
+            )
+            tile_counts = [(end - start) // tile for start, end in sharding.vocab_shard_bounds]
+        else:
+            local_m, local_s = _local_tile_stats(z_masked, tile)
+            tile_counts = [(end - start) // tile for start, end in sharding.vocab_shard_bounds]
         m_all, s_all = _gather_tile_stats(local_m, local_s, contract, tp_group, tile_counts)
         target_logit = _gather_target_logit(z_masked, safe_target, contract, tp_group)
         lse = _merge_tile_partials(m_all, s_all)
@@ -401,7 +448,7 @@ class _VocabParallelLogprobFunction(torch.autograd.Function):
         if not ctx.needs_input_grad[0] or (
             grad_logp is None and grad_lse is None and grad_entropy is None
         ):
-            return None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None
 
         z_masked, lse, safe_target, active_mask, padding_cols, entropy = ctx.saved_tensors
         n, local_vocab = z_masked.shape
@@ -432,20 +479,157 @@ class _VocabParallelLogprobFunction(torch.autograd.Function):
             grad = grad + grad_entropy.unsqueeze(1) * p * entropy_input
         if bool(padding_cols.any()):
             grad = grad.masked_fill(padding_cols.unsqueeze(0), 0.0)
-        return grad.to(ctx.input_dtype), None, None, None, None, None, None, None
+        return grad.to(ctx.input_dtype), None, None, None, None, None, None, None, None
+
+
+class VocabParallelLogprobKernels(Protocol):
+    """Native kernel pair a fused WS2 backend plugs into :func:`apply_with_kernels`.
+
+    ``tile_stats`` returns FP32 ``(max, sumexp)`` partials of shape
+    ``[tokens, num_tiles]`` over the real-vocabulary part of each tile, with a
+    fixed per-tile reduction order that does not depend on the tile's position
+    in the local shard or on the storage dtype.  ``backward`` returns
+    ``grad_logits`` in the shard dtype for
+    ``coef_logp * (onehot - p) + coef_lse * p`` with ``p = exp(z - lse)`` on
+    finite rows, ``0`` on non-finite rows and padding columns.
+    """
+
+    def tile_stats(
+        self, shard: torch.Tensor, vocab_start: int, real_vocab: int, num_tiles: int
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    def backward(
+        self,
+        shard: torch.Tensor,
+        lse: torch.Tensor,
+        coef_logp: torch.Tensor,
+        coef_lse: torch.Tensor,
+        target_local: torch.Tensor,
+        vocab_start: int,
+        real_vocab: int,
+        has_lse_grad: bool,
+    ) -> torch.Tensor: ...
+
+
+class _KernelVocabParallelLogprobFunction(torch.autograd.Function):
+    """Selected logprob + LSE with native tile statistics and a fused native backward.
+
+    The transport (``_gather_tile_stats``, ``_gather_target_logit``) and the
+    fixed tile-order merge are the reference helpers above, so every kernel
+    backend shares one contract and differs from the reference only by the
+    FP32 summation order inside a tile.  The input shard is saved as-is (no
+    FP32 copy); the backward kernel recomputes ``p`` from it.
+    """
+
+    @staticmethod
+    def forward(ctx, local_logits, target_1d, active_mask, contract, tp_group, tile, kernels):
+        sharding = contract.sharding
+        shard = local_logits.contiguous()
+        local_tiles = sharding.local_vocab_size // tile
+        if local_tiles <= 0:
+            raise RuntimeError("native tile stats require at least one local vocab tile")
+        local_m, local_s = kernels.tile_stats(
+            shard, sharding.local_vocab_start, sharding.real_vocab_size, local_tiles
+        )
+        m_all, s_all = _gather_tile_stats(
+            local_m.contiguous(), local_s.contiguous(), contract, tp_group, tile
+        )
+        safe_target = torch.where(active_mask, target_1d, torch.zeros_like(target_1d))
+        # Exact: the owner's logit is copied in its storage dtype and widened once.
+        target_logit = _gather_target_logit(shard, safe_target, contract, tp_group).float()
+        lse = _merge_tile_partials(m_all, s_all)
+        selected_logp = torch.where(active_mask, target_logit - lse, torch.zeros_like(lse))
+
+        ctx.save_for_backward(shard, lse, safe_target, active_mask)
+        ctx.kernels = kernels
+        ctx.local_vocab_start = sharding.local_vocab_start
+        ctx.real_vocab_size = sharding.real_vocab_size
+        ctx.set_materialize_grads(False)
+        return selected_logp, lse
+
+    @staticmethod
+    def backward(ctx, grad_logp, grad_lse):
+        if not ctx.needs_input_grad[0] or (grad_logp is None and grad_lse is None):
+            return None, None, None, None, None, None, None
+        shard, lse, safe_target, active_mask = ctx.saved_tensors
+        n, local_vocab = shard.shape
+        start = ctx.local_vocab_start
+        if grad_logp is not None:
+            coef_logp = (
+                torch.where(active_mask, grad_logp, torch.zeros_like(grad_logp))
+                .float()
+                .contiguous()
+            )
+            owns = (safe_target >= start) & (safe_target < start + local_vocab)
+            hit = owns & active_mask
+            target_local = torch.where(
+                hit, safe_target - start, torch.full_like(safe_target, -1)
+            ).contiguous()
+        else:
+            coef_logp = lse.new_zeros((n,))
+            target_local = torch.full((n,), -1, dtype=torch.long, device=shard.device)
+        has_lse_grad = grad_lse is not None
+        coef_lse = grad_lse.float().contiguous() if has_lse_grad else lse.new_zeros((n,))
+        grad = ctx.kernels.backward(
+            shard,
+            lse.contiguous(),
+            coef_logp,
+            coef_lse,
+            target_local,
+            start,
+            ctx.real_vocab_size,
+            has_lse_grad,
+        )
+        return grad, None, None, None, None, None, None
+
+
+def apply_with_kernels(
+    local_logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    *,
+    contract: LogprobContract,
+    tp_group: Any,
+    num_vocab_tiles: int,
+    validate: bool,
+    kernels: VocabParallelLogprobKernels,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Contract-checked selected-logprob/LSE forward through a native kernel pair."""
+
+    if not isinstance(contract, LogprobContract):
+        raise LogprobContractError("contract must be a LogprobContract")
+    tile = _tile_size(contract, num_vocab_tiles)
+    _validate_invocation(local_logits, target_ids, contract, tp_group)
+
+    target_1d = target_ids.reshape(-1).to(device=local_logits.device, dtype=torch.long)
+    active_mask = torch.tensor(
+        contract.mask.active_mask, dtype=torch.bool, device=local_logits.device
+    )
+    if validate:
+        _validate_active_targets(target_1d, active_mask, contract.sharding.real_vocab_size)
+        if contract.sharding.tp_world_size > 1:
+            _preflight_cross_rank_agreement(contract, tp_group, num_vocab_tiles, True)
+
+    selected_logp, lse = _KernelVocabParallelLogprobFunction.apply(
+        local_logits, target_1d, active_mask, contract, tp_group, tile, kernels
+    )
+
+    if validate and bool((~torch.isfinite(lse) & active_mask).any().item()):
+        raise LogprobContractError(
+            "non-finite logsumexp on an active row: logits over the real "
+            "vocabulary must be finite for every active token"
+        )
+    return selected_logp, lse
 
 
 class VocabParallelLogprobOp:
-    """Vocab-parallel selected-token logprob (WS2 reference).
-
-    Deterministic by default (cross-TP bitwise, tile-ordered merge);
-    ``deterministic=False`` selects the faster whole-shard reduction with no
-    reproducibility guarantee.
-    """
+    """Deterministic vocab-parallel selected-token logprob (WS2 reference)."""
 
     op_class = "logprob"
     is_batch_invariant = True
     backend_id = BACKEND_ID
+    # False: PyTorch tile loop. True: ROCm extension kernel. A callable with the
+    # _native_rocm_tile_stats signature: backend-specific tile statistics.
+    use_native_tile_stats: bool | Callable[..., tuple[torch.Tensor, torch.Tensor]] = False
 
     def __init__(self) -> None:
         pass
@@ -492,6 +676,7 @@ class VocabParallelLogprobOp:
             deterministic=deterministic,
             with_entropy=False,
             with_entropy_grad=False,
+            use_native_tile_stats=self.use_native_tile_stats,
         )
         return selected_logp, lse
 
@@ -523,6 +708,7 @@ class VocabParallelLogprobOp:
             deterministic=deterministic,
             with_entropy=True,
             with_entropy_grad=with_entropy_grad,
+            use_native_tile_stats=self.use_native_tile_stats,
         )
 
     def _apply(
@@ -537,6 +723,7 @@ class VocabParallelLogprobOp:
         deterministic: bool,
         with_entropy: bool,
         with_entropy_grad: bool,
+        use_native_tile_stats: bool | Callable[..., tuple[torch.Tensor, torch.Tensor]],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not isinstance(contract, LogprobContract):
             raise LogprobContractError("contract must be a LogprobContract")
@@ -547,9 +734,8 @@ class VocabParallelLogprobOp:
         elif contract.reduction.determinism_scope is DeterminismScope.CROSS_TP_BITWISE:
             raise LogprobContractError(
                 "deterministic=False cannot honor determinism_scope=cross_tp_bitwise: "
-                "the fast path reduces each shard in one piece, so its floating-point "
-                "grouping changes with the TP degree; keep deterministic=True or relax "
-                "the contract to determinism_scope=fixed_topology"
+                "keep deterministic=True or relax the contract to "
+                "determinism_scope=fixed_topology"
             )
         else:
             tile = None
@@ -573,6 +759,7 @@ class VocabParallelLogprobOp:
             tile,
             with_entropy,
             with_entropy_grad,
+            use_native_tile_stats if deterministic else False,
         )
 
         if validate and bool((~torch.isfinite(lse) & active_mask).any().item()):
@@ -586,5 +773,7 @@ class VocabParallelLogprobOp:
 __all__ = [
     "BACKEND_ID",
     "DEFAULT_NUM_VOCAB_TILES",
+    "VocabParallelLogprobKernels",
     "VocabParallelLogprobOp",
+    "apply_with_kernels",
 ]

@@ -45,24 +45,42 @@ class NativeBatchInvariantLogpOp:
         logits_2d = logits.reshape(-1, vocab_size).float()
         target_1d = target_ids.reshape(-1).to(logits.device, dtype=torch.long)
 
-        selected_logp = self._row_wise_selected_logprob(
+        selected_logp, _ = self._row_wise_selected_logprob_with_lse(
             logits_2d, target_1d, ignore_index=ignore_index, validate=validate
         )
 
         return selected_logp.reshape(lead_shape)
 
+    def forward_with_lse(
+        self,
+        logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        ignore_index: int = -100,
+        *,
+        validate: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return selected logprob and the FP32 vocab-domain LSE for diagnostics."""
+        self._validate_shapes(logits, target_ids)
+        lead_shape = logits.shape[:-1]
+        logits_2d = logits.reshape(-1, logits.size(-1)).float()
+        target_1d = target_ids.reshape(-1).to(logits.device, dtype=torch.long)
+        logp, lse = self._row_wise_selected_logprob_with_lse(
+            logits_2d, target_1d, ignore_index=ignore_index, validate=validate
+        )
+        return logp.reshape(lead_shape), lse.reshape(lead_shape)
+
     # ---------------------------------------------------------------------- #
     # Core Computation
     # ---------------------------------------------------------------------- #
     @staticmethod
-    def _row_wise_selected_logprob(
+    def _row_wise_selected_logprob_with_lse(
         logits_2d: torch.Tensor,
         target_1d: torch.Tensor,
         *,
         ignore_index: int,
         validate: bool = True,
-    ) -> torch.Tensor:
-        """Per-row selected logprob with locked reduction order.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-row selected logprob and LSE with locked reduction order.
 
         The three reduction steps (max, sum-exp, gather) operate on each row
         independently.  PyTorch's ``max(dim=-1)`` and ``sum(dim=-1)`` iterate
@@ -104,7 +122,7 @@ class NativeBatchInvariantLogpOp:
 
         selected_logp = selected_logp.where(valid_mask, torch.zeros_like(selected_logp))
 
-        return selected_logp
+        return selected_logp, log_sum_exp
 
     # ---------------------------------------------------------------------- #
     # Helper

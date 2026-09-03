@@ -148,3 +148,48 @@ class BatchInvariantLogpSM90Op:
                 )
 
         return _BatchInvariantLogpSM90Function.apply(logits, target_ids, ignore_index)
+
+    def forward_with_lse(
+        self,
+        logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        ignore_index: int = -100,
+        *,
+        validate: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the exact SM90 path and return its direct FP32 logprob/LSE outputs.
+
+        Unlike the production ``apply`` method, this diagnostic entry point never
+        falls back to Triton or PyTorch, so comparison provenance stays truthful.
+        """
+        if logits.dim() < 2:
+            raise ValueError(
+                f"logits must be at least 2-D ([*lead, V]), got shape {tuple(logits.shape)}"
+            )
+        if logits.shape[:-1] != target_ids.shape:
+            raise ValueError(
+                f"logits leading shape {tuple(logits.shape[:-1])} must match "
+                f"target_ids shape {tuple(target_ids.shape)}"
+            )
+        if not _sm90_supported(logits):
+            raise RuntimeError(
+                "exact cuda-sm90 logprob diagnostics require Hopper, CUDA BF16/FP32 logits, "
+                "and a 16-byte-aligned vocab row stride; fallback is disabled"
+            )
+        if validate:
+            vocab_size = logits.size(-1)
+            valid_targets = target_ids.reshape(-1)
+            valid_targets = valid_targets[valid_targets != ignore_index]
+            if valid_targets.numel() and (
+                (valid_targets < 0).any() or (valid_targets >= vocab_size).any()
+            ):
+                bad = valid_targets[(valid_targets < 0) | (valid_targets >= vocab_size)]
+                raise ValueError(
+                    f"target_ids contains values outside [0, {vocab_size}): {bad.tolist()}"
+                )
+
+        lead_shape = logits.shape[:-1]
+        logits_2d = logits.reshape(-1, logits.size(-1)).contiguous()
+        target_1d = target_ids.reshape(-1).to(device=logits.device, dtype=torch.int64).contiguous()
+        logp, lse = _C.batch_invariant_logp_sm90(logits_2d, target_1d, int(ignore_index))
+        return logp.reshape(lead_shape), lse.reshape(lead_shape)
