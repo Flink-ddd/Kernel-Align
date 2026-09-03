@@ -7,36 +7,37 @@ backend PR can run independently.
 
 Issue: [DSV4][P1/7] mHC 与 RMSNorm 确定性前向/反向 (#2).
 
-## The eight P1 tasks
+## The eight sub-issues of #2
 
-Issue #2 splits the work by **function**, not by operator. Read that carefully
-before claiming one: `P1-D3` owns *every* custom backward across both mHC and
-RMSNorm, and `P1-D1`/`P1-D2` own only forwards.
+`P1-N` is a development-order label; **GitHub issue numbers stay authoritative
+for links**. Five WS1 operator tasks, each delivering forward *and* backward
+together, plus three WS2 parallelism tasks.
 
-| Label | Owner | Scope |
-| --- | --- | --- |
-| `P1-S0` | maintainer | This start kit: `LayerContract`, CPU oracle, forward/saved-tensor golden fixtures, provider stub, standalone acceptance command |
-| `P1-D1` | dev | `hc_pre` / `hc_post` **forward** — covers `hc_split_sinkhorn_fwd`, `fp32_gemm_rms_fwd`, `h_aggregate_fwd`, `mhc_pre_fwd`, `mhc_post_fwd` |
-| `P1-D2` | dev | RMSNorm / residual-RMSNorm **forward**: extend the existing WS1 RMSNorm, add residual-RMSNorm, fixed reduction tree, `rsqrt` |
-| `P1-D3` | dev | mHC/RMSNorm custom **backward**, built on the recorded saved-tensor fixtures — **does not wait on D1/D2 kernels** |
-| `P1-D4` | dev | TE/Megatron/Miles provider adapter, capability and fallback checks — codes against the stub API first |
-| `P1-D5` | dev | Trace, batch/padding/stride/recompute tests, correctness/performance benchmarks — runs against the oracle/stub first |
-| `P1-D6` | dev | Fixed-K / batch-invariant GEMM reference + bit-equivalence harness (consumed by P2/P3/P5/P7) |
-| `P1-R0` | maintainer | Review each `P1-D*` independently, package the P1 provider artifact, strict bytes / fallback / performance / local GPU CI |
+| Label | Issue | Stage | Scope |
+| --- | --- | --- | --- |
+| `P1-S0` | this PR | — | Start kit: contract, oracle, fixtures, provider stub, acceptance command |
+| `P1-1` | #14 | WS1 | `hc_split_sinkhorn` — controller mapping + 20 Sinkhorn rounds (fwd + bwd) |
+| `P1-2` | #15 | WS1 | `fp32_gemm_rms` — FP32 controller projection + controller RMS (fwd + bwd). **Also carries the fixed-K / batch-invariant GEMM reference + bit-equivalence harness** that P2/P3/P5/P7 consume |
+| `P1-3` | #16 | WS1 | `mhc_post` — sublayer output written back into the four residual streams (fwd + bwd) |
+| `P1-4` | #17 | WS1 | `mhc_pre` / `h_aggregate` — mHC entry and four-stream aggregation (fwd + composite bwd) |
+| `P1-5` | #18 | WS1 | `rmsnorm_residual` — single-stream RMSNorm + residual fork (fwd + bwd) |
+| `P1-6` | #19 | WS2 | `fp32_gemm_rms` TP/SP contract — the full `K=16384` controller dot and RMS statistic may not silently become local-K |
+| `P1-7` | #20 | WS2 | Rank-local invariance of the three mHC operators under TP/SP/CP/DP/PP |
+| `P1-8` | #21 | WS2 | `rmsnorm_residual` TP+SP semantics and cross-rank `dgamma` reduction |
 
-`Foundation v1 -> P1-S0 -> {P1-D1 || P1-D2 || P1-D3 || P1-D4 || P1-D5 || P1-D6} -> P1-R0`
+```
+Foundation v1 -> P1-S0 -> {P1-1 || P1-2 || P1-3 || P1-4 || P1-5} -> P1-R0
+                                     |
+                                     +-> WS2: P1-6, P1-7, P1-8
+```
 
-Every `P1-D*` depends only on `P1-S0`, never on each other. That is what the
-kit buys: D3 differentiates against recorded saved tensors, D4 and D5 run
-against the stub and the oracle, so none of them block on a forward kernel.
+Every WS1 task depends only on `P1-S0`, never on the others. `P1-4`'s composite
+backward calls `hc_split_sinkhorn_bwd` and `fp32_gemm_rms_bwd`, but it codes
+against the oracle for those, so it does not wait on `P1-1` or `P1-2`.
 
-### The five WS1 operators (a different axis)
-
-The operators to be written are `hc_split_sinkhorn`, `fp32_gemm_rms`,
-`mhc_post`, `mhc_pre` (with `h_aggregate`) and `rmsnorm_residual`, plus the
-`P1-D6` fixed-K GEMM. Operators are the *what*; the tasks above are the *who*.
-`ReferenceProvider` is keyed by operator, so an owner overrides whichever
-`_fwd`/`_bwd` entry points fall inside their task.
+For the three WS2 tasks, the `placement` field on `LayerContract` and
+`check_capability` are the attachment points: a provider that has not declared
+a placement already fails closed on it.
 
 ## What is in the kit
 
@@ -145,7 +146,7 @@ them means regenerating the manifest and bumping the schema/profile id):
 | D5 | **Numeric profile `oracle-fp32-mhc-v1`**: FP32, the two trees above, mul-then-add (**no FMA fusion**). A strict CUDA kernel matches with `__fmul_rn`/`__fadd_rn` or registers its own profile. | Byte-equality needs the rounding points pinned, not just the order. |
 | D6 | **`alpha` is three learnable FP32 scalars** (`alpha_pre`, `alpha_post`, `alpha_res`) broadcast over the PRE / POST / COMB segments; `bias` is a `[24]` vector. Backward returns three scalars, each a pinned segment fold on top of the token fold. | Matches Megatron exactly (`alpha_pre/post/res` are `nn.Parameter(torch.full((1,), ...))`, cat-expanded in `_compute_h`). Forward is identical to a `[24]` gain, but backward is not — a `[24]` `dAlpha` would leave the segment reduction order unpinned. |
 | D7 | **The transformer sublayer is external to P1.** `y_sublayer` enters the block as data and `d_normalized` / `d_residual` enter the backward as data; `dy_sublayer` is an output boundary. | This is what makes P1 acceptance runnable with no P2–P7 code in the loop, exactly as the issue requires. |
-| D8 | **`unfused` is canonical and the default**, and v1 does not reuse TE's `TEFusedResidualRMSNorm`. `fused-pre-norm` stays supported as the exception for an engine that physically cannot expose the intermediate. Fusion itself is not banned — changing the reduction layout or moving a downcast point is. | Train/infer byte-equality is the goal, and only the unfused decomposition lets every boundary be hashed separately, so a divergence localizes to one operator instead of one megakernel. TE's fused module *refuses* to expose the intermediate — it raises on any forward hook — which would collapse two boundaries into one. The extra pass is worth it; a fused fast path can be swapped back through the provider hook once proven byte-equal. |
+| D8 | **`unfused` is canonical and the default.** For `rmsnorm_residual`, #18 says to prefer TE's `TEFusedResidualRMSNorm` first and self-write only if TE fails the deterministic contract — **it fails**: it refuses to expose the pre-normalization intermediate (it raises on any forward hook), so the fork and the norm cannot be hashed as separate boundaries. That is exactly the escape hatch #18 provides, so v1 is unfused. `fused-pre-norm` stays supported for an engine that physically cannot expose the intermediate. Fusion itself is not banned — changing the reduction layout or moving a downcast point is. | Train/infer byte-equality needs every boundary hashable on its own, so a divergence localizes to one operator instead of one megakernel. A fused fast path can be swapped back through the provider hook once proven byte-equal. |
 | D9 | **`trainability='mixer-frozen'` returns `None` for `d_controller_weight`/`d_alpha`/`d_bias`**, not zeros. | #2: a stop-grad mixer must not leak `dMixWeight`. `None` cannot be silently summed into an optimizer; a zero tensor can. |
 | D10 | **Gradients are returned FP32** (the accumulator dtype); rounding to BF16 happens only at an outer block edge. | Consistent with "FP32 reductions, BF16 boundaries". |
 

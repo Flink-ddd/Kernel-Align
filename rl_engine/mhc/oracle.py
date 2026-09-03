@@ -468,12 +468,13 @@ def rmsnorm_residual_fwd(
     and the controller RMS in :func:`fp32_gemm_rms_fwd` uses that other form
     on purpose. The residual fork keeps the original BF16 bytes untouched.
 
-    v1 does **not** reuse TE's ``TEFusedResidualRMSNorm``. That module fuses the
-    fork and the norm and refuses to expose the intermediate (it raises on any
-    forward hook), which would collapse two hashable boundaries into one and
-    leave a divergence unlocalizable. Keeping the two boundaries separate is
-    worth the extra pass; a TE fast path can be swapped back in later through
-    the provider hook once it is proven byte-equal.
+    P1-5 (#18) says to prefer TE's ``TEFusedResidualRMSNorm`` first and to
+    self-write only when TE's reduction/dtype fails the deterministic contract.
+    It fails: that module fuses the fork and the norm and refuses to expose the
+    intermediate (it raises on any forward hook), so the two boundaries cannot
+    be hashed separately and a divergence cannot be localized. v1 is therefore
+    unfused; a TE fast path can be swapped back through the provider hook once
+    it is proven byte-equal.
     """
     x32 = _f32(x)
     d = x32.shape[1]

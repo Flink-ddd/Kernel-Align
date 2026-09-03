@@ -39,14 +39,12 @@ def test_reference_provider_matches_oracle_bytes() -> None:
 
 def test_stub_provider_fails_closed() -> None:
     stub = StubProvider()
-    with pytest.raises(NotImplementedError, match="P1-D1"):
+    with pytest.raises(NotImplementedError, match=r"P1-1 \(#14\)"):
         stub.hc_split_sinkhorn_fwd(torch.zeros(1, 24))
-    with pytest.raises(NotImplementedError, match="P1-D6"):
+    # #15 absorbs the fixed-K GEMM reference, so it points at P1-2, not its own task
+    with pytest.raises(NotImplementedError, match=r"P1-2 \(#15\)"):
         stub.fixed_k_gemm_fwd(torch.zeros(1, 4), torch.zeros(2, 4))
-    # backward belongs to P1-D3 regardless of which operator it is
-    with pytest.raises(NotImplementedError, match="P1-D3"):
-        stub.rmsnorm_residual_bwd(None, None, None, None, {})
-    with pytest.raises(NotImplementedError, match="P1-D2"):
+    with pytest.raises(NotImplementedError, match=r"P1-5 \(#18\)"):
         stub.rmsnorm_residual_fwd(torch.zeros(1, 8), torch.zeros(8), 1e-6)
     batch = fixtures.make_batch("one_row")
     with pytest.raises(NotImplementedError):
