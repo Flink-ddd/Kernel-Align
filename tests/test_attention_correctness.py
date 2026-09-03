@@ -8,6 +8,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
+    STRICT_ATTENTION_ROCM_SCHEDULE_ID,
+)
+from rl_engine.kernels.ops.rocm.attention.flash_attn import (
+    StrictRocmAiterCKAttentionCore,
+    StrictRocmAttentionUnavailable,
+)
+
 try:
     from torch.nn.attention import SDPBackend, sdpa_kernel
 except ImportError:
@@ -440,3 +449,143 @@ def test_native_attention_rejects_invalid_gqa_head_ratio():
 
     with pytest.raises(ValueError, match="q heads must be divisible"):
         NativeAttentionOp()(q, k, v)
+
+
+def test_strict_rocm_aiter_ck_core_fixes_forward_and_backward_contract(monkeypatch):
+    calls = []
+
+    def fake_fwd(
+        q,
+        k,
+        v,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_left,
+        window_right,
+        sink_size,
+        return_lse,
+        return_dropout_mask,
+    ):
+        calls.append(
+            (
+                "forward",
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_left,
+                window_right,
+                sink_size,
+                return_lse,
+                return_dropout_mask,
+            )
+        )
+        return (
+            q.clone(),
+            torch.zeros(q.size(0), q.size(2), q.size(1), dtype=torch.float32),
+            torch.empty(0),
+            torch.zeros(2, dtype=torch.int64),
+        )
+
+    def fake_bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_left,
+        window_right,
+        deterministic,
+        **kwargs,
+    ):
+        calls.append(
+            (
+                "backward",
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_left,
+                window_right,
+                deterministic,
+                kwargs["rng_state"].shape,
+            )
+        )
+        return torch.ones_like(q), torch.ones_like(k), torch.ones_like(v), torch.empty(0)
+
+    core = StrictRocmAiterCKAttentionCore(
+        _mha_fwd=fake_fwd,
+        _mha_bwd=fake_bwd,
+        _source_sha256="a" * 64,
+    )
+    monkeypatch.setattr(core, "_validate_inputs", lambda *_args: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: type("Props", (), {"name": "test-gpu", "gcnArchName": "gfx-test"})(),
+    )
+    q = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, 2, 3, 8, dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(1, 2, 3, 8, dtype=torch.bfloat16, requires_grad=True)
+    result = core.forward_with_lse(
+        q,
+        k,
+        v,
+        causal=True,
+        scale=0.125,
+        query_position_ids=torch.tensor([[1, 2]]),
+        key_position_ids=torch.tensor([[0, 1, 2]]),
+    )
+    result.out.float().sum().backward()
+
+    assert calls == [
+        ("forward", 0.0, 0.125, True, -1, -1, 0, True, False),
+        ("backward", 0.0, 0.125, True, -1, -1, True, torch.Size([2])),
+    ]
+    assert result.out.shape == q.shape
+    assert result.lse.shape == q.shape[:3]
+    assert result.lse.dtype is torch.float32
+    assert result.provenance["strict_core_id"] == STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID
+    assert result.provenance["strict_schedule"] == STRICT_ATTENTION_ROCM_SCHEDULE_ID
+    assert result.provenance["attention_backend"] == "aiter.rocm.ck_dense_mha"
+    assert result.provenance["split_kv_control"] == "dense_non_split_api"
+    assert result.provenance["num_splits"] == 1
+    assert result.provenance["deterministic_backward"] is True
+    assert result.provenance["aiter_source_sha256"] == "a" * 64
+    assert q.grad is not None and k.grad is not None and v.grad is not None
+
+
+def test_strict_rocm_aiter_ck_core_rejects_non_fp32_lse(monkeypatch):
+    def fake_fwd(q, k, v, *_args):
+        return (
+            q,
+            torch.zeros(q.size(0), q.size(2), q.size(1), dtype=q.dtype),
+            torch.empty(0),
+            torch.empty(2),
+        )
+
+    core = StrictRocmAiterCKAttentionCore(
+        _mha_fwd=fake_fwd,
+        _mha_bwd=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(core, "_validate_inputs", lambda *_args: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: type("Props", (), {"name": "test-gpu", "gcnArchName": "gfx-test"})(),
+    )
+    q = torch.randn(1, 4, 1, 8, dtype=torch.bfloat16)
+    k = torch.randn(1, 2, 1, 8, dtype=torch.bfloat16)
+
+    with pytest.raises(StrictRocmAttentionUnavailable, match="FP32 LSE"):
+        core.forward_with_lse(
+            q,
+            k,
+            k,
+            causal=True,
+            query_position_ids=torch.tensor([[0]]),
+            key_position_ids=torch.tensor([[0]]),
+        )

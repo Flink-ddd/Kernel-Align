@@ -24,7 +24,7 @@ dependencies = [
 rl_kernel = "rl_engine.integrations.vllm_runtime:register_vllm_plugin"
 
 [project.optional-dependencies]
-cuda = ["flashinfer-python>=0.1.6", "nvidia-ml-py"]
+cuda = ["flashinfer-python>=0.6.0,<0.7", "nvidia-ml-py"]
 rocm = ["aiter"]
 vllm = ["vllm>=0.6.0"]
 drift-viewer = ["Pillow>=10", "PySide6>=6.6"]

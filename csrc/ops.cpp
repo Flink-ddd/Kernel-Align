@@ -78,12 +78,7 @@ torch::Tensor lm_head_sm90_forward_fp32(torch::Tensor hidden,
                                         torch::optional<torch::Tensor> bias);
 #endif
 
-#if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
-std::vector<torch::Tensor> deterministic_logp_tile_stats(
-    torch::Tensor logits,
-    int64_t vocab_start,
-    int64_t real_vocab,
-    int64_t num_tiles);
+#if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA) || defined(KERNEL_ALIGN_WITH_ROCM)
 torch::Tensor fused_logp_forward_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor output);
 torch::Tensor fused_logp_forward_fp32(torch::Tensor logits, torch::Tensor token_ids);
 torch::Tensor fused_logp_forward_indexed_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices, torch::Tensor output);
@@ -130,8 +125,9 @@ torch::Tensor hip_deterministic_logp_backward(
     bool has_lse_grad);
 #endif
 
-#if !defined(__HIPCC__) && !defined(__HIP_PLATFORM_AMD__)
-// Single-node TP=8 deterministic collectives.
+#if !defined(USE_ROCM) && !defined(KERNEL_ALIGN_WITH_ROCM)
+// Single-node TP=8 deterministic CUDA IPC collectives. ROCm uses the
+// rank-ordered RCCL transport in rl_engine.distributed.collectives.
 std::tuple<std::vector<int64_t>, int64_t> deterministic_collective_ipc_meta(
     torch::Tensor& tensor);
 int64_t deterministic_collective_create(
@@ -148,6 +144,54 @@ void deterministic_collective_reduce_scatter(int64_t handle, torch::Tensor& outp
 void deterministic_collective_all_gather(int64_t handle, torch::Tensor& output);
 void deterministic_collective_all_gather_fused(
     int64_t handle, torch::Tensor& input, torch::Tensor& output);
+#endif
+
+#if defined(KERNEL_ALIGN_WITH_ROCM)
+// ROCm keeps arithmetic in a fixed balanced tree while using either RCCL or
+// HIP IPC for rank-ordered transport. These kernels expose the local and IPC
+// reduction paths without changing the CUDA implementation.
+void deterministic_collective_rocm_all_reduce(
+    torch::Tensor rank_inputs,
+    torch::Tensor output);
+void deterministic_collective_rocm_reduce_scatter(
+    torch::Tensor rank_inputs,
+    torch::Tensor output);
+torch::Tensor deterministic_collective_rocm_ipc_allocate(int64_t size_bytes);
+std::tuple<std::vector<int64_t>, int64_t>
+deterministic_collective_rocm_ipc_meta(torch::Tensor tensor);
+int64_t deterministic_collective_rocm_ipc_create(
+    torch::Tensor staging,
+    const std::vector<std::vector<int64_t>>& handles,
+    const std::vector<int64_t>& offsets,
+    int64_t rank);
+void deterministic_collective_rocm_ipc_synchronize(int64_t handle);
+void deterministic_collective_rocm_ipc_destroy(int64_t handle);
+void deterministic_collective_rocm_ipc_stage(int64_t handle, torch::Tensor input);
+void deterministic_collective_rocm_ipc_all_reduce(
+    int64_t handle,
+    torch::Tensor output);
+void deterministic_collective_rocm_ipc_all_reduce_input(
+    int64_t handle,
+    torch::Tensor input,
+    torch::Tensor output);
+void deterministic_collective_rocm_ipc_reduce_scatter(
+    int64_t handle,
+    torch::Tensor output);
+void deterministic_collective_rocm_ipc_reduce_scatter_input(
+    int64_t handle,
+    torch::Tensor input,
+    torch::Tensor output);
+void deterministic_collective_rocm_ipc_reduce_scatter_many(
+    int64_t handle,
+    const std::vector<torch::Tensor>& inputs,
+    const std::vector<torch::Tensor>& outputs);
+void deterministic_collective_rocm_ipc_all_gather(
+    int64_t handle,
+    torch::Tensor output);
+void deterministic_collective_rocm_ipc_all_gather_input(
+    int64_t handle,
+    torch::Tensor input,
+    torch::Tensor output);
 #endif
 
 // Batch-Invariant Deterministic GEMM Declarations
@@ -351,9 +395,17 @@ std::vector<torch::Tensor> deterministic_attention_backward(
     double scale,
     torch::optional<torch::Tensor> key_padding_mask);
 
-// Prefix-Shared Attention Declarations & Wrappers
+#if defined(KERNEL_ALIGN_WITH_ROCM)
+torch::Tensor deterministic_rope_apply_rocm(
+    torch::Tensor x,
+    torch::Tensor cos,
+    torch::Tensor sin,
+    double sin_sign);
+#endif
 
 #if !defined(USE_ROCM)
+// Prefix-Shared Attention Declarations & Wrappers (NVIDIA PTX only).
+
 void prefix_shared_attention_forward(
   const __nv_bfloat16 *Q,  // [bs, G, len_q, DIM]
   const __nv_bfloat16 *K,  // [bs, len_kv, DIM]
@@ -449,7 +501,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Single-card SM90 batch-invariant LM-head forward with fp32 output");
 #endif
 
-#if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
+#if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA) || defined(KERNEL_ALIGN_WITH_ROCM)
     m.def("fused_logp_forward_out", &fused_logp_forward_out, "Fused logp out");
     m.def("fused_logp_forward_fp32", &fused_logp_forward_fp32, "Fused logp fp32");
     m.def("fused_logp_forward_indexed_out", &fused_logp_forward_indexed_out, "Fused logp indexed out");
@@ -474,8 +526,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "ROCm fused vocab-parallel selected-logprob/LSE backward on the local shard");
 #endif
 
-#if !defined(__HIPCC__) && !defined(__HIP_PLATFORM_AMD__)
-    // Single-node TP=8 fixed-tree collectives.
+#if !defined(USE_ROCM) && !defined(KERNEL_ALIGN_WITH_ROCM)
+    // Single-node TP=8 fixed-tree CUDA IPC collectives. ROCm dispatches to
+    // the Python RCCL transport implementation instead.
     m.def(
         "deterministic_collective_ipc_meta",
         &deterministic_collective_ipc_meta,
@@ -514,8 +567,60 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Run a fused small-message deterministic rank-ordered all-gather");
 #endif
 
-    // Prefix-shared attention uses NVIDIA PTX and falls back to PyTorch SDPA on ROCm.
+#if defined(KERNEL_ALIGN_WITH_ROCM)
+    m.def(
+        "deterministic_collective_rocm_all_reduce",
+        &deterministic_collective_rocm_all_reduce,
+        "Run the ROCm fixed-tree all-reduce kernel");
+    m.def(
+        "deterministic_collective_rocm_reduce_scatter",
+        &deterministic_collective_rocm_reduce_scatter,
+        "Run the ROCm fixed-tree reduce-scatter kernel");
+    m.def("deterministic_collective_rocm_ipc_meta",
+          &deterministic_collective_rocm_ipc_meta,
+          "Export a ROCm allocation for IPC deterministic collectives");
+    m.def("deterministic_collective_rocm_ipc_allocate",
+          &deterministic_collective_rocm_ipc_allocate,
+          "Allocate ROCm memory that supports IPC export");
+    m.def("deterministic_collective_rocm_ipc_create",
+          &deterministic_collective_rocm_ipc_create,
+          "Create a ROCm IPC deterministic collective state");
+    m.def("deterministic_collective_rocm_ipc_destroy",
+          &deterministic_collective_rocm_ipc_destroy,
+          "Destroy a ROCm IPC deterministic collective state");
+    m.def("deterministic_collective_rocm_ipc_synchronize",
+          &deterministic_collective_rocm_ipc_synchronize,
+          "Wait until every rank finishes reading ROCm IPC staging");
+    m.def("deterministic_collective_rocm_ipc_stage",
+          &deterministic_collective_rocm_ipc_stage,
+          "Stage an input for ROCm IPC deterministic collectives");
+    m.def("deterministic_collective_rocm_ipc_all_reduce",
+          &deterministic_collective_rocm_ipc_all_reduce,
+          "Run a direct ROCm IPC fixed-tree all-reduce");
+    m.def("deterministic_collective_rocm_ipc_all_reduce_input",
+          &deterministic_collective_rocm_ipc_all_reduce_input,
+          "Stage and run a direct ROCm IPC fixed-tree all-reduce");
+    m.def("deterministic_collective_rocm_ipc_reduce_scatter",
+          &deterministic_collective_rocm_ipc_reduce_scatter,
+          "Run a direct ROCm IPC fixed-tree reduce-scatter");
+    m.def("deterministic_collective_rocm_ipc_reduce_scatter_input",
+          &deterministic_collective_rocm_ipc_reduce_scatter_input,
+          "Stage and run a direct ROCm IPC fixed-tree reduce-scatter");
+    m.def("deterministic_collective_rocm_ipc_reduce_scatter_many",
+          &deterministic_collective_rocm_ipc_reduce_scatter_many,
+          "Run multiple ROCm IPC fixed-tree reduce-scatters with one synchronization");
+    m.def("deterministic_collective_rocm_ipc_all_gather",
+          &deterministic_collective_rocm_ipc_all_gather,
+          "Run a direct ROCm IPC rank-ordered all-gather");
+    m.def("deterministic_collective_rocm_ipc_all_gather_input",
+          &deterministic_collective_rocm_ipc_all_gather_input,
+          "Stage and run a direct ROCm IPC rank-ordered all-gather");
+#endif
+
 #if !defined(USE_ROCM)
+    // Prefix-shared attention uses NVIDIA PTX; the declaration above carries the
+    // same guard, so the registration must repeat it or a ROCm build fails on an
+    // undeclared identifier.
     m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
 #endif
 
@@ -563,5 +668,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "deterministic_attention_backward",
         &deterministic_attention_backward,
         "Deterministic standard softmax attention backward (dQ, dK, dV)");
+#if defined(KERNEL_ALIGN_WITH_ROCM)
+    m.def(
+        "deterministic_rope_apply_rocm",
+        &deterministic_rope_apply_rocm,
+        "Deterministic GPT-NeoX RoPE apply for ROCm");
+#endif
 #endif
 }
