@@ -7,18 +7,36 @@ backend PR can run independently.
 
 Issue: [DSV4][P1/7] mHC 与 RMSNorm 确定性前向/反向 (#2).
 
-## Sub-issue naming
+## The eight P1 tasks
 
-| Label | Scope |
-| --- | --- |
-| `P1-S0` | This start kit (contract, oracle, fixtures, acceptance command) |
-| `P1-D1` | `hc_split_sinkhorn` (fwd + bwd through all 20 Sinkhorn rounds) |
-| `P1-D2` | `fp32_gemm_rms` (controller projection + controller RMS, fwd + bwd) |
-| `P1-D3` | `mhc_post` (fwd + `dR_old`/`dy`/`dC`/`dPOST`) |
-| `P1-D4` | `mhc_pre` / `h_aggregate` + the TE/Megatron/Miles provider adapter |
-| `P1-D5` | `rmsnorm_residual` (fwd + `dX`/`dGamma`), unfused; TE fast path only once proven byte-equal |
-| `P1-D6` | Fixed-K / batch-invariant GEMM reference + equivalence harness |
-| `P1-R0` | Review, package the P1 provider artifact, GPU CI |
+Issue #2 splits the work by **function**, not by operator. Read that carefully
+before claiming one: `P1-D3` owns *every* custom backward across both mHC and
+RMSNorm, and `P1-D1`/`P1-D2` own only forwards.
+
+| Label | Owner | Scope |
+| --- | --- | --- |
+| `P1-S0` | maintainer | This start kit: `LayerContract`, CPU oracle, forward/saved-tensor golden fixtures, provider stub, standalone acceptance command |
+| `P1-D1` | dev | `hc_pre` / `hc_post` **forward** — covers `hc_split_sinkhorn_fwd`, `fp32_gemm_rms_fwd`, `h_aggregate_fwd`, `mhc_pre_fwd`, `mhc_post_fwd` |
+| `P1-D2` | dev | RMSNorm / residual-RMSNorm **forward**: extend the existing WS1 RMSNorm, add residual-RMSNorm, fixed reduction tree, `rsqrt` |
+| `P1-D3` | dev | mHC/RMSNorm custom **backward**, built on the recorded saved-tensor fixtures — **does not wait on D1/D2 kernels** |
+| `P1-D4` | dev | TE/Megatron/Miles provider adapter, capability and fallback checks — codes against the stub API first |
+| `P1-D5` | dev | Trace, batch/padding/stride/recompute tests, correctness/performance benchmarks — runs against the oracle/stub first |
+| `P1-D6` | dev | Fixed-K / batch-invariant GEMM reference + bit-equivalence harness (consumed by P2/P3/P5/P7) |
+| `P1-R0` | maintainer | Review each `P1-D*` independently, package the P1 provider artifact, strict bytes / fallback / performance / local GPU CI |
+
+`Foundation v1 -> P1-S0 -> {P1-D1 || P1-D2 || P1-D3 || P1-D4 || P1-D5 || P1-D6} -> P1-R0`
+
+Every `P1-D*` depends only on `P1-S0`, never on each other. That is what the
+kit buys: D3 differentiates against recorded saved tensors, D4 and D5 run
+against the stub and the oracle, so none of them block on a forward kernel.
+
+### The five WS1 operators (a different axis)
+
+The operators to be written are `hc_split_sinkhorn`, `fp32_gemm_rms`,
+`mhc_post`, `mhc_pre` (with `h_aggregate`) and `rmsnorm_residual`, plus the
+`P1-D6` fixed-K GEMM. Operators are the *what*; the tasks above are the *who*.
+`ReferenceProvider` is keyed by operator, so an owner overrides whichever
+`_fwd`/`_bwd` entry points fall inside their task.
 
 ## What is in the kit
 

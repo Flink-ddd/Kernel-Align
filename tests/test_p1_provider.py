@@ -43,6 +43,11 @@ def test_stub_provider_fails_closed() -> None:
         stub.hc_split_sinkhorn_fwd(torch.zeros(1, 24))
     with pytest.raises(NotImplementedError, match="P1-D6"):
         stub.fixed_k_gemm_fwd(torch.zeros(1, 4), torch.zeros(2, 4))
+    # backward belongs to P1-D3 regardless of which operator it is
+    with pytest.raises(NotImplementedError, match="P1-D3"):
+        stub.rmsnorm_residual_bwd(None, None, None, None, {})
+    with pytest.raises(NotImplementedError, match="P1-D2"):
+        stub.rmsnorm_residual_fwd(torch.zeros(1, 8), torch.zeros(8), 1e-6)
     batch = fixtures.make_batch("one_row")
     with pytest.raises(NotImplementedError):
         oracle.mhc_block_forward(batch, ops=stub)

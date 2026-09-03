@@ -179,34 +179,34 @@ class StubProvider(ReferenceProvider):
         )
 
     def hc_split_sinkhorn_fwd(self, h, contract=None):
-        raise self._todo("P1-D1 (hc_split_sinkhorn)")
+        raise self._todo("P1-D1 (hc_pre/hc_post forward)")
 
     def hc_split_sinkhorn_bwd(self, dpre, dpost, dc, saved):
-        raise self._todo("P1-D1 (hc_split_sinkhorn)")
+        raise self._todo("P1-D3 (mHC/RMSNorm custom backward)")
 
     def fp32_gemm_rms_fwd(self, x_flat, weight, eps):
-        raise self._todo("P1-D2 (fp32_gemm_rms)")
+        raise self._todo("P1-D1 (hc_pre/hc_post forward)")
 
     def fp32_gemm_rms_bwd(self, dp, dr, x_flat, weight, saved):
-        raise self._todo("P1-D2 (fp32_gemm_rms)")
+        raise self._todo("P1-D3 (mHC/RMSNorm custom backward)")
 
     def mhc_post_fwd(self, r_old, y, c, post):
-        raise self._todo("P1-D3 (mhc_post)")
+        raise self._todo("P1-D1 (hc_pre/hc_post forward)")
 
     def mhc_post_bwd(self, dr_new, r_old, y, c, post):
-        raise self._todo("P1-D3 (mhc_post)")
+        raise self._todo("P1-D3 (mHC/RMSNorm custom backward)")
 
     def h_aggregate_fwd(self, pre, r_old):
-        raise self._todo("P1-D4 (mhc_pre / h_aggregate)")
+        raise self._todo("P1-D1 (hc_pre/hc_post forward)")
 
     def h_aggregate_bwd(self, dh, pre, r_old):
-        raise self._todo("P1-D4 (mhc_pre / h_aggregate)")
+        raise self._todo("P1-D3 (mHC/RMSNorm custom backward)")
 
     def rmsnorm_residual_fwd(self, x, gamma, eps):
-        raise self._todo("P1-D5 (rmsnorm_residual)")
+        raise self._todo("P1-D2 (RMSNorm/residual-RMSNorm forward)")
 
     def rmsnorm_residual_bwd(self, dy, d_residual, x, gamma, saved):
-        raise self._todo("P1-D5 (rmsnorm_residual)")
+        raise self._todo("P1-D3 (mHC/RMSNorm custom backward)")
 
     def fixed_k_gemm_fwd(self, x, w):
         raise self._todo("P1-D6 (fixed-K GEMM reference)")
