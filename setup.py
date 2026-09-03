@@ -241,7 +241,7 @@ def get_extensions():
                 sources=[
                     "csrc/ascend/batch_invariant_logp_ascend.asc",
                     "csrc/ascend/rope_ascend.asc",
-                    "csrc/ascend/ops_ascend.cpp",
+                    "csrc/ascend/npu_module.cpp",
                 ],
                 language="asc",
             )
