@@ -163,26 +163,73 @@ class AttentionAblationOp:
         # fallback to the PyTorch reference when AG/RS is required.
         self.cp_backend = cp_backend
         self.communication_backend = communication_backend.strip()
-        self._cuda_runtime_group: Any = None
-        self._cuda_runtime_bound = False
+        self._runtime_group: Any = None
+        self._runtime_platform: str | None = None
 
-    def bind_cuda_runtime(self, *, process_group: Any = None) -> Any:
-        """Bind the shared production CUDA core/transport once per process."""
+    def bind_accelerator_runtime(
+        self,
+        tensor: Tensor,
+        *,
+        process_group: Any = None,
+    ) -> Any:
+        """Bind the strict runtime matching a CUDA or ROCm tensor.
 
-        if self._cuda_runtime_bound:
-            if process_group is not self._cuda_runtime_group:
+        PyTorch intentionally exposes AMD GPUs through the ``cuda`` device
+        type.  The HIP build marker, rather than ``tensor.device.type``, is
+        therefore the platform discriminator used by every framework bridge.
+        """
+
+        if tensor.device.type != "cuda":
+            raise AttentionContractError(
+                "production Attention requires a CUDA or ROCm accelerator tensor"
+            )
+        platform = "rocm" if torch.version.hip is not None else "cuda"
+        return self.bind_runtime(platform=platform, process_group=process_group)
+
+    def bind_runtime(self, *, platform: str, process_group: Any = None) -> Any:
+        """Bind one platform runtime and reject process-local identity drift."""
+
+        normalized = platform.strip().lower()
+        if normalized not in {"cuda", "rocm"}:
+            raise AttentionContractError("Attention runtime platform must be 'cuda' or 'rocm'")
+        if self._runtime_platform is not None:
+            if normalized != self._runtime_platform:
                 raise AttentionContractError(
-                    "Attention CUDA runtime is already bound to another process group"
+                    "Attention runtime is already bound to another accelerator platform"
+                )
+            if process_group is not self._runtime_group:
+                raise AttentionContractError(
+                    "Attention runtime is already bound to another process group"
                 )
             return self.core
-        from rl_engine.kernels.ops.cuda.attention.strict_runtime import StrictCUDAAttentionRuntime
 
-        runtime = StrictCUDAAttentionRuntime(process_group=process_group)
+        if normalized == "rocm":
+            from rl_engine.kernels.ops.rocm.attention.strict_runtime import (
+                StrictRocmAttentionRuntime,
+            )
+
+            runtime = StrictRocmAttentionRuntime(process_group=process_group)
+        else:
+            from rl_engine.kernels.ops.cuda.attention.strict_runtime import (
+                StrictCUDAAttentionRuntime,
+            )
+
+            runtime = StrictCUDAAttentionRuntime(process_group=process_group)
         self.core = runtime
         self.cp_backend = runtime
-        self._cuda_runtime_group = process_group
-        self._cuda_runtime_bound = True
+        self._runtime_group = process_group
+        self._runtime_platform = normalized
         return runtime
+
+    def bind_cuda_runtime(self, *, process_group: Any = None) -> Any:
+        """Compatibility entry point for CUDA-only callers."""
+
+        return self.bind_runtime(platform="cuda", process_group=process_group)
+
+    def bind_rocm_runtime(self, *, process_group: Any = None) -> Any:
+        """Bind the AITER/CK + RCCL production runtime once per process."""
+
+        return self.bind_runtime(platform="rocm", process_group=process_group)
 
     def __call__(
         self,
@@ -395,8 +442,12 @@ class AttentionAblationOp:
                     )
                 return self.cp_backend, _callable_backend_id(self.cp_backend)
             return self._reference_backend(), REFERENCE_BACKEND_ID
-        if q.device.type != "cuda" or torch.version.hip is not None:
+        if q.device.type != "cuda":
             return self._reference_backend(), REFERENCE_BACKEND_ID
+        if torch.version.hip is not None:
+            if self.core is None:
+                self.bind_rocm_runtime()
+            return self.core, _callable_backend_id(self.core)
         if self.core is None:
             from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
                 DeterministicAttentionOp,

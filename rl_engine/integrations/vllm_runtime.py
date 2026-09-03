@@ -105,7 +105,9 @@ def configure_vllm_environment(plan: IntegrationPlan, *, readback_dir: str | Non
     os.environ["RL_KERNEL_VLLM_INTEGRATION"] = "1"
     configure_integration_environment(plan, readback_dir=readback_dir)
     if plan.implementation_for("attention", "rollout") is Implementation.RL_KERNEL:
-        os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
+        os.environ["VLLM_ATTENTION_BACKEND"] = (
+            "ROCM_AITER_FA" if torch.version.hip is not None else "FLASH_ATTN"
+        )
     if plan.implementation_for("logp", "rollout") is Implementation.RL_KERNEL:
         real_vocab = os.getenv("RL_KERNEL_VLLM_REAL_VOCAB_SIZE", "").strip()
         padded_vocab = os.getenv("RL_KERNEL_VLLM_PADDED_VOCAB_SIZE", "").strip()
@@ -602,19 +604,39 @@ def _patch_worker_sampler(integration: VllmIntegration, *, strict_linear_logp: b
 def _register_attention_backend(integration: VllmIntegration) -> None:
     global _RLK_ATTENTION_BACKEND, _RLK_ATTENTION_BUILDER, _RLK_ATTENTION_IMPL
 
-    from vllm.v1.attention.backends.flash_attn import (
-        FlashAttentionBackend,
-        FlashAttentionImpl,
-        FlashAttentionMetadataBuilder,
-    )
     from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+
+    if torch.version.hip is not None:
+        from vllm.v1.attention.backends.rocm_aiter_fa import (
+            AiterFlashAttentionBackend as PlatformAttentionBackend,
+        )
+        from vllm.v1.attention.backends.rocm_aiter_fa import (
+            AiterFlashAttentionImpl as PlatformAttentionImpl,
+        )
+        from vllm.v1.attention.backends.rocm_aiter_fa import (
+            AiterFlashAttentionMetadataBuilder as PlatformAttentionMetadataBuilder,
+        )
+
+        selected_backend = AttentionBackendEnum.ROCM_AITER_FA
+    else:
+        from vllm.v1.attention.backends.flash_attn import (
+            FlashAttentionBackend as PlatformAttentionBackend,
+        )
+        from vllm.v1.attention.backends.flash_attn import (
+            FlashAttentionImpl as PlatformAttentionImpl,
+        )
+        from vllm.v1.attention.backends.flash_attn import (
+            FlashAttentionMetadataBuilder as PlatformAttentionMetadataBuilder,
+        )
+
+        selected_backend = AttentionBackendEnum.FLASH_ATTN
 
     operator: VllmAttentionOperator | None = None
     if integration.plan.implementation_for("attention", "rollout") is Implementation.RL_KERNEL:
         operator = VllmAttentionOperator()
         integration.install_operator("attention", operator)
 
-    class RlKernelFlashAttentionImpl(FlashAttentionImpl):
+    class RlKernelAttentionImpl(PlatformAttentionImpl):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             if operator is not None:
@@ -626,42 +648,41 @@ def _register_attention_backend(integration: VllmIntegration) -> None:
                 raise RuntimeError("vLLM Attention executed without its installed integration")
 
             def native(_impl: Any, *call_args: Any, **call_kwargs: Any) -> Any:
-                return FlashAttentionImpl.forward(self, *call_args, **call_kwargs)
+                return PlatformAttentionImpl.forward(self, *call_args, **call_kwargs)
 
             return integration.execute("attention", native, self, *args, **kwargs)
 
-    class RlKernelFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
+    class RlKernelAttentionMetadataBuilder(PlatformAttentionMetadataBuilder):
         pass
 
-    class RlKernelFlashAttentionBackend(FlashAttentionBackend):
+    class RlKernelAttentionBackend(PlatformAttentionBackend):
         @staticmethod
         def get_impl_cls() -> type[Any]:
-            return RlKernelFlashAttentionImpl
+            return RlKernelAttentionImpl
 
         @staticmethod
         def get_builder_cls() -> type[Any]:
-            return RlKernelFlashAttentionMetadataBuilder
+            return RlKernelAttentionMetadataBuilder
 
-    RlKernelFlashAttentionImpl.__module__ = __name__
-    RlKernelFlashAttentionImpl.__qualname__ = "RlKernelFlashAttentionImpl"
-    RlKernelFlashAttentionMetadataBuilder.__module__ = __name__
-    RlKernelFlashAttentionMetadataBuilder.__qualname__ = "RlKernelFlashAttentionMetadataBuilder"
-    RlKernelFlashAttentionBackend.__module__ = __name__
-    RlKernelFlashAttentionBackend.__qualname__ = "RlKernelFlashAttentionBackend"
-    _RLK_ATTENTION_IMPL = RlKernelFlashAttentionImpl
-    _RLK_ATTENTION_BUILDER = RlKernelFlashAttentionMetadataBuilder
-    _RLK_ATTENTION_BACKEND = RlKernelFlashAttentionBackend
-    globals()["RlKernelFlashAttentionImpl"] = RlKernelFlashAttentionImpl
-    globals()["RlKernelFlashAttentionMetadataBuilder"] = RlKernelFlashAttentionMetadataBuilder
-    globals()["RlKernelFlashAttentionBackend"] = RlKernelFlashAttentionBackend
-    # vLLM 0.27 selects FLASH_ATTN for Qwen on CUDA before custom third-party
-    # names are considered. Override the selected enum in-place so the launcher
-    # does not need to edit vLLM source or pass version-specific CLI flags.
+    RlKernelAttentionImpl.__module__ = __name__
+    RlKernelAttentionImpl.__qualname__ = "RlKernelAttentionImpl"
+    RlKernelAttentionMetadataBuilder.__module__ = __name__
+    RlKernelAttentionMetadataBuilder.__qualname__ = "RlKernelAttentionMetadataBuilder"
+    RlKernelAttentionBackend.__module__ = __name__
+    RlKernelAttentionBackend.__qualname__ = "RlKernelAttentionBackend"
+    _RLK_ATTENTION_IMPL = RlKernelAttentionImpl
+    _RLK_ATTENTION_BUILDER = RlKernelAttentionMetadataBuilder
+    _RLK_ATTENTION_BACKEND = RlKernelAttentionBackend
+    globals()["RlKernelAttentionImpl"] = RlKernelAttentionImpl
+    globals()["RlKernelAttentionMetadataBuilder"] = RlKernelAttentionMetadataBuilder
+    globals()["RlKernelAttentionBackend"] = RlKernelAttentionBackend
+    # Override the platform-selected enum so vLLM keeps its native metadata and
+    # cache update path while RL-Kernel owns the attention arithmetic call.
     register_backend(
-        AttentionBackendEnum.FLASH_ATTN,
-        f"{__name__}.RlKernelFlashAttentionBackend",
+        selected_backend,
+        f"{__name__}.RlKernelAttentionBackend",
     )
-    integration.record_installed_hook("attention", f"{__name__}.RlKernelFlashAttentionBackend")
+    integration.record_installed_hook("attention", f"{__name__}.RlKernelAttentionBackend")
 
 
 def install_vllm_integration(plan: IntegrationPlan) -> VllmIntegration:

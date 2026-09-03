@@ -22,6 +22,8 @@ from rl_engine.integrations.linear_logp import LinearLogpWrapper, take_rollout_l
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_FA4_SCHEDULE_ID,
     STRICT_ATTENTION_PRODUCTION_CORE_ID,
+    STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
+    STRICT_ATTENTION_ROCM_SCHEDULE_ID,
     AttentionContract,
     AttentionDType,
     AttentionMode,
@@ -118,6 +120,30 @@ def _attention_dtype(tensor: torch.Tensor) -> AttentionDType:
 def _require_nvidia_cuda(tensor: torch.Tensor, module: str) -> None:
     if tensor.device.type != "cuda" or torch.version.hip is not None:
         raise RuntimeError(f"strict {module} R/R requires NVIDIA CUDA tensors")
+
+
+def _require_attention_accelerator(tensor: torch.Tensor) -> str:
+    """Return the real Attention platform behind PyTorch's CUDA device API."""
+
+    if tensor.device.type != "cuda":
+        raise RuntimeError("strict Attention R/R requires CUDA or ROCm GPU tensors")
+    return "rocm" if torch.version.hip is not None else "cuda"
+
+
+def _strict_attention_platform_contract(platform: str) -> tuple[str, str, str]:
+    if platform == "rocm":
+        return (
+            STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
+            STRICT_ATTENTION_ROCM_SCHEDULE_ID,
+            "rccl_ag_rs",
+        )
+    if platform == "cuda":
+        return (
+            STRICT_ATTENTION_PRODUCTION_CORE_ID,
+            STRICT_ATTENTION_FA4_SCHEDULE_ID,
+            "cuda_ag_rs",
+        )
+    raise RuntimeError(f"unsupported strict Attention platform {platform!r}")
 
 
 class SemanticOperatorHandle:
@@ -478,7 +504,10 @@ class MegatronAttentionOperator:
         if query.ndim != expected_ndim or key.ndim != expected_ndim or value.ndim != expected_ndim:
             layout = "[T, H, D]" if packed_seq_params is not None else "[S, B, H, D]"
             raise RuntimeError(f"Megatron Attention Q/K/V must use {layout}")
-        _require_nvidia_cuda(query, "Attention")
+        runtime_platform = _require_attention_accelerator(query)
+        strict_core_id, strict_schedule, communication_backend = (
+            _strict_attention_platform_contract(runtime_platform)
+        )
 
         parallel_state = _megatron_parallel_state()
         cp_world = int(parallel_state.get_context_parallel_world_size())
@@ -494,7 +523,7 @@ class MegatronAttentionOperator:
                 "context_parallel_size": cp_world,
             },
         )
-        operator.bind_cuda_runtime(process_group=cp_group)
+        operator.bind_accelerator_runtime(query, process_group=cp_group)
         scale = float(getattr(module, "softmax_scale", query.size(-1) ** -0.5))
 
         def execute_sequence(
@@ -533,11 +562,11 @@ class MegatronAttentionOperator:
                     local_block_offsets=block_offsets,
                 ),
                 config=AttentionAblationConfig(
-                    strict_core_id=STRICT_ATTENTION_PRODUCTION_CORE_ID,
-                    strict_schedule=STRICT_ATTENTION_FA4_SCHEDULE_ID,
+                    strict_core_id=strict_core_id,
+                    strict_schedule=strict_schedule,
                 ),
                 return_lse=True,
-                communication_backend="cuda_ag_rs" if cp_world > 1 else "none",
+                communication_backend=communication_backend if cp_world > 1 else "none",
                 query_position_ids=position_ids,
                 key_position_ids=position_ids,
                 scale=scale,
@@ -632,10 +661,10 @@ class MegatronAttentionOperator:
                 if packed_seq_params is not None
                 else "megatron_sbh_zigzag_cp"
             ),
-            "materialization": "owner_local_zigzag_cuda_ag_rs",
+            "materialization": f"owner_local_zigzag_{communication_backend}",
             "cp_world_size": cp_world,
             "tp_world_size": tp_world,
-            "runtime_platform": "cuda",
+            "runtime_platform": runtime_platform,
             "triton_used": False,
             **execution_provenance,
         }
@@ -748,16 +777,68 @@ def _vllm_kv_cache_views(
     kv_cache: torch.Tensor,
     *,
     head_size: int,
+    num_kv_heads: int | None = None,
+    platform: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return vLLM's paged cache as [blocks, block, kv_heads, head]."""
+    """Return CUDA and ROCm vLLM caches as [blocks, block, kv_heads, head]."""
 
+    def normalize(plane: torch.Tensor) -> torch.Tensor:
+        if plane.ndim != 4 or plane.size(-1) != head_size:
+            raise RuntimeError("vLLM K/V cache planes must be 4-D with a head-size tail")
+        if num_kv_heads is None or plane.size(2) == num_kv_heads:
+            # [blocks, block, heads, head] (LBHNC after selecting K/V).
+            return plane
+        if plane.size(1) == num_kv_heads:
+            # [blocks, heads, block, head].
+            return plane.permute(0, 2, 1, 3)
+        if plane.size(0) == num_kv_heads:
+            # [heads, blocks, block, head] (LHBNC after selecting K/V).
+            return plane.permute(1, 2, 0, 3)
+        raise RuntimeError(
+            "vLLM K/V cache layout does not expose the declared number of KV heads"
+        )
+
+    if (
+        kv_cache.ndim == 4
+        and platform == "rocm"
+        and kv_cache.size(1) == 2
+        and num_kv_heads is not None
+        and kv_cache.size(-1) == num_kv_heads * head_size
+    ):
+        key_cache, value_cache = kv_cache.unbind(1)
+        blocks, block_size, _packed_heads = key_cache.shape
+        return (
+            key_cache.view(blocks, block_size, num_kv_heads, head_size),
+            value_cache.view(blocks, block_size, num_kv_heads, head_size),
+        )
     if kv_cache.ndim == 4 and kv_cache.size(-1) == 2 * head_size:
         return kv_cache.transpose(1, 2).split(head_size, dim=-1)
+    # The K/V axis is leading in CUDA FlashAttention caches and follows the
+    # block axis in the ROCm AITER layouts.  Prefer the platform convention in
+    # the ambiguous two-block case where both dimensions happen to equal two.
+    if kv_cache.ndim == 5 and platform == "rocm" and kv_cache.size(1) == 2:
+        key_cache, value_cache = kv_cache.unbind(1)
+        return normalize(key_cache), normalize(value_cache)
     if kv_cache.ndim == 5 and kv_cache.size(0) == 2:
         key_cache, value_cache = kv_cache.unbind(0)
-        return key_cache, value_cache
+        return normalize(key_cache), normalize(value_cache)
+    if kv_cache.ndim == 5 and kv_cache.size(1) == 2:
+        key_cache, value_cache = kv_cache.unbind(1)
+        return normalize(key_cache), normalize(value_cache)
+    if (
+        kv_cache.ndim == 4
+        and kv_cache.size(1) == 2
+        and num_kv_heads is not None
+        and kv_cache.size(-1) == num_kv_heads * head_size
+    ):
+        key_cache, value_cache = kv_cache.unbind(1)
+        blocks, block_size, _packed_heads = key_cache.shape
+        return (
+            key_cache.view(blocks, block_size, num_kv_heads, head_size),
+            value_cache.view(blocks, block_size, num_kv_heads, head_size),
+        )
     raise RuntimeError(
-        "vLLM FlashAttention KV cache must use " "[blocks, kv_heads, block, 2 * head_size]"
+        "vLLM Attention KV cache does not match a supported CUDA/ROCm paged layout"
     )
 
 
@@ -931,10 +1012,12 @@ class VllmAttentionOperator:
             return output.zero_()
         if query.ndim != 3:
             raise RuntimeError("vLLM query must use [tokens, heads, head_dim]")
-        _require_nvidia_cuda(query, "Attention")
+        runtime_platform = _require_attention_accelerator(query)
         key_cache, value_cache = _vllm_kv_cache_views(
             kv_cache,
             head_size=int(impl.head_size),
+            num_kv_heads=int(impl.num_kv_heads),
+            platform=runtime_platform,
         )
         if key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
             raise RuntimeError("strict vLLM Attention requires an unquantized KV cache")
@@ -964,7 +1047,7 @@ class VllmAttentionOperator:
                 "context_parallel_size": 1,
             },
         )
-        runtime = operator.bind_cuda_runtime()
+        runtime = operator.bind_accelerator_runtime(query)
         groups, metadata_summary = self._materialization_groups(
             attn_metadata,
             query=query,
@@ -1013,10 +1096,14 @@ class VllmAttentionOperator:
             last_operator_provenance = _compact_attention_provenance(result.provenance)
         self._last_provenance = {
             "framework_layout": "vllm_paged_kv",
-            "materialization": "direct_paged_fa4",
+            "materialization": (
+                "logical_paged_kv_to_aiter_ck_dense"
+                if runtime_platform == "rocm"
+                else "direct_paged_fa4"
+            ),
             "tp_world_size": tp_world,
             "tp_group_bound": tp_group is not None,
-            "runtime_platform": "cuda",
+            "runtime_platform": runtime_platform,
             "triton_used": False,
             "direct_output_buffer": direct_output_buffer,
             **metadata_summary,
