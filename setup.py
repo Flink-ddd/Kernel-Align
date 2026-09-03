@@ -213,7 +213,7 @@ def get_extensions():
 
         cxx_flags = ["-O3", "-std=c++17", "-DKERNEL_ALIGN_WITH_CUDA"]
         extra_link_args = list(torch_rpath)
-        if os.name != "nt":
+        if os.name != "nt" and not is_rocm:
             # CUDA IPC metadata queries use the driver API (cuPointerGetAttribute).
             extra_link_args.append("-lcuda")
 
