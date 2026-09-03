@@ -46,6 +46,13 @@ def _left_fold(parts: list[torch.Tensor]) -> torch.Tensor:
     return acc
 
 
+# NOTE: these two encode the *CUDA* det_gemm kernel's K-reduction tree. On ROCm
+# det_gemm dispatches to TritonDetGemmOp, whose K-tree differs, so a K-split sum
+# is not bitwise equal to the unsplit GEMM there. ``get_device_capability()``
+# returns (9, 4) on gfx942, so the SM80 guard above does not exclude ROCm.
+# Whether the Triton path *should* be K-split invariant is a separate question
+# for the det_gemm owners; skipping here does not settle it.
+@pytest.mark.cuda_only
 def test_simulated_tp2_matches_full():
     # Two shards: AllReduce is a+b, and BF16 add is commutative.
     torch.manual_seed(8)
@@ -69,6 +76,7 @@ def test_simulated_tp8_left_fold_does_not_match_full():
     assert n_mismatch > 0, "TP=8 left-fold unexpectedly matched TP=1"
 
 
+@pytest.mark.cuda_only
 def test_simulated_tp2_is_batch_invariant():
     torch.manual_seed(9)
     k, n = 256, 64

@@ -71,6 +71,12 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     ROCM_AITER = "rl_engine.kernels.ops.rocm.aiter.AiterOp"
     ROCM_CK = "rl_engine.kernels.ops.rocm.composable_kernel.CKOp"
     ROCM_FLASH_ATTN = "rl_engine.kernels.ops.rocm.attention.flash_attn.RocmFlashAttentionOp"
+    # WS2 strict ROCm attention core (AITER/CK dense MHA, Split-KV disabled).
+    # Reachable only through ``get_attention_op``: it is not a drop-in for the
+    # SDPA-shaped ``attn`` wrappers and must never be a silent fallback.
+    ROCM_STRICT_ATTENTION = (
+        "rl_engine.kernels.ops.rocm.attention.flash_attn.StrictRocmAiterCKAttentionCore"
+    )
 
     # GRPO loss (group reward normalization + clipped surrogate + KL)
     TRITON_GRPO_LOSS = "rl_engine.kernels.ops.triton.loss.grpo_loss.TritonGRPOLossOp"
@@ -344,6 +350,27 @@ def resolve_logp_op_type(
                 f"got {logp_backend!r}"
             )
     return op_type
+
+
+def _rocm_strict_attention_available() -> bool:
+    """Return whether the strict ROCm AITER/CK attention core can actually load.
+
+    True only when this process can really execute the strict arithmetic, so an
+    unavailable vendor stack leaves the backend unregistered rather than
+    registered-but-failing at materialization time.
+    """
+
+    if torch.version.hip is None:
+        return False
+    try:
+        from rl_engine.kernels.ops.rocm.attention.flash_attn import _load_aiter_ck_ops
+    except ImportError:
+        return False
+    try:
+        _load_aiter_ck_ops()
+    except Exception:  # StrictRocmAttentionUnavailable and vendor import errors
+        return False
+    return True
 
 
 class KernelRegistry:
@@ -667,6 +694,83 @@ class KernelRegistry:
                 prepend=True,
             )
 
+        # Strict ROCm production core: AITER/CK dense MHA, Split-KV disabled.
+        # Registered only when the vendor entry points genuinely load, so an
+        # explicit request on a machine without AITER fails loudly in
+        # ``get_attention_op`` instead of resolving to different arithmetic.
+        if _rocm_strict_attention_available():
+            self.register_attention_backend(
+                OpBackend.ROCM_STRICT_ATTENTION,
+                AttentionBackendCapability(
+                    backend_id="aiter.rocm.ck_dense_mha",
+                    roles=frozenset({AttentionRole.TRAIN, AttentionRole.INFER}),
+                    # DECODE is deliberately absent. StrictRocmAttentionRuntime
+                    # has a paged entry point, but no caller routes to it: the
+                    # Vime request carries no page table and builds its contract
+                    # with kv_cache=None. Declaring the mode before a dispatch
+                    # path reaches it would let the binding layer pass on a
+                    # decode path nothing executes.
+                    modes=frozenset({AttentionMode.PREFILL, AttentionMode.CHUNKED_PREFILL}),
+                    dtypes=frozenset({AttentionDType.BF16, AttentionDType.FP16}),
+                    # The core itself is single-rank arithmetic. CP is supplied
+                    # by StrictRocmAttentionRuntime, which wraps this core in
+                    # the RCCL AG/RS transport; the sizes mirror the world
+                    # sizes RCCLDeterministicCollective accepts. The merge
+                    # order is that collective's fixed balanced rank tree, not
+                    # RCCL's own reduction, so the CP merge is deterministic.
+                    cp_world_sizes=(1, 2, 4, 8),
+                    tp_world_sizes=None,
+                    exports_attention_lse=True,
+                    deterministic_cp_merge=True,
+                    supports_packed_varlen=False,
+                    supports_kv_cache=False,
+                    supports_rope_metadata=True,
+                    supports_fused_rope_attention=False,
+                    supports_split_kv_disabled=True,
+                    supports_split_kv_fixed=False,
+                    supports_split_kv_auto=False,
+                    reports_actual_split_kv_plan=True,
+                    implementation_kind="production",
+                ),
+                platform="rocm",
+                prepend=True,
+            )
+
+    def register_attention_backend(
+        self,
+        backend: OpBackend,
+        capability: AttentionBackendCapability,
+        *,
+        platform: Optional[str] = None,
+        prepend: bool = False,
+    ) -> None:
+        """Register (or replace) a backend for WS2 contract-aware attention dispatch.
+
+        The supported seam for a backend that only exists on some machines: the
+        static ``ws2_attention`` priority lists cannot express "present only when
+        the vendor stack loads", so a conditional backend registers itself here.
+        Re-registering the same backend replaces its capability without
+        duplicating the candidate entry.
+        """
+
+        if not isinstance(backend, OpBackend):
+            raise AttentionContractError("backend must be an OpBackend")
+        if not isinstance(capability, AttentionBackendCapability):
+            raise AttentionContractError("capability must be an AttentionBackendCapability")
+        resolved_platform = platform if platform is not None else self._platform()
+        if resolved_platform not in self._priority_map:
+            raise AttentionContractError(
+                f"unsupported platform {resolved_platform!r}; expected one of "
+                f"{sorted(self._priority_map)}"
+            )
+        self._attention_capabilities[backend] = capability
+        candidates = self._priority_map[resolved_platform].setdefault("ws2_attention", [])
+        if backend not in candidates:
+            if prepend:
+                candidates.insert(0, backend)
+            else:
+                candidates.append(backend)
+
     def _adjust_priority_from_env(self):
         rocm_attn_backend = os.getenv("RL_KERNEL_ROCM_ATTN_BACKEND", "").strip().lower()
         if rocm_attn_backend in {"flash_attn", "flash-attn", "flash_attention"}:
@@ -931,6 +1035,13 @@ class KernelRegistry:
         if not isinstance(requested_backend, str) or not requested_backend.strip():
             raise AttentionContractError("requested_backend must be a non-empty string")
         requested_backend = requested_backend.strip().lower()
+        if requested_backend == "auto" and contract.sharding.cp_world_size > 1:
+            raise AttentionContractError(
+                "Unsafe dispatch: requested_backend='auto' is not permitted when "
+                "cp_world_size > 1 without explicit cross-rank preflighting; name a "
+                "policy or backend id and agree on "
+                "AttentionContract.cross_rank_fingerprint() across ranks."
+            )
 
         platform = self._platform()
         candidates = self._priority_map.get(platform, {}).get("ws2_attention", [])

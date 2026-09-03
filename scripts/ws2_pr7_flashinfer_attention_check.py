@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""PR7 FlashInfer RoPE-fused paged attention validation entry point.
+"""PR7 strict paged-layout Attention validation entry point.
 
-The default dry-run mode is CI/local friendly: it builds the FlashInfer page plan
-and provenance without importing FlashInfer or requiring CUDA.  On a CUDA host
-with FlashInfer installed, omit ``--dry-run`` to run the opt-in PR7 candidate and
-compare it with the PR6 full logical KV reference.
+The default dry-run mode is CI/local friendly: it builds the paged-KV plan and
+provenance without requiring a GPU vendor backend. On a GPU host, omit
+``--dry-run`` to run the platform production core and its strict reference.
 """
 
 from __future__ import annotations
@@ -28,6 +27,8 @@ if str(REPO_ROOT) not in sys.path:
 from rl_engine.kernels.attention_contract import (  # noqa: E402
     STRICT_ATTENTION_FA4_SCHEDULE_ID,
     STRICT_ATTENTION_PRODUCTION_CORE_ID,
+    STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
+    STRICT_ATTENTION_ROCM_SCHEDULE_ID,
 )
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (  # noqa: E402
     AttentionCPCommunicationPlan,
@@ -44,7 +45,6 @@ from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (  #
     _materialize_strict_logical_kv,
     build_flashinfer_paged_kv_plan,
 )
-from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RoPESM90Op  # noqa: E402
 from rl_engine.testing.attention_comparison import (  # noqa: E402
     AttentionPathResult,
     DecodeAttentionInputs,
@@ -69,7 +69,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report: dict[str, Any] = {
         "status": "dry_run" if args.dry_run else "executed",
         "pr": "PR7",
-        "target": "Qwen3-8B TP-local FlashInfer candidate; CP transport validated separately",
+        "target": "Qwen3-8B TP-local paged Attention; CP transport validated separately",
         "mode": config.mode,
         "device": str(device),
         "shape": {
@@ -98,11 +98,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         | {"cp_comm_required": config.require_cp_comm},
         "paged_kv_plan": plan.provenance(),
         "tests_expected": [
-            "FlashInfer ROPE_LLAMA vs NativeRoPEOp + full logical KV reference",
+            "platform production core vs direct same-core reference",
             "split-K disabled/fixed policy drift",
             "batch composition/position invariant sweep",
             "attention-domain LSE export drift",
-            "strict shared CUDA core with separate multi-rank AG/RS forward/backward evidence",
+            "strict platform core with separate multi-rank AG/RS forward/backward evidence",
         ],
         "thresholds": {
             "out_max_abs": args.out_atol,
@@ -152,7 +152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     pytorch_reference = run_decode_full_prefill_reference(reference_inputs)
     reference = (
-        _run_strict_cuda_reference(inputs, config, plan)
+        _run_strict_platform_reference(inputs, config, plan)
         if config.strict_mode
         else pytorch_reference
     )
@@ -180,12 +180,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "lse": lse_stats,
         "dlogp": dlogp_stats,
     }
-    report["reference_backend"] = (
-        "rlkernel.cuda.deterministic_attention"
-        if config.strict_mode
-        else "rlkernel.pytorch.full_logical_kv_reference"
-    )
+    report["reference_backend"] = "rlkernel.pytorch.full_logical_kv_reference"
     if config.strict_mode:
+        report.update(_strict_execution_report_fields(candidate.provenance))
         report["diagnostic_drift_vs_pytorch"] = {
             "out": _drift_stats(candidate.out, pytorch_reference.out),
             "lse": _drift_stats(candidate.lse, pytorch_reference.lse),
@@ -391,15 +388,15 @@ def _make_inputs(args: argparse.Namespace, device: torch.device) -> DecodeAttent
     return DecodeAttentionInputs(q=q, k_cache=k_cache, v_cache=v_cache, metadata=metadata)
 
 
-def _run_strict_cuda_reference(
+def _run_strict_platform_reference(
     inputs: DecodeAttentionInputs,
     config: FlashInferPagedAttentionConfig,
     paged_plan: Any,
 ) -> AttentionPathResult:
-    """Call the production FA4 core directly on the logical KV sequence."""
+    """Call the platform production core directly on the logical KV sequence."""
 
-    core = config.deterministic_core or StrictFlashAttention4Core(split_kv=config.split_kv)
-    rope = config.strict_rope_op or RoPESM90Op()
+    core = config.deterministic_core or _strict_attention_core(config.split_kv)
+    rope = config.strict_rope_op or _strict_rope_op()
     logical_k, logical_v, key_positions = _materialize_strict_logical_kv(
         inputs.k_cache,
         inputs.v_cache,
@@ -429,7 +426,7 @@ def _run_strict_cuda_reference(
         outputs.append(result.out)
         lses.append(result.lse)
     return AttentionPathResult(
-        name="direct_flash_attention4_num_splits1",
+        name="direct_platform_strict_attention",
         out=torch.cat(outputs, dim=0),
         lse=torch.cat(lses, dim=0),
         provenance={
@@ -438,6 +435,28 @@ def _run_strict_cuda_reference(
             "split_kv_policy": "disabled",
         },
     )
+
+
+def _strict_execution_report_fields(provenance: dict[str, Any]) -> dict[str, Any]:
+    """Describe the backend that actually executed, independent of the host running tests."""
+
+    backend = provenance.get("actual_backend", "unknown")
+    return {
+        "target": (
+            f"Qwen3-8B TP-local {backend} strict production core; "
+            "CP transport validated separately"
+        ),
+        "reference_backend": backend,
+        "rope": {
+            "rope_backend": provenance.get("rope_backend"),
+            "rope_fusion": provenance.get("rope_fusion"),
+            "rope_fusion_boundary": provenance.get("rope_fusion_boundary"),
+            "rope_theta": provenance.get("rope_theta"),
+            "rotary_dim": provenance.get("rotary_dim"),
+            "q_rope_state": provenance.get("q_rope_state"),
+            "k_cache_rope_state": provenance.get("k_cache_rope_state"),
+        },
+    }
 
 
 def _run_batch_invariance_sweep(
@@ -645,33 +664,58 @@ def _acceptance_errors(report: dict[str, Any], args: argparse.Namespace) -> list
     if provenance.get("fallback") is not False:
         errors.append("FlashInfer execution used or omitted fallback provenance")
     if args.strict:
+        platform = provenance.get("platform", "cuda")
+        if platform not in {"cuda", "rocm"}:
+            errors.append("strict runtime platform provenance is invalid")
+        is_rocm = platform == "rocm"
+        expected_core = (
+            STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID
+            if is_rocm
+            else STRICT_ATTENTION_PRODUCTION_CORE_ID
+        )
+        expected_schedule = (
+            STRICT_ATTENTION_ROCM_SCHEDULE_ID if is_rocm else STRICT_ATTENTION_FA4_SCHEDULE_ID
+        )
+        expected_backend = "aiter.rocm.ck_dense_mha" if is_rocm else "flash_attention_4.cute"
         if provenance.get("strict_mode") is not True:
             errors.append("strict runtime did not execute the shared Attention core")
-        if provenance.get("strict_core_id") != STRICT_ATTENTION_PRODUCTION_CORE_ID:
-            errors.append("strict runtime did not execute the FA4 production core")
-        if provenance.get("strict_schedule") != STRICT_ATTENTION_FA4_SCHEDULE_ID:
+        if provenance.get("strict_core_id") != expected_core:
+            errors.append("strict runtime core identity is invalid")
+        if provenance.get("strict_schedule") != expected_schedule:
             errors.append("strict runtime arithmetic schedule is invalid")
-        if provenance.get("actual_backend") != "flash_attention_4.cute":
-            errors.append("strict runtime backend is not FlashAttention-4 CuTe")
+        if provenance.get("actual_backend") != expected_backend:
+            errors.append("strict runtime backend identity is invalid")
         if provenance.get("native_attention_arithmetic") is not True:
-            errors.append("strict runtime did not execute native FA4 Attention arithmetic")
+            errors.append("strict runtime did not execute the native production arithmetic")
         if provenance.get("num_splits") != 1:
-            errors.append("strict runtime did not fix FA4 num_splits=1")
+            errors.append("strict runtime did not prove one reduction partition")
         if provenance.get("deterministic_backward") is not True:
-            errors.append("strict runtime did not request deterministic FA4 backward")
-        if provenance.get("fa_api_source") != "flash_attn.cute.interface":
-            errors.append("strict runtime did not prove the FA4 CuTe API source")
+            errors.append("strict runtime did not request deterministic backward")
         if provenance.get("reference_only") is not False:
             errors.append("strict runtime selected the reference core")
+        if is_rocm:
+            if provenance.get("split_kv_control") != "dense_non_split_api":
+                errors.append("strict ROCm runtime did not use AITER dense non-Split-K MHA")
+            if provenance.get("aiter_api_source") != "aiter.ops.mha":
+                errors.append("strict ROCm runtime did not prove the AITER API source")
+            if not provenance.get("aiter_source_sha256"):
+                errors.append("strict ROCm runtime did not fingerprint AITER MHA")
+        elif provenance.get("fa_api_source") != "flash_attn.cute.interface":
+            errors.append("strict CUDA runtime did not prove the FA4 CuTe API source")
         strict_plans = provenance.get("strict_core_row_plans")
         if not isinstance(strict_plans, list) or not strict_plans:
             errors.append("strict no-Split-K execution plans are missing")
         elif any(plan.get("actual_split_kv_policy") != "disabled" for plan in strict_plans):
             errors.append("strict runtime did not keep Split-KV disabled")
-        if provenance.get("rope_backend") not in {
-            "rlkernel.cuda.rope_sm90",
-            "rlkernel.cuda.rope_sm90_op",
-        }:
+        expected_rope_backends = (
+            {"rlkernel.rocm.deterministic_rope"}
+            if is_rocm
+            else {
+                "rlkernel.cuda.rope_sm90",
+                "rlkernel.cuda.rope_sm90_op",
+            }
+        )
+        if provenance.get("rope_backend") not in expected_rope_backends:
             errors.append("strict runtime did not use the RL-Kernel WS1 RoPE operator")
     elif provenance.get("pos_encoding_mode") != "ROPE_LLAMA":
         errors.append("FlashInfer runtime did not use ROPE_LLAMA")
@@ -691,6 +735,20 @@ def _acceptance_errors(report: dict[str, Any], args: argparse.Namespace) -> list
         if report.get(sweep_name, {}).get("passed") is not True:
             errors.append(f"{sweep_name} failed")
     return errors
+
+
+def _strict_attention_core(split_kv):
+    if torch.version.hip is not None:
+        from rl_engine.kernels.ops.rocm.attention.flash_attn import StrictRocmAiterCKAttentionCore
+
+        return StrictRocmAiterCKAttentionCore(split_kv=split_kv)
+    return StrictFlashAttention4Core(split_kv=split_kv)
+
+
+def _strict_rope_op():
+    from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RocmDeterministicRoPEOp, RoPESM90Op
+
+    return RocmDeterministicRoPEOp() if torch.version.hip is not None else RoPESM90Op()
 
 
 def _select_batch_row(inputs: DecodeAttentionInputs, batch_index: int) -> DecodeAttentionInputs:

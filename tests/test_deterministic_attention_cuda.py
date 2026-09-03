@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Deterministic standard-softmax attention CUDA tests (issue #147).
+"""Deterministic standard-softmax Attention tests for CUDA and ROCm.
 
 Covers (per §7 and §8 of the implementation plan):
 - Forward correctness via #108 harness (run_operator_suite)
@@ -23,28 +23,43 @@ import math
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+from rl_engine.platforms.device import device_ctx
+
+IS_ROCM = device_ctx.is_rocm
+IS_CUDA = device_ctx.device_type == "cuda"
+IS_GPU = IS_CUDA or IS_ROCM
+BACKEND = "rocm" if IS_ROCM else "cuda"
+
+pytestmark = pytest.mark.skipif(not IS_GPU, reason="CUDA/ROCm GPU not available")
+ROCM_ONLY = pytest.mark.skipif(not IS_ROCM, reason="ROCm-only acceptance check")
 
 try:
+    from rl_engine.kernels.attention_contract import SplitKVSpec
     from rl_engine.kernels.gtest.op_checks import CandidateSpec, OperatorCase, run_operator_suite
-    from rl_engine.kernels.ops.cuda.attention.deterministic_attn import DeterministicAttentionOp
+    from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
+        DeterministicAttentionOp,
+        RLKernelDeterministicAttentionCore,
+    )
     from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
 
     _OP_AVAILABLE = True
 except (ImportError, RuntimeError):
     _OP_AVAILABLE = False
 
+if IS_ROCM:
+    from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RocmDeterministicRoPEOp
+
 pytestmark = [
     pytestmark,
-    pytest.mark.skipif(not _OP_AVAILABLE, reason="CUDA attention op not built"),
+    pytest.mark.skipif(not _OP_AVAILABLE, reason=f"{BACKEND} attention op not built"),
 ]
 
-DEVICE = "cuda"
+DEVICE = device_ctx.device
 D = 128
 
 
 @pytest.fixture
-def cuda_op():
+def attention_op():
     return DeterministicAttentionOp()
 
 
@@ -109,8 +124,8 @@ def _build_harness_cases():
 
 def test_harness_forward():
     """§8.4: run_operator_suite forward — candidate vs gold (accuracy tolerance)."""
-    cuda = DeterministicAttentionOp()
-    candidate = CandidateSpec(name="cuda-attention", fn=cuda, backend="cuda")
+    attention = DeterministicAttentionOp()
+    candidate = CandidateSpec(name=f"{BACKEND}-attention", fn=attention, backend=BACKEND)
     report = run_operator_suite("attention", candidates=[candidate], cases=_build_harness_cases())
     for cr in report.candidates:
         for case in cr.cases:
@@ -126,8 +141,8 @@ def test_harness_forward():
 
 def test_harness_backward():
     """§8.4: run_operator_suite backward — grad comparison vs gold fp32 autograd."""
-    cuda = DeterministicAttentionOp()
-    candidate = CandidateSpec(name="cuda-attention", fn=cuda, backend="cuda")
+    attention = DeterministicAttentionOp()
+    candidate = CandidateSpec(name=f"{BACKEND}-attention", fn=attention, backend=BACKEND)
     report = run_operator_suite(
         "attention",
         candidates=[candidate],
@@ -163,18 +178,18 @@ for dtype in [torch.bfloat16, torch.float16]:
 
 
 @pytest.mark.parametrize("dtype,hq,hkv,sq,skv,causal", SWEEP_CONFIGS)
-def test_forward_sweep(cuda_op, gold_op, dtype, hq, hkv, sq, skv, causal):
+def test_forward_sweep(attention_op, gold_op, dtype, hq, hkv, sq, skv, causal):
     B = 2
     torch.manual_seed(42)
     q = torch.randn(B, hq, sq, D, device=DEVICE, dtype=dtype)
     k = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=dtype)
     v = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=dtype)
 
-    out_cuda = cuda_op.forward(q, k, v, causal=causal)
+    out_actual = attention_op.forward(q, k, v, causal=causal)
     out_gold = gold_op.forward_fp32(q, k, v, causal=causal)
 
     atol, rtol = _tol(dtype)
-    torch.testing.assert_close(out_cuda.float(), out_gold.float(), atol=atol, rtol=rtol)
+    torch.testing.assert_close(out_actual.float(), out_gold.float(), atol=atol, rtol=rtol)
 
 
 # =============================================================================
@@ -183,18 +198,18 @@ def test_forward_sweep(cuda_op, gold_op, dtype, hq, hkv, sq, skv, causal):
 
 
 @pytest.mark.parametrize("scale", [None, 0.0, 0.05])
-def test_scale(cuda_op, gold_op, scale):
+def test_scale(attention_op, gold_op, scale):
     B, hq, hkv, sq, skv = 2, 4, 1, 8, 16
     torch.manual_seed(42)
     q = torch.randn(B, hq, sq, D, device=DEVICE, dtype=torch.bfloat16)
     k = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16)
     v = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16)
 
-    out_cuda = cuda_op.forward(q, k, v, causal=True, scale=scale)
+    out_actual = attention_op.forward(q, k, v, causal=True, scale=scale)
     out_gold = gold_op.forward_fp32(q, k, v, causal=True, scale=scale)
 
     atol, rtol = _tol(torch.bfloat16)
-    torch.testing.assert_close(out_cuda.float(), out_gold.float(), atol=atol, rtol=rtol)
+    torch.testing.assert_close(out_actual.float(), out_gold.float(), atol=atol, rtol=rtol)
 
 
 # =============================================================================
@@ -203,7 +218,7 @@ def test_scale(cuda_op, gold_op, scale):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_forward_with_padding(cuda_op, gold_op, dtype):
+def test_forward_with_padding(attention_op, gold_op, dtype):
     B, hq, hkv, sq, skv = 2, 4, 1, 8, 16
     torch.manual_seed(7)
     q = torch.randn(B, hq, sq, D, device=DEVICE, dtype=dtype)
@@ -213,21 +228,21 @@ def test_forward_with_padding(cuda_op, gold_op, dtype):
     mask[0, 10:] = False
     mask[1, 12:] = False
 
-    out_cuda = cuda_op.forward(q, k, v, causal=True, key_padding_mask=mask)
+    out_actual = attention_op.forward(q, k, v, causal=True, key_padding_mask=mask)
     out_gold = gold_op.forward_fp32(q, k, v, causal=True, key_padding_mask=mask)
 
     atol, rtol = _tol(dtype)
-    torch.testing.assert_close(out_cuda.float(), out_gold.float(), atol=atol, rtol=rtol)
+    torch.testing.assert_close(out_actual.float(), out_gold.float(), atol=atol, rtol=rtol)
 
 
-def test_fully_masked_row(cuda_op):
+def test_fully_masked_row(attention_op):
     B, hq, hkv, sq, skv = 1, 1, 1, 2, 4
     q = torch.randn(B, hq, sq, D, device=DEVICE, dtype=torch.bfloat16)
     k = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16)
     v = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16)
     mask = torch.zeros(B, skv, device=DEVICE, dtype=torch.bool)
 
-    out, lse = cuda_op.forward_with_lse(q, k, v, causal=False, key_padding_mask=mask)
+    out, lse = attention_op.forward_with_lse(q, k, v, causal=False, key_padding_mask=mask)
     assert (out == 0).all()
     assert (lse == float("-inf")).all()
 
@@ -237,14 +252,14 @@ def test_fully_masked_row(cuda_op):
 # =============================================================================
 
 
-def test_lse_correctness(cuda_op):
+def test_lse_correctness(attention_op):
     B, hq, hkv, sq, skv = 2, 4, 1, 8, 16
     torch.manual_seed(99)
     q = torch.randn(B, hq, sq, D, device=DEVICE, dtype=torch.bfloat16)
     k = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16)
     v = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16)
 
-    _, lse_cuda = cuda_op.forward_with_lse(q, k, v, causal=True)
+    _, lse_actual = attention_op.forward_with_lse(q, k, v, causal=True)
 
     scale = 1.0 / math.sqrt(D)
     g = hq // hkv
@@ -256,7 +271,7 @@ def test_lse_correctness(cuda_op):
     scores = scores.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
     lse_gold = torch.logsumexp(scores, dim=-1)
 
-    torch.testing.assert_close(lse_cuda, lse_gold, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(lse_actual, lse_gold, atol=5e-2, rtol=2e-2)
 
 
 # =============================================================================
@@ -264,7 +279,7 @@ def test_lse_correctness(cuda_op):
 # =============================================================================
 
 
-def test_valid_only_vs_padded_accuracy(cuda_op):
+def test_valid_only_vs_padded_accuracy(attention_op):
     """Padding changes reduction width; result is near-equal, not bitwise.
 
     We use causal=False here so that all valid keys are equally visible
@@ -295,8 +310,8 @@ def test_valid_only_vs_padded_accuracy(cuda_op):
     mask = torch.ones(B, skv_padded, device=DEVICE, dtype=torch.bool)
     mask[:, skv_valid:] = False
 
-    out_valid = cuda_op.forward(q, k_valid, v_valid, causal=False)
-    out_padded = cuda_op.forward(q, k_padded, v_padded, causal=False, key_padding_mask=mask)
+    out_valid = attention_op.forward(q, k_valid, v_valid, causal=False)
+    out_padded = attention_op.forward(q, k_padded, v_padded, causal=False, key_padding_mask=mask)
 
     atol, rtol = _tol(torch.bfloat16)
     torch.testing.assert_close(out_valid.float(), out_padded.float(), atol=atol, rtol=rtol)
@@ -307,7 +322,7 @@ def test_valid_only_vs_padded_accuracy(cuda_op):
 # =============================================================================
 
 
-def test_batch_invariance_single(cuda_op):
+def test_batch_invariance_single(attention_op):
     """Same sample in full batch vs extracted single — bitwise."""
     B, hq, hkv, sq, skv = 4, 4, 1, 8, 16
     torch.manual_seed(11)
@@ -315,17 +330,17 @@ def test_batch_invariance_single(cuda_op):
     k = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16)
     v = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16)
 
-    out_full, lse_full = cuda_op.forward_with_lse(q, k, v, causal=True)
+    out_full, lse_full = attention_op.forward_with_lse(q, k, v, causal=True)
 
     for i in range(B):
-        out_single, lse_single = cuda_op.forward_with_lse(
+        out_single, lse_single = attention_op.forward_with_lse(
             q[i : i + 1], k[i : i + 1], v[i : i + 1], causal=True
         )
         assert torch.equal(out_full[i : i + 1], out_single), f"Output batch invariance failed i={i}"
         assert torch.equal(lse_full[i : i + 1], lse_single), f"LSE batch invariance failed i={i}"
 
 
-def test_batch_invariance_position_permutation(cuda_op):
+def test_batch_invariance_position_permutation(attention_op):
     """Same sample at different batch positions — bitwise."""
     B, hq, hkv, sq, skv = 4, 32, 8, 8, 16
     torch.manual_seed(12)
@@ -333,13 +348,13 @@ def test_batch_invariance_position_permutation(cuda_op):
     k = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16)
     v = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16)
 
-    out_full = cuda_op.forward(q, k, v, causal=True)
+    out_full = attention_op.forward(q, k, v, causal=True)
 
     perm = [2, 0, 3, 1]
     q_perm = q[perm]
     k_perm = k[perm]
     v_perm = v[perm]
-    out_perm = cuda_op.forward(q_perm, k_perm, v_perm, causal=True)
+    out_perm = attention_op.forward(q_perm, k_perm, v_perm, causal=True)
 
     for new_pos, orig_pos in enumerate(perm):
         assert torch.equal(
@@ -347,7 +362,7 @@ def test_batch_invariance_position_permutation(cuda_op):
         ), f"Position permutation invariance failed: orig={orig_pos} new={new_pos}"
 
 
-def test_batch_invariance_chunk(cuda_op):
+def test_batch_invariance_chunk(attention_op):
     """Batch-dim chunking — bitwise."""
     B, hq, hkv, sq, skv = 4, 4, 1, 8, 16
     torch.manual_seed(13)
@@ -355,11 +370,11 @@ def test_batch_invariance_chunk(cuda_op):
     k = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16)
     v = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16)
 
-    out_full = cuda_op.forward(q, k, v, causal=True)
+    out_full = attention_op.forward(q, k, v, causal=True)
     out_chunk = torch.cat(
         [
-            cuda_op.forward(q[:2], k[:2], v[:2], causal=True),
-            cuda_op.forward(q[2:], k[2:], v[2:], causal=True),
+            attention_op.forward(q[:2], k[:2], v[:2], causal=True),
+            attention_op.forward(q[2:], k[2:], v[2:], causal=True),
         ],
         dim=0,
     )
@@ -381,20 +396,22 @@ def test_batch_invariance_chunk(cuda_op):
         (3, 32, 8),
     ],
 )
-def test_chunked_prefill(cuda_op, chunk_size, hq, hkv):
+def test_chunked_prefill(attention_op, chunk_size, hq, hkv):
     B, T = 1, 16
     torch.manual_seed(22)
     q = torch.randn(B, hq, T, D, device=DEVICE, dtype=torch.bfloat16)
     k = torch.randn(B, hkv, T, D, device=DEVICE, dtype=torch.bfloat16)
     v = torch.randn(B, hkv, T, D, device=DEVICE, dtype=torch.bfloat16)
 
-    out_full = cuda_op.forward(q, k, v, causal=True)
+    out_full = attention_op.forward(q, k, v, causal=True)
 
     outs = []
     for t in range(0, T, chunk_size):
         c = min(chunk_size, T - t)
         outs.append(
-            cuda_op.forward(q[:, :, t : t + c], k[:, :, : t + c], v[:, :, : t + c], causal=True)
+            attention_op.forward(
+                q[:, :, t : t + c], k[:, :, : t + c], v[:, :, : t + c], causal=True
+            )
         )
     out_chunked = torch.cat(outs, dim=2)
     assert torch.equal(
@@ -403,7 +420,7 @@ def test_chunked_prefill(cuda_op, chunk_size, hq, hkv):
 
 
 @pytest.mark.parametrize("chunk_size", [1, 3, 8])
-def test_chunked_prefill_with_padding(cuda_op, chunk_size):
+def test_chunked_prefill_with_padding(attention_op, chunk_size):
     """§7.4: chunked-prefill with key_padding_mask (mask sliced with Skv)."""
     B, hq, hkv, T = 1, 4, 1, 16
     torch.manual_seed(23)
@@ -413,13 +430,13 @@ def test_chunked_prefill_with_padding(cuda_op, chunk_size):
     mask = torch.ones(B, T, device=DEVICE, dtype=torch.bool)
     mask[0, 12:] = False
 
-    out_full = cuda_op.forward(q, k, v, causal=True, key_padding_mask=mask)
+    out_full = attention_op.forward(q, k, v, causal=True, key_padding_mask=mask)
 
     outs = []
     for t in range(0, T, chunk_size):
         c = min(chunk_size, T - t)
         outs.append(
-            cuda_op.forward(
+            attention_op.forward(
                 q[:, :, t : t + c],
                 k[:, :, : t + c],
                 v[:, :, : t + c],
@@ -434,7 +451,7 @@ def test_chunked_prefill_with_padding(cuda_op, chunk_size):
 
 
 @pytest.mark.parametrize("chunk_size", [1, 3])
-def test_chunked_prefill_lse(cuda_op, chunk_size):
+def test_chunked_prefill_lse(attention_op, chunk_size):
     """§7.4: LSE chunked-prefill invariance."""
     B, hq, hkv, T = 1, 4, 1, 12
     torch.manual_seed(24)
@@ -442,12 +459,12 @@ def test_chunked_prefill_lse(cuda_op, chunk_size):
     k = torch.randn(B, hkv, T, D, device=DEVICE, dtype=torch.bfloat16)
     v = torch.randn(B, hkv, T, D, device=DEVICE, dtype=torch.bfloat16)
 
-    _, lse_full = cuda_op.forward_with_lse(q, k, v, causal=True)
+    _, lse_full = attention_op.forward_with_lse(q, k, v, causal=True)
 
     lses = []
     for t in range(0, T, chunk_size):
         c = min(chunk_size, T - t)
-        _, lse_chunk = cuda_op.forward_with_lse(
+        _, lse_chunk = attention_op.forward_with_lse(
             q[:, :, t : t + c], k[:, :, : t + c], v[:, :, : t + c], causal=True
         )
         lses.append(lse_chunk)
@@ -460,7 +477,7 @@ def test_chunked_prefill_lse(cuda_op, chunk_size):
 # =============================================================================
 
 
-def test_prefill_decode_slice(cuda_op):
+def test_prefill_decode_slice(attention_op):
     """§7.5.1: prefill[:, :, -1:] == decode(q[-1:], k_full, v_full)."""
     B, hq, hkv, sq, skv = 1, 4, 1, 8, 16
     torch.manual_seed(33)
@@ -468,8 +485,8 @@ def test_prefill_decode_slice(cuda_op):
     k = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16)
     v = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16)
 
-    prefill = cuda_op.forward(q, k, v, causal=True)
-    decode = cuda_op.forward(q[:, :, -1:], k, v, causal=True)
+    prefill = attention_op.forward(q, k, v, causal=True)
+    decode = attention_op.forward(q[:, :, -1:], k, v, causal=True)
     assert torch.equal(prefill[:, :, -1:], decode)
 
 
@@ -482,7 +499,7 @@ def test_prefill_decode_slice(cuda_op):
         (3, 32, 8),
     ],
 )
-def test_kv_cache_handoff(cuda_op, S_new, hq, hkv):
+def test_kv_cache_handoff(attention_op, S_new, hq, hkv):
     """§7.5.2: cat(k_cache, k_new) handoff == prefill tail."""
     B, S_past = 1, 12
     torch.manual_seed(44)
@@ -491,12 +508,12 @@ def test_kv_cache_handoff(cuda_op, S_new, hq, hkv):
     v_full = torch.randn(B, hkv, S_past + S_new, D, device=DEVICE, dtype=torch.bfloat16)
 
     q_new = q_full[:, :, -S_new:]
-    prefill_tail = cuda_op.forward(q_full, k_full, v_full, causal=True)[:, :, -S_new:]
-    decode_path = cuda_op.forward(q_new, k_full, v_full, causal=True)
+    prefill_tail = attention_op.forward(q_full, k_full, v_full, causal=True)[:, :, -S_new:]
+    decode_path = attention_op.forward(q_new, k_full, v_full, causal=True)
     assert torch.equal(decode_path, prefill_tail)
 
 
-def test_kv_cache_handoff_with_padding(cuda_op):
+def test_kv_cache_handoff_with_padding(attention_op):
     """§7.5.2: cat handoff with padding mask."""
     B, hq, hkv, S_past, S_new = 1, 4, 1, 12, 1
     Skv = S_past + S_new
@@ -508,10 +525,10 @@ def test_kv_cache_handoff_with_padding(cuda_op):
     mask[0, 8:10] = False
 
     q_new = q_full[:, :, -S_new:]
-    prefill_tail = cuda_op.forward(q_full, k_full, v_full, causal=True, key_padding_mask=mask)[
+    prefill_tail = attention_op.forward(q_full, k_full, v_full, causal=True, key_padding_mask=mask)[
         :, :, -S_new:
     ]
-    decode_path = cuda_op.forward(q_new, k_full, v_full, causal=True, key_padding_mask=mask)
+    decode_path = attention_op.forward(q_new, k_full, v_full, causal=True, key_padding_mask=mask)
     assert torch.equal(decode_path, prefill_tail)
 
 
@@ -520,7 +537,7 @@ def test_kv_cache_handoff_with_padding(cuda_op):
 # =============================================================================
 
 
-def test_backward_smoke(cuda_op):
+def test_backward_smoke(attention_op):
     """Backward runs and produces gradients with correct shapes."""
     B, hq, hkv, sq, skv = 1, 4, 1, 4, 8
     torch.manual_seed(55)
@@ -528,7 +545,7 @@ def test_backward_smoke(cuda_op):
     k = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
     v = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
 
-    out = cuda_op.forward(q, k, v, causal=True)
+    out = attention_op.forward(q, k, v, causal=True)
     loss = out.sum()
     loss.backward()
 
@@ -537,7 +554,7 @@ def test_backward_smoke(cuda_op):
     assert v.grad is not None and v.grad.shape == v.shape
 
 
-def test_backward_fp64_reference(cuda_op):
+def test_backward_fp64_reference(attention_op):
     """§7.6: FP64 high-precision gradient comparison."""
     B, hq, hkv, sq, skv = 1, 4, 1, 4, 8
     torch.manual_seed(56)
@@ -547,11 +564,11 @@ def test_backward_fp64_reference(cuda_op):
 
     grad_out = torch.randn(B, hq, sq, D, device=DEVICE, dtype=torch.float32)
 
-    out_cuda = cuda_op.forward(q_bf16, k_bf16, v_bf16, causal=True)
-    out_cuda.backward(grad_out.to(out_cuda.dtype))
-    dq_cuda = q_bf16.grad.float()
-    dk_cuda = k_bf16.grad.float()
-    dv_cuda = v_bf16.grad.float()
+    out_actual = attention_op.forward(q_bf16, k_bf16, v_bf16, causal=True)
+    out_actual.backward(grad_out.to(out_actual.dtype))
+    dq_actual = q_bf16.grad.float()
+    dk_actual = k_bf16.grad.float()
+    dv_actual = v_bf16.grad.float()
 
     scale = 1.0 / math.sqrt(D)
     g = hq // hkv
@@ -572,12 +589,12 @@ def test_backward_fp64_reference(cuda_op):
     dk_gold = k64.grad.float()
     dv_gold = v64.grad.float()
 
-    torch.testing.assert_close(dq_cuda, dq_gold, atol=5e-2, rtol=2e-2)
-    torch.testing.assert_close(dk_cuda, dk_gold, atol=5e-2, rtol=2e-2)
-    torch.testing.assert_close(dv_cuda, dv_gold, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(dq_actual, dq_gold, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(dk_actual, dk_gold, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(dv_actual, dv_gold, atol=5e-2, rtol=2e-2)
 
 
-def test_gradient_batch_invariance(cuda_op):
+def test_gradient_batch_invariance(attention_op):
     """§7.6: dQ/dK/dV bitwise identical for same sample at different batch positions."""
     B, hq, hkv, sq, skv = 3, 4, 1, 4, 8
     torch.manual_seed(57)
@@ -589,21 +606,21 @@ def test_gradient_batch_invariance(cuda_op):
     q_full = q.clone().requires_grad_(True)
     k_full = k.clone().requires_grad_(True)
     v_full = v.clone().requires_grad_(True)
-    out_full = cuda_op.forward(q_full, k_full, v_full, causal=True)
+    out_full = attention_op.forward(q_full, k_full, v_full, causal=True)
     out_full.backward(grad_out)
 
     for i in range(B):
         qi = q[i : i + 1].clone().requires_grad_(True)
         ki = k[i : i + 1].clone().requires_grad_(True)
         vi = v[i : i + 1].clone().requires_grad_(True)
-        out_i = cuda_op.forward(qi, ki, vi, causal=True)
+        out_i = attention_op.forward(qi, ki, vi, causal=True)
         out_i.backward(grad_out[i : i + 1])
         assert torch.equal(q_full.grad[i : i + 1], qi.grad), f"dQ batch invariance failed i={i}"
         assert torch.equal(k_full.grad[i : i + 1], ki.grad), f"dK batch invariance failed i={i}"
         assert torch.equal(v_full.grad[i : i + 1], vi.grad), f"dV batch invariance failed i={i}"
 
 
-def test_gqa_dk_dv_order(cuda_op):
+def test_gqa_dk_dv_order(attention_op):
     """§7.6/§4.1: GQA dK/dV must follow fixed (hq_local, query_index) order.
 
     Two checks:
@@ -623,13 +640,13 @@ def test_gqa_dk_dv_order(cuda_op):
     q1 = q_data.clone().requires_grad_(True)
     k1 = k_data.clone().requires_grad_(True)
     v1 = v_data.clone().requires_grad_(True)
-    cuda_op.forward(q1, k1, v1, causal=True).backward(grad_data)
+    attention_op.forward(q1, k1, v1, causal=True).backward(grad_data)
 
     q_batch = q_data.expand(4, -1, -1, -1).contiguous().clone().requires_grad_(True)
     k_batch = k_data.expand(4, -1, -1, -1).contiguous().clone().requires_grad_(True)
     v_batch = v_data.expand(4, -1, -1, -1).contiguous().clone().requires_grad_(True)
     grad_batch = grad_data.expand(4, -1, -1, -1).contiguous()
-    cuda_op.forward(q_batch, k_batch, v_batch, causal=True).backward(grad_batch)
+    attention_op.forward(q_batch, k_batch, v_batch, causal=True).backward(grad_batch)
 
     assert torch.equal(k1.grad, k_batch.grad[0:1]), "dK GQA order depends on batch size"
     assert torch.equal(v1.grad, v_batch.grad[0:1]), "dV GQA order depends on batch size"
@@ -655,3 +672,119 @@ def test_gqa_dk_dv_order(cuda_op):
 
     torch.testing.assert_close(k1.grad.float(), dk_gold, atol=5e-2, rtol=2e-2)
     torch.testing.assert_close(v1.grad.float(), dv_gold, atol=5e-2, rtol=2e-2)
+
+
+# =============================================================================
+# Strict core acceptance and ROCm HIP RoPE acceptance
+# =============================================================================
+
+
+def _strict_qkv(*, batch: int = 2, sequence: int = 7):
+    generator = torch.Generator(device="cpu").manual_seed(942)
+    q = torch.randn(batch, 4, sequence, D, dtype=torch.bfloat16, generator=generator).to(DEVICE)
+    k = torch.randn(batch, 1, sequence, D, dtype=torch.bfloat16, generator=generator).to(DEVICE)
+    v = torch.randn(batch, 1, sequence, D, dtype=torch.bfloat16, generator=generator).to(DEVICE)
+    return q, k, v
+
+
+def test_strict_attention_core_is_repeat_bitwise_and_no_fallback():
+    q, k, v = _strict_qkv()
+    positions = torch.arange(q.size(2), device=q.device).expand(q.size(0), -1)
+    core = RLKernelDeterministicAttentionCore()
+    first = core.forward_with_lse(
+        q,
+        k,
+        v,
+        query_position_ids=positions,
+        key_position_ids=positions,
+    )
+    second = core.forward_with_lse(
+        q,
+        k,
+        v,
+        query_position_ids=positions,
+        key_position_ids=positions,
+    )
+    assert torch.equal(first.out, second.out)
+    assert torch.equal(first.lse, second.lse)
+    assert first.provenance["attention_backend"] == f"rlkernel.{BACKEND}.deterministic_attention"
+    assert first.provenance["fallback"] is False
+    assert first.provenance["split_kv"]["actual_split_kv_policy"] == "disabled"
+
+
+def test_strict_attention_forward_backward_train_rollout_bitwise():
+    q, k, v = (tensor.requires_grad_() for tensor in _strict_qkv(batch=1, sequence=5))
+    positions = torch.arange(q.size(2), device=q.device).expand(q.size(0), -1)
+    core = RLKernelDeterministicAttentionCore()
+    train = core.forward_with_lse(
+        q,
+        k,
+        v,
+        query_position_ids=positions,
+        key_position_ids=positions,
+    )
+    grad = torch.randn(train.out.shape, dtype=train.out.dtype, device="cpu").to(DEVICE)
+    (train.out.float() * grad.float()).sum().backward()
+    train_grads = tuple(tensor.grad.detach().clone() for tensor in (q, k, v))
+
+    q2, k2, v2 = (tensor.detach().clone().requires_grad_() for tensor in (q, k, v))
+    rollout = core.forward_with_lse(
+        q2,
+        k2,
+        v2,
+        query_position_ids=positions,
+        key_position_ids=positions,
+    )
+    (rollout.out.float() * grad.float()).sum().backward()
+    assert torch.equal(train.out, rollout.out)
+    assert torch.equal(train.lse, rollout.lse)
+    assert all(
+        torch.equal(expected, actual.grad)
+        for expected, actual in zip(train_grads, (q2, k2, v2), strict=True)
+    )
+
+
+@ROCM_ONLY
+def test_rocm_rope_is_batch_invariant_and_backward_repeat_bitwise():
+    generator = torch.Generator(device="cpu").manual_seed(714)
+    x = torch.randn(3, 4, 6, D, dtype=torch.bfloat16, generator=generator).to(DEVICE)
+    positions = torch.arange(6, device=x.device).expand(3, -1)
+    rope = RocmDeterministicRoPEOp()
+    together = rope(x, positions)
+    separate = torch.cat([rope(x[index : index + 1], positions[index]) for index in range(3)])
+    assert torch.equal(together, separate)
+    assert torch.equal(together, rope(x, positions))
+
+    grad = torch.randn(together.shape, dtype=together.dtype, device="cpu").to(DEVICE)
+    x1 = x.detach().clone().requires_grad_()
+    x2 = x.detach().clone().requires_grad_()
+    (rope(x1, positions).float() * grad.float()).sum().backward()
+    (rope(x2, positions).float() * grad.float()).sum().backward()
+    assert torch.equal(x1.grad, x2.grad)
+
+
+@ROCM_ONLY
+def test_rocm_rope_matches_fp32_rotate_half_reference():
+    x = torch.randn(1, 2, 4, D, dtype=torch.bfloat16, device=DEVICE)
+    positions = torch.arange(4, device=x.device).expand(1, -1)
+    actual = RocmDeterministicRoPEOp()(x, positions)
+    half = x.size(-1) // 2
+    inv_freq = 1.0 / (
+        1_000_000.0 ** (torch.arange(half, dtype=torch.float32, device=x.device) / half)
+    )
+    frequency = positions.float().unsqueeze(-1) * inv_freq
+    cos = frequency.cos().unsqueeze(1)
+    sin = frequency.sin().unsqueeze(1)
+    reference = torch.cat(
+        (
+            x[..., :half].float() * cos - x[..., half:].float() * sin,
+            x[..., half:].float() * cos + x[..., :half].float() * sin,
+        ),
+        dim=-1,
+    ).to(x.dtype)
+    torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
+def test_strict_core_rejects_split_k():
+    with pytest.raises(ValueError, match="Split-KV"):
+        RLKernelDeterministicAttentionCore(split_kv=SplitKVSpec.fixed(32))

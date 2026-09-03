@@ -15,6 +15,7 @@ import argparse
 import json
 import math
 import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,9 @@ if str(REPO_ROOT) not in sys.path:
 from rl_engine.kernels.attention_contract import (  # noqa: E402
     STRICT_ATTENTION_FA4_SCHEDULE_ID,
     STRICT_ATTENTION_PRODUCTION_CORE_ID,
+    STRICT_ATTENTION_RING_SCHEDULE_ID,
+    STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
+    STRICT_ATTENTION_ROCM_SCHEDULE_ID,
 )
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (  # noqa: E402
     AttentionCPBlockMetadata,
@@ -39,6 +43,7 @@ from rl_engine.kernels.ops.cuda.attention.cp_comm import (  # noqa: E402
     AttentionParallelSpec,
     CUDAAGRSAttentionCPCommunication,
     P2PNCCLAttentionCPCommunication,
+    RCCLAGRSAttentionCPCommunication,
 )
 from rl_engine.kernels.ops.cuda.attention.flash_attn import StrictFlashAttention4Core  # noqa: E402
 from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (  # noqa: E402
@@ -46,7 +51,6 @@ from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (  #
     FlashInferQwen3PagedAttentionOp,
     _apply_strict_rope,
 )
-from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RoPESM90Op  # noqa: E402
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (  # noqa: E402
     AttentionPartialState,
     DeterministicCPAttentionReferenceOp,
@@ -68,9 +72,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--final-write-atol", type=float, default=2.0e-2)
     parser.add_argument(
         "--transport",
-        choices=("p2p_nccl_reference", "cuda_ag_rs"),
+        choices=("p2p_nccl_reference", "cuda_ag_rs", "rccl_ag_rs"),
         default="p2p_nccl_reference",
-        help="P2P is the correctness reference; cuda_ag_rs selects PR311/PR312",
+        help="P2P is the reference; cuda_ag_rs and rccl_ag_rs are self-owned transports",
     )
     parser.add_argument(
         "--strict-shared-core",
@@ -78,22 +82,128 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="run AG(Q/K/V/positions) -> shared CUDA core -> RS(Out/LSE) with backward",
     )
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--run-rocm-matrix",
+        action="store_true",
+        help="run the complete 1/2/4/8-GPU ROCm acceptance matrix",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("results/rocm-attention"),
+        help="directory for --run-rocm-matrix logs and JSON reports",
+    )
     args = parser.parse_args(argv)
-    if args.strict_shared_core and args.transport != "cuda_ag_rs":
-        parser.error("--strict-shared-core requires --transport cuda_ag_rs")
+    if args.strict_shared_core and args.transport not in {"cuda_ag_rs", "rccl_ag_rs"}:
+        parser.error("--strict-shared-core requires a self-owned AG/RS transport")
+    if args.run_rocm_matrix and (args.strict_shared_core or args.output is not None):
+        parser.error("--run-rocm-matrix cannot be combined with single-run output options")
     return args
+
+
+def _run_rocm_matrix(output_dir: Path) -> int:
+    if torch.version.hip is None or torch.cuda.device_count() < 8:
+        raise RuntimeError("the formal acceptance matrix requires 8 visible ROCm GPUs")
+
+    repo = Path(__file__).resolve().parents[1]
+    output = (repo / output_dir).resolve() if not output_dir.is_absolute() else output_dir
+    output.mkdir(parents=True, exist_ok=True)
+    script = Path(__file__).resolve()
+    commands: list[tuple[str, list[str]]] = [
+        (
+            "single_gpu",
+            [sys.executable, "-m", "pytest", "-q", "tests/test_deterministic_attention_cuda.py"],
+        ),
+        (
+            "adapter_cp_contracts",
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "tests/test_flashinfer_pr7_attention.py",
+                "tests/test_cp_attention.py",
+                "tests/test_attention_comparison.py",
+            ],
+        ),
+    ]
+    for transport, strict in (("p2p_nccl_reference", False), ("rccl_ag_rs", True)):
+        for ranks in (2, 4, 8):
+            name = f"{transport}_{ranks}r"
+            command = [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                f"--nproc-per-node={ranks}",
+                str(script),
+                "--transport",
+                transport,
+                "--output",
+                str(output / f"{name}.json"),
+            ]
+            if strict:
+                command.append("--strict-shared-core")
+            commands.append((name, command))
+
+    steps: list[dict[str, object]] = []
+    for name, command in commands:
+        completed = subprocess.run(
+            command,
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        (output / f"{name}.log").write_text(completed.stdout, encoding="utf-8")
+        steps.append({"name": name, "command": command, "returncode": completed.returncode})
+
+    summary = {
+        "schema_version": "ws2_rocm_attention_acceptance/v1",
+        "git_commit": _current_git_commit(repo),
+        "platform": "rocm",
+        "torch": str(torch.__version__),
+        "hip": str(torch.version.hip),
+        "collective": list(torch.cuda.nccl.version()),
+        "device_count": torch.cuda.device_count(),
+        "device_name": torch.cuda.get_device_name(0),
+        "steps": steps,
+        "passed": all(step["returncode"] == 0 for step in steps),
+    }
+    (output / "summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0 if summary["passed"] else 1
+
+
+def _current_git_commit(repo: Path) -> str:
+    """Bind an acceptance artifact to the checkout that generated it."""
+
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("ROCm Attention acceptance requires a Git checkout") from exc
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.run_rocm_matrix:
+        return _run_rocm_matrix(args.output_dir)
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        raise RuntimeError("this check requires at least two visible CUDA devices")
+        raise RuntimeError("this check requires at least two visible CUDA/ROCm devices")
     dist.init_process_group("nccl", init_method="env://")
     try:
         world_size = dist.get_world_size()
         global_rank = dist.get_rank()
         if world_size not in {2, 4, 8}:
-            raise RuntimeError("this check requires 2, 4, or 8 NCCL ranks")
+            raise RuntimeError("this check requires 2, 4, or 8 NCCL/RCCL ranks")
         if torch.cuda.device_count() < world_size:
             raise RuntimeError("this single-node check requires one visible GPU per NCCL rank")
         local_rank = int(os.environ.get("LOCAL_RANK", str(global_rank)))
@@ -129,12 +239,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         dist.all_gather_object(reports, result)
         if global_rank == 0:
             report = {
-                "schema_version": (
-                    "ws2_p2p_nccl_attention_reference/v1"
-                    if args.transport == "p2p_nccl_reference"
-                    else "ws2_cuda_ag_rs_attention/v1"
-                ),
+                "schema_version": f"ws2_{args.transport}_attention/v2",
+                "git_commit": _current_git_commit(REPO_ROOT),
                 "backend": str(dist.get_backend()),
+                "platform": "rocm" if torch.version.hip is not None else "cuda",
+                "torch_version": str(torch.__version__),
+                "runtime_version": (
+                    str(torch.version.hip)
+                    if torch.version.hip is not None
+                    else str(torch.version.cuda)
+                ),
+                "collective_version": list(torch.cuda.nccl.version()),
+                "device_name": torch.cuda.get_device_name(0),
                 "transport": args.transport,
                 "world_size": world_size,
                 "tp_world_size": 1 if world_size == 2 else 2,
@@ -210,11 +326,17 @@ def run_check(
         expected_kv_token_range=(0, args.seq_len),
         query_token_ranges=owner_ranges,
     )
-    communication: P2PNCCLAttentionCPCommunication | CUDAAGRSAttentionCPCommunication
+    communication: (
+        P2PNCCLAttentionCPCommunication
+        | CUDAAGRSAttentionCPCommunication
+        | RCCLAGRSAttentionCPCommunication
+    )
     if args.transport == "p2p_nccl_reference":
         communication = P2PNCCLAttentionCPCommunication(process_group=cp_group)
-    else:
+    elif args.transport == "cuda_ag_rs":
         communication = CUDAAGRSAttentionCPCommunication(process_group=cp_group)
+    else:
+        communication = RCCLAGRSAttentionCPCommunication(process_group=cp_group)
 
     query_start, query_end = owner_ranges[cp_rank]
     q_local = q[:, :, query_start:query_end, :].contiguous()
@@ -348,7 +470,11 @@ def _run_strict_shared_core_check(
     args: argparse.Namespace,
     *,
     plan: AttentionCPCommunicationPlan,
-    communication: CUDAAGRSAttentionCPCommunication | P2PNCCLAttentionCPCommunication,
+    communication: (
+        CUDAAGRSAttentionCPCommunication
+        | RCCLAGRSAttentionCPCommunication
+        | P2PNCCLAttentionCPCommunication
+    ),
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -381,16 +507,14 @@ def _run_strict_shared_core_check(
     q_ref = q.detach().clone().requires_grad_()
     k_ref = k.detach().clone().requires_grad_()
     v_ref = v.detach().clone().requires_grad_()
-    rope = RoPESM90Op()
+    rope = _strict_rope_op()
     q_ready = _apply_strict_rope(rope, q_ref, positions, config.rope.rope_theta)
     k_ready = _apply_strict_rope(rope, k_ref, positions, config.rope.rope_theta)
-    reference = StrictFlashAttention4Core().forward_with_lse(
+    reference = _strict_attention_reference_rows(
         q_ready,
         k_ready,
         v_ref,
-        causal=True,
-        query_position_ids=positions,
-        key_position_ids=positions,
+        positions=positions,
         output_dtype=q.dtype,
     )
     out_ref = reference.out[:, :, start:end, :]
@@ -435,23 +559,18 @@ def _run_strict_shared_core_check(
         repeat_lse_bitwise = repeat_lse_bitwise and torch.equal(repeated.lse, distributed.lse)
 
     provenance = distributed.provenance
-    identity_valid = (
-        provenance.get("strict_core_id") == STRICT_ATTENTION_PRODUCTION_CORE_ID
-        and provenance.get("strict_schedule") == STRICT_ATTENTION_FA4_SCHEDULE_ID
-        and provenance.get("strict_mode") is True
-        and provenance.get("native_attention_arithmetic") is True
-        and provenance.get("num_splits") == 1
-        and provenance.get("deterministic_backward") is True
-        and provenance.get("fa_api_source") == "flash_attn.cute.interface"
-        and provenance.get("fallback") is False
-        and provenance.get("strict_split_kv") == "disabled"
-        and provenance.get("strict_comm_autograd") is True
-        and provenance.get("production_ready") is True
+    identity_errors = _strict_shared_core_identity_errors(
+        provenance,
+        transport=args.transport,
+        is_rocm=torch.version.hip is not None,
     )
     return {
         "executed": True,
         "passed": (
-            all(bitwise.values()) and repeat_out_bitwise and repeat_lse_bitwise and identity_valid
+            all(bitwise.values())
+            and repeat_out_bitwise
+            and repeat_lse_bitwise
+            and not identity_errors
         ),
         "strict_core_id": provenance.get("strict_core_id"),
         "strict_schedule": provenance.get("strict_schedule"),
@@ -463,11 +582,120 @@ def _run_strict_shared_core_check(
         "fallback": provenance.get("fallback"),
         "split_kv_policy": provenance.get("strict_split_kv"),
         "communication_autograd": provenance.get("strict_comm_autograd"),
+        "strict_provenance": provenance,
+        "identity_errors": identity_errors,
         "bitwise": bitwise,
         "max_abs": max_abs,
         "repeat_out_bitwise": repeat_out_bitwise,
         "repeat_lse_bitwise": repeat_lse_bitwise,
     }
+
+
+def _strict_shared_core_identity_errors(
+    provenance: dict[str, object],
+    *,
+    transport: str,
+    is_rocm: bool,
+) -> list[str]:
+    """Return every strict-contract provenance mismatch for the rank report."""
+
+    expected_core = (
+        STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID if is_rocm else STRICT_ATTENTION_PRODUCTION_CORE_ID
+    )
+    expected_schedule = (
+        STRICT_ATTENTION_ROCM_SCHEDULE_ID if is_rocm else STRICT_ATTENTION_FA4_SCHEDULE_ID
+    )
+    expected_backend = "aiter.rocm.ck_dense_mha" if is_rocm else "flash_attention_4.cute"
+    expected_rope = "rlkernel.rocm.deterministic_rope" if is_rocm else "rlkernel.cuda.rope_sm90"
+    expected_communication = "rccl_ag_rs" if is_rocm else "self_owned_cuda_ag_rs"
+    required = {
+        "strict_core_id": expected_core,
+        "strict_schedule": expected_schedule,
+        "attention_backend": expected_backend,
+        "actual_backend": expected_backend,
+        "rope_backend": expected_rope,
+        "strict_mode": True,
+        "native_attention_arithmetic": True,
+        "num_splits": 1,
+        "deterministic_backward": True,
+        "reference_only": False,
+        "fallback": False,
+        "strict_split_kv": "disabled",
+        "strict_comm_autograd": True,
+        "communication_backend": expected_communication,
+        "production_ready": True,
+        "strict_full_qkv_all_gather": True,
+        "strict_position_ids_all_gather": True,
+        "compute_communication": "decoupled",
+        "compute_schedule": STRICT_ATTENTION_RING_SCHEDULE_ID,
+        "communication_overlap": "disabled",
+        "ring_schedule_default": True,
+        "ring_partial_arithmetic": False,
+        "rope_fusion": False,
+        "q_rope_state": "post_rope",
+        "k_cache_rope_state": "post_rope",
+    }
+    errors = [
+        f"{name}={provenance.get(name)!r}, expected {expected!r}"
+        for name, expected in required.items()
+        if provenance.get(name) != expected
+    ]
+    if is_rocm:
+        if provenance.get("split_kv_control") != "dense_non_split_api":
+            errors.append("split_kv_control must prove the AITER dense non-Split-K API")
+        if provenance.get("aiter_api_source") != "aiter.ops.mha":
+            errors.append("aiter_api_source must identify aiter.ops.mha")
+        if not provenance.get("aiter_source_sha256"):
+            errors.append("aiter_source_sha256 is missing")
+    else:
+        if provenance.get("fa_api_source") != "flash_attn.cute.interface":
+            errors.append("fa_api_source must identify the FA4 CuTe API")
+    return errors
+
+
+def _strict_attention_core():
+    if torch.version.hip is not None:
+        from rl_engine.kernels.ops.rocm.attention.flash_attn import StrictRocmAiterCKAttentionCore
+
+        return StrictRocmAiterCKAttentionCore()
+    return StrictFlashAttention4Core()
+
+
+def _strict_attention_reference_rows(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    positions: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> SimpleNamespace:
+    """Run the production core with its one-logical-row execution contract."""
+
+    core = _strict_attention_core()
+    rows = [
+        core.forward_with_lse(
+            q[index : index + 1],
+            k[index : index + 1],
+            v[index : index + 1],
+            causal=True,
+            query_position_ids=positions[index : index + 1],
+            key_position_ids=positions[index : index + 1],
+            output_dtype=output_dtype,
+        )
+        for index in range(q.size(0))
+    ]
+    return SimpleNamespace(
+        out=torch.cat([row.out for row in rows], dim=0),
+        lse=torch.cat([row.lse for row in rows], dim=0),
+    )
+
+
+def _strict_rope_op():
+    from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RocmDeterministicRoPEOp, RoPESM90Op
+
+    if torch.version.hip is not None:
+        return RocmDeterministicRoPEOp()
+    return RoPESM90Op()
 
 
 if __name__ == "__main__":

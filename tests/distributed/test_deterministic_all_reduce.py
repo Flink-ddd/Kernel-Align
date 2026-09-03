@@ -12,13 +12,17 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from rl_engine.distributed import DeterministicCollective
+from rl_engine.distributed import create_deterministic_collective
 
 _MAX_WORLD_SIZE = 8
 _TP_SIZES = (1, 2, 4, 8)
 _EXTERNAL_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 
 pytestmark = [
+    # The deterministic collectives are CUDA-IPC kernels, compiled out of ROCm
+    # builds on purpose. ROCm reports GPUs through the CUDA device API, so the
+    # device_count guard below does not exclude it.
+    pytest.mark.cuda_only,
     pytest.mark.skipif(
         _EXTERNAL_WORLD_SIZE != 1,
         reason="this cross-TP test owns its worker processes; run pytest directly",
@@ -61,7 +65,7 @@ def _worker(rank: int, port: int) -> None:
         groups = {tp_size: dist.new_group(ranks=list(range(tp_size))) for tp_size in _TP_SIZES}
         for tp_size, group in groups.items():
             if rank < tp_size:
-                with DeterministicCollective(
+                with create_deterministic_collective(
                     group=group,
                     device=device,
                     max_size_bytes=1024 * 1024,
@@ -96,6 +100,25 @@ def _worker(rank: int, port: int) -> None:
                         returned = collective.all_reduce(inplace, out=inplace)
                         assert returned is inplace
                         assert torch.equal(inplace, expected)
+
+                        if dtype in (torch.float16, torch.bfloat16):
+                            packed_input = torch.cat((input, input[:1]))
+                            packed_expected = torch.cat((expected, expected[:1]))
+                            packed_output = collective.all_reduce(packed_input)
+                            assert torch.equal(packed_output, packed_expected)
+
+                            output_storage = torch.empty(
+                                packed_expected.numel() + 1,
+                                dtype=dtype,
+                                device=device,
+                            )
+                            misaligned_output = output_storage[1:].view_as(packed_expected)
+                            returned = collective.all_reduce(
+                                packed_input,
+                                out=misaligned_output,
+                            )
+                            assert returned is misaligned_output
+                            assert torch.equal(misaligned_output, packed_expected)
             dist.barrier()
     finally:
         dist.destroy_process_group()

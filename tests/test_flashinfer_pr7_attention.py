@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import sys
 import types
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
@@ -14,6 +17,9 @@ from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_CORE_ID,
     STRICT_ATTENTION_FA4_SCHEDULE_ID,
     STRICT_ATTENTION_PRODUCTION_CORE_ID,
+    STRICT_ATTENTION_RING_SCHEDULE_ID,
+    STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
+    STRICT_ATTENTION_ROCM_SCHEDULE_ID,
     STRICT_ATTENTION_SCHEDULE_ID,
     SplitKVSpec,
 )
@@ -48,8 +54,21 @@ from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (
     materialize_flashinfer_paged_kv_cache,
 )
 from rl_engine.testing.attention_comparison import DecodeKVCacheMetadata
-from scripts import ws2_p2p_nccl_attention_reference_check as p2p_check_script
-from scripts import ws2_pr7_flashinfer_attention_check as check_script
+
+
+def _load_repo_script(name: str):
+    path = Path(__file__).resolve().parents[1] / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"rl_kernel_{name}", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load repository script {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+p2p_check_script = _load_repo_script("ws2_p2p_nccl_attention_reference_check")
+check_script = _load_repo_script("ws2_pr7_flashinfer_attention_check")
 
 
 class _FakeFlashInferWrapper:
@@ -1717,7 +1736,7 @@ def test_pr7_check_acceptance_errors_require_all_drift_and_invariance_fields():
     assert check_script._acceptance_errors(report, args) == ["batch_invariant_sweep failed"]
 
 
-def test_pr7_check_accepts_strict_fa4_production_core():
+def test_pr7_check_accepts_strict_cuda_production_core():
     args = check_script._parse_args(["--strict", "--device", "cuda"])
     report = {
         "device": "cuda:0",
@@ -1736,6 +1755,44 @@ def test_pr7_check_accepts_strict_fa4_production_core():
             "reference_only": False,
             "strict_core_row_plans": [{"actual_split_kv_policy": "disabled"}],
             "rope_backend": "rlkernel.cuda.rope_sm90",
+            "rope_theta": 1_000_000.0,
+            "rotary_dim": 128,
+            "arithmetic_semantics_verified": True,
+        },
+        "drift": {
+            "out": {"max_abs": 0.0},
+            "lse": {"max_abs": 0.0},
+            "dlogp": {"max_abs": 0.0},
+        },
+        "batch_invariant_sweep": {"passed": True},
+        "page_layout_invariant_sweep": {"passed": True},
+    }
+
+    assert check_script._acceptance_errors(report, args) == []
+
+
+def test_pr7_check_accepts_strict_rocm_production_core():
+    args = check_script._parse_args(["--strict", "--device", "cuda"])
+    report = {
+        "device": "cuda:0",
+        "shape": {"q_heads": 16, "kv_heads": 4, "head_dim": 128},
+        "candidate_provenance": {
+            "attention_mode": "decode",
+            "fallback": False,
+            "strict_mode": True,
+            "strict_core_id": STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
+            "strict_schedule": STRICT_ATTENTION_ROCM_SCHEDULE_ID,
+            "actual_backend": "aiter.rocm.ck_dense_mha",
+            "platform": "rocm",
+            "native_attention_arithmetic": True,
+            "num_splits": 1,
+            "deterministic_backward": True,
+            "reference_only": False,
+            "split_kv_control": "dense_non_split_api",
+            "aiter_api_source": "aiter.ops.mha",
+            "aiter_source_sha256": "a" * 64,
+            "strict_core_row_plans": [{"actual_split_kv_policy": "disabled"}],
+            "rope_backend": "rlkernel.rocm.deterministic_rope",
             "rope_theta": 1_000_000.0,
             "rotary_dim": 128,
             "arithmetic_semantics_verified": True,
@@ -1782,8 +1839,42 @@ def test_pr7_check_rejects_reference_core_as_production():
     }
 
     errors = check_script._acceptance_errors(report, args)
-    assert "strict runtime did not execute the FA4 production core" in errors
+    assert "strict runtime did not execute the native production arithmetic" in errors
     assert "strict runtime selected the reference core" in errors
+
+
+@pytest.mark.parametrize(
+    ("backend", "rope_backend"),
+    [
+        ("flash_attention_4.cute", "rlkernel.cuda.rope_sm90"),
+        ("aiter.rocm.ck_dense_mha", "rlkernel.rocm.deterministic_rope"),
+    ],
+)
+def test_strict_report_uses_executed_platform_provenance(backend, rope_backend):
+    fields = check_script._strict_execution_report_fields(
+        {
+            "actual_backend": backend,
+            "rope_backend": rope_backend,
+            "rope_fusion": False,
+            "rope_fusion_boundary": "rlkernel_rope_then_attention",
+            "rope_theta": 1_000_000.0,
+            "rotary_dim": 128,
+            "q_rope_state": "post_rope",
+            "k_cache_rope_state": "post_rope",
+        }
+    )
+
+    assert fields["reference_backend"] == backend
+    assert backend in fields["target"]
+    assert fields["rope"] == {
+        "rope_backend": rope_backend,
+        "rope_fusion": False,
+        "rope_fusion_boundary": "rlkernel_rope_then_attention",
+        "rope_theta": 1_000_000.0,
+        "rotary_dim": 128,
+        "q_rope_state": "post_rope",
+        "k_cache_rope_state": "post_rope",
+    }
 
 
 def test_pr7_check_rejects_nonfinite_drift_and_wrong_tp_local_shape():
@@ -1843,6 +1934,116 @@ def test_strict_shared_core_entrypoint_requires_self_owned_ag_rs():
 
     args = p2p_check_script.parse_args(["--transport", "cuda_ag_rs", "--strict-shared-core"])
     assert args.strict_shared_core is True
+
+
+def test_strict_shared_core_reference_executes_one_logical_row(monkeypatch):
+    calls = []
+
+    class _RowCore:
+        def forward_with_lse(self, q, k, v, **kwargs):
+            calls.append((q.shape[0], kwargs["query_position_ids"].clone()))
+            return types.SimpleNamespace(
+                out=q + k + v,
+                lse=(q + k).sum(dim=-1),
+            )
+
+    monkeypatch.setattr(p2p_check_script, "_strict_attention_core", _RowCore)
+    q = torch.randn(2, 1, 3, 4, requires_grad=True)
+    k = torch.randn(2, 1, 3, 4, requires_grad=True)
+    v = torch.randn(2, 1, 3, 4, requires_grad=True)
+    positions = torch.arange(3).expand(2, -1)
+
+    result = p2p_check_script._strict_attention_reference_rows(
+        q,
+        k,
+        v,
+        positions=positions,
+        output_dtype=q.dtype,
+    )
+
+    assert [batch for batch, _positions in calls] == [1, 1]
+    assert [item.tolist() for _batch, item in calls] == [[[0, 1, 2]], [[0, 1, 2]]]
+    assert torch.equal(result.out, q + k + v)
+    assert torch.equal(result.lse, (q + k).sum(dim=-1))
+    (result.out.sum() + result.lse.sum()).backward()
+    assert q.grad is not None
+    assert k.grad is not None
+    assert v.grad is not None
+
+
+def _strict_acceptance_provenance(**overrides):
+    provenance = {
+        "strict_core_id": STRICT_ATTENTION_PRODUCTION_CORE_ID,
+        "strict_schedule": STRICT_ATTENTION_FA4_SCHEDULE_ID,
+        "attention_backend": "flash_attention_4.cute",
+        "actual_backend": "flash_attention_4.cute",
+        "rope_backend": "rlkernel.cuda.rope_sm90",
+        "strict_mode": True,
+        "native_attention_arithmetic": True,
+        "num_splits": 1,
+        "deterministic_backward": True,
+        "reference_only": False,
+        "fa_api_source": "flash_attn.cute.interface",
+        "fallback": False,
+        "strict_split_kv": "disabled",
+        "strict_comm_autograd": True,
+        "communication_backend": "self_owned_cuda_ag_rs",
+        "production_ready": True,
+        "strict_full_qkv_all_gather": True,
+        "strict_position_ids_all_gather": True,
+        "compute_communication": "decoupled",
+        "compute_schedule": STRICT_ATTENTION_RING_SCHEDULE_ID,
+        "communication_overlap": "disabled",
+        "ring_schedule_default": True,
+        "ring_partial_arithmetic": False,
+        "rope_fusion": False,
+        "q_rope_state": "post_rope",
+        "k_cache_rope_state": "post_rope",
+    }
+    provenance.update(overrides)
+    return provenance
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("compute_schedule", "dynamic_ring"),
+        ("communication_overlap", "enabled"),
+        ("ring_schedule_default", False),
+        ("ring_partial_arithmetic", True),
+        ("actual_backend", "flashinfer"),
+        ("rope_backend", "native_rope"),
+        ("strict_comm_autograd", False),
+    ],
+)
+def test_strict_shared_core_acceptance_rejects_provenance_drift(field, invalid):
+    errors = p2p_check_script._strict_shared_core_identity_errors(
+        _strict_acceptance_provenance(**{field: invalid}),
+        transport="cuda_ag_rs",
+        is_rocm=False,
+    )
+
+    assert any(error.startswith(f"{field}=") for error in errors)
+
+
+def test_strict_shared_core_acceptance_requires_rocm_backend_and_rope():
+    provenance = _strict_acceptance_provenance(
+        strict_core_id=STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
+        strict_schedule=STRICT_ATTENTION_ROCM_SCHEDULE_ID,
+        attention_backend="aiter.rocm.ck_dense_mha",
+        actual_backend="aiter.rocm.ck_dense_mha",
+        rope_backend="rlkernel.rocm.deterministic_rope",
+        communication_backend="rccl_ag_rs",
+        split_kv_control="dense_non_split_api",
+        aiter_api_source="aiter.ops.mha",
+        aiter_source_sha256="a" * 64,
+    )
+
+    assert not p2p_check_script._strict_shared_core_identity_errors(
+        provenance,
+        transport="rccl_ag_rs",
+        is_rocm=True,
+    )
 
 
 @pytest.mark.parametrize(
@@ -2007,6 +2208,10 @@ def test_fa4_core_bshd_entrypoint_preserves_framework_layout(monkeypatch):
     assert result.lse.dtype is torch.float32
 
 
+# FA4 is the CUDA production core. On ROCm the strict default correctly resolves
+# to the AITER CK core instead, so the StrictFlashAttention4Core monkeypatch below
+# is never consulted and the assertions cannot hold there.
+@pytest.mark.cuda_only
 def test_strict_paged_default_selects_fa4_production_core(monkeypatch):
     core = _RecordingStrictCore()
     core.core_id = STRICT_ATTENTION_PRODUCTION_CORE_ID

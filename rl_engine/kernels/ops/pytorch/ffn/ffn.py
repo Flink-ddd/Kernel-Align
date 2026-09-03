@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Bias-free gated FFN assembled from deterministic CUDA kernels."""
+"""Bias-free gated FFN assembled from deterministic GPU kernels."""
 
 from __future__ import annotations
 
@@ -126,9 +126,9 @@ def _require_ffn_kernels(*, disable_split_k: bool, packed_gate_up: bool = False)
     if not _EXT_AVAILABLE or _C is None or missing:
         suffix = f" Missing symbols: {', '.join(missing)}." if missing else ""
         needed = (
-            "compiled deterministic GEMM and SwiGLU CUDA kernels"
+            "compiled deterministic GEMM and SwiGLU GPU kernels"
             if disable_split_k
-            else "compiled SwiGLU CUDA kernels"
+            else "compiled SwiGLU GPU kernels"
         )
         raise RuntimeError(f"qwen3_ffn requires the {needed}.{suffix}")
 
@@ -231,7 +231,8 @@ def _validate_ffn_inputs(
         if tensor.dtype != torch.bfloat16:
             raise TypeError(f"{name} must have dtype bfloat16, got {tensor.dtype}.")
         if not tensor.is_cuda:
-            raise RuntimeError(f"{name} must be on a CUDA device, got '{tensor.device}'.")
+            # PyTorch exposes AMD GPU tensors through the torch.cuda API too.
+            raise RuntimeError(f"{name} must be on a CUDA/ROCm GPU device, got '{tensor.device}'.")
         if tensor.device != rmsnorm_output.device:
             raise RuntimeError(
                 f"all FFN inputs must be on {rmsnorm_output.device}, "
@@ -295,8 +296,14 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         tp_world = tp_dist.get_world_size(group=tp_group) if tp_dist is not None else 1
         gemm_tokens = rmsnorm_output_2d.size(0) * (tp_world if sequence_parallel else 1)
         element_size = rmsnorm_output_2d.element_size()
+        token_hidden_bytes = gemm_tokens * rmsnorm_output_2d.size(1) * element_size
+        # Sequence-parallel backward reduces the gate and up input-gradient
+        # lanes together. ``reduce_scatter_many`` packs those lanes along the
+        # final dimension, so reserve capacity for both lanes in one transport
+        # call rather than growing the collective (or failing) mid-backward.
+        reduction_bytes = token_hidden_bytes * (2 if sequence_parallel else 1)
         min_size_bytes = max(
-            gemm_tokens * rmsnorm_output_2d.size(1) * element_size,
+            reduction_bytes,
             gemm_tokens * gate_weight.size(0) * element_size,
             gate_weight.numel() * element_size,
             up_weight.numel() * element_size,
@@ -466,28 +473,25 @@ class _DeterministicFFNFunction(torch.autograd.Function):
             gate_weight,
             disable_split_k=disable_split_k,
         )
-        if ctx.sequence_parallel:
-            grad_rmsnorm_from_gate = _reduce_scatter_tokens(
-                grad_rmsnorm_from_gate,
-                tp_collective,
-            )
-        elif tp_collective is not None:
-            grad_rmsnorm_from_gate = _all_reduce_inplace(
-                grad_rmsnorm_from_gate,
-                tp_collective,
-            )
-
         grad_rmsnorm_from_up = _linear_da(
             grad_up,
             up_weight,
             disable_split_k=disable_split_k,
         )
         if ctx.sequence_parallel:
-            grad_rmsnorm_from_up = _reduce_scatter_tokens(
-                grad_rmsnorm_from_up,
-                tp_collective,
+            # These are independent reduction lanes. Pack them into one
+            # ReduceScatter while keeping each lane's balanced rank tree
+            # separate; adding them before the collective would change the
+            # floating-point parenthesization and break cross-TP bitwise
+            # invariance.
+            grad_rmsnorm_from_gate, grad_rmsnorm_from_up = tp_collective.reduce_scatter_many(
+                (grad_rmsnorm_from_gate, grad_rmsnorm_from_up)
             )
         elif tp_collective is not None:
+            grad_rmsnorm_from_gate = _all_reduce_inplace(
+                grad_rmsnorm_from_gate,
+                tp_collective,
+            )
             grad_rmsnorm_from_up = _all_reduce_inplace(
                 grad_rmsnorm_from_up,
                 tp_collective,
@@ -537,7 +541,8 @@ def qwen3_ffn(
             unchanged.
         tp_group: Optional tensor-parallel process group. Gate and Up are
             column-parallel; Down is row-parallel. Reductions use the
-            deterministic fixed-tree collectives rather than NCCL.
+            platform deterministic fixed-tree collectives. On ROCm, RCCL only
+            transports rank inputs and the reduction tree executes locally.
         cp_group: Optional context-parallel process group. Each rank owns
             different token rows and the same local weight shards. Weight
             gradients AllGather tokens along CP and run the full-token
@@ -629,6 +634,11 @@ class Qwen3FFNOp:
         dist = _require_parallel_group(tp_group, "tensor")
         if dist is None:
             return 0, 1
+        if getattr(torch.version, "hip", None) is not None:
+            raise RuntimeError(
+                "packed TP inference requires the native CUDA IPC collective and "
+                "is not available with the ROCm/RCCL transport"
+            )
         tp_world_size = int(dist.get_world_size(group=tp_group))
         if fused_gate_up_weight.size(0) % 2:
             raise ValueError("fused gate/up weight must contain two equal shards")
