@@ -89,6 +89,7 @@ jobs:
             tests/test_attention_cross_config_binding.py \
             tests/test_attention_preprocess.py \
             tests/test_attention_projection.py \
+            tests/test_rocm_attention_ablation_benchmark.py \
             tests/test_cp_attention.py \
             tests/test_cp_attention_transformer_engine.py
 
