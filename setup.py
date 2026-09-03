@@ -3,13 +3,10 @@
 
 import importlib.util
 import os
-import sysconfig
 import warnings
-from distutils.errors import CompileError
-from distutils.spawn import find_executable
 from pathlib import Path
 
-from setuptools import Extension, find_packages, setup
+from setuptools import find_packages, setup
 
 
 def _load_envs_module():
@@ -142,21 +139,12 @@ def get_extensions():
             "csrc/cuda/rmsnorm.cu",
             "csrc/cuda/activation.cu",
             "csrc/cuda/attention/deterministic_attention.cu",
+            "csrc/cuda/distributed/deterministic_collective.cu",
         ]
         if not is_rocm:
-            # prefix_shared_attention contains NVIDIA PTX (cp.async, ldmatrix,
-            # and mma.sync); the ROCm dispatcher falls back to PyTorch SDPA for
-            # it. The CUDA collective owns CUDA IPC handles and driver API calls.
-            cuda_sources.extend(
-                [
-                    "csrc/cuda/attention/prefix_shared_attention.cu",
-                    "csrc/cuda/distributed/deterministic_collective.cu",
-                ]
-            )
-        else:
-            # RCCL stays transport-only on ROCm; this HIP kernel performs the
-            # fixed balanced-tree arithmetic after AllGather.
-            cuda_sources.append("csrc/rocm/distributed/deterministic_collective.hip")
+            # This source contains NVIDIA PTX (cp.async, ldmatrix, and mma.sync).
+            # The ROCm dispatcher falls back to PyTorch SDPA for this operator.
+            cuda_sources.append("csrc/cuda/attention/prefix_shared_attention.cu")
 
         nvcc_flags = ["-O3", "-Xfatbin", "-compress-all"]
         if envs.env_flag(envs.KERNEL_ALIGN_USE_FAST_MATH):
@@ -223,10 +211,9 @@ def get_extensions():
             nvcc_flags.append("-allow-unsupported-compiler")
             nvcc_flags.append("-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH")
 
-        platform_define = "-DKERNEL_ALIGN_WITH_ROCM" if is_rocm else "-DKERNEL_ALIGN_WITH_CUDA"
-        cxx_flags = ["-O3", "-std=c++17", platform_define]
+        cxx_flags = ["-O3", "-std=c++17", "-DKERNEL_ALIGN_WITH_CUDA"]
         extra_link_args = list(torch_rpath)
-        if not is_rocm and os.name != "nt":
+        if os.name != "nt" and not is_rocm:
             # CUDA IPC metadata queries use the driver API (cuPointerGetAttribute).
             extra_link_args.append("-lcuda")
 
