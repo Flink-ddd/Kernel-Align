@@ -139,6 +139,45 @@ def test_attention_wrapper_supports_explicit_injected_backend():
     assert torch.equal(result.out, q)
 
 
+def test_attention_wrapper_binds_rocm_runtime_once(monkeypatch):
+    import rl_engine.kernels.ops.rocm.attention.strict_runtime as rocm_runtime
+
+    calls = []
+
+    class Runtime:
+        def __init__(self, *, process_group=None):
+            calls.append(process_group)
+
+    monkeypatch.setattr(rocm_runtime, "StrictRocmAttentionRuntime", Runtime)
+    group = object()
+    operator = AttentionAblationOp()
+
+    first = operator.bind_rocm_runtime(process_group=group)
+    second = operator.bind_runtime(platform="rocm", process_group=group)
+
+    assert first is second
+    assert calls == [group]
+    assert operator.core is first and operator.cp_backend is first
+
+
+def test_attention_wrapper_rejects_runtime_platform_or_group_drift(monkeypatch):
+    import rl_engine.kernels.ops.rocm.attention.strict_runtime as rocm_runtime
+
+    class Runtime:
+        def __init__(self, *, process_group=None):
+            self.process_group = process_group
+
+    monkeypatch.setattr(rocm_runtime, "StrictRocmAttentionRuntime", Runtime)
+    group = object()
+    operator = AttentionAblationOp()
+    operator.bind_rocm_runtime(process_group=group)
+
+    with pytest.raises(AttentionContractError, match="platform"):
+        operator.bind_cuda_runtime(process_group=group)
+    with pytest.raises(AttentionContractError, match="process group"):
+        operator.bind_rocm_runtime(process_group=object())
+
+
 def test_wrapper_owned_deterministic_core_does_not_require_external_provenance():
     q, k, v = _qkv()
 

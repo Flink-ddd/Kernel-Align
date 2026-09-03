@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import ast
 import os
+import sys
 from collections import namedtuple
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -22,6 +23,7 @@ from rl_engine.integrations.ablation import (
 from rl_engine.integrations.framework_operators import (
     MegatronAttentionOperator,
     SemanticOperatorHandle,
+    VllmAttentionOperator,
     VllmLogpOperator,
     _megatron_zigzag_layout,
     _packed_local_sequence_layout,
@@ -36,6 +38,7 @@ from rl_engine.integrations.runtime import FrameworkOperatorIntegration
 from rl_engine.integrations.state import clear_active_integration
 from rl_engine.integrations.vllm_runtime import (
     _patch_qwen3_strict_model,
+    _register_attention_backend,
     configure_vllm_environment,
 )
 from rl_engine.kernels.attention_contract import (
@@ -135,6 +138,79 @@ def test_vllm_rlkernel_attention_overrides_selected_flash_attn_backend(
     assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASH_ATTN"
 
 
+def test_vllm_rocm_attention_selects_aiter_metadata_backend(monkeypatch):
+    monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
+    monkeypatch.setattr(torch.version, "hip", "7.1")
+    plan = IntegrationPlan.from_case_ids(attention="P/R")
+
+    configure_vllm_environment(plan)
+
+    assert os.environ["VLLM_ATTENTION_BACKEND"] == "ROCM_AITER_FA"
+
+
+def test_vllm_rocm_registration_wraps_aiter_backend(monkeypatch):
+    selected = []
+
+    class BackendEnum:
+        ROCM_AITER_FA = "ROCM_AITER_FA"
+        FLASH_ATTN = "FLASH_ATTN"
+
+    class AiterImpl:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        def forward(self, *args, **kwargs):
+            return args, kwargs
+
+    class AiterBuilder:
+        pass
+
+    class AiterBackend:
+        pass
+
+    registry = ModuleType("vllm.v1.attention.backends.registry")
+    registry.AttentionBackendEnum = BackendEnum
+    registry.register_backend = lambda backend, path: selected.append((backend, path))
+    aiter = ModuleType("vllm.v1.attention.backends.rocm_aiter_fa")
+    aiter.AiterFlashAttentionBackend = AiterBackend
+    aiter.AiterFlashAttentionImpl = AiterImpl
+    aiter.AiterFlashAttentionMetadataBuilder = AiterBuilder
+    monkeypatch.setitem(sys.modules, registry.__name__, registry)
+    monkeypatch.setitem(sys.modules, aiter.__name__, aiter)
+    monkeypatch.setattr(torch.version, "hip", "7.1")
+
+    plan = IntegrationPlan.from_case_ids(attention="P/R")
+
+    class Integration:
+        def __init__(self):
+            self.plan = plan
+            self.installed = {}
+            self.hooks = []
+
+        def install_operator(self, module, operator):
+            self.installed[module] = operator
+
+        def record_installed_hook(self, module, hook):
+            self.hooks.append((module, hook))
+
+    integration = Integration()
+    _register_attention_backend(integration)
+
+    assert selected == [
+        (
+            BackendEnum.ROCM_AITER_FA,
+            "rl_engine.integrations.vllm_runtime.RlKernelAttentionBackend",
+        )
+    ]
+    assert "attention" in integration.installed
+    assert integration.hooks == [
+        (
+            "attention",
+            "rl_engine.integrations.vllm_runtime.RlKernelAttentionBackend",
+        )
+    ]
+
+
 def test_megatron_install_is_idempotent_in_one_actor():
     class Attention:
         def forward(self, value):
@@ -193,7 +269,8 @@ def test_megatron_packed_attention_runs_each_sequence_in_thd_order(monkeypatch):
     calls: list[dict[str, object]] = []
 
     class Operator:
-        def bind_cuda_runtime(self, *, process_group=None):
+        def bind_accelerator_runtime(self, tensor, *, process_group=None):
+            assert tensor is query
             assert process_group == "cp-group"
 
         def __call__(self, q, k, v, **kwargs):
@@ -224,11 +301,11 @@ def test_megatron_packed_attention_runs_each_sequence_in_thd_order(monkeypatch):
         get_tensor_model_parallel_rank=lambda: 0,
         get_context_parallel_group=lambda: "cp-group",
     )
+    monkeypatch.setattr(framework_operators, "_megatron_parallel_state", lambda: parallel_state)
     monkeypatch.setattr(
-        framework_operators, "_megatron_parallel_state", lambda: parallel_state
-    )
-    monkeypatch.setattr(
-        framework_operators, "_require_nvidia_cuda", lambda tensor, module: None
+        framework_operators,
+        "_require_attention_accelerator",
+        lambda tensor: "cuda",
     )
     packed = SimpleNamespace(
         qkv_format="thd",
@@ -259,6 +336,116 @@ def test_megatron_packed_attention_runs_each_sequence_in_thd_order(monkeypatch):
     ]
 
 
+def test_megatron_attention_binds_rocm_core_and_schedule(monkeypatch):
+    calls = []
+
+    class Operator:
+        def bind_accelerator_runtime(self, tensor, *, process_group=None):
+            calls.append((tensor, process_group))
+
+        def __call__(self, q, k, v, **kwargs):
+            del k, v
+            calls.append(kwargs)
+            return SimpleNamespace(
+                out=q.clone(),
+                provenance={
+                    "actual_backend": "rlkernel.rocm.attention.aiter_ck_ag_rs.v1",
+                    "fallback": False,
+                },
+            )
+
+    operator = Operator()
+
+    class Handle:
+        provenance = {}
+
+        def get(self, tensor, *, topology):
+            assert topology["context_parallel_size"] == 1
+            return operator
+
+    parallel_state = SimpleNamespace(
+        get_context_parallel_world_size=lambda: 1,
+        get_context_parallel_rank=lambda: 0,
+        get_tensor_model_parallel_world_size=lambda: 2,
+        get_tensor_model_parallel_rank=lambda: 0,
+    )
+    monkeypatch.setattr(framework_operators, "_megatron_parallel_state", lambda: parallel_state)
+    monkeypatch.setattr(
+        framework_operators,
+        "_require_attention_accelerator",
+        lambda tensor: "rocm",
+    )
+    query = torch.zeros(4, 1, 2, 8, dtype=torch.bfloat16)
+    key = torch.zeros(4, 1, 1, 8, dtype=torch.bfloat16)
+    adapter = MegatronAttentionOperator(handle=Handle())
+
+    output = adapter(SimpleNamespace(softmax_scale=0.25), query, key, key, None)
+
+    assert output.shape == (4, 1, 16)
+    assert calls[0] == (query, None)
+    config = calls[1]["config"]
+    assert config.strict_core_id == "rlkernel.attention.rocm.aiter_ck_dense_mha.v1"
+    assert config.strict_schedule == "single_batch_aiter_ck_dense_mha_no_splitkv"
+    assert calls[1]["communication_backend"] == "none"
+    assert adapter.provenance["execution"]["runtime_platform"] == "rocm"
+
+
+def test_vllm_attention_routes_paged_cache_to_rocm_runtime(monkeypatch):
+    runtime_calls = []
+
+    class Runtime:
+        def forward_paged_with_lse(self, q, k, v, **kwargs):
+            runtime_calls.append((q, k, v, kwargs))
+            return SimpleNamespace(
+                out=q.clone(),
+                lse=torch.zeros(q.shape[:-1], dtype=torch.float32),
+                provenance={
+                    "actual_backend": "rlkernel.rocm.attention.aiter_ck_ag_rs.v1",
+                    "fallback": False,
+                },
+            )
+
+    class Operator:
+        def bind_accelerator_runtime(self, tensor, *, process_group=None):
+            assert process_group is None
+            return Runtime()
+
+    class Handle:
+        provenance = {}
+
+        def get(self, tensor, *, topology):
+            assert topology["context_parallel_size"] == 1
+            return Operator()
+
+    monkeypatch.setattr(
+        framework_operators,
+        "_require_attention_accelerator",
+        lambda tensor: "rocm",
+    )
+    query = torch.zeros(1, 2, 8, dtype=torch.bfloat16)
+    kv_cache = torch.zeros(2, 1, 4, 16, dtype=torch.bfloat16)
+    metadata = SimpleNamespace(
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        num_actual_tokens=1,
+        max_seq_len=1,
+    )
+    impl = SimpleNamespace(head_size=8, num_heads=2, num_kv_heads=1, scale=8**-0.5)
+    adapter = VllmAttentionOperator(handle=Handle())
+
+    output = adapter(impl, object(), query, query, query, kv_cache, metadata)
+
+    assert output.shape == (1, 16)
+    assert len(runtime_calls) == 1
+    assert runtime_calls[0][0].shape == (1, 2, 1, 8)
+    assert adapter.provenance["execution"]["runtime_platform"] == "rocm"
+    assert (
+        adapter.provenance["execution"]["materialization"]
+        == "logical_paged_kv_to_aiter_ck_dense"
+    )
+
+
 def test_vllm_current_flash_attention_kv_cache_layout_is_materialized():
     cache = torch.arange(2 * 3 * 4 * 10).reshape(2, 3, 4, 10)
 
@@ -268,6 +455,49 @@ def test_vllm_current_flash_attention_kv_cache_layout_is_materialized():
     assert value.shape == (2, 4, 3, 5)
     assert torch.equal(key, cache.transpose(1, 2)[..., :5])
     assert torch.equal(value, cache.transpose(1, 2)[..., 5:])
+
+
+def test_vllm_rocm_kv_cache_pair_axis_is_materialized():
+    cache = torch.arange(3 * 2 * 4 * 1 * 5).reshape(3, 2, 4, 1, 5)
+
+    key, value = _vllm_kv_cache_views(
+        cache,
+        head_size=5,
+        num_kv_heads=1,
+        platform="rocm",
+    )
+
+    assert key.shape == (3, 4, 1, 5)
+    assert value.shape == (3, 4, 1, 5)
+    assert torch.equal(key, cache[:, 0])
+    assert torch.equal(value, cache[:, 1])
+
+
+def test_vllm_rocm_lhbnc_kv_cache_is_normalized_to_block_major():
+    cache = torch.arange(2 * 1 * 3 * 4 * 5).reshape(2, 1, 3, 4, 5)
+
+    key, value = _vllm_kv_cache_views(cache, head_size=5, num_kv_heads=1)
+
+    assert key.shape == (3, 4, 1, 5)
+    assert value.shape == (3, 4, 1, 5)
+    assert torch.equal(key, cache[0].permute(1, 2, 0, 3))
+    assert torch.equal(value, cache[1].permute(1, 2, 0, 3))
+
+
+def test_vllm_rocm_flattened_kv_cache_is_unpacked():
+    cache = torch.arange(3 * 2 * 4 * 10).reshape(3, 2, 4, 10)
+
+    key, value = _vllm_kv_cache_views(
+        cache,
+        head_size=5,
+        num_kv_heads=2,
+        platform="rocm",
+    )
+
+    assert key.shape == (3, 4, 2, 5)
+    assert value.shape == (3, 4, 2, 5)
+    assert torch.equal(key.flatten(2), cache[:, 0])
+    assert torch.equal(value.flatten(2), cache[:, 1])
 
 
 def test_megatron_strict_attention_projections_install_without_debug_environment(
@@ -586,6 +816,28 @@ def test_strict_readback_accepts_cuda_without_triton():
                 {
                     "runtime_platform": "cuda",
                     "actual_backend": "rlkernel.cuda.fa4",
+                    "triton_used": False,
+                }
+            )
+        },
+    )
+    integration.record_installed_hook("attention", "test.attention")
+    integration.execute("attention", lambda value: value, "x")
+
+    integration.assert_strict_ready()
+
+
+def test_strict_readback_accepts_rocm_without_triton():
+    plan = IntegrationPlan.from_case_ids(attention="R/R")
+    integration = FrameworkOperatorIntegration(
+        framework="megatron",
+        target="training",
+        plan=plan,
+        rl_kernel_operators={
+            "attention": _ReadbackOperator(
+                {
+                    "runtime_platform": "rocm",
+                    "actual_backend": "rlkernel.rocm.attention.aiter_ck_ag_rs.v1",
                     "triton_used": False,
                 }
             )
