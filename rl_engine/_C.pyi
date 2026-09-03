@@ -24,6 +24,10 @@ def deterministic_collective_all_gather_fused(
 ) -> None: ...
 def fused_logp(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor: ...
 def fused_logp_sm90(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor: ...
+def fused_logp_sm90_with_lse(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
 def batch_invariant_logp_sm90(
     logits: torch.Tensor,
     target: torch.Tensor,
@@ -144,6 +148,39 @@ def fused_logp_forward_online_indexed_out(
 def fused_logp_forward_online_indexed_fp32(
     logits: torch.Tensor,
     token_ids: torch.Tensor,
+    row_indices: torch.Tensor,
+) -> torch.Tensor: ...
+def fused_logp_forward_with_lse(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
+def fused_logp_forward_indexed_with_lse(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    row_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
+def fused_logp_forward_online_with_lse(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
+def fused_logp_forward_online_indexed_with_lse(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    row_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
+def fused_logp_backward(
+    grad_out: torch.Tensor,
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    row_max: torch.Tensor,
+    log_sum: torch.Tensor,
+) -> torch.Tensor: ...
+def fused_logp_backward_indexed(
+    grad_out: torch.Tensor,
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    row_max: torch.Tensor,
+    log_sum: torch.Tensor,
     row_indices: torch.Tensor,
 ) -> torch.Tensor: ...
 def deterministic_logp(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor: ...
