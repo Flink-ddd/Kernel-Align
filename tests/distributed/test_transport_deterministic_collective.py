@@ -257,6 +257,7 @@ def test_latest_collective_api_can_skip_signature_handshakes(
         (peers[0], peers[0]),
         validate_signature=False,
     )
+    fake_dist.peer_inputs = [torch.cat((peer, peer), dim=-1) for peer in peers]
     scattered = collective.reduce_scatter_many(
         (peers[0], peers[0]),
         validate_signature=False,
@@ -277,6 +278,79 @@ def test_reduce_scatter_reduces_then_selects_local_leading_shard(
 
     expected_full = torch.full_like(peers[0], 10)
     assert torch.equal(output, expected_full.chunk(4, dim=0)[2])
+
+
+def test_reduce_scatter_many_packs_lanes_and_transports_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Each lane must retain its own balanced tree. A left fold would produce
+    # one for lane 0 and two for lane 1, while the fixed tree produces zero for
+    # both lanes in FP32.
+    lane_values = [
+        (
+            1.0e20,
+            1.0,
+            -1.0e20,
+            1.0,
+        ),
+        (
+            1.0e20,
+            2.0,
+            -1.0e20,
+            2.0,
+        ),
+    ]
+    # Give each rank distinct values while preserving the cancellation pattern
+    # in every row. The fake transport returns these packed rank inputs.
+    lane_peers = [
+        (
+            torch.full((8, 1), lane_values[0][rank], dtype=torch.float32),
+            torch.full((8, 1), lane_values[1][rank], dtype=torch.float32),
+        )
+        for rank in range(4)
+    ]
+    packed_peers = [torch.cat(lanes, dim=-1) for lanes in lane_peers]
+    collective, fake_dist = _make_collective(monkeypatch, packed_peers, rank=2)
+
+    local_lanes = lane_peers[2]
+    outputs = (torch.empty(2, 1), torch.empty(2, 1))
+    returned = collective.reduce_scatter_many(local_lanes, outs=outputs)
+
+    assert returned[0] is outputs[0]
+    assert returned[1] is outputs[1]
+    assert torch.equal(outputs[0], torch.zeros_like(outputs[0]))
+    assert torch.equal(outputs[1], torch.zeros_like(outputs[1]))
+    assert fake_dist.tensor_transport_calls == 1
+
+
+def test_reduce_scatter_many_rejects_oversized_packed_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peers = [torch.ones(4, 2, dtype=torch.float32) for _ in range(2)]
+    collective, fake_dist = _make_collective(
+        monkeypatch,
+        peers,
+        max_size_bytes=32,
+    )
+    monkeypatch.setattr(collectives, "_PACKED_REDUCE_SCATTER_MAX_BYTES", 1024)
+
+    with pytest.raises(ValueError, match="packed input requires"):
+        collective.reduce_scatter_many((peers[0], peers[0]))
+    assert fake_dist.tensor_transport_calls == 0
+
+
+def test_reduce_scatter_many_uses_separate_calls_for_large_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peers = [torch.ones(4, 2, dtype=torch.float32) for _ in range(2)]
+    collective, fake_dist = _make_collective(monkeypatch, peers)
+    monkeypatch.setattr(collectives, "_PACKED_REDUCE_SCATTER_MAX_BYTES", 1)
+
+    outputs = collective.reduce_scatter_many((peers[0], peers[0]))
+
+    assert len(outputs) == 2
+    assert all(torch.equal(output, torch.full_like(output, 2)) for output in outputs)
+    assert fake_dist.tensor_transport_calls == 2
 
 
 def test_matching_signature_is_checked_before_tensor_transport(

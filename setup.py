@@ -147,6 +147,10 @@ def get_extensions():
             # This source contains NVIDIA PTX (cp.async, ldmatrix, and mma.sync).
             # The ROCm dispatcher falls back to PyTorch SDPA for this operator.
             cuda_sources.append("csrc/cuda/attention/prefix_shared_attention.cu")
+        else:
+            # RCCL remains transport-only on ROCm; this HIP kernel performs
+            # the fixed balanced-tree arithmetic after AllGather.
+            cuda_sources.append("csrc/rocm/distributed/deterministic_collective.hip")
 
         nvcc_flags = ["-O3", "-Xfatbin", "-compress-all"]
         if envs.env_flag(envs.KERNEL_ALIGN_USE_FAST_MATH):

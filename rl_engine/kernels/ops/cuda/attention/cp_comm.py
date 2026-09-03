@@ -641,10 +641,14 @@ class _RCCLRankOrderedTransport:
             raise AttentionCPCommunicationUnavailable(
                 "RCCL Scatter leading dimension must divide the CP world size"
             )
-        chunks = tuple(chunk.contiguous() for chunk in full.chunk(self.world_size, dim=0))
-        local = torch.empty_like(chunks[self.rank])
+        # ``full`` is contiguous and split along its leading dimension, so
+        # each root chunk is already contiguous. Non-root ranks do not need a
+        # scatter list at all; avoiding those copies matters for strict CP
+        # output tensors, which can be large.
+        local_shape = (full.size(0) // self.world_size, *full.shape[1:])
+        local = torch.empty(local_shape, dtype=full.dtype, device=full.device)
         if self.world_size == 1:
-            local.copy_(chunks[0])
+            local.copy_(full)
             return local
 
         # ``src`` is a global rank even when a subgroup is supplied.
@@ -660,12 +664,8 @@ class _RCCLRankOrderedTransport:
                         "PyTorch cannot map the RCCL subgroup root to a global rank"
                     )
                 global_root = int(get_group_ranks(self.group)[self.root])
-        dist.scatter(
-            local,
-            scatter_list=list(chunks) if self.rank == self.root else None,
-            src=global_root,
-            group=self.group,
-        )
+        scatter_list = list(full.chunk(self.world_size, dim=0)) if self.rank == self.root else None
+        dist.scatter(local, scatter_list=scatter_list, src=global_root, group=self.group)
         return local
 
     def reduce_scatter(self, full: torch.Tensor) -> torch.Tensor:

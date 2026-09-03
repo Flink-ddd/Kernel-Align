@@ -40,6 +40,7 @@ def test_rocm_build_excludes_cuda_ipc_collective_and_driver(monkeypatch) -> None
     extension = _load_extension_config(monkeypatch, hip="test")
 
     assert "csrc/cuda/distributed/deterministic_collective.cu" not in extension["sources"]
+    assert "csrc/rocm/distributed/deterministic_collective.hip" in extension["sources"]
     assert "-DKERNEL_ALIGN_WITH_ROCM" in extension["extra_compile_args"]["cxx"]
     assert "-DKERNEL_ALIGN_WITH_CUDA" not in extension["extra_compile_args"]["cxx"]
     assert "-lcuda" not in extension["extra_link_args"]
