@@ -30,12 +30,8 @@ class Arm:
 
 ARMS = {
     "G00": Arm("G00", False, "P/P", "P/P", "P/P", "native VIME baseline"),
-    "G10": Arm(
-        "G10", True, "P/P", "P/P", "P/P", "VIME framework-level consistency only"
-    ),
-    "G01": Arm(
-        "G01", False, "R/R", "R/R", "R/R", "RL-Kernel operator-level consistency only"
-    ),
+    "G10": Arm("G10", True, "P/P", "P/P", "P/P", "VIME framework-level consistency only"),
+    "G01": Arm("G01", False, "R/R", "R/R", "R/R", "RL-Kernel operator-level consistency only"),
     "G11": Arm(
         "G11",
         True,
@@ -44,6 +40,16 @@ ARMS = {
         "R/R",
         "framework-level and operator-level consistency",
     ),
+    # Short operator-attribution matrix. Framework logp reuse stays disabled so
+    # that only Attention, FFN, and selected-token logp change across M000-M111.
+    "M000": Arm("M000", False, "P/P", "P/P", "P/P", "all production"),
+    "M100": Arm("M100", False, "R/R", "P/P", "P/P", "RL-Kernel attention"),
+    "M010": Arm("M010", False, "P/P", "R/R", "P/P", "RL-Kernel FFN"),
+    "M001": Arm("M001", False, "P/P", "P/P", "R/R", "RL-Kernel logp"),
+    "M110": Arm("M110", False, "R/R", "R/R", "P/P", "RL-Kernel attention and FFN"),
+    "M101": Arm("M101", False, "R/R", "P/P", "R/R", "RL-Kernel attention and logp"),
+    "M011": Arm("M011", False, "P/P", "R/R", "R/R", "RL-Kernel FFN and logp"),
+    "M111": Arm("M111", False, "R/R", "R/R", "R/R", "all RL-Kernel operators"),
 }
 
 TOPOLOGY = {
@@ -64,9 +70,7 @@ TOPOLOGY = {
 # Pinning the choice keeps the production arms independent of host-specific
 # backend auto-selection.
 MEGATRON_ATTENTION_BACKEND = "fused"
-RL_KERNEL_LINEAR_LOGP_PROVIDER = (
-    "rl_engine.integrations.vime.linear_logp_provider.provider"
-)
+RL_KERNEL_LINEAR_LOGP_PROVIDER = "rl_engine.integrations.vime.linear_logp_provider.provider"
 
 MODEL_ARGS = (
     "--swiglu",
@@ -191,9 +195,7 @@ def _gpu_inventory() -> list[dict[str, str]]:
     inventory = []
     for line in result.stdout.splitlines():
         index, name, memory, driver = (field.strip() for field in line.split(",", 3))
-        inventory.append(
-            {"index": index, "name": name, "memory_mib": memory, "driver": driver}
-        )
+        inventory.append({"index": index, "name": name, "memory_mib": memory, "driver": driver})
     return inventory
 
 
@@ -203,9 +205,7 @@ def _default_run_id(group: str, num_rollout: int, seed: int) -> str:
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -222,9 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-root", default=os.environ.get("MODEL_ROOT"))
     parser.add_argument("--ref-load", default=os.environ.get("TORCH_DIST_ROOT"))
     parser.add_argument("--prompt-data", default=os.environ.get("PROMPT_DATA"))
-    parser.add_argument(
-        "--python", default=os.environ.get("RL_KERNEL_REAL_PYTHON", sys.executable)
-    )
+    parser.add_argument("--python", default=os.environ.get("RL_KERNEL_REAL_PYTHON", sys.executable))
     parser.add_argument("--ray-bin", default=os.environ.get("RAY_BIN"))
     parser.add_argument(
         "--ray-address",
@@ -258,12 +256,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--extra-pythonpath", action="append", default=[])
-    parser.add_argument(
-        "--ld-library-path", default=os.environ.get("LD_LIBRARY_PATH", "")
-    )
-    parser.add_argument(
-        "--wait", action="store_true", help="stream logs until the Ray job exits"
-    )
+    parser.add_argument("--ld-library-path", default=os.environ.get("LD_LIBRARY_PATH", ""))
+    parser.add_argument("--wait", action="store_true", help="stream logs until the Ray job exits")
     parser.add_argument(
         "--allow-dirty",
         action="store_true",
@@ -279,9 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.num_rollout <= 0:
         raise ValueError("--num-rollout must be positive")
-    trajectories_per_rollout = (
-        args.rollout_batch_size * args.n_samples_per_prompt
-    )
+    trajectories_per_rollout = args.rollout_batch_size * args.n_samples_per_prompt
     if args.global_batch_size != trajectories_per_rollout:
         raise ValueError(
             "--global-batch-size must equal --rollout-batch-size * "
@@ -312,9 +304,7 @@ def main(argv: list[str] | None = None) -> int:
         "vime": _repository_state(vime_root),
         "megatron": _repository_state(megatron_root),
     }
-    dirty_repositories = [
-        name for name, state in repository_state.items() if state["dirty"]
-    ]
+    dirty_repositories = [name for name, state in repository_state.items() if state["dirty"]]
     if dirty_repositories and not args.allow_dirty:
         raise RuntimeError(
             "refusing a non-reproducible run from dirty repositories: "
@@ -324,20 +314,14 @@ def main(argv: list[str] | None = None) -> int:
 
     run_id = args.run_id or _default_run_id(args.group, args.num_rollout, args.seed)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", run_id):
-        raise ValueError(
-            "--run-id may contain only letters, digits, dot, underscore, and dash"
-        )
+        raise ValueError("--run-id may contain only letters, digits, dot, underscore, and dash")
     run_dir = args.output_root.expanduser().resolve() / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
 
     pythonpath = [str(rl_kernel_root), str(vime_root), str(megatron_root)]
-    pythonpath.extend(
-        str(Path(item).expanduser().resolve()) for item in args.extra_pythonpath
-    )
+    pythonpath.extend(str(Path(item).expanduser().resolve()) for item in args.extra_pythonpath)
     if os.environ.get("PYTHONPATH"):
-        pythonpath.extend(
-            item for item in os.environ["PYTHONPATH"].split(os.pathsep) if item
-        )
+        pythonpath.extend(item for item in os.environ["PYTHONPATH"].split(os.pathsep) if item)
 
     max_engine_decode_batch = _max_engine_decode_batch(
         args.rollout_batch_size, args.n_samples_per_prompt, args.router_policy
@@ -371,9 +355,7 @@ def main(argv: list[str] | None = None) -> int:
         "RL_KERNEL_RUN_ID": run_id,
     }
     if os.environ.get("CUDNN_FRONTEND_CUDART_LIB_NAME"):
-        env_vars["CUDNN_FRONTEND_CUDART_LIB_NAME"] = os.environ[
-            "CUDNN_FRONTEND_CUDART_LIB_NAME"
-        ]
+        env_vars["CUDNN_FRONTEND_CUDART_LIB_NAME"] = os.environ["CUDNN_FRONTEND_CUDART_LIB_NAME"]
 
     train_command = [
         str(entrypoint),
@@ -478,9 +460,7 @@ def main(argv: list[str] | None = None) -> int:
     if arm.framework_use_rollout_logprobs:
         train_command.append("--use-rollout-logprobs")
     if args.use_kl_loss:
-        train_command.extend(
-            ["--use-kl-loss", "--kl-loss-coef", str(args.kl_loss_coef)]
-        )
+        train_command.extend(["--use-kl-loss", "--kl-loss-coef", str(args.kl_loss_coef)])
     if {arm.attention_case, arm.ffn_case, arm.logp_case} == {"R/R"}:
         train_command.extend(
             [
@@ -540,9 +520,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         "snapshotting": {
             "train_data_every_step": True,
-            "template": str(
-                run_dir / "train-data" / "{rollout_id}.rank{rank}.pt"
-            ),
+            "template": str(run_dir / "train-data" / "{rollout_id}.rank{rank}.pt"),
             "full_model_checkpoint_every_step": False,
         },
         "rollout_routing": {
@@ -568,9 +546,7 @@ def main(argv: list[str] | None = None) -> int:
             "ref_load": str(ref_load),
             "prompt_data": str(prompt_data),
         },
-        "revisions": {
-            name: state["revision"] for name, state in repository_state.items()
-        },
+        "revisions": {name: state["revision"] for name, state in repository_state.items()},
         "repository_state": repository_state,
         "prompt_data_sha256": _sha256(prompt_data),
         "gpu_inventory": _gpu_inventory(),

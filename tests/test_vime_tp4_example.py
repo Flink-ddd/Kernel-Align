@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-from dataclasses import asdict
 import os
-from pathlib import Path
 import subprocess
+from dataclasses import asdict
+from pathlib import Path
 
 from examples.vime_qwen3_8b_tp4_cp2_200.run_arm import (
     ARMS,
@@ -12,6 +12,7 @@ from examples.vime_qwen3_8b_tp4_cp2_200.run_arm import (
     RL_KERNEL_LINEAR_LOGP_PROVIDER,
     _linear_logp_provider_args,
 )
+from examples.vime_qwen3_8b_tp4_cp2_200.run_supplement_suite import specs
 from examples.vime_qwen3_8b_tp4_cp2_200.validate_run import (
     VIME_NATIVE_LINEAR_LOGP_MARKER,
     _validate_readbacks,
@@ -50,8 +51,7 @@ def _production_readbacks() -> list[dict]:
             "target": "rollout",
             "installed_hooks": {module: module for module in vllm_modules},
             "operators": {
-                module: _production_operator("vllm", "rollout", module)
-                for module in vllm_modules
+                module: _production_operator("vllm", "rollout", module) for module in vllm_modules
             },
             "fallbacks": [],
         },
@@ -64,12 +64,7 @@ def test_tp4_formal_matrix_pins_the_vime_qwen3_attention_backend():
 
 def test_launcher_forces_cuda_graph_without_a_logp_provider():
     root = Path(__file__).parents[1]
-    launcher = (
-        root
-        / "examples"
-        / "vime_qwen3_8b_tp4_cp2_200"
-        / "aligned_python_entrypoint.sh"
-    )
+    launcher = root / "examples" / "vime_qwen3_8b_tp4_cp2_200" / "aligned_python_entrypoint.sh"
     env = os.environ.copy()
     env.update(
         RL_KERNEL_REAL_PYTHON="/bin/echo",
@@ -114,6 +109,54 @@ def test_rlkernel_arms_install_the_strict_logp_provider():
 
     assert _linear_logp_provider_args(ARMS["G01"]) == expected
     assert _linear_logp_provider_args(ARMS["G11"]) == expected
+
+
+def test_module_ablation_matrix_changes_only_operator_routes():
+    expected = {
+        "M000": ("P/P", "P/P", "P/P"),
+        "M100": ("R/R", "P/P", "P/P"),
+        "M010": ("P/P", "R/R", "P/P"),
+        "M001": ("P/P", "P/P", "R/R"),
+        "M110": ("R/R", "R/R", "P/P"),
+        "M101": ("R/R", "P/P", "R/R"),
+        "M011": ("P/P", "R/R", "R/R"),
+        "M111": ("R/R", "R/R", "R/R"),
+    }
+
+    for group, cases in expected.items():
+        arm = ARMS[group]
+        assert not arm.framework_use_rollout_logprobs
+        assert (arm.attention_case, arm.ffn_case, arm.logp_case) == cases
+
+
+def test_module_ablation_logp_provider_follows_training_route():
+    provider_groups = {"M001", "M101", "M011", "M111"}
+    expected_module_groups = {
+        "M000",
+        "M100",
+        "M010",
+        "M001",
+        "M110",
+        "M101",
+        "M011",
+        "M111",
+    }
+    for group in expected_module_groups:
+        has_provider = bool(_linear_logp_provider_args(ARMS[group]))
+        assert has_provider == (group in provider_groups)
+    assert expected_module_groups == {key for key in ARMS if key.startswith("M")}
+
+
+def test_supplement_suite_uses_short_module_and_three_seed_precision_designs():
+    module = specs("module")
+    assert len(module) == 8
+    assert all(rounds == 8 and seed == 1234 for _, rounds, seed in module)
+
+    precision = specs("precision")
+    assert len(precision) == 12
+    assert {group for group, _, _ in precision} == {"G00", "G10", "G01", "G11"}
+    assert {seed for _, _, seed in precision} == {1234, 2345, 3456}
+    assert all(rounds == 30 for _, rounds, _ in precision)
 
 
 def test_validator_accepts_native_vime_logp_evidence_for_production_arm():
@@ -166,4 +209,6 @@ def test_validator_rejects_production_label_over_rlkernel_actual_backend():
     )
 
     assert not report["passed"]
-    assert any("production route executed an RL-Kernel backend" in error for error in report["errors"])
+    assert any(
+        "production route executed an RL-Kernel backend" in error for error in report["errors"]
+    )
