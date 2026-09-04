@@ -156,7 +156,7 @@ def test_supplement_suite_uses_short_module_and_three_seed_precision_designs():
     assert len(precision) == 12
     assert {group for group, _, _ in precision} == {"G00", "G10", "G01", "G11"}
     assert {seed for _, _, seed in precision} == {1234, 2345, 3456}
-    assert all(rounds == 30 for _, rounds, _ in precision)
+    assert all(rounds == 8 for _, rounds, _ in precision)
 
 
 def test_validator_accepts_native_vime_logp_evidence_for_production_arm():

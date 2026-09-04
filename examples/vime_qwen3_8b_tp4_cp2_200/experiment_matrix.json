@@ -32,7 +32,7 @@
   },
   "phases": {
     "short": {"num_rollout": 8, "seeds": [1234]},
-    "precision": {"num_rollout": 30, "seeds": [1234, 2345, 3456]},
+    "precision": {"num_rollout": 8, "seeds": [1234, 2345, 3456]},
     "convergence": {"num_rollout": 200, "seeds": [1234]},
     "module_ablation": {
       "num_rollout": 8,

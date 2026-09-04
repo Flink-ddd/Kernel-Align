@@ -91,7 +91,7 @@ def wait_for_idle_gpus(*, threshold: int, poll_seconds: int) -> None:
 def specs(phase: str) -> list[tuple[str, int, int]]:
     if phase == "module":
         return [(group, 8, 1234) for group in MODULE_GROUPS]
-    return [(group, 30, seed) for seed in PRECISION_SEEDS for group in PRECISION_GROUPS]
+    return [(group, 8, seed) for seed in PRECISION_SEEDS for group in PRECISION_GROUPS]
 
 
 def run_one(args: argparse.Namespace, group: str, rounds: int, seed: int) -> None:
