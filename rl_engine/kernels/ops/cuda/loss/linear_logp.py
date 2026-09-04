@@ -1247,9 +1247,7 @@ class _StrictLocalLogitsTPAutograd(torch.autograd.Function):
         )
         if grad_lse is not None:
             probs = torch.exp(logits.float() - lse.reshape(-1, 1))
-            dlogits = (dlogits.float() + probs * grad_lse.reshape(-1, 1).float()).to(
-                torch.bfloat16
-            )
+            dlogits = (dlogits.float() + probs * grad_lse.reshape(-1, 1).float()).to(torch.bfloat16)
         if temp.numel():
             dlogits = (dlogits.float() / temp.reshape(-1, 1)).to(torch.bfloat16)
         return dlogits.reshape(ctx.input_shape).contiguous(), None, None, None, None, None, None

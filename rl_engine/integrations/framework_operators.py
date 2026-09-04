@@ -436,9 +436,7 @@ class MegatronAttentionOperator:
             return cached
         if len(self._position_ids_cache) >= 128:
             self._position_ids_cache.pop(next(iter(self._position_ids_cache)))
-        value = torch.tensor(positions, dtype=torch.int64, device=device).repeat(
-            batch_size, 1
-        )
+        value = torch.tensor(positions, dtype=torch.int64, device=device).repeat(batch_size, 1)
         self._position_ids_cache[key] = value
         return value
 

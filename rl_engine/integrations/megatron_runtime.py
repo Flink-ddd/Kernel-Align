@@ -78,9 +78,7 @@ class _DeterministicTPOutputProjection(torch.autograd.Function):
         from rl_engine.kernels.ops.cuda.matmul.det_gemm import det_gemm_linear
 
         if input_value.ndim == 3:
-            input_2d = input_value.transpose(0, 1).contiguous().reshape(
-                -1, input_value.shape[-1]
-            )
+            input_2d = input_value.transpose(0, 1).contiguous().reshape(-1, input_value.shape[-1])
             ctx.batch_major = True
         else:
             input_2d = input_value.reshape(-1, input_value.shape[-1]).contiguous()
@@ -88,9 +86,7 @@ class _DeterministicTPOutputProjection(torch.autograd.Function):
         weight_2d = weight.contiguous()
         output_2d = det_gemm_linear(input_2d, weight_2d)
         if bias is not None:
-            output_2d = (output_2d.float() + bias.float().reshape(1, -1)).to(
-                torch.bfloat16
-            )
+            output_2d = (output_2d.float() + bias.float().reshape(1, -1)).to(torch.bfloat16)
         ctx.save_for_backward(input_2d, weight_2d)
         ctx.input_shape = input_value.shape
         ctx.input_dtype = input_value.dtype
@@ -100,9 +96,7 @@ class _DeterministicTPOutputProjection(torch.autograd.Function):
         ctx.tp_group = tp_group
         if ctx.batch_major:
             return (
-                output_2d.reshape(
-                    input_value.shape[1], input_value.shape[0], weight.size(0)
-                )
+                output_2d.reshape(input_value.shape[1], input_value.shape[0], weight.size(0))
                 .transpose(0, 1)
                 .contiguous()
             )
@@ -110,9 +104,7 @@ class _DeterministicTPOutputProjection(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor):
-        from rl_engine.kernels.ops.cuda.loss.linear_logp import (
-            _deterministic_tp_all_reduce_,
-        )
+        from rl_engine.kernels.ops.cuda.loss.linear_logp import _deterministic_tp_all_reduce_
         from rl_engine.kernels.ops.cuda.matmul.det_gemm import (
             det_gemm_linear_input_gradient,
             det_gemm_linear_weight_gradient,
@@ -120,11 +112,7 @@ class _DeterministicTPOutputProjection(torch.autograd.Function):
 
         input_2d, weight = ctx.saved_tensors
         if ctx.batch_major:
-            dlogits = (
-                grad_output.transpose(0, 1)
-                .contiguous()
-                .reshape(-1, grad_output.shape[-1])
-            )
+            dlogits = grad_output.transpose(0, 1).contiguous().reshape(-1, grad_output.shape[-1])
         else:
             dlogits = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()
         if dlogits.dtype != torch.bfloat16:
@@ -134,16 +122,16 @@ class _DeterministicTPOutputProjection(torch.autograd.Function):
             grad_input = det_gemm_linear_input_gradient(dlogits, weight)
             _deterministic_tp_all_reduce_(grad_input, ctx.tp_group)
             if ctx.batch_major:
-                grad_input = grad_input.reshape(
-                    ctx.input_shape[1], ctx.input_shape[0], ctx.input_shape[2]
-                ).transpose(0, 1).contiguous()
+                grad_input = (
+                    grad_input.reshape(ctx.input_shape[1], ctx.input_shape[0], ctx.input_shape[2])
+                    .transpose(0, 1)
+                    .contiguous()
+                )
             else:
                 grad_input = grad_input.reshape(ctx.input_shape)
             grad_input = grad_input.to(ctx.input_dtype)
         if ctx.needs_input_grad[1]:
-            grad_weight = det_gemm_linear_weight_gradient(input_2d, dlogits).to(
-                ctx.weight_dtype
-            )
+            grad_weight = det_gemm_linear_weight_gradient(input_2d, dlogits).to(ctx.weight_dtype)
         if ctx.has_bias and ctx.needs_input_grad[2]:
             grad_bias = dlogits.float().sum(dim=0).to(ctx.bias_dtype)
         return grad_input, grad_weight, grad_bias, None
@@ -389,9 +377,7 @@ def _patch_strict_logp_output_layer(
         if output_weight is None:
             raise RuntimeError("strict TP LM head requires an explicit weight")
         gather_output = (
-            instance.gather_output
-            if runtime_gather_output is None
-            else bool(runtime_gather_output)
+            instance.gather_output if runtime_gather_output is None else bool(runtime_gather_output)
         )
         if gather_output:
             raise RuntimeError("strict reusable TP LM head does not support gathered logits")

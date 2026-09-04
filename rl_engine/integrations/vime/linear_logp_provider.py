@@ -64,9 +64,7 @@ def _default_strict_linear_logp() -> Any:
 
 def _as_positive_int(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise LinearLogpProviderUnavailable(
-            f"{name} must be a positive integer; got {value!r}"
-        )
+        raise LinearLogpProviderUnavailable(f"{name} must be a positive integer; got {value!r}")
     return value
 
 
@@ -98,9 +96,7 @@ def _tp_coordinates(tp_group: Any) -> tuple[int, int]:
 
 
 def _tile_count(metadata: Mapping[str, Any], padded_vocab_size: int) -> int:
-    configured = metadata.get(
-        "num_vocab_tiles", os.getenv("RL_KERNEL_LOGPROB_NUM_VOCAB_TILES")
-    )
+    configured = metadata.get("num_vocab_tiles", os.getenv("RL_KERNEL_LOGPROB_NUM_VOCAB_TILES"))
     if configured is None or configured == "":
         configured = DEFAULT_NUM_VOCAB_TILES
     try:
@@ -148,9 +144,7 @@ def _vocab_partition(
             f"{logits.shape[1]} * {tp_world_size} != {padded_vocab_size}"
         )
     if real_vocab_size > padded_vocab_size:
-        raise LinearLogpProviderUnavailable(
-            "real_vocab_size must not exceed padded_vocab_size"
-        )
+        raise LinearLogpProviderUnavailable("real_vocab_size must not exceed padded_vocab_size")
     return local_start, logits.shape[1], real_vocab_size, padded_vocab_size
 
 
@@ -165,14 +159,10 @@ def _contract_for_request(request: Any) -> tuple[LogprobContract, int]:
     if logits.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise LinearLogpProviderUnavailable(f"unsupported logit dtype {logits.dtype}")
     if targets.device != logits.device:
-        raise LinearLogpProviderUnavailable(
-            "target_ids must share the local logits device"
-        )
+        raise LinearLogpProviderUnavailable("target_ids must share the local logits device")
 
     layout = getattr(request, "token_layout", None)
-    cp_world_size = _as_positive_int(
-        getattr(layout, "world_size", None), "token_layout.world_size"
-    )
+    cp_world_size = _as_positive_int(getattr(layout, "world_size", None), "token_layout.world_size")
     cp_rank = getattr(layout, "rank", None)
     if (
         isinstance(cp_rank, bool)
@@ -185,13 +175,9 @@ def _contract_for_request(request: Any) -> tuple[LogprobContract, int]:
     if getattr(layout, "layout", None) not in (
         {"single"} if cp_world_size == 1 else {"zigzag", "allgather"}
     ):
-        raise LinearLogpProviderUnavailable(
-            "token_layout does not describe local token ownership"
-        )
+        raise LinearLogpProviderUnavailable("token_layout does not describe local token ownership")
 
-    tp_rank, tp_world_size = _tp_coordinates(
-        getattr(request, "tensor_parallel_group", None)
-    )
+    tp_rank, tp_world_size = _tp_coordinates(getattr(request, "tensor_parallel_group", None))
     declared_tp_rank = metadata.get("tp_rank")
     declared_tp_world_size = metadata.get("tp_world_size")
     if declared_tp_rank is not None and declared_tp_rank != tp_rank:
@@ -207,9 +193,7 @@ def _contract_for_request(request: Any) -> tuple[LogprobContract, int]:
     local_start, local_size, real_vocab_size, padded_vocab_size = _vocab_partition(
         request, logits, tp_rank, tp_world_size
     )
-    bounds = tuple(
-        (rank * local_size, (rank + 1) * local_size) for rank in range(tp_world_size)
-    )
+    bounds = tuple((rank * local_size, (rank + 1) * local_size) for rank in range(tp_world_size))
     contract = LogprobContract(
         role=LogprobRole.TRAIN,
         dtype={
@@ -217,9 +201,7 @@ def _contract_for_request(request: Any) -> tuple[LogprobContract, int]:
             torch.float16: LogprobDType.FP16,
             torch.float32: LogprobDType.FP32,
         }[logits.dtype],
-        mask=MaskSpec(
-            num_tokens=logits.shape[0], active_mask=(True,) * logits.shape[0]
-        ),
+        mask=MaskSpec(num_tokens=logits.shape[0], active_mask=(True,) * logits.shape[0]),
         sharding=ShardingSpec(
             tp_rank=tp_rank,
             tp_world_size=tp_world_size,
@@ -235,9 +217,7 @@ def _contract_for_request(request: Any) -> tuple[LogprobContract, int]:
 
 
 def _is_identity_temperature(value: Any) -> bool:
-    return value is None or (
-        not isinstance(value, torch.Tensor) and float(value) == 1.0
-    )
+    return value is None or (not isinstance(value, torch.Tensor) and float(value) == 1.0)
 
 
 @torch.no_grad()
@@ -259,9 +239,7 @@ def _metric_entropy_from_strict_lse(
     centered.sub_(lse.reshape(-1, 1).float())
     probabilities = centered.exp()
     centered.neg_()
-    local_entropy = torch.einsum(
-        "ij,ij->i", probabilities, centered
-    ).contiguous()
+    local_entropy = torch.einsum("ij,ij->i", probabilities, centered).contiguous()
     _rank, world = _tp_coordinates(tp_group)
     if world == 1:
         return local_entropy
@@ -289,19 +267,13 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> LinearLogpResult
     projection = getattr(context, "projection", None)
     partition = getattr(context, "vocab_partition", None)
     if strict and not isinstance(hidden, torch.Tensor):
-        raise RuntimeError(
-            "strict Vime linear_logp request is missing structural context"
-        )
+        raise RuntimeError("strict Vime linear_logp request is missing structural context")
     if strict and getattr(request, "log_prob_keep_mask", None) is not None:
-        raise RuntimeError(
-            "strict Vime linear_logp does not support top-p replay in this contract"
-        )
+        raise RuntimeError("strict Vime linear_logp does not support top-p replay in this contract")
     if linear_logp is None and strict and isinstance(hidden, torch.Tensor):
         linear_logp = _default_strict_linear_logp()
     if linear_logp is not None and isinstance(hidden, torch.Tensor):
-        if projection is None or not isinstance(
-            getattr(projection, "weight", None), torch.Tensor
-        ):
+        if projection is None or not isinstance(getattr(projection, "weight", None), torch.Tensor):
             raise RuntimeError("linear_logp context must expose projection.weight")
         if partition is None:
             raise RuntimeError("linear_logp context must expose vocab_partition")
@@ -410,9 +382,7 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> LinearLogpResult
             "hidden_shape": list(hidden.shape),
             "hidden_dtype": str(hidden.dtype).replace("torch.", ""),
             "target_shape": list(request.target_ids.shape),
-            "tp_world_size": int(
-                getattr(request, "metadata", {}).get("tp_world_size", 1)
-            ),
+            "tp_world_size": int(getattr(request, "metadata", {}).get("tp_world_size", 1)),
             "tp_rank": int(getattr(request, "metadata", {}).get("tp_rank", 0)),
             "cp_world_size": int(getattr(request, "token_layout").world_size),
             "cp_rank": int(getattr(request, "token_layout").rank),
@@ -439,13 +409,8 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> LinearLogpResult
 
     contract, num_vocab_tiles = _contract_for_request(request)
     dispatch = kernel_registry.get_logprob_op(contract, requested_backend=BACKEND_ID)
-    if (
-        dispatch.provenance["actual_backend"] != BACKEND_ID
-        or dispatch.provenance["fallback"]
-    ):
-        raise RuntimeError(
-            "explicit WS2 backend dispatch changed during materialization"
-        )
+    if dispatch.provenance["actual_backend"] != BACKEND_ID or dispatch.provenance["fallback"]:
+        raise RuntimeError("explicit WS2 backend dispatch changed during materialization")
     if getattr(request, "with_entropy", False):
         logp, _lse, entropy = dispatch.op.apply_with_entropy(
             request.logits,

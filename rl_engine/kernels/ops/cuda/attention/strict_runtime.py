@@ -161,9 +161,7 @@ class StrictCUDAAttentionRuntime:
                     plan,
                 )
                 gathered_tensors_are_sequence_first = True
-            elif callable(gather_query_sequence_first) and callable(
-                gather_kv_sequence_first
-            ):
+            elif callable(gather_query_sequence_first) and callable(gather_kv_sequence_first):
                 global_q = gather_query_sequence_first(q, plan)
                 global_k, global_v = gather_kv_sequence_first(k, v, plan)
                 gathered_tensors_are_sequence_first = True
@@ -177,9 +175,7 @@ class StrictCUDAAttentionRuntime:
                 q_sort,
                 k_sort,
                 inverse_q_sort,
-            ) = self._position_layout(
-                query_position_ids, key_position_ids, plan
-            )
+            ) = self._position_layout(query_position_ids, key_position_ids, plan)
             communication_backend = "cuda_ag_rs"
             self.communication_executed = True
 
@@ -483,9 +479,7 @@ class StrictCUDAAttentionRuntime:
         order: torch.Tensor,
     ) -> torch.Tensor:
         if tensor.ndim != 4:
-            raise RuntimeError(
-                "strict Attention sequence-first BSHD reorder expects a 4-D tensor"
-            )
+            raise RuntimeError("strict Attention sequence-first BSHD reorder expects a 4-D tensor")
         batch_major = tensor.permute(1, 0, 2, 3)
         index = order[:, :, None, None].expand(
             tensor.size(1), order.size(1), tensor.size(2), tensor.size(3)
@@ -498,9 +492,7 @@ class StrictCUDAAttentionRuntime:
         order: torch.Tensor,
     ) -> torch.Tensor:
         if tensor.ndim != 4:
-            raise RuntimeError(
-                "strict Attention output reorder expects a BSHD tensor"
-            )
+            raise RuntimeError("strict Attention output reorder expects a BSHD tensor")
         sequence_first = tensor.permute(1, 0, 2, 3)
         index = order.transpose(0, 1)[:, :, None, None].expand(
             order.size(1), tensor.size(0), tensor.size(2), tensor.size(3)
@@ -513,9 +505,7 @@ class StrictCUDAAttentionRuntime:
         order: torch.Tensor,
     ) -> torch.Tensor:
         if tensor.ndim != 3:
-            raise RuntimeError(
-                "strict Attention LSE reorder expects a BHS tensor"
-            )
+            raise RuntimeError("strict Attention LSE reorder expects a BHS tensor")
         sequence_first = tensor.permute(2, 0, 1)
         index = order.transpose(0, 1)[:, :, None].expand(
             order.size(1), tensor.size(0), tensor.size(1)

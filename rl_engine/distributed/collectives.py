@@ -196,9 +196,7 @@ class DeterministicCollective:
         self._lock = threading.Lock()
         self._handle = 0
         self._validated_signatures: set[tuple[Any, ...]] = set()
-        self._direct_staging_views: dict[
-            tuple[tuple[int, ...], torch.dtype], torch.Tensor
-        ] = {}
+        self._direct_staging_views: dict[tuple[tuple[int, ...], torch.dtype], torch.Tensor] = {}
         self._staging = torch.zeros(
             _COLLECTIVE_STAGING_FRAMES * (self.max_size_bytes + _COLLECTIVE_FRAME_METADATA_BYTES),
             dtype=torch.uint8,

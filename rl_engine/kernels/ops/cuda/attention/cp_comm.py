@@ -823,15 +823,8 @@ class CUDAAGRSAttentionCPCommunication:
             or lse.size(0) != full_tokens
             or out.shape[1:3] != lse.shape[1:3]
         ):
-            raise ValueError(
-                "sequence-first strict outputs must use [S,B,H,D] and [S,B,H]"
-            )
-        if (
-            not out.is_cuda
-            or not lse.is_cuda
-            or not out.is_contiguous()
-            or not lse.is_contiguous()
-        ):
+            raise ValueError("sequence-first strict outputs must use [S,B,H,D] and [S,B,H]")
+        if not out.is_cuda or not lse.is_cuda or not out.is_contiguous() or not lse.is_contiguous():
             raise ValueError("sequence-first strict outputs must be contiguous CUDA tensors")
         collective = self._get_collective(plan)
         rank = plan.parallel.cp_rank
