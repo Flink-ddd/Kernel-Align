@@ -251,8 +251,8 @@ class FrameworkOperatorIntegration:
                 wrong_backends.append(f"{module}={operator['backend_id']}")
             elif _contains_triton(operator):
                 wrong_backends.append(f"{module}=triton")
-            elif _runtime_platform(operator.get("provenance")) != "cuda":
-                wrong_backends.append(f"{module}=non-cuda")
+            elif _runtime_platform(operator.get("provenance")) not in {"cuda", "rocm"}:
+                wrong_backends.append(f"{module}=non-cuda/rocm")
         failures: list[str] = []
         if missing_hooks:
             failures.append("missing hooks: " + ", ".join(missing_hooks))
