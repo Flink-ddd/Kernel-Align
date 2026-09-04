@@ -113,6 +113,10 @@ void deterministic_collective_reduce_scatter(int64_t handle, torch::Tensor& outp
 void deterministic_collective_all_gather(int64_t handle, torch::Tensor& output);
 void deterministic_collective_all_gather_fused(
     int64_t handle, torch::Tensor& input, torch::Tensor& output);
+void deterministic_collective_all_gather_many(
+    int64_t handle,
+    std::vector<torch::Tensor> inputs,
+    std::vector<torch::Tensor> outputs);
 
 // Batch-Invariant Deterministic GEMM Declarations
 bool det_gemm_sm90_compiled();
@@ -473,6 +477,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "deterministic_collective_all_gather_fused",
         &deterministic_collective_all_gather_fused,
         "Run a fused small-message deterministic rank-ordered all-gather");
+    m.def(
+        "deterministic_collective_all_gather_many",
+        &deterministic_collective_all_gather_many,
+        "Gather multiple tensors with one deterministic staging handshake");
 
     // Prefix-shared attention uses NVIDIA PTX and falls back to PyTorch SDPA on ROCm.
 #if !defined(USE_ROCM)

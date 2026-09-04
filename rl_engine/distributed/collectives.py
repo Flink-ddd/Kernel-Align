@@ -181,6 +181,7 @@ class DeterministicCollective:
             "deterministic_collective_all_reduce_staged",
             "deterministic_collective_reduce_scatter",
             "deterministic_collective_all_gather",
+            "deterministic_collective_all_gather_many",
         )
         missing = [name for name in required_symbols if not hasattr(_C, name)]
         if missing:
@@ -329,13 +330,27 @@ class DeterministicCollective:
         *,
         validate_signature: bool = True,
     ) -> tuple[torch.Tensor, ...]:
-        """Gather several tensors through the available single-tensor ABI."""
+        """Gather several tensors with one staging handshake and no packing."""
 
         if not inputs:
             raise ValueError("all_gather_many requires at least one input")
-        return tuple(
-            self.all_gather(input, validate_signature=validate_signature) for input in inputs
-        )
+        outputs = []
+        for input in inputs:
+            self._validate_gather_input(input)
+            output_shape = (input.size(0) * self.world_size, *input.shape[1:])
+            output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+            self._validate_sharded_output(output, input, output_shape)
+            outputs.append(output)
+        with self._lock:
+            if validate_signature:
+                self._validate_matching_many_signature("all_gather_many", inputs)
+            self._validate_many_capacity(inputs)
+            self._extension.deterministic_collective_all_gather_many(
+                self._handle,
+                list(inputs),
+                outputs,
+            )
+        return tuple(outputs)
 
     def reduce_scatter(
         self,

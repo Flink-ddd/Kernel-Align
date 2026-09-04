@@ -1534,6 +1534,79 @@ class DeterministicCollectiveState {
     AT_CUDA_CHECK(cudaGetLastError());
   }
 
+  void all_gather_many(
+      const std::vector<torch::Tensor>& inputs,
+      const std::vector<torch::Tensor>& outputs,
+      cudaStream_t stream) {
+    TORCH_CHECK(!inputs.empty(), "all_gather_many requires at least one input");
+    TORCH_CHECK(
+        inputs.size() == outputs.size(),
+        "all_gather_many inputs and outputs must have the same length");
+    TORCH_CHECK(
+        !has_staged_input_,
+        "cannot run all_gather_many with a pending stage()");
+
+    std::vector<int64_t> offsets(inputs.size());
+    std::vector<int64_t> input_bytes(inputs.size());
+    int64_t total_bytes = 0;
+    for (size_t index = 0; index < inputs.size(); ++index) {
+      const auto& input = inputs[index];
+      const auto& output = outputs[index];
+      check_tensor(input, "input");
+      check_tensor(output, "output");
+      TORCH_CHECK(
+          output.scalar_type() == input.scalar_type(),
+          "all_gather_many output dtype must match its input dtype");
+      const int64_t bytes = input.numel() * input.element_size();
+      TORCH_CHECK(
+          output.numel() * output.element_size() == bytes * world_size_,
+          "all_gather_many output must contain one input per rank");
+      total_bytes = (total_bytes + 15) & ~int64_t{15};
+      offsets[index] = total_bytes;
+      input_bytes[index] = bytes;
+      total_bytes += bytes;
+    }
+    TORCH_CHECK(
+        total_bytes <= capacity_bytes_,
+        "all_gather_many inputs require ", total_bytes,
+        " bytes but staging capacity is ", capacity_bytes_);
+
+    wait_for_previous_done_kernel<<<1, 1, 0, stream>>>(
+        peers_, world_size_, local_stage_sequence_);
+    AT_CUDA_CHECK(cudaGetLastError());
+    auto* local_payload = const_cast<uint8_t*>(
+        static_cast<const uint8_t*>(peers_.values[rank_]));
+    for (size_t index = 0; index < inputs.size(); ++index) {
+      if (input_bytes[index] == 0) continue;
+      AT_CUDA_CHECK(cudaMemcpyAsync(
+          local_payload + offsets[index],
+          inputs[index].data_ptr(),
+          input_bytes[index],
+          cudaMemcpyDeviceToDevice,
+          stream));
+    }
+    publish_next_stage_sequence_kernel<<<1, 1, 0, stream>>>(
+        local_stage_sequence_);
+    AT_CUDA_CHECK(cudaGetLastError());
+    wait_for_staged_peers(stream);
+
+    for (size_t index = 0; index < inputs.size(); ++index) {
+      auto* output = static_cast<uint8_t*>(outputs[index].data_ptr());
+      for (int peer = 0; peer < world_size_; ++peer) {
+        if (input_bytes[index] == 0) continue;
+        const auto* peer_payload =
+            static_cast<const uint8_t*>(peers_.values[peer]);
+        AT_CUDA_CHECK(cudaMemcpyAsync(
+            output + static_cast<int64_t>(peer) * input_bytes[index],
+            peer_payload + offsets[index],
+            input_bytes[index],
+            cudaMemcpyDeviceToDevice,
+            stream));
+      }
+    }
+    publish_done(stream);
+  }
+
   void reduce_scatter(torch::Tensor& output, cudaStream_t stream) {
     check_tensor(output, "output");
     TORCH_CHECK(has_staged_input_, "stage() must be called before reduce_scatter()");
@@ -1883,6 +1956,16 @@ void deterministic_collective_all_gather_fused(
   const c10::cuda::CUDAGuard device_guard(input.device());
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
   state_from_handle(handle)->all_gather_fused(input, output, stream);
+}
+
+void deterministic_collective_all_gather_many(
+    int64_t handle,
+    std::vector<torch::Tensor> inputs,
+    std::vector<torch::Tensor> outputs) {
+  TORCH_CHECK(!inputs.empty(), "all_gather_many requires at least one input");
+  const c10::cuda::CUDAGuard device_guard(inputs.front().device());
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  state_from_handle(handle)->all_gather_many(inputs, outputs, stream);
 }
 
 void deterministic_collective_reduce_scatter(int64_t handle, torch::Tensor& output) {

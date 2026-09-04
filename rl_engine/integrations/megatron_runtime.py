@@ -29,6 +29,8 @@ _PATCH_MARKER = "__rl_kernel_original_forward__"
 _STRICT_ATTENTION_PATCH_MARKER = "__rl_kernel_original_strict_attention_init__"
 _STRICT_ATTENTION_PROJECTION_MARKER = "__rl_kernel_strict_attention_projection__"
 _STRICT_TE_RMS_NORM_PATCH_MARKER = "__rl_kernel_original_strict_rms_norm_forward__"
+_STRICT_LOGP_OUTPUT_PATCH_MARKER = "__rl_kernel_original_strict_logp_output_forward__"
+_STRICT_LOGP_REUSABLE_MARKER = "__rl_kernel_reusable_local_logits__"
 
 
 class _DeterministicTensorParallelReduce(torch.autograd.Function):
@@ -60,6 +62,91 @@ def _deterministic_reduce_from_tensor_model_parallel_region(
     tp_group: Any,
 ) -> torch.Tensor:
     return _DeterministicTensorParallelReduce.apply(input_value, tp_group)
+
+
+class _DeterministicTPOutputProjection(torch.autograd.Function):
+    """Materialize the strict TP LM head once and preserve its dgrad contract."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        input_value: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        tp_group: Any,
+    ) -> torch.Tensor:
+        from rl_engine.kernels.ops.cuda.matmul.det_gemm import det_gemm_linear
+
+        if input_value.ndim == 3:
+            input_2d = input_value.transpose(0, 1).contiguous().reshape(
+                -1, input_value.shape[-1]
+            )
+            ctx.batch_major = True
+        else:
+            input_2d = input_value.reshape(-1, input_value.shape[-1]).contiguous()
+            ctx.batch_major = False
+        weight_2d = weight.contiguous()
+        output_2d = det_gemm_linear(input_2d, weight_2d)
+        if bias is not None:
+            output_2d = (output_2d.float() + bias.float().reshape(1, -1)).to(
+                torch.bfloat16
+            )
+        ctx.save_for_backward(input_2d, weight_2d)
+        ctx.input_shape = input_value.shape
+        ctx.input_dtype = input_value.dtype
+        ctx.weight_dtype = weight.dtype
+        ctx.bias_dtype = None if bias is None else bias.dtype
+        ctx.has_bias = bias is not None
+        ctx.tp_group = tp_group
+        if ctx.batch_major:
+            return (
+                output_2d.reshape(
+                    input_value.shape[1], input_value.shape[0], weight.size(0)
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
+        return output_2d.reshape(*input_value.shape[:-1], weight.size(0))
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor):
+        from rl_engine.kernels.ops.cuda.loss.linear_logp import (
+            _deterministic_tp_all_reduce_,
+        )
+        from rl_engine.kernels.ops.cuda.matmul.det_gemm import (
+            det_gemm_linear_input_gradient,
+            det_gemm_linear_weight_gradient,
+        )
+
+        input_2d, weight = ctx.saved_tensors
+        if ctx.batch_major:
+            dlogits = (
+                grad_output.transpose(0, 1)
+                .contiguous()
+                .reshape(-1, grad_output.shape[-1])
+            )
+        else:
+            dlogits = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()
+        if dlogits.dtype != torch.bfloat16:
+            raise TypeError("strict TP LM-head backward requires BF16 dlogits")
+        grad_input = grad_weight = grad_bias = None
+        if ctx.needs_input_grad[0]:
+            grad_input = det_gemm_linear_input_gradient(dlogits, weight)
+            _deterministic_tp_all_reduce_(grad_input, ctx.tp_group)
+            if ctx.batch_major:
+                grad_input = grad_input.reshape(
+                    ctx.input_shape[1], ctx.input_shape[0], ctx.input_shape[2]
+                ).transpose(0, 1).contiguous()
+            else:
+                grad_input = grad_input.reshape(ctx.input_shape)
+            grad_input = grad_input.to(ctx.input_dtype)
+        if ctx.needs_input_grad[1]:
+            grad_weight = det_gemm_linear_weight_gradient(input_2d, dlogits).to(
+                ctx.weight_dtype
+            )
+        if ctx.has_bias and ctx.needs_input_grad[2]:
+            grad_bias = dlogits.float().sum(dim=0).to(ctx.bias_dtype)
+        return grad_input, grad_weight, grad_bias, None
 
 
 def _optional_class(path: str) -> type[Any] | None:
@@ -264,6 +351,71 @@ def _patch_strict_te_rms_norm(rms_norm_cls: type[Any] | None = None) -> None:
     rms_norm_cls.forward = wrapped
 
 
+def _patch_strict_logp_output_layer(
+    linear_cross_entropy_cls: type[Any] | None = None,
+) -> None:
+    """Replace Megatron's duplicate LM-head path with one reusable strict result."""
+
+    if linear_cross_entropy_cls is None:
+        from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
+
+        linear_cross_entropy_cls = LinearCrossEntropyModule
+    if hasattr(linear_cross_entropy_cls, _STRICT_LOGP_OUTPUT_PATCH_MARKER):
+        return
+    original = linear_cross_entropy_cls.forward
+
+    def wrapped(
+        instance: Any,
+        input_: torch.Tensor,
+        weight: torch.Tensor | None = None,
+        runtime_gather_output: bool | None = None,
+        output_cross_entropy_loss: bool = False,
+        labels: torch.Tensor | None = None,
+        reduction: str = "none",
+        ignore_index: int = -100,
+    ) -> Any:
+        if output_cross_entropy_loss:
+            return original(
+                instance,
+                input_,
+                weight,
+                runtime_gather_output,
+                output_cross_entropy_loss,
+                labels,
+                reduction,
+                ignore_index,
+            )
+        output_weight = instance.weight if weight is None else weight
+        if output_weight is None:
+            raise RuntimeError("strict TP LM head requires an explicit weight")
+        gather_output = (
+            instance.gather_output
+            if runtime_gather_output is None
+            else bool(runtime_gather_output)
+        )
+        if gather_output:
+            raise RuntimeError("strict reusable TP LM head does not support gathered logits")
+        if bool(getattr(instance, "sequence_parallel", False)):
+            raise RuntimeError("strict reusable TP LM head does not support sequence parallelism")
+        if bool(getattr(instance, "explicit_expert_comm", False)) or bool(
+            getattr(instance, "disable_grad_reduce", False)
+        ):
+            raise RuntimeError("strict reusable TP LM head requires ordinary TP dgrad reduction")
+        bias = instance.bias if not instance.skip_bias_add else None
+        output = _DeterministicTPOutputProjection.apply(
+            input_, output_weight, bias, instance.tp_group
+        )
+        instance._rl_kernel_local_logits = output
+        output_bias = instance.bias if instance.skip_bias_add else None
+        return output, output_bias
+
+    wrapped.__name__ = getattr(original, "__name__", "forward")
+    wrapped.__doc__ = getattr(original, "__doc__", None)
+    setattr(linear_cross_entropy_cls, _STRICT_LOGP_OUTPUT_PATCH_MARKER, original)
+    setattr(linear_cross_entropy_cls, _STRICT_LOGP_REUSABLE_MARKER, True)
+    linear_cross_entropy_cls.forward = wrapped
+
+
 def install_megatron_integration(
     plan: IntegrationPlan,
     *,
@@ -304,6 +456,8 @@ def install_megatron_integration(
         raise RuntimeError("R/R Megatron FFN selected but no supported class was found")
 
     set_active_integration("megatron", integration)
+    if plan.implementation_for("logp", "training") is Implementation.RL_KERNEL:
+        _patch_strict_logp_output_layer()
     if plan.implementation_for("attention", "training") is Implementation.RL_KERNEL:
         _patch_strict_attention_projections()
         if plan.implementation_for("ffn", "training") is Implementation.RL_KERNEL:
@@ -324,7 +478,9 @@ def install_megatron_integration(
         )
     if plan.implementation_for("logp", "training") is Implementation.RL_KERNEL:
         integration.record_installed_hook(
-            "logp", "rl_engine.integrations.vime.linear_logp_provider.provider"
+            "logp",
+            "rl_engine.integrations.vime.linear_logp_provider.provider,"
+            "megatron.core.transformer.linear_cross_entropy.LinearCrossEntropyModule.forward",
         )
     return integration
 

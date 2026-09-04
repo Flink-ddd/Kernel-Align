@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
+from functools import lru_cache
 from threading import Lock
 from typing import Any, Mapping, cast
 
@@ -255,6 +256,7 @@ def _megatron_parallel_state() -> Any:
     return parallel_state
 
 
+@lru_cache(maxsize=512)
 def _megatron_zigzag_layout(
     local_tokens: int,
     *,
@@ -410,6 +412,35 @@ class MegatronAttentionOperator:
         self._packed_layout_owner: Any | None = None
         self._packed_layout_key: tuple[Any, ...] | None = None
         self._packed_layout_value: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+        self._position_ids_cache: dict[tuple[Any, ...], torch.Tensor] = {}
+
+    def _position_ids(
+        self,
+        positions: tuple[int, ...],
+        *,
+        batch_size: int,
+        cp_rank: int,
+        cp_world_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        key = (
+            len(positions),
+            int(batch_size),
+            int(cp_rank),
+            int(cp_world_size),
+            device.type,
+            device.index,
+        )
+        cached = self._position_ids_cache.get(key)
+        if cached is not None:
+            return cached
+        if len(self._position_ids_cache) >= 128:
+            self._position_ids_cache.pop(next(iter(self._position_ids_cache)))
+        value = torch.tensor(positions, dtype=torch.int64, device=device).repeat(
+            batch_size, 1
+        )
+        self._position_ids_cache[key] = value
+        return value
 
     def _packed_layout(
         self,
@@ -509,11 +540,13 @@ class MegatronAttentionOperator:
                 cp_rank=cp_rank,
                 cp_world_size=cp_world,
             )
-            position_ids = torch.tensor(
+            position_ids = self._position_ids(
                 positions,
-                dtype=torch.int64,
+                batch_size=q_ready.size(0),
+                cp_rank=cp_rank,
+                cp_world_size=cp_world,
                 device=q_ready.device,
-            ).repeat(q_ready.size(0), 1)
+            )
             return operator(
                 q_ready,
                 k_ready,
@@ -583,20 +616,21 @@ class MegatronAttentionOperator:
             sequence_provenance: list[dict[str, Any] | None] = [None] * len(global_lengths)
             launch_group_count = 0
             for (local_length, global_length), sequences in grouped_sequences.items():
-                q_ready = (
-                    torch.stack([query[start:end] for _index, start, end in sequences], dim=0)
-                    .permute(0, 2, 1, 3)
-                    .contiguous()
+                # Stack the cheap [H, T, D] views directly into FA4's
+                # [B, H, T, D] layout.  Stacking before permuting would first
+                # materialize [B, T, H, D] and then copy the entire tensor a
+                # second time for every layer and microbatch.
+                q_ready = torch.stack(
+                    [query[start:end].permute(1, 0, 2) for _index, start, end in sequences],
+                    dim=0,
                 )
-                k_ready = (
-                    torch.stack([key[start:end] for _index, start, end in sequences], dim=0)
-                    .permute(0, 2, 1, 3)
-                    .contiguous()
+                k_ready = torch.stack(
+                    [key[start:end].permute(1, 0, 2) for _index, start, end in sequences],
+                    dim=0,
                 )
-                v_ready = (
-                    torch.stack([value[start:end] for _index, start, end in sequences], dim=0)
-                    .permute(0, 2, 1, 3)
-                    .contiguous()
+                v_ready = torch.stack(
+                    [value[start:end].permute(1, 0, 2) for _index, start, end in sequences],
+                    dim=0,
                 )
                 result = execute_sequence(
                     q_ready,
