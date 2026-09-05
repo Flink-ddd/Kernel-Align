@@ -155,23 +155,51 @@ measurements. See the [installation guide](./docs/getting_started/installation.m
 
 ## Quick Start
 
-Install a PyTorch build matching your accelerator runtime, then install RL-Kernel from
-source. Python 3.10 or newer is required.
+Install Python 3.10 or newer, a PyTorch build matching your accelerator runtime, and the
+corresponding CUDA or ROCm compiler toolchain. Then clone RL-Kernel:
 
 ```bash
 git clone https://github.com/RL-Align/RL-Kernel.git
 cd RL-Kernel
-
-# Native CUDA or ROCm extension
-RL_KERNEL_REQUIRE_EXT=1 python -m pip install --no-build-isolation -e .
-python -c "import rl_engine._C as _C; assert hasattr(_C, 'fused_logp'); print(_C.__file__)"
 ```
 
-For CPU-only or pure-Python development, use `python -m pip install -e .`.
-Strict train–inference consistency requires the corresponding operators and runtime
-configuration in both engines. Follow the [installation guide](./docs/getting_started/installation.md)
-and [quick-start guide](./docs/getting_started/quickstart.md); the full benchmark
-configuration and companion VIME revision are linked in [PR #377](https://github.com/RL-Align/RL-Kernel/pull/377).
+### NVIDIA CUDA
+
+Build against a visible NVIDIA GPU. Set `TORCH_CUDA_ARCH_LIST` when you want to pin the
+target architecture instead of relying on device detection.
+
+```bash
+# H100 / H200 (SM90)
+TORCH_CUDA_ARCH_LIST="9.0+PTX" python3 setup.py develop
+```
+
+Common CUDA targets are `8.0` for A100, `8.6` for A10/A40, and `9.0+PTX` for H100/H200.
+
+### AMD ROCm
+
+Set the target explicitly. The current MI300/MI325 build command is:
+
+```bash
+PYTORCH_ROCM_ARCH=gfx942 python3 setup.py develop
+```
+
+Common ROCm targets are `gfx90a` for MI200, `gfx942` for MI300/MI325, and `gfx950` for
+MI350/MI355. A portable build can target more than one architecture:
+
+```bash
+PYTORCH_ROCM_ARCH='gfx90a;gfx942;gfx950' python3 setup.py develop
+```
+
+### Verify the Native Extension
+
+```bash
+python3 -c "import rl_engine._C as _C; assert hasattr(_C, 'fused_logp'); print(_C.__file__)"
+```
+
+For CPU-only or pure-Python development, use `python3 -m pip install -e .`. Ascend and
+Moore Threads support is still under development and does not yet have a general-purpose
+Quick Start build command. See the [installation guide](./docs/getting_started/installation.md)
+for backend dependencies and troubleshooting.
 
 ## Community and Contributions
 
