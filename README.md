@@ -173,12 +173,21 @@ target architecture instead of relying on device detection.
 
 ```bash
 # H100 / H200 / GH200 (SM90)
-RL_KERNEL_REQUIRE_EXT=1 TORCH_CUDA_ARCH_LIST="9.0+PTX" \
+MAX_JOBS=8 \
+RL_KERNEL_REQUIRE_EXT=1 \
+TORCH_CUDA_ARCH_LIST="9.0+PTX" \
   python3 -m pip install --no-build-isolation --no-deps -e .
 ```
 
 The supported CUDA target is SM90 (compute capability 9.0), corresponding to NVIDIA H100,
-H200, and GH200. Other CUDA architectures are being adapted.
+H200, and GH200. This build command and the native extension check below have been
+validated on an NVIDIA H100 80GB HBM3. Other CUDA architectures are being adapted.
+
+Verify the loaded extension, GPU, SM capability, and required native symbol:
+
+```bash
+python3 -c "import torch, rl_engine._C as C; print('GPU:', torch.cuda.get_device_name(0)); print('Capability:', torch.cuda.get_device_capability(0)); print('Extension:', C.__file__); print('fused_logp:', hasattr(C, 'fused_logp')); assert hasattr(C, 'fused_logp'); print('H100 build: PASS')"
+```
 
 ### AMD ROCm
 
