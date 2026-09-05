@@ -34,7 +34,7 @@ deterministic operators for consistent numerical computation across rollout and 
 engines, together with hardware-specific kernels for faster execution and lower memory
 use in GRPO, PPO, and related workloads.
 
-Today, the end-to-end path covers **Qwen3-8B Dense with VIME, vLLM, and Megatron-LM**.
+Today, the end-to-end path covers **Qwen3-8B Dense with vime, vLLM, and Megatron-LM**.
 Work on DeepSeek-V4 Flash MoE, Miles, and AReaL is ongoing.
 
 ## Why RL-Kernel?
@@ -50,7 +50,7 @@ differences enter the policy ratios and KL terms used by RL algorithms.
   and collectives cover the numerical boundaries in RL post-training.
 - **Performance:** fused computation and hardware-specific kernels reduce rollout time,
   memory use, and synchronization costs.
-- **VIME integration:** VIME orchestrates vLLM rollout and Megatron-LM training, with
+- **vime integration:** vime orchestrates vLLM rollout and Megatron-LM training, with
   RL-Kernel supplying the operators used by both engines.
 - **Hardware:** NVIDIA SM90 and AMD gfx942 are supported. Ascend dav_c220 has partial
   operator coverage. Support for other hardware is in progress.
@@ -68,12 +68,12 @@ operators, and hardware backends fit together.
   <img src="docs/assets/RL-Kernel underlying operator library technical architecture.png" alt="RL-Kernel global architecture" width="800">
 </p>
 
-The smaller diagram shows the current VIME integration and the planned Miles and AReaL
+The smaller diagram shows the current vime integration and the planned Miles and AReaL
 integrations.
 
 ```mermaid
 flowchart TB
-    VIME["VIME · integrated"] --> ORCH["RL orchestration integration"]
+    vime["vime · integrated"] --> ORCH["RL orchestration integration"]
     MILES["Miles · roadmap"] -.-> ORCH
     AREAL["AReaL · roadmap"] -.-> ORCH
     ORCH --> VLLM["vLLM · rollout"]
@@ -86,32 +86,32 @@ flowchart TB
     RLK -.-> MUSA["Moore Threads · MUSA · in progress"]
 ```
 
-The benchmark below uses **VIME, vLLM, Megatron-LM, and CUDA**. See
+The benchmark below uses **vime, vLLM, Megatron-LM, and CUDA**. See
 [runtime dispatch](./docs/design/runtime-dispatch.md) for operator selection.
 
 ## Current Scope and Roadmap
 
-The current end-to-end path uses Qwen3-8B Dense with VIME.
+The current end-to-end path uses Qwen3-8B Dense with vime.
 
 | Area | Current | Next |
 | :--- | :--- | :--- |
 | **Model** | Qwen3-8B Dense | [DeepSeek-V4-Flash-0731 MoE](./docs/blog/2026-08-09-dsv4-flash-moe-consistency-roadmap.md) |
-| **Orchestration** | VIME | Miles and AReaL |
+| **Orchestration** | vime | Miles and AReaL |
 | **Engines** | vLLM rollout and Megatron-LM training | More rollout and training engines |
 
 ## Benchmark Highlights
 
-### VIME native vs. RL-Kernel + VIME
+### vime native vs. RL-Kernel + vime
 
-[PR #377](https://github.com/RL-Align/RL-Kernel/pull/377) compares VIME native G10 with
-RL-Kernel G11. Both runs use VIME, vLLM rollout, Megatron-LM training, and rollout LogP
+[PR #377](https://github.com/RL-Align/RL-Kernel/pull/377) compares vime native G10 with
+RL-Kernel G11. Both runs use vime, vLLM rollout, Megatron-LM training, and rollout LogP
 reuse. G11 uses RL-Kernel attention, FFN, and LogP in rollout and training.
 
 **Setup:** Qwen3-8B BF16 · GRPO · 1 node with 8×H100 80GB · actor TP4, CP2, PP1 ·
 two TP4 rollout engines · 8 prompts × 16 samples (batch 128) · 200 steps · seed 1234 ·
 maximum response length 7,168 · KL-loss coefficient 0.001.
 
-| Metric | VIME native (G10) | VIME + RL-Kernel (G11) | G11 result |
+| Metric | vime native (G10) | vime + RL-Kernel (G11) | G11 result |
 | :--- | ---: | ---: | :--- |
 | Steps with nonzero train–rollout LogP mismatch | 200 of 200 | **0 of 200** | **Exact agreement at every step** |
 | Maximum absolute Δlogp across the run | 1.591547 | **0** | **Zero measured difference** |
@@ -124,7 +124,7 @@ maximum response length 7,168 · KL-loss coefficient 0.001.
 G11 saves **47.47 seconds per rollout step**, offsetting the additional actor training
 cost for a net saving of **20.72 seconds per end-to-end step**.
 
-![Qwen3-8B performance comparison: stage times, throughput, and relative changes for VIME native G10 and optimized RL-Kernel G11](./docs/assets/qwen3-8b-performance-summary.png)
+![Qwen3-8B performance comparison: stage times, throughput, and relative changes for vime native G10 and optimized RL-Kernel G11](./docs/assets/qwen3-8b-performance-summary.png)
 
 ## Hardware Support
 
@@ -151,7 +151,7 @@ git clone https://github.com/RL-Align/RL-Kernel.git
 cd RL-Kernel
 ```
 
-For the Qwen3-8B train–rollout command and setup for VIME with RL-Kernel, see the
+For the Qwen3-8B train–rollout command and setup for vime with RL-Kernel, see the
 [8×H100 integration runbook](https://github.com/RL-Align/RL-Kernel/issues/342).
 
 ### NVIDIA CUDA
@@ -210,7 +210,7 @@ are welcome. See the [contributing guide](./docs/contributing/README.md).
 ## Acknowledgments
 
 RL-Kernel builds on the work of the open-source AI infrastructure community, including
-[VIME](https://github.com/vllm-project/vime), [vLLM](https://github.com/vllm-project/vllm),
+[vime](https://github.com/vllm-project/vime), [vLLM](https://github.com/vllm-project/vllm),
 [Megatron-LM](https://github.com/NVIDIA/Megatron-LM),
 [DeepSpeed](https://github.com/deepspeedai/DeepSpeed), and
 [FlashInfer](https://github.com/flashinfer-ai/flashinfer).
