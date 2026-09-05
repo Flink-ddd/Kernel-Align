@@ -55,8 +55,9 @@ differences enter the policy ratios and KL terms used by RL algorithms.
   paths, and deterministic collectives target rollout, memory, and synchronization costs.
 - **Current integration:** VIME is the supported RL orchestration layer, with vLLM for
   rollout and Megatron-LM for training. RL-Kernel supplies the operators beneath them.
-- **Multiple accelerators:** dense-model train–inference consistency is supported on CUDA
-  and ROCm, with Ascend and Moore Threads adaptation in progress.
+- **Current accelerator targets:** NVIDIA SM90 (H100, H200, and GH200) and AMD gfx942
+  (MI300A, MI300X, and MI325X) are the supported targets. Ascend `dav_c220` has partial
+  operator coverage; other hardware models are being adapted.
 
 ## Architecture
 
@@ -85,9 +86,9 @@ flowchart TB
     ORCH --> MEGATRON["Megatron-LM · training"]
     VLLM --> RLK["RL-Kernel · deterministic and optimized operators"]
     MEGATRON --> RLK
-    RLK --> CUDA["CUDA · supported"]
-    RLK --> ROCM["ROCm · supported"]
-    RLK -.-> ASCEND["Ascend · partial adaptation"]
+    RLK --> CUDA["CUDA · SM90<br/>H100 / H200 / GH200"]
+    RLK --> ROCM["ROCm · gfx942<br/>MI300A / MI300X / MI325X"]
+    RLK -.-> ASCEND["Ascend · dav_c220<br/>partial adaptation"]
     RLK -.-> MUSA["Moore Threads / MUSA · in progress"]
 ```
 
@@ -136,22 +137,24 @@ cost for a net saving of **20.72 seconds per end-to-end step**.
 
 ## Hardware Support
 
-The following matrix tracks accelerator coverage for the current dense-model path. It
-does not extend the end-to-end model claim beyond Qwen3-8B Dense.
+The following matrix lists the current architecture targets and their corresponding
+hardware models. It does not imply published end-to-end validation on every listed model,
+or extend the current end-to-end model claim beyond Qwen3-8B Dense on H100.
 
-| Vendor | Accelerator | Software stack | Dense train–inference consistency | Coverage / progress |
-| :--- | :--- | :--- | :---: | :--- |
-| **NVIDIA** | GPU | CUDA | ✅ **Supported** | Dense-model strict path; Qwen3-8B H100 end-to-end results above |
-| **AMD** | GPU | ROCm | ✅ **Supported** | Dense-model strict path; backend-specific setup and validation |
-| **Huawei** | Ascend NPU | CANN / Ascend C | 🟡 **Partially adapted** | Selected operators adapted; broader dense-model integration in progress |
-| **Moore Threads** | GPU | MUSA | 🚧 **In progress** | Accelerator adaptation and dense-model integration underway |
+| Vendor | Architecture target | Corresponding hardware models | Software stack | Coverage / progress |
+| :--- | :--- | :--- | :--- | :--- |
+| **NVIDIA** | SM90 (compute capability 9.0) | H100, H200, GH200 | CUDA | ✅ **Supported** — dense-model strict path; published end-to-end results use H100 |
+| **AMD** | gfx942 (CDNA 3) | Instinct MI300A, MI300X, MI325X | ROCm | ✅ **Supported** — dense-model strict path with backend-specific setup and validation |
+| **Huawei** | `dav_c220` (CANN `dav-2201` target) | Ascend `dav_c220` | CANN 9.1.0 / Ascend C | 🟡 **Partially adapted** — selected operators are available; other Ascend models are being adapted |
+| **Moore Threads** | Under adaptation | — | MUSA | 🚧 **In progress** — hardware adaptation and dense-model integration are underway |
 
 ✅ **Supported** · 🟡 **Partial adaptation** · 🚧 **Active development**
 
-Support applies to the implemented dense-model paths; model, dtype, operator, and
-parallelism coverage varies by backend. The performance numbers above are CUDA/H100
-measurements. See the [installation guide](./docs/getting_started/installation.md) and
-[operator catalog](./docs/operators/README.md) for backend requirements and contracts.
+Support applies to the listed architecture targets and implemented dense-model paths;
+model, dtype, operator, and parallelism coverage varies by backend. The performance
+numbers above are CUDA/H100 measurements. **Other hardware models are being adapted.**
+See the [installation guide](./docs/getting_started/installation.md) and [operator
+catalog](./docs/operators/README.md) for backend requirements and contracts.
 
 ## Quick Start
 
@@ -169,29 +172,25 @@ Build against a visible NVIDIA GPU. Set `TORCH_CUDA_ARCH_LIST` when you want to 
 target architecture instead of relying on device detection.
 
 ```bash
-# H100 / H200 (SM90)
+# H100 / H200 / GH200 (SM90)
 RL_KERNEL_REQUIRE_EXT=1 TORCH_CUDA_ARCH_LIST="9.0+PTX" \
   python3 -m pip install --no-build-isolation --no-deps -e .
 ```
 
-Common CUDA targets are `8.0` for A100, `8.6` for A10/A40, and `9.0+PTX` for H100/H200.
+The supported CUDA target is SM90 (compute capability 9.0), corresponding to NVIDIA H100,
+H200, and GH200. Other CUDA architectures are being adapted.
 
 ### AMD ROCm
 
-Set the target explicitly. The current MI300/MI325 build command is:
+Set the target explicitly. The supported gfx942 target corresponds to AMD Instinct MI300A,
+MI300X, and MI325X:
 
 ```bash
 RL_KERNEL_REQUIRE_EXT=1 PYTORCH_ROCM_ARCH=gfx942 \
   python3 -m pip install --no-build-isolation --no-deps -e .
 ```
 
-Common ROCm targets are `gfx90a` for MI200, `gfx942` for MI300/MI325, and `gfx950` for
-MI350/MI355. A portable build can target more than one architecture:
-
-```bash
-RL_KERNEL_REQUIRE_EXT=1 PYTORCH_ROCM_ARCH='gfx90a;gfx942;gfx950' \
-  python3 -m pip install --no-build-isolation --no-deps -e .
-```
+Other ROCm architectures are being adapted.
 
 ### Verify the Native Extension
 
@@ -199,10 +198,11 @@ RL_KERNEL_REQUIRE_EXT=1 PYTORCH_ROCM_ARCH='gfx90a;gfx942;gfx950' \
 python3 -c "import rl_engine._C as _C; assert hasattr(_C, 'fused_logp'); print(_C.__file__)"
 ```
 
-For CPU-only or pure-Python development, use `python3 -m pip install -e .`. Ascend and
-Moore Threads support is still under development and does not yet have a general-purpose
-Quick Start build command. See the [installation guide](./docs/getting_started/installation.md)
-for backend dependencies and troubleshooting.
+For CPU-only or pure-Python development, use `python3 -m pip install -e .`. Ascend support
+is currently limited to partial operator coverage on `dav_c220` (CANN `dav-2201` target);
+other Ascend models are being adapted. Moore Threads support is also under development.
+Neither backend has a general-purpose Quick Start build command yet. See the [installation
+guide](./docs/getting_started/installation.md) for backend dependencies and troubleshooting.
 
 ## Community and Contributions
 
