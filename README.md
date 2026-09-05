@@ -144,7 +144,7 @@ or extend the current end-to-end model claim beyond Qwen3-8B Dense on H100.
 | Vendor | Architecture target | Corresponding hardware models | Software stack | Coverage / progress |
 | :--- | :--- | :--- | :--- | :--- |
 | **NVIDIA** | SM90 (compute capability 9.0) | H100, H200, GH200 | CUDA | ✅ **Supported** — dense-model strict path; published end-to-end results use H100 |
-| **AMD** | gfx942 (CDNA 3) | Instinct MI300A, MI300X, MI325X | ROCm | ✅ **Supported** — dense-model strict path with backend-specific setup and validation |
+| **AMD** | gfx942 (CDNA 3) | Instinct MI300A, MI300X, MI325X | ROCm | ✅ **Supported** — native extension loading and backend checks verified on MI300X |
 | **Huawei** | `dav_c220` (CANN `dav-2201` target) | Ascend `dav_c220` | CANN 9.1.0 / Ascend C | 🟡 **Partially adapted** — selected operators are available; other Ascend models are being adapted |
 | **Moore Threads** | Under adaptation | — | MUSA | 🚧 **In progress** — hardware adaptation and dense-model integration are underway |
 
@@ -199,13 +199,15 @@ RL_KERNEL_REQUIRE_EXT=1 PYTORCH_ROCM_ARCH=gfx942 \
   python3 -m pip install --no-build-isolation --no-deps -e .
 ```
 
-Other ROCm architectures are being adapted.
-
-### Verify the Native Extension
+Verify the ROCm environment and required native symbol:
 
 ```bash
-python3 -c "import rl_engine._C as _C; assert hasattr(_C, 'fused_logp'); print(_C.__file__)"
+python3 scripts/check_rocm_env.py
+python3 -c "import torch, rl_engine._C as C; print('GPU:', torch.cuda.get_device_name(0)); print('HIP:', torch.version.hip); print('Extension:', C.__file__); print('fused_logp:', hasattr(C, 'fused_logp')); assert hasattr(C, 'fused_logp'); print('MI300X build: PASS')"
 ```
+
+The native extension load and environment checks have been validated on an AMD Instinct
+MI300X reporting `gfx942`. Other ROCm architectures are being adapted.
 
 For CPU-only or pure-Python development, use `python3 -m pip install -e .`. Ascend support
 is currently limited to partial operator coverage on `dav_c220` (CANN `dav-2201` target);
