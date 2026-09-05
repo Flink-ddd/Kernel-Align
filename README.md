@@ -19,10 +19,10 @@
 </p>
 
 <p align="center">
-  <a href="#benchmark-highlights">Results</a> ·
-  <a href="#current-scope-and-roadmap">Current scope</a> ·
-  <a href="#hardware-support">Hardware support</a> ·
   <a href="#architecture">Architecture</a> ·
+  <a href="#current-scope-and-roadmap">Current scope</a> ·
+  <a href="#benchmark-highlights">Results</a> ·
+  <a href="#hardware-support">Hardware support</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="https://rl-align.github.io/RL-Kernel/">Documentation</a>
 </p>
@@ -46,12 +46,52 @@ differences enter the policy ratios and KL terms used by RL algorithms.
 - **Exact train–inference consistency:** deterministic operator contracts align the strict
   dense-model path. The published experiment verifies exact runtime LogP agreement across
   all 200 training steps.
+- **RL-native operator stack:** deterministic attention and dense FFN, fused and
+  batch-invariant LogP, GRPO/PPO objectives, and deterministic collectives cover the
+  numerical boundaries that matter to RL post-training.
 - **Efficient RL execution:** fused log-probability computation, optimized attention and FFN
   paths, and deterministic collectives target rollout, memory, and synchronization costs.
 - **Current integration:** VIME is the supported RL orchestration layer, with vLLM for
   rollout and Megatron-LM for training. RL-Kernel supplies the operators beneath them.
 - **Multiple accelerators:** dense-model train–inference consistency is supported on CUDA
   and ROCm, with Ascend and Moore Threads adaptation in progress.
+
+## Architecture
+
+RL-Kernel sits between framework execution engines and accelerator backends. Runtime
+adapters select operators through a hardware-aware registry; strict routes enforce the
+required numerical contract and expose execution provenance.
+
+The complete architecture below is a layer map, not a current support matrix. It shows
+the broader external scheduling and engine ecosystem, operator-library layers, and
+hardware abstraction boundary.
+
+<p align="center">
+  <img src="docs/assets/RL-Kernel underlying operator library technical architecture.png" alt="RL-Kernel global architecture" width="800">
+</p>
+
+The following diagram is a concise view of the validated runtime path, planned
+orchestration integrations, and accelerator coverage. Solid arrows represent the current
+VIME path; dashed arrows from Miles and AReaL represent roadmap work.
+
+```mermaid
+flowchart TB
+    VIME["VIME · integrated"] --> ORCH["RL orchestration integration"]
+    MILES["Miles · roadmap"] -.-> ORCH
+    AREAL["AReaL · roadmap"] -.-> ORCH
+    ORCH --> VLLM["vLLM · rollout"]
+    ORCH --> MEGATRON["Megatron-LM · training"]
+    VLLM --> RLK["RL-Kernel · deterministic and optimized operators"]
+    MEGATRON --> RLK
+    RLK --> CUDA["CUDA · supported"]
+    RLK --> ROCM["ROCm · supported"]
+    RLK -.-> ASCEND["Ascend · partial adaptation"]
+    RLK -.-> MUSA["Moore Threads / MUSA · in progress"]
+```
+
+The published benchmark validates **VIME + vLLM + Megatron-LM on CUDA**. Framework and
+backend coverage are documented independently. See [runtime dispatch](./docs/design/runtime-dispatch.md)
+for operator selection and strict execution contracts.
 
 ## Current Scope and Roadmap
 
@@ -111,53 +151,6 @@ parallelism coverage varies by backend. The performance numbers above are CUDA/H
 measurements. See the [installation guide](./docs/getting_started/installation.md) and
 [operator catalog](./docs/operators/README.md) for backend requirements and contracts.
 
-## Architecture
-
-RL-Kernel sits between framework execution engines and accelerator backends. Runtime
-adapters select operators through a hardware-aware registry; strict routes enforce the
-required numerical contract and expose execution provenance.
-
-The complete architecture below is a layer map, not a current support matrix. It shows
-the broader external scheduling and engine ecosystem, operator-library layers, and
-hardware abstraction boundary.
-
-<p align="center">
-  <img src="docs/assets/RL-Kernel underlying operator library technical architecture.png" alt="RL-Kernel global architecture" width="800">
-</p>
-
-The following diagram is a concise view of the validated runtime path, planned
-orchestration integrations, and accelerator coverage. Solid arrows represent the current
-VIME path; dashed arrows from Miles and AReaL represent roadmap work.
-
-```mermaid
-flowchart TB
-    VIME["VIME · integrated"] --> ORCH["RL orchestration integration"]
-    MILES["Miles · roadmap"] -.-> ORCH
-    AREAL["AReaL · roadmap"] -.-> ORCH
-    ORCH --> VLLM["vLLM · rollout"]
-    ORCH --> MEGATRON["Megatron-LM · training"]
-    VLLM --> RLK["RL-Kernel · deterministic and optimized operators"]
-    MEGATRON --> RLK
-    RLK --> CUDA["CUDA · supported"]
-    RLK --> ROCM["ROCm · supported"]
-    RLK -.-> ASCEND["Ascend · partial adaptation"]
-    RLK -.-> MUSA["Moore Threads / MUSA · in progress"]
-```
-
-The benchmark above validates **VIME + vLLM + Megatron-LM on CUDA**. Framework and
-backend coverage are documented independently. See [runtime dispatch](./docs/design/runtime-dispatch.md)
-for operator selection and strict execution contracts.
-
-## Operator Families
-
-| Family | Purpose | Documentation |
-| :--- | :--- | :--- |
-| **Attention** | Deterministic attention and context-parallel execution | [Attention](./docs/operators/attention.md) |
-| **Dense FFN** | Deterministic GEMM, SiLU, and SwiGLU paths | [GEMM](./docs/operators/det-gemm.md) · [Activations](./docs/operators/activation.md) |
-| **Log probabilities** | Fused, linear, batch-invariant, and vocabulary-parallel LogP | [Fused LogP](./docs/operators/fused-logp.md) · [Linear LogP](./docs/operators/linear-logp.md) · [Batch-invariant LogP](./docs/operators/batch-invariant-logp.md) |
-| **GRPO / PPO objectives** | Group normalization, policy ratios, KL penalties, and clipped losses | [GRPO loss](./docs/operators/grpo-loss.md) · [Ratio / KL](./docs/operators/ratio-kl.md) |
-| **Collectives** | Deterministic reductions for supported distributed topologies | [Collectives](./rl_engine/distributed/collectives.py) |
-
 ## Quick Start
 
 Install a PyTorch build matching your accelerator runtime, then install RL-Kernel from
@@ -177,16 +170,6 @@ Strict train–inference consistency requires the corresponding operators and ru
 configuration in both engines. Follow the [installation guide](./docs/getting_started/installation.md)
 and [quick-start guide](./docs/getting_started/quickstart.md); the full benchmark
 configuration and companion VIME revision are linked in [PR #377](https://github.com/RL-Align/RL-Kernel/pull/377).
-
-## Documentation
-
-| Resource | What you will find |
-| :--- | :--- |
-| [Documentation site](https://rl-align.github.io/RL-Kernel/) | Setup, design, API, and usage guides |
-| [Operator catalog](./docs/operators/README.md) | Operator contracts and backend coverage |
-| [Benchmarking](./docs/benchmarking/README.md) | Benchmark entry points and reporting methods |
-| [VIME integration](./docs/blog/2026-07-08-announcing-rl-kernel-linear-logp-for-vime.md) | Linear LogP integration and measurements |
-| [中文：发布 vime + RL-Kernel](./docs/blog/2026-07-08-announcing-rl-kernel-linear-logp-for-vime-zh.md) | Chinese VIME integration announcement |
 
 ## Community and Contributions
 
