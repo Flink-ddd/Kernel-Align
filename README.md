@@ -39,11 +39,6 @@ validated end-to-end path is **Qwen3-8B Dense with VIME, vLLM, and Megatron-LM**
 DeepSeek-V4 Flash MoE and additional RL orchestration integrations are under active
 development or on the roadmap.
 
-With **VIME + vLLM + Megatron-LM**, the published Qwen3-8B experiment achieves **zero
-train–rollout LogP mismatches at every one of 200 steps**, **68.7% higher rollout
-throughput**, and **8.2% lower end-to-end step time** than VIME's native production
-operator path. [See the configuration and results below](#benchmark-highlights).
-
 ## Why RL-Kernel?
 
 Rollout and training engines can produce different log probabilities for the same tokens
