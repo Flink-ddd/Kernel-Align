@@ -133,7 +133,7 @@ maximum response length 7,168 · KL-loss coefficient 0.001.
 G11 saves **47.47 seconds per rollout step**, offsetting the additional actor training
 cost for a net saving of **20.72 seconds per end-to-end step**.
 
-![Qwen3-8B performance comparison: stage times, throughput, and relative changes for VIME native G10 and optimized RL-Kernel G11](https://raw.githubusercontent.com/RL-Align/RL-Kernel/40db4d31982cd4a7ba28fbc96982b2af1f62921d/examples/vime_qwen3_8b_tp4_cp2_200/results/scale_reference_s1234_g10_g11_optimized/performance-summary.png)
+![Qwen3-8B performance comparison: stage times, throughput, and relative changes for VIME native G10 and optimized RL-Kernel G11](./docs/assets/qwen3-8b-performance-summary.png)
 
 ## Hardware Support
 
