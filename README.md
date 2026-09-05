@@ -130,6 +130,16 @@ RL-Kernel sits between framework execution engines and accelerator backends. Run
 adapters select operators through a hardware-aware registry; strict routes enforce the
 required numerical contract and expose execution provenance.
 
+The complete architecture shows the external scheduling, rollout and training engines,
+operator-library layers, and hardware abstraction boundary.
+
+<p align="center">
+  <img src="docs/assets/RL-Kernel underlying operator library technical architecture.png" alt="RL-Kernel global architecture" width="800">
+</p>
+
+The following diagram is a concise view of the validated runtime path and accelerator
+coverage.
+
 ```mermaid
 flowchart TB
     VIME["VIME · RL orchestration"] --> VLLM["vLLM · rollout"]
