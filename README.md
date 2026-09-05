@@ -20,6 +20,7 @@
 
 <p align="center">
   <a href="#benchmark-highlights">Results</a> ·
+  <a href="#current-scope-and-roadmap">Current scope</a> ·
   <a href="#hardware-support">Hardware support</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="#quick-start">Quick start</a> ·
@@ -47,10 +48,21 @@ differences enter the policy ratios and KL terms used by RL algorithms.
   all 200 training steps.
 - **Efficient RL execution:** fused log-probability computation, optimized attention and FFN
   paths, and deterministic collectives target rollout, memory, and synchronization costs.
-- **Framework integration:** provider and runtime adapters connect RL-Kernel to VIME,
-  vLLM, and Megatron-LM. VIME orchestrates the workflow; RL-Kernel supplies the operators.
+- **Current integration:** VIME is the supported RL orchestration layer, with vLLM for
+  rollout and Megatron-LM for training. RL-Kernel supplies the operators beneath them.
 - **Multiple accelerators:** dense-model train–inference consistency is supported on CUDA
   and ROCm, with Ascend and Moore Threads adaptation in progress.
+
+## Current Scope and Roadmap
+
+Current end-to-end support is deliberately scoped to **Qwen3-8B Dense** and **VIME**.
+Items in development or on the roadmap are not yet part of the supported path.
+
+| Dimension | Available today | In development / roadmap |
+| :--- | :--- | :--- |
+| **Model architecture** | Qwen3-8B Dense | [DeepSeek-V4-Flash-0731 MoE](./docs/blog/2026-08-09-dsv4-flash-moe-consistency-roadmap.md) — active development |
+| **RL orchestration** | VIME | Miles and AReaL |
+| **Execution engines** | vLLM rollout + Megatron-LM training | Additional engine integrations will follow validated operator coverage |
 
 ## Benchmark Highlights
 
@@ -80,35 +92,10 @@ cost for a net saving of **20.72 seconds per end-to-end step**.
 
 ![Qwen3-8B performance comparison: stage times, throughput, and relative changes for VIME native G10 and optimized RL-Kernel G11](https://raw.githubusercontent.com/RL-Align/RL-Kernel/40db4d31982cd4a7ba28fbc96982b2af1f62921d/examples/vime_qwen3_8b_tp4_cp2_200/results/scale_reference_s1234_g10_g11_optimized/performance-summary.png)
 
-<details>
-<summary><strong>200-step consistency and training curves</strong></summary>
-
-G11 records `mismatch_count == 0` and `max_abs_diff == 0` at all 200 steps; G10
-records nonzero mismatch at every step. The bottom panels show the runtime LogP checks.
-The upper panels show raw reward and `train/kl_loss`.
-
-![Training and consistency curves: raw reward, KL loss, train-rollout mismatch count, and maximum absolute LogP difference over 200 steps](https://raw.githubusercontent.com/RL-Align/RL-Kernel/40db4d31982cd4a7ba28fbc96982b2af1f62921d/examples/vime_qwen3_8b_tp4_cp2_200/results/scale_reference_s1234_g10_g11_optimized/consistency-reward.png)
-
-</details>
-
-**How to read these results.** Timing and throughput are arithmetic means over all 200
-steps. This is a comparison of implementations under the same workload configuration;
-the arms use different implementation revisions and generate different trajectories
-(G11's mean response length is 4.8% higher). Exact agreement refers to the measured
-train–rollout LogP on this strict path. Results come from one training seed on H100;
-speedups depend on the workload and hardware. Mean raw reward is 0.528555 for G10 and
-0.491445 for G11, so these results establish consistency and execution performance,
-without establishing a model-quality improvement.
-
-[Experiment and version provenance](https://github.com/RL-Align/RL-Kernel/pull/377) ·
-[Published result report](https://github.com/RL-Align/RL-Kernel/tree/40db4d31982cd4a7ba28fbc96982b2af1f62921d/examples/vime_qwen3_8b_tp4_cp2_200/results/scale_reference_s1234_g10_g11_optimized) ·
-[200-step CSV](https://github.com/RL-Align/RL-Kernel/blob/40db4d31982cd4a7ba28fbc96982b2af1f62921d/examples/vime_qwen3_8b_tp4_cp2_200/results/scale_reference_s1234_g10_g11_optimized/rounds.csv) ·
-[Statistics JSON](https://github.com/RL-Align/RL-Kernel/blob/40db4d31982cd4a7ba28fbc96982b2af1f62921d/examples/vime_qwen3_8b_tp4_cp2_200/results/scale_reference_s1234_g10_g11_optimized/summary.json)
-
 ## Hardware Support
 
-The following matrix tracks **dense-model train–inference consistency**. Accelerator
-support and the scope of published benchmarks are listed separately.
+The following matrix tracks accelerator coverage for the current dense-model path. It
+does not extend the end-to-end model claim beyond Qwen3-8B Dense.
 
 | Vendor | Accelerator | Software stack | Dense train–inference consistency | Coverage / progress |
 | :--- | :--- | :--- | :---: | :--- |
@@ -130,20 +117,25 @@ RL-Kernel sits between framework execution engines and accelerator backends. Run
 adapters select operators through a hardware-aware registry; strict routes enforce the
 required numerical contract and expose execution provenance.
 
-The complete architecture shows the external scheduling, rollout and training engines,
-operator-library layers, and hardware abstraction boundary.
+The complete architecture below is a layer map, not a current support matrix. It shows
+the broader external scheduling and engine ecosystem, operator-library layers, and
+hardware abstraction boundary.
 
 <p align="center">
   <img src="docs/assets/RL-Kernel underlying operator library technical architecture.png" alt="RL-Kernel global architecture" width="800">
 </p>
 
-The following diagram is a concise view of the validated runtime path and accelerator
-coverage.
+The following diagram is a concise view of the validated runtime path, planned
+orchestration integrations, and accelerator coverage. Solid arrows represent the current
+VIME path; dashed arrows from Miles and AReaL represent roadmap work.
 
 ```mermaid
 flowchart TB
-    VIME["VIME · RL orchestration"] --> VLLM["vLLM · rollout"]
-    VIME --> MEGATRON["Megatron-LM · training"]
+    VIME["VIME · integrated"] --> ORCH["RL orchestration integration"]
+    MILES["Miles · roadmap"] -.-> ORCH
+    AREAL["AReaL · roadmap"] -.-> ORCH
+    ORCH --> VLLM["vLLM · rollout"]
+    ORCH --> MEGATRON["Megatron-LM · training"]
     VLLM --> RLK["RL-Kernel · deterministic and optimized operators"]
     MEGATRON --> RLK
     RLK --> CUDA["CUDA · supported"]
