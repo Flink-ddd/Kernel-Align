@@ -22,10 +22,12 @@ _EnumT = TypeVar("_EnumT", bound=Enum)
 # The FA4 core is the strict production path. The materializing RL-Kernel core
 # remains available as an explicit reference and capability-gap fallback.
 STRICT_ATTENTION_PRODUCTION_CORE_ID = "rlkernel.attention.flash_attention4.num_splits1.v1"
+STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID = "rlkernel.attention.rocm.aiter_ck_dense_mha.v1"
 STRICT_ATTENTION_REFERENCE_CORE_ID = "rlkernel.attention.deterministic_core.v1"
 # Compatibility alias for callers that explicitly select the original core.
 STRICT_ATTENTION_CORE_ID = STRICT_ATTENTION_REFERENCE_CORE_ID
 STRICT_ATTENTION_FA4_SCHEDULE_ID = "single_batch_flash_attention4_num_splits1"
+STRICT_ATTENTION_ROCM_SCHEDULE_ID = "single_batch_aiter_ck_dense_mha_no_splitkv"
 STRICT_ATTENTION_SCHEDULE_ID = "single_batch_single_query_global_kv_blocks"
 
 
@@ -1680,6 +1682,8 @@ __all__ = [
     "STRICT_ATTENTION_FA4_SCHEDULE_ID",
     "STRICT_ATTENTION_PRODUCTION_CORE_ID",
     "STRICT_ATTENTION_REFERENCE_CORE_ID",
+    "STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID",
+    "STRICT_ATTENTION_ROCM_SCHEDULE_ID",
     "STRICT_ATTENTION_SCHEDULE_ID",
     "validate_split_kv_alignment",
     "validate_split_kv_plan_set_alignment",

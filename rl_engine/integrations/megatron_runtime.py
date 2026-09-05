@@ -497,7 +497,7 @@ class _DeterministicTPOutputProjection(torch.autograd.Function):
         bias: torch.Tensor | None,
         tp_group: Any,
     ) -> torch.Tensor:
-        from rl_engine.kernels.ops.cuda.matmul.det_gemm import det_gemm_linear
+        from rl_engine.kernels.ops.matmul.det_gemm import det_gemm_linear
 
         if input_value.ndim == 3:
             input_2d = input_value.transpose(0, 1).contiguous().reshape(-1, input_value.shape[-1])
@@ -527,7 +527,7 @@ class _DeterministicTPOutputProjection(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor):
         from rl_engine.kernels.ops.cuda.loss.linear_logp import _deterministic_tp_all_reduce_
-        from rl_engine.kernels.ops.cuda.matmul.det_gemm import (
+        from rl_engine.kernels.ops.matmul.det_gemm import (
             det_gemm_linear_input_gradient,
             det_gemm_linear_weight_gradient,
         )

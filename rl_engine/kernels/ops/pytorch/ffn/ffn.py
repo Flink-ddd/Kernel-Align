@@ -19,7 +19,7 @@ from rl_engine.distributed.collectives import (
     deterministic_staging_reserve,
 )
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
-from rl_engine.kernels.ops.cuda.matmul.det_gemm import (
+from rl_engine.kernels.ops.matmul.det_gemm import (
     det_gemm_linear,
     det_gemm_linear_input_gradient,
     det_gemm_linear_weight_gradient,

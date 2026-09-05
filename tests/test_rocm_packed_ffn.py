@@ -7,7 +7,7 @@ import torch
 
 import rl_engine.kernels.ops.pytorch.ffn.ffn as ffn_module
 from rl_engine.integrations.framework_operators import VllmFFNOperator
-from rl_engine.kernels.ops.cuda.matmul.det_gemm import (
+from rl_engine.kernels.ops.matmul.det_gemm import (
     DetGemmOp,
     det_gemm_linear_weight_gradient,
 )

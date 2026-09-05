@@ -37,7 +37,7 @@ from rl_engine.kernels.attention_projection import ROCM_DETERMINISTIC_PROJECTION
 from rl_engine.kernels.logprob_contract import LogprobContract, LogprobDType, LogprobRole, MaskSpec
 from rl_engine.kernels.logprob_contract import ReductionSpec as LogprobReductionSpec
 from rl_engine.kernels.logprob_contract import ShardingSpec as LogprobShardingSpec
-from rl_engine.kernels.ops.cuda.matmul.det_gemm import det_gemm_backend_id
+from rl_engine.kernels.ops.matmul.det_gemm import DetGemmOp, det_gemm_backend_id
 from rl_engine.kernels.ops.pytorch.attention.ablation import AttentionAblationConfig
 from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import BACKEND_ID as LOGP_BACKEND_ID
 from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import DEFAULT_NUM_VOCAB_TILES
@@ -174,12 +174,6 @@ def _strict_attention_projection_provenance(platform: str) -> dict[str, Any]:
 
 def _strict_attention_projection_op() -> Any:
     """Construct the deterministic projection selected for this PyTorch build."""
-
-    if torch.version.hip is not None:
-        from rl_engine.kernels.ops.triton.matmul.det_gemm import TritonDetGemmOp
-
-        return TritonDetGemmOp()
-    from rl_engine.kernels.ops.cuda.matmul.det_gemm import DetGemmOp
 
     return DetGemmOp()
 

@@ -470,7 +470,7 @@ def _patch_strict_lm_head_linear(
         return
     previous_apply = linear_method_cls.apply
     if det_gemm is None:
-        from rl_engine.kernels.ops.cuda.matmul.det_gemm import DetGemmOp
+        from rl_engine.kernels.ops.matmul.det_gemm import DetGemmOp
 
         det_gemm = DetGemmOp()
 

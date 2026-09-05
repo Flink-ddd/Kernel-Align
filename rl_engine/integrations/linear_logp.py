@@ -290,7 +290,7 @@ class LinearLogpWrapper:
 
     def _resolve_rocm_linear(self) -> Any:
         if self._rocm_linear is None:
-            from rl_engine.kernels.ops.cuda.matmul.det_gemm import DetGemmOp
+            from rl_engine.kernels.ops.matmul.det_gemm import DetGemmOp
 
             self._rocm_linear = DetGemmOp()
         return self._rocm_linear
