@@ -5,12 +5,13 @@
 <h1 align="center">RL-Kernel</h1>
 
 <p align="center">
-  <strong>Bitwise train–inference consistency. Faster RL post-training.</strong>
+  <strong>Building cross-hardware and multi-model RL post-training infrastructure for kernel-level train–inference consistency.</strong>
 </p>
 
 <p align="center">
   <a href="https://rl-align.github.io/RL-Kernel/"><img src="https://img.shields.io/badge/Documentation-Docs-2ea44f" alt="Documentation"></a>
   <a href="https://rl-align.slack.com/join/shared_invite/zt-46bxj7uyt-gEK3xzwSJr_lppJsZolR~g#/shared-invite/email"><img src="https://img.shields.io/badge/Slack-Join%20Us-4A154B" alt="Slack"></a>
+  <a href="https://www.linkedin.com/company/rl-align"><img src="https://img.shields.io/badge/LinkedIn-Follow-0A66C2?logo=linkedin&logoColor=white" alt="Follow RL-Align on LinkedIn"></a>
   <a href="./docs/community/wechat.md"><img src="https://img.shields.io/badge/WeChat-Join%20Group-07C160?logo=wechat&logoColor=white" alt="WeChat"></a>
   <a href="./docs/assets/whatsapp-group.png"><img src="https://img.shields.io/badge/WhatsApp-Join%20Group-25D366?logo=whatsapp&logoColor=white" alt="WhatsApp"></a>
   <a href="https://deepwiki.com/RL-Align/RL-Kernel"><img src="https://img.shields.io/badge/Ask-DeepWiki-7B3FE4" alt="Ask DeepWiki"></a>
@@ -27,10 +28,16 @@
   <a href="https://rl-align.github.io/RL-Kernel/">Documentation</a>
 </p>
 
-**RL-Kernel** is a high-performance operator library for **GRPO and PPO-style RL
-post-training**. It aligns numerical computation between rollout and training engines
-with deterministic attention, dense FFN, log-probability, and collective operations.
-Hardware-specific kernels optimize execution and memory use beneath the RL framework.
+**RL-Kernel** is high-performance **RL post-training infrastructure** designed for
+bitwise, operator-level train–inference consistency across heterogeneous rollout and
+training engines. It combines deterministic operators, hardware-aware runtime dispatch,
+and accelerator-specific kernels to improve execution speed and memory efficiency for
+GRPO, PPO, and related RL workloads.
+
+The project is building toward cross-hardware and multi-model coverage. Today, the
+validated end-to-end path is **Qwen3-8B Dense with VIME, vLLM, and Megatron-LM**;
+DeepSeek-V4 Flash MoE and additional RL orchestration integrations are under active
+development or on the roadmap.
 
 With **VIME + vLLM + Megatron-LM**, the published Qwen3-8B experiment achieves **zero
 train–rollout LogP mismatches at every one of 200 steps**, **68.7% higher rollout
