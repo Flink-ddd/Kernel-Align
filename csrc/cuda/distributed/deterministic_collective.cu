@@ -30,7 +30,7 @@ constexpr int kThreads = 256;
 constexpr int kMaxBlocks = 4096;
 constexpr int kStagingFrames = 3;
 constexpr int kFusedStagingSlots = 2;
-constexpr int64_t kSequenceHeaderBytes = 3 * sizeof(uint64_t);
+constexpr int64_t kSequenceHeaderBytes = 4 * sizeof(uint64_t);
 // Small tensor collectives are launch-bound. Keep the existing DMA path for
 // larger transfers, where replacing cudaMemcpyAsync with a one-block copy
 // would reduce bandwidth and hurt overlap.
@@ -186,6 +186,13 @@ __device__ __forceinline__ T fixed_tree_reduce(
     const PeerPointers& peers,
     int64_t index);
 
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+template <int WorldSize>
+__device__ __forceinline__ nv_bfloat162 fixed_tree_reduce_bf16x2(
+    const PeerPointers& peers,
+    int64_t pair_index);
+#endif
+
 template <typename T, int WorldSize>
 __global__ void deterministic_all_reduce_fast_kernel(
     PeerPointers peers,
@@ -198,8 +205,153 @@ __global__ void deterministic_all_reduce_fast_kernel(
   }
   __syncthreads();
 
-  for (int64_t index = threadIdx.x; index < element_count; index += blockDim.x) {
-    output[index] = fixed_tree_reduce<T, WorldSize>(peers, index);
+  if constexpr (std::is_same_v<T, nv_bfloat16>) {
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    const int64_t pair_count = element_count / 2;
+    auto* pair_output = reinterpret_cast<nv_bfloat162*>(output);
+    for (int64_t pair_index = threadIdx.x;
+         pair_index < pair_count;
+         pair_index += blockDim.x) {
+      pair_output[pair_index] =
+          fixed_tree_reduce_bf16x2<WorldSize>(peers, pair_index);
+    }
+    if ((element_count & 1) != 0 && threadIdx.x == 0) {
+      output[element_count - 1] =
+          fixed_tree_reduce<nv_bfloat16, WorldSize>(peers, element_count - 1);
+    }
+#endif
+  } else {
+    for (int64_t index = threadIdx.x; index < element_count; index += blockDim.x) {
+      output[index] = fixed_tree_reduce<T, WorldSize>(peers, index);
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    __threadfence_system();
+    store_release_system(
+        local_done_sequence,
+        load_acquire_system(local_stage_sequence));
+  }
+}
+
+// Preserve the graph-safe single-slot protocol while removing the launch
+// boundary between staging and reduction. The sequence and fixed-tree order
+// are identical to stage_payload_fast_kernel followed by
+// deterministic_all_reduce_fast_kernel.
+template <typename T, int WorldSize>
+__global__ void deterministic_all_reduce_graph_safe_fused_fast_kernel(
+    PeerPointers peers,
+    uint64_t* local_stage_sequence,
+    uint64_t* local_done_sequence,
+    const uint8_t* input,
+    uint8_t* payload,
+    T* output,
+    int64_t element_count,
+    int64_t input_bytes) {
+  if (threadIdx.x == 0) {
+    const uint64_t sequence = load_acquire_system(local_stage_sequence);
+    for (int peer = 0; peer < WorldSize; ++peer) {
+      while (load_acquire_system(peers.done_sequences[peer]) < sequence) {
+        __nanosleep(64);
+      }
+    }
+  }
+  __syncthreads();
+
+  if (((reinterpret_cast<uintptr_t>(input) |
+        reinterpret_cast<uintptr_t>(payload) |
+        static_cast<uintptr_t>(input_bytes)) & 15u) == 0u) {
+    const auto* source = reinterpret_cast<const uint4*>(input);
+    auto* destination = reinterpret_cast<uint4*>(payload);
+    const int64_t vector_count = input_bytes / sizeof(uint4);
+    for (int64_t index = threadIdx.x; index < vector_count; index += blockDim.x) {
+      destination[index] = source[index];
+    }
+  } else {
+    for (int64_t index = threadIdx.x; index < input_bytes; index += blockDim.x) {
+      payload[index] = input[index];
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    __threadfence_system();
+    store_release_system(
+        local_stage_sequence,
+        load_acquire_system(local_stage_sequence) + 1);
+    wait_for_stage_sequence(peers, WorldSize, local_stage_sequence);
+  }
+  __syncthreads();
+
+  if constexpr (std::is_same_v<T, nv_bfloat16>) {
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    const int64_t pair_count = element_count / 2;
+    auto* pair_output = reinterpret_cast<nv_bfloat162*>(output);
+    for (int64_t pair_index = threadIdx.x;
+         pair_index < pair_count;
+         pair_index += blockDim.x) {
+      pair_output[pair_index] =
+          fixed_tree_reduce_bf16x2<WorldSize>(peers, pair_index);
+    }
+    if ((element_count & 1) != 0 && threadIdx.x == 0) {
+      output[element_count - 1] =
+          fixed_tree_reduce<nv_bfloat16, WorldSize>(peers, element_count - 1);
+    }
+#endif
+  } else {
+    for (int64_t index = threadIdx.x; index < element_count; index += blockDim.x) {
+      output[index] = fixed_tree_reduce<T, WorldSize>(peers, index);
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    __threadfence_system();
+    store_release_system(
+        local_done_sequence,
+        load_acquire_system(local_stage_sequence));
+  }
+}
+
+// The caller has already written the GEMM result into this rank's IPC
+// payload. Publish those bytes and run the same fixed tree without copying
+// them through an intermediate tensor.
+template <typename T, int WorldSize>
+__global__ void deterministic_all_reduce_staged_fast_kernel(
+    PeerPointers peers,
+    uint64_t* local_stage_sequence,
+    uint64_t* local_done_sequence,
+    T* output,
+    int64_t element_count) {
+  if (threadIdx.x == 0) {
+    __threadfence_system();
+    store_release_system(
+        local_stage_sequence,
+        load_acquire_system(local_stage_sequence) + 1);
+    wait_for_stage_sequence(peers, WorldSize, local_stage_sequence);
+  }
+  __syncthreads();
+
+  if constexpr (std::is_same_v<T, nv_bfloat16>) {
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    const int64_t pair_count = element_count / 2;
+    auto* pair_output = reinterpret_cast<nv_bfloat162*>(output);
+    for (int64_t pair_index = threadIdx.x;
+         pair_index < pair_count;
+         pair_index += blockDim.x) {
+      pair_output[pair_index] =
+          fixed_tree_reduce_bf16x2<WorldSize>(peers, pair_index);
+    }
+    if ((element_count & 1) != 0 && threadIdx.x == 0) {
+      output[element_count - 1] =
+          fixed_tree_reduce<nv_bfloat16, WorldSize>(peers, element_count - 1);
+    }
+#endif
+  } else {
+    for (int64_t index = threadIdx.x; index < element_count; index += blockDim.x) {
+      output[index] = fixed_tree_reduce<T, WorldSize>(peers, index);
+    }
   }
   __syncthreads();
 
@@ -537,6 +689,87 @@ void launch_all_reduce_fast(
           local_done_sequence,
           output,
           element_count);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported deterministic collective world size ", world_size);
+  }
+}
+
+template <typename T>
+void launch_all_reduce_graph_safe_fused_fast(
+    const PeerPointers& peers,
+    uint64_t* local_stage_sequence,
+    uint64_t* local_done_sequence,
+    const uint8_t* input,
+    uint8_t* payload,
+    T* output,
+    int64_t element_count,
+    int64_t input_bytes,
+    int64_t world_size,
+    cudaStream_t stream) {
+  switch (world_size) {
+    case 1:
+      deterministic_all_reduce_graph_safe_fused_fast_kernel<T, 1>
+          <<<1, kThreads, 0, stream>>>(
+              peers, local_stage_sequence, local_done_sequence,
+              input, payload, output, element_count, input_bytes);
+      break;
+    case 2:
+      deterministic_all_reduce_graph_safe_fused_fast_kernel<T, 2>
+          <<<1, kThreads, 0, stream>>>(
+              peers, local_stage_sequence, local_done_sequence,
+              input, payload, output, element_count, input_bytes);
+      break;
+    case 4:
+      deterministic_all_reduce_graph_safe_fused_fast_kernel<T, 4>
+          <<<1, kThreads, 0, stream>>>(
+              peers, local_stage_sequence, local_done_sequence,
+              input, payload, output, element_count, input_bytes);
+      break;
+    case 8:
+      deterministic_all_reduce_graph_safe_fused_fast_kernel<T, 8>
+          <<<1, kThreads, 0, stream>>>(
+              peers, local_stage_sequence, local_done_sequence,
+              input, payload, output, element_count, input_bytes);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported deterministic collective world size ", world_size);
+  }
+}
+
+template <typename T>
+void launch_all_reduce_staged_fast(
+    const PeerPointers& peers,
+    uint64_t* local_stage_sequence,
+    uint64_t* local_done_sequence,
+    T* output,
+    int64_t element_count,
+    int64_t world_size,
+    cudaStream_t stream) {
+  switch (world_size) {
+    case 1:
+      deterministic_all_reduce_staged_fast_kernel<T, 1>
+          <<<1, kThreads, 0, stream>>>(
+              peers, local_stage_sequence, local_done_sequence,
+              output, element_count);
+      break;
+    case 2:
+      deterministic_all_reduce_staged_fast_kernel<T, 2>
+          <<<1, kThreads, 0, stream>>>(
+              peers, local_stage_sequence, local_done_sequence,
+              output, element_count);
+      break;
+    case 4:
+      deterministic_all_reduce_staged_fast_kernel<T, 4>
+          <<<1, kThreads, 0, stream>>>(
+              peers, local_stage_sequence, local_done_sequence,
+              output, element_count);
+      break;
+    case 8:
+      deterministic_all_reduce_staged_fast_kernel<T, 8>
+          <<<1, kThreads, 0, stream>>>(
+              peers, local_stage_sequence, local_done_sequence,
+              output, element_count);
       break;
     default:
       TORCH_CHECK(false, "unsupported deterministic collective world size ", world_size);
@@ -908,6 +1141,79 @@ class DeterministicCollectiveState {
     }
   }
 
+  void prepare_staged(torch::Tensor& input, cudaStream_t stream) {
+    check_tensor(input, "direct staging input");
+    const int64_t input_bytes = input.numel() * input.element_size();
+    TORCH_CHECK(
+        input_bytes <= kSingleBlockFastPathMaxBytes,
+        "direct staging supports at most ",
+        kSingleBlockFastPathMaxBytes,
+        " bytes, got ",
+        input_bytes);
+    TORCH_CHECK(
+        input.data_ptr() == peers_.values[rank_],
+        "direct staging tensor must start at this rank's IPC payload");
+    wait_for_previous_done_kernel<<<1, 1, 0, stream>>>(
+        peers_, world_size_, local_stage_sequence_);
+    AT_CUDA_CHECK(cudaGetLastError());
+  }
+
+  void all_reduce_staged(
+      torch::Tensor& input,
+      torch::Tensor& output,
+      cudaStream_t stream) {
+    check_tensor(input, "direct staging input");
+    check_tensor(output, "output");
+    const int64_t input_bytes = input.numel() * input.element_size();
+    TORCH_CHECK(
+        input_bytes <= kSingleBlockFastPathMaxBytes,
+        "direct staged all-reduce supports at most ",
+        kSingleBlockFastPathMaxBytes,
+        " bytes, got ",
+        input_bytes);
+    TORCH_CHECK(
+        input.data_ptr() == peers_.values[rank_],
+        "direct staging tensor must start at this rank's IPC payload");
+    TORCH_CHECK(
+        output.scalar_type() == input.scalar_type(),
+        "direct staged all-reduce output dtype must match the input dtype");
+    TORCH_CHECK(
+        output.numel() == input.numel(),
+        "direct staged all-reduce output size must match the input size");
+    TORCH_CHECK(
+        output.data_ptr() != input.data_ptr(),
+        "direct staged all-reduce output must not alias the IPC payload");
+
+    switch (input.scalar_type()) {
+      case at::ScalarType::Float:
+        launch_all_reduce_staged_fast<float>(
+            peers_, local_stage_sequence_, local_done_sequence_,
+            static_cast<float*>(output.data_ptr()), output.numel(),
+            world_size_, stream);
+        break;
+      case at::ScalarType::Half:
+        launch_all_reduce_staged_fast<half>(
+            peers_, local_stage_sequence_, local_done_sequence_,
+            static_cast<half*>(output.data_ptr()), output.numel(),
+            world_size_, stream);
+        break;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+      case at::ScalarType::BFloat16:
+        launch_all_reduce_staged_fast<nv_bfloat16>(
+            peers_, local_stage_sequence_, local_done_sequence_,
+            static_cast<nv_bfloat16*>(output.data_ptr()), output.numel(),
+            world_size_, stream);
+        break;
+#endif
+      default:
+        TORCH_CHECK(
+            false,
+            "deterministic all-reduce supports float32, float16, and bfloat16; got ",
+            input.scalar_type());
+    }
+    AT_CUDA_CHECK(cudaGetLastError());
+  }
+
   void stage(torch::Tensor& input, cudaStream_t stream) {
     check_tensor(input, "input");
     const int64_t input_bytes = input.numel() * input.element_size();
@@ -1148,9 +1454,46 @@ class DeterministicCollectiveState {
         output.numel() == input.numel(),
         "all-reduce output size must match the input size");
 
-    // Use the graph-safe staged protocol for every message size. The fused
-    // two-slot protocol is intentionally kept available in the extension for
-    // experiments, but is not safe to replay across vLLM's many graph shapes.
+    // Fuse the hot small-message path without changing the graph-safe
+    // single-slot sequence protocol or the fixed-tree reduction order. The
+    // experimental two-slot protocol remains disabled across graph shapes.
+    if (input_bytes <= kSingleBlockFastPathMaxBytes) {
+      auto* payload = const_cast<uint8_t*>(
+          static_cast<const uint8_t*>(peers_.values[rank_]));
+      switch (input.scalar_type()) {
+        case at::ScalarType::Float:
+          launch_all_reduce_graph_safe_fused_fast<float>(
+              peers_, local_stage_sequence_, local_done_sequence_,
+              static_cast<const uint8_t*>(input.data_ptr()), payload,
+              static_cast<float*>(output.data_ptr()), output.numel(),
+              input_bytes, world_size_, stream);
+          break;
+        case at::ScalarType::Half:
+          launch_all_reduce_graph_safe_fused_fast<half>(
+              peers_, local_stage_sequence_, local_done_sequence_,
+              static_cast<const uint8_t*>(input.data_ptr()), payload,
+              static_cast<half*>(output.data_ptr()), output.numel(),
+              input_bytes, world_size_, stream);
+          break;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+        case at::ScalarType::BFloat16:
+          launch_all_reduce_graph_safe_fused_fast<nv_bfloat16>(
+              peers_, local_stage_sequence_, local_done_sequence_,
+              static_cast<const uint8_t*>(input.data_ptr()), payload,
+              static_cast<nv_bfloat16*>(output.data_ptr()), output.numel(),
+              input_bytes, world_size_, stream);
+          break;
+#endif
+        default:
+          TORCH_CHECK(
+              false,
+              "deterministic all-reduce supports float32, float16, and bfloat16; got ",
+              input.scalar_type());
+      }
+      AT_CUDA_CHECK(cudaGetLastError());
+      return;
+    }
+
     stage(input, stream);
     all_reduce(output, stream, /*allow_owner_path=*/false);
   }
@@ -1189,6 +1532,79 @@ class DeterministicCollectiveState {
         world_size_,
         stream);
     AT_CUDA_CHECK(cudaGetLastError());
+  }
+
+  void all_gather_many(
+      const std::vector<torch::Tensor>& inputs,
+      const std::vector<torch::Tensor>& outputs,
+      cudaStream_t stream) {
+    TORCH_CHECK(!inputs.empty(), "all_gather_many requires at least one input");
+    TORCH_CHECK(
+        inputs.size() == outputs.size(),
+        "all_gather_many inputs and outputs must have the same length");
+    TORCH_CHECK(
+        !has_staged_input_,
+        "cannot run all_gather_many with a pending stage()");
+
+    std::vector<int64_t> offsets(inputs.size());
+    std::vector<int64_t> input_bytes(inputs.size());
+    int64_t total_bytes = 0;
+    for (size_t index = 0; index < inputs.size(); ++index) {
+      const auto& input = inputs[index];
+      const auto& output = outputs[index];
+      check_tensor(input, "input");
+      check_tensor(output, "output");
+      TORCH_CHECK(
+          output.scalar_type() == input.scalar_type(),
+          "all_gather_many output dtype must match its input dtype");
+      const int64_t bytes = input.numel() * input.element_size();
+      TORCH_CHECK(
+          output.numel() * output.element_size() == bytes * world_size_,
+          "all_gather_many output must contain one input per rank");
+      total_bytes = (total_bytes + 15) & ~int64_t{15};
+      offsets[index] = total_bytes;
+      input_bytes[index] = bytes;
+      total_bytes += bytes;
+    }
+    TORCH_CHECK(
+        total_bytes <= capacity_bytes_,
+        "all_gather_many inputs require ", total_bytes,
+        " bytes but staging capacity is ", capacity_bytes_);
+
+    wait_for_previous_done_kernel<<<1, 1, 0, stream>>>(
+        peers_, world_size_, local_stage_sequence_);
+    AT_CUDA_CHECK(cudaGetLastError());
+    auto* local_payload = const_cast<uint8_t*>(
+        static_cast<const uint8_t*>(peers_.values[rank_]));
+    for (size_t index = 0; index < inputs.size(); ++index) {
+      if (input_bytes[index] == 0) continue;
+      AT_CUDA_CHECK(cudaMemcpyAsync(
+          local_payload + offsets[index],
+          inputs[index].data_ptr(),
+          input_bytes[index],
+          cudaMemcpyDeviceToDevice,
+          stream));
+    }
+    publish_next_stage_sequence_kernel<<<1, 1, 0, stream>>>(
+        local_stage_sequence_);
+    AT_CUDA_CHECK(cudaGetLastError());
+    wait_for_staged_peers(stream);
+
+    for (size_t index = 0; index < inputs.size(); ++index) {
+      auto* output = static_cast<uint8_t*>(outputs[index].data_ptr());
+      for (int peer = 0; peer < world_size_; ++peer) {
+        if (input_bytes[index] == 0) continue;
+        const auto* peer_payload =
+            static_cast<const uint8_t*>(peers_.values[peer]);
+        AT_CUDA_CHECK(cudaMemcpyAsync(
+            output + static_cast<int64_t>(peer) * input_bytes[index],
+            peer_payload + offsets[index],
+            input_bytes[index],
+            cudaMemcpyDeviceToDevice,
+            stream));
+      }
+    }
+    publish_done(stream);
   }
 
   void reduce_scatter(torch::Tensor& output, cudaStream_t stream) {
@@ -1507,6 +1923,23 @@ void deterministic_collective_all_reduce(int64_t handle, torch::Tensor& output) 
   state_from_handle(handle)->all_reduce(output, stream);
 }
 
+void deterministic_collective_prepare_staged(
+    int64_t handle,
+    torch::Tensor& input) {
+  const c10::cuda::CUDAGuard device_guard(input.device());
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  state_from_handle(handle)->prepare_staged(input, stream);
+}
+
+void deterministic_collective_all_reduce_staged(
+    int64_t handle,
+    torch::Tensor& input,
+    torch::Tensor& output) {
+  const c10::cuda::CUDAGuard device_guard(input.device());
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  state_from_handle(handle)->all_reduce_staged(input, output, stream);
+}
+
 void deterministic_collective_all_reduce_fused(
     int64_t handle,
     torch::Tensor& input,
@@ -1523,6 +1956,16 @@ void deterministic_collective_all_gather_fused(
   const c10::cuda::CUDAGuard device_guard(input.device());
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
   state_from_handle(handle)->all_gather_fused(input, output, stream);
+}
+
+void deterministic_collective_all_gather_many(
+    int64_t handle,
+    std::vector<torch::Tensor> inputs,
+    std::vector<torch::Tensor> outputs) {
+  TORCH_CHECK(!inputs.empty(), "all_gather_many requires at least one input");
+  const c10::cuda::CUDAGuard device_guard(inputs.front().device());
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  state_from_handle(handle)->all_gather_many(inputs, outputs, stream);
 }
 
 void deterministic_collective_reduce_scatter(int64_t handle, torch::Tensor& output) {

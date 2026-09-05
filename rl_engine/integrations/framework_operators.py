@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
+from functools import lru_cache
 from threading import Lock
 from typing import Any, Mapping, cast
 
@@ -255,6 +256,7 @@ def _megatron_parallel_state() -> Any:
     return parallel_state
 
 
+@lru_cache(maxsize=512)
 def _megatron_zigzag_layout(
     local_tokens: int,
     *,
@@ -410,6 +412,33 @@ class MegatronAttentionOperator:
         self._packed_layout_owner: Any | None = None
         self._packed_layout_key: tuple[Any, ...] | None = None
         self._packed_layout_value: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+        self._position_ids_cache: dict[tuple[Any, ...], torch.Tensor] = {}
+
+    def _position_ids(
+        self,
+        positions: tuple[int, ...],
+        *,
+        batch_size: int,
+        cp_rank: int,
+        cp_world_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        key = (
+            len(positions),
+            int(batch_size),
+            int(cp_rank),
+            int(cp_world_size),
+            device.type,
+            device.index,
+        )
+        cached = self._position_ids_cache.get(key)
+        if cached is not None:
+            return cached
+        if len(self._position_ids_cache) >= 128:
+            self._position_ids_cache.pop(next(iter(self._position_ids_cache)))
+        value = torch.tensor(positions, dtype=torch.int64, device=device).repeat(batch_size, 1)
+        self._position_ids_cache[key] = value
+        return value
 
     def _packed_layout(
         self,
@@ -509,11 +538,13 @@ class MegatronAttentionOperator:
                 cp_rank=cp_rank,
                 cp_world_size=cp_world,
             )
-            position_ids = torch.tensor(
+            position_ids = self._position_ids(
                 positions,
-                dtype=torch.int64,
+                batch_size=q_ready.size(0),
+                cp_rank=cp_rank,
+                cp_world_size=cp_world,
                 device=q_ready.device,
-            ).repeat(q_ready.size(0), 1)
+            )
             return operator(
                 q_ready,
                 k_ready,
@@ -583,20 +614,21 @@ class MegatronAttentionOperator:
             sequence_provenance: list[dict[str, Any] | None] = [None] * len(global_lengths)
             launch_group_count = 0
             for (local_length, global_length), sequences in grouped_sequences.items():
-                q_ready = (
-                    torch.stack([query[start:end] for _index, start, end in sequences], dim=0)
-                    .permute(0, 2, 1, 3)
-                    .contiguous()
+                # Stack the cheap [H, T, D] views directly into FA4's
+                # [B, H, T, D] layout.  Stacking before permuting would first
+                # materialize [B, T, H, D] and then copy the entire tensor a
+                # second time for every layer and microbatch.
+                q_ready = torch.stack(
+                    [query[start:end].permute(1, 0, 2) for _index, start, end in sequences],
+                    dim=0,
                 )
-                k_ready = (
-                    torch.stack([key[start:end] for _index, start, end in sequences], dim=0)
-                    .permute(0, 2, 1, 3)
-                    .contiguous()
+                k_ready = torch.stack(
+                    [key[start:end].permute(1, 0, 2) for _index, start, end in sequences],
+                    dim=0,
                 )
-                v_ready = (
-                    torch.stack([value[start:end] for _index, start, end in sequences], dim=0)
-                    .permute(0, 2, 1, 3)
-                    .contiguous()
+                v_ready = torch.stack(
+                    [value[start:end].permute(1, 0, 2) for _index, start, end in sequences],
+                    dim=0,
                 )
                 result = execute_sequence(
                     q_ready,
@@ -637,6 +669,9 @@ class MegatronAttentionOperator:
             "tp_world_size": tp_world,
             "runtime_platform": "cuda",
             "triton_used": False,
+            "tp_output_projection_collective": (
+                "deterministic_all_reduce.ipc_localized_fixed_tree.v1"
+            ),
             **execution_provenance,
         }
         return output
@@ -836,6 +871,31 @@ class VllmAttentionOperator:
                 "metadata_source": "vllm_gpu",
             }
 
+        max_seq_len = int(getattr(attn_metadata, "max_seq_len", block_table.size(1) * block_size))
+        page_count = min(block_table.size(1), (max_seq_len + block_size - 1) // block_size)
+        cache_key = (
+            _tensor_cache_token(query_starts_source),
+            _tensor_cache_token(seq_lens_source),
+            _tensor_cache_token(block_table),
+            query.device.type,
+            query.device.index,
+            num_actual,
+            block_size,
+            page_count,
+        )
+        owner_id = id(cache_owner) if cache_owner is not None else None
+        # Resolve the cross-layer cache before scheduling any GPU metadata work.
+        # Repeating an owner still forces the first layer of the next forward to miss.
+        if (
+            owner_id is not None
+            and self._metadata_cache_key == cache_key
+            and owner_id not in self._metadata_cache_owners
+            and self._metadata_cache_value is not None
+        ):
+            self._metadata_cache_owners.add(owner_id)
+            groups, cached_summary = self._metadata_cache_value
+            return groups, {**cached_summary, "metadata_reused_across_layers": True}
+
         query_starts = query_starts_source.to(device=query.device, dtype=torch.int32)
         seq_lens = seq_lens_source.to(device=query.device, dtype=torch.int32)
         query_indices = torch.arange(num_actual, dtype=torch.int32, device=query.device)
@@ -853,29 +913,6 @@ class VllmAttentionOperator:
             seqused_k,
             torch.ones_like(seqused_k),
         )
-
-        max_seq_len = int(getattr(attn_metadata, "max_seq_len", block_table.size(1) * block_size))
-        page_count = min(block_table.size(1), (max_seq_len + block_size - 1) // block_size)
-        cache_key = (
-            _tensor_cache_token(query_starts_source),
-            _tensor_cache_token(seq_lens_source),
-            _tensor_cache_token(block_table),
-            query.device.type,
-            query.device.index,
-            num_actual,
-            block_size,
-            page_count,
-        )
-        owner_id = id(cache_owner) if cache_owner is not None else None
-        if (
-            owner_id is not None
-            and self._metadata_cache_key == cache_key
-            and owner_id not in self._metadata_cache_owners
-            and self._metadata_cache_value is not None
-        ):
-            self._metadata_cache_owners.add(owner_id)
-            groups, cached_summary = self._metadata_cache_value
-            return groups, {**cached_summary, "metadata_reused_across_layers": True}
 
         pages = (
             block_table.index_select(0, request_indices)[:, :page_count]

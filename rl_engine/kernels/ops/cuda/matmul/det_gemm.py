@@ -139,13 +139,16 @@ def det_gemm_linear(
     weight: torch.Tensor,
     *,
     native_op: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply a native [N,K] weight through the selected strict backend."""
 
     if det_gemm_backend() == _CUBLASLT_BACKEND:
         _configure_cublaslt_nosplitk(a)
         _report_strict_route_once()
-        return torch.mm(a, weight.t())
+        return torch.mm(a, weight.t(), out=out) if out is not None else torch.mm(a, weight.t())
+    if out is not None:
+        raise RuntimeError("direct-output deterministic GEMM currently requires cublaslt_nosplitk")
     _require_sm90_backend()
     _report_strict_route_once()
     if native_op is not None:
@@ -349,7 +352,13 @@ class DetGemmOp:
             )
         return _DetGemmFn.apply(a.contiguous(), b.contiguous(), False)
 
-    def linear(self, a: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    def linear(
+        self,
+        a: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Apply a native [N,K] linear weight without materializing weight.T."""
         assert a.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, "BF16 only"
         assert a.is_cuda and weight.is_cuda, "Inputs must be on CUDA device"
@@ -360,7 +369,13 @@ class DetGemmOp:
         )
         if not self.has_hardware_op or any(not hasattr(_C, name) for name in required):
             raise RuntimeError("DetGemmOp.linear requires the rebuilt native-weight CUDA extension")
-        return _DetLinearFn.apply(a.contiguous(), weight.contiguous())
+        a = a.contiguous()
+        weight = weight.contiguous()
+        if out is not None:
+            if torch.is_grad_enabled() and (a.requires_grad or weight.requires_grad):
+                raise RuntimeError("direct-output deterministic GEMM is inference-only")
+            return det_gemm_linear(a, weight, out=out)
+        return _DetLinearFn.apply(a, weight)
 
     def forward_fp32(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         assert a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16, "BF16 only"

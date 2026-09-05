@@ -279,7 +279,8 @@ class LinearLogpWrapper:
         real_vocab_size: int,
         target: str = "rollout",
         temperature: float | torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Score deterministic local LM-head logits without a duplicate GEMM."""
 
         if local_logits.ndim != 2 or local_logits.dtype != torch.bfloat16:
@@ -314,7 +315,7 @@ class LinearLogpWrapper:
             sm90_deterministic_logp_from_local_logits_tp,
         )
 
-        result, _lse = sm90_deterministic_logp_from_local_logits_tp(
+        result, lse = sm90_deterministic_logp_from_local_logits_tp(
             local_logits.contiguous(),
             target_ids,
             tp_group=tp_group,
@@ -342,7 +343,7 @@ class LinearLogpWrapper:
             "logits_materialized": True,
             "lm_head_result_reused": True,
         }
-        return result
+        return (result, lse) if return_lse else result
 
     @staticmethod
     def _mismatch_provenance() -> dict[str, Any]:

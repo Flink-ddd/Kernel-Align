@@ -108,6 +108,52 @@ class StrictFlashAttention4Core:
         self.api_source = api_source
         self._op = op
         self._paged_op = paged_op
+        self._validated_position_layouts: dict[tuple[Any, ...], None] = {}
+
+    def _validate_positions_cached(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        *,
+        causal: bool,
+        query_position_ids: torch.Tensor | None,
+        key_position_ids: torch.Tensor | None,
+    ) -> None:
+        key = (
+            tuple(q.shape),
+            tuple(k.shape),
+            bool(causal),
+            (
+                None
+                if query_position_ids is None
+                else (
+                    query_position_ids.data_ptr(),
+                    int(query_position_ids._version),
+                    tuple(query_position_ids.shape),
+                )
+            ),
+            (
+                None
+                if key_position_ids is None
+                else (
+                    key_position_ids.data_ptr(),
+                    int(key_position_ids._version),
+                    tuple(key_position_ids.shape),
+                )
+            ),
+        )
+        if key in self._validated_position_layouts:
+            return
+        RLKernelDeterministicAttentionCore._validate_positions(
+            q,
+            k,
+            causal=causal,
+            query_position_ids=query_position_ids,
+            key_position_ids=key_position_ids,
+        )
+        if len(self._validated_position_layouts) >= 128:
+            self._validated_position_layouts.pop(next(iter(self._validated_position_layouts)))
+        self._validated_position_layouts[key] = None
 
     @classmethod
     def precompile_training(
@@ -130,9 +176,7 @@ class StrictFlashAttention4Core:
         tensors, RNG state, or distributed collectives.
         """
         if torch.version.hip is not None:
-            raise StrictFlashAttentionUnavailable(
-                "FA4 CUDA precompile is unavailable on ROCm"
-            )
+            raise StrictFlashAttentionUnavailable("FA4 CUDA precompile is unavailable on ROCm")
         if not torch.cuda.is_available():
             raise StrictFlashAttentionUnavailable(
                 "FA4 CUDA precompile requires an available CUDA device"
@@ -144,11 +188,7 @@ class StrictFlashAttention4Core:
         if head_dim <= 0 or sequence_length <= 0:
             raise ValueError("head_dim and sequence_length must be positive")
 
-        target = (
-            torch.device("cuda", torch.cuda.current_device())
-            if device is None
-            else device
-        )
+        target = torch.device("cuda", torch.cuda.current_device()) if device is None else device
         if target.type != "cuda":
             raise ValueError("strict FA4 training precompile requires a CUDA device")
 
@@ -236,7 +276,7 @@ class StrictFlashAttention4Core:
         output_dtype: torch.dtype | None = None,
     ) -> DeterministicAttentionCoreResult:
         self._validate_inputs(q, k, v, key_padding_mask)
-        RLKernelDeterministicAttentionCore._validate_positions(
+        self._validate_positions_cached(
             q,
             k,
             causal=causal,
@@ -282,7 +322,7 @@ class StrictFlashAttention4Core:
     ) -> DeterministicAttentionCoreResult:
         """Run strict FA4 on tensors already laid out as [B, S, H, D]."""
         self._validate_bshd_inputs(q, k, v, key_padding_mask)
-        RLKernelDeterministicAttentionCore._validate_positions(
+        self._validate_positions_cached(
             q.transpose(1, 2),
             k.transpose(1, 2),
             causal=causal,

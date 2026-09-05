@@ -216,6 +216,43 @@ def _contract_for_request(request: Any) -> tuple[LogprobContract, int]:
     return contract, _tile_count(metadata, padded_vocab_size)
 
 
+def _is_identity_temperature(value: Any) -> bool:
+    return value is None or (not isinstance(value, torch.Tensor) and float(value) == 1.0)
+
+
+@torch.no_grad()
+def _metric_entropy_from_strict_lse(
+    local_logits: torch.Tensor,
+    lse: torch.Tensor,
+    *,
+    vocab_start_index: int,
+    real_vocab_size: int,
+    tp_group: Any,
+) -> torch.Tensor:
+    """Compute metric-only entropy without re-running selected-logp/LSE."""
+
+    local_real = max(
+        0,
+        min(local_logits.size(1), int(real_vocab_size) - int(vocab_start_index)),
+    )
+    centered = local_logits[:, :local_real].float()
+    centered.sub_(lse.reshape(-1, 1).float())
+    probabilities = centered.exp()
+    centered.neg_()
+    local_entropy = torch.einsum("ij,ij->i", probabilities, centered).contiguous()
+    _rank, world = _tp_coordinates(tp_group)
+    if world == 1:
+        return local_entropy
+    import torch.distributed as dist
+
+    gathered = [torch.empty_like(local_entropy) for _ in range(world)]
+    dist.all_gather(gathered, local_entropy, group=tp_group)
+    entropy = gathered[0].clone()
+    for partial in gathered[1:]:
+        entropy.add_(partial)
+    return entropy
+
+
 def _provider_impl(request: Any, *, linear_logp: Any = None) -> LinearLogpResult:
     """Compute Vime log-probabilities on the explicit TP/CP contract."""
 
@@ -240,20 +277,70 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> LinearLogpResult
             raise RuntimeError("linear_logp context must expose projection.weight")
         if partition is None:
             raise RuntimeError("linear_logp context must expose vocab_partition")
-        logp = linear_logp(
-            hidden,
-            projection.weight,
-            request.target_ids,
-            getattr(projection, "bias", None),
-            tp_group=getattr(request, "tensor_parallel_group", None),
-            vocab_start_index=int(partition.local_start),
-            global_vocab_size=int(partition.padded_size),
-            real_vocab_size=int(partition.real_size),
-            temperature=getattr(request, "temperature", None),
+        reuse_local_logits = bool(getattr(context, "reuse_local_logits", False))
+        with_entropy = bool(getattr(request, "with_entropy", False))
+        with_entropy_grad = bool(getattr(request, "with_entropy_grad", False))
+        fast_metric_entropy = (
+            reuse_local_logits
+            and with_entropy
+            and not with_entropy_grad
+            and _is_identity_temperature(getattr(request, "temperature", None))
         )
+        strict_lse = None
+        if reuse_local_logits:
+            if not isinstance(getattr(context, "local_logits", None), torch.Tensor):
+                raise RuntimeError("strict reusable LM-head context is missing local logits")
+            from_local_logits = getattr(linear_logp, "from_local_logits", None)
+            if not callable(from_local_logits):
+                raise RuntimeError(
+                    "strict reusable LM-head logits require a from_local_logits provider"
+                )
+            scored = from_local_logits(
+                context.local_logits,
+                request.target_ids,
+                tp_group=getattr(request, "tensor_parallel_group", None),
+                vocab_start_index=int(partition.local_start),
+                global_vocab_size=int(partition.padded_size),
+                real_vocab_size=int(partition.real_size),
+                target="training",
+                temperature=getattr(request, "temperature", None),
+                return_lse=fast_metric_entropy,
+            )
+            if fast_metric_entropy:
+                logp, strict_lse = scored
+            else:
+                logp = scored
+        else:
+            logp = linear_logp(
+                hidden,
+                projection.weight,
+                request.target_ids,
+                getattr(projection, "bias", None),
+                tp_group=getattr(request, "tensor_parallel_group", None),
+                vocab_start_index=int(partition.local_start),
+                global_vocab_size=int(partition.padded_size),
+                real_vocab_size=int(partition.real_size),
+                temperature=getattr(request, "temperature", None),
+            )
         entropy = None
         entropy_provenance: dict[str, Any] = {}
-        if getattr(request, "with_entropy", False):
+        if fast_metric_entropy:
+            if strict_lse is None:
+                raise RuntimeError("metric-only entropy requires the strict local-logits LSE")
+            entropy = _metric_entropy_from_strict_lse(
+                context.local_logits,
+                strict_lse,
+                vocab_start_index=int(partition.local_start),
+                real_vocab_size=int(partition.real_size),
+                tp_group=getattr(request, "tensor_parallel_group", None),
+            )
+            entropy_provenance = {
+                "backend_id": "rlkernel.strict-lse-metric-entropy.v1",
+                "logits_materialized": True,
+                "strict_lse_reused": True,
+                "with_entropy_grad": False,
+            }
+        elif with_entropy:
             entropy_contract, entropy_tiles = _contract_for_request(request)
             entropy_dispatch = kernel_registry.get_logprob_op(
                 entropy_contract, requested_backend=BACKEND_ID
@@ -271,7 +358,7 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> LinearLogpResult
                 contract=entropy_contract,
                 tp_group=getattr(request, "tensor_parallel_group", None),
                 num_vocab_tiles=entropy_tiles,
-                with_entropy_grad=bool(getattr(request, "with_entropy_grad", False)),
+                with_entropy_grad=with_entropy_grad,
             )
             entropy_provenance = {
                 "backend_id": entropy_dispatch.capability.backend_id,
@@ -285,7 +372,10 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> LinearLogpResult
             "strict_backend": True,
             "top_p_replay": False,
             "cp_is_merge_axis": False,
-            "logits_materialized": bool(getattr(request, "with_entropy", False)),
+            "logits_materialized": bool(
+                reuse_local_logits or getattr(request, "with_entropy", False)
+            ),
+            "lm_head_result_reused": reuse_local_logits,
             "entropy": entropy_provenance,
         }
         provenance["request"] = {
@@ -382,7 +472,11 @@ def provider(request: Any) -> LinearLogpResult:
 
     case = operator_ablation_case("logp", os.getenv("RL_KERNEL_LOGP_CASE", "P/P"))
     if case.training is Implementation.PRODUCTION:
-        return _provider_impl(request)
+        raise RuntimeError(
+            "the RL-Kernel linear_logp provider must not be configured for a "
+            "production Megatron logp route; omit --linear-logp-provider so "
+            "Vime executes calculate_log_probs_and_entropy directly"
+        )
 
     from rl_engine.integrations.state import get_active_integration
 

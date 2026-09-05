@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import socket
 import threading
+from collections.abc import Iterable
 from types import TracebackType
 from typing import Any
 
@@ -14,10 +15,14 @@ import torch.distributed as dist
 _SUPPORTED_WORLD_SIZES = (1, 2, 4, 8)
 _DEFAULT_MAX_SIZE_BYTES = 64 * 1024 * 1024
 _COLLECTIVE_STAGING_FRAMES = 3
-_COLLECTIVE_FRAME_METADATA_BYTES = 3 * 8
+_COLLECTIVE_FRAME_METADATA_BYTES = 4 * 8
+_DIRECT_STAGING_MAX_BYTES = 256 * 1024
 _REDUCTION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+_REDUCTION_DTYPE_BYTES = {torch.float32: 4, torch.float16: 2, torch.bfloat16: 2}
 _COLLECTIVES: dict[tuple[int, int, int, int], DeterministicCollective] = {}
 DETERMINISTIC_ALL_REDUCE_OP = "rl_kernel::deterministic_all_reduce_"
+DETERMINISTIC_STAGING_RESERVE_OP = "rl_kernel::deterministic_staging_reserve_"
+DETERMINISTIC_STAGED_ALL_REDUCE_OP = "rl_kernel::deterministic_staged_all_reduce"
 
 
 @torch.library.custom_op(DETERMINISTIC_ALL_REDUCE_OP, mutates_args={"input"})
@@ -46,6 +51,63 @@ def deterministic_all_reduce_inplace(
 
     _deterministic_all_reduce_(input, collective_handle)
     return input
+
+
+@torch.library.custom_op(DETERMINISTIC_STAGING_RESERVE_OP, mutates_args={"staging"})
+def _deterministic_staging_reserve_(staging: torch.Tensor, collective_handle: int) -> None:
+    """Wait until every peer has finished reading the shared direct-output slot."""
+
+    from rl_engine import _C
+
+    _C.deterministic_collective_prepare_staged(collective_handle, staging)
+
+
+@_deterministic_staging_reserve_.register_fake
+def _deterministic_staging_reserve_fake(
+    staging: torch.Tensor,
+    collective_handle: int,
+) -> None:
+    del staging, collective_handle
+
+
+@torch.library.custom_op(DETERMINISTIC_STAGED_ALL_REDUCE_OP, mutates_args=())
+def _deterministic_staged_all_reduce(
+    staging: torch.Tensor,
+    collective_handle: int,
+) -> torch.Tensor:
+    """Reduce a GEMM result already resident in the local CUDA IPC payload."""
+
+    from rl_engine import _C
+
+    output = torch.empty_like(staging)
+    _C.deterministic_collective_all_reduce_staged(collective_handle, staging, output)
+    return output
+
+
+@_deterministic_staged_all_reduce.register_fake
+def _deterministic_staged_all_reduce_fake(
+    staging: torch.Tensor,
+    collective_handle: int,
+) -> torch.Tensor:
+    del collective_handle
+    return torch.empty_like(staging)
+
+
+def deterministic_staging_reserve(
+    staging: torch.Tensor,
+    *,
+    collective_handle: int,
+) -> torch.Tensor:
+    _deterministic_staging_reserve_(staging, collective_handle)
+    return staging
+
+
+def deterministic_all_reduce_staged(
+    staging: torch.Tensor,
+    *,
+    collective_handle: int,
+) -> torch.Tensor:
+    return _deterministic_staged_all_reduce(staging, collective_handle)
 
 
 class DeterministicCollective:
@@ -115,8 +177,11 @@ class DeterministicCollective:
             "deterministic_collective_destroy",
             "deterministic_collective_stage",
             "deterministic_collective_all_reduce",
+            "deterministic_collective_prepare_staged",
+            "deterministic_collective_all_reduce_staged",
             "deterministic_collective_reduce_scatter",
             "deterministic_collective_all_gather",
+            "deterministic_collective_all_gather_many",
         )
         missing = [name for name in required_symbols if not hasattr(_C, name)]
         if missing:
@@ -131,6 +196,7 @@ class DeterministicCollective:
         self._lock = threading.Lock()
         self._handle = 0
         self._validated_signatures: set[tuple[Any, ...]] = set()
+        self._direct_staging_views: dict[tuple[tuple[int, ...], torch.dtype], torch.Tensor] = {}
         self._staging = torch.zeros(
             _COLLECTIVE_STAGING_FRAMES * (self.max_size_bytes + _COLLECTIVE_FRAME_METADATA_BYTES),
             dtype=torch.uint8,
@@ -165,6 +231,44 @@ class DeterministicCollective:
             self.rank,
         )
         self._synchronize_ranks()
+
+    def prepare_direct_staging_views(
+        self,
+        shapes: Iterable[tuple[int, ...]],
+        *,
+        dtype: torch.dtype,
+    ) -> None:
+        """Materialize stable, graph-capturable views of the local IPC payload."""
+
+        if dtype not in _REDUCTION_DTYPE_BYTES:
+            raise TypeError(f"unsupported direct-staging dtype {dtype}")
+        element_size = _REDUCTION_DTYPE_BYTES[dtype]
+        for raw_shape in shapes:
+            shape = tuple(int(dim) for dim in raw_shape)
+            numel = 1
+            for dim in shape:
+                if dim < 0:
+                    raise ValueError(f"direct-staging dimensions must be non-negative, got {shape}")
+                numel *= dim
+            size_bytes = numel * element_size
+            if size_bytes > min(self.max_size_bytes, _DIRECT_STAGING_MAX_BYTES):
+                continue
+            byte_view = self._staging.narrow(
+                0,
+                _COLLECTIVE_FRAME_METADATA_BYTES,
+                size_bytes,
+            )
+            self._direct_staging_views[(shape, dtype)] = byte_view.view(dtype).view(shape)
+
+    def direct_staging_view(
+        self,
+        shape: tuple[int, ...],
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """Return a pre-bound direct-output view, or ``None`` for an uncaptured shape."""
+
+        return self._direct_staging_views.get((tuple(int(dim) for dim in shape), dtype))
 
     def all_reduce(
         self,
@@ -224,13 +328,27 @@ class DeterministicCollective:
         *,
         validate_signature: bool = True,
     ) -> tuple[torch.Tensor, ...]:
-        """Gather several tensors through the available single-tensor ABI."""
+        """Gather several tensors with one staging handshake and no packing."""
 
         if not inputs:
             raise ValueError("all_gather_many requires at least one input")
-        return tuple(
-            self.all_gather(input, validate_signature=validate_signature) for input in inputs
-        )
+        outputs = []
+        for input in inputs:
+            self._validate_gather_input(input)
+            output_shape = (input.size(0) * self.world_size, *input.shape[1:])
+            output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+            self._validate_sharded_output(output, input, output_shape)
+            outputs.append(output)
+        with self._lock:
+            if validate_signature:
+                self._validate_matching_many_signature("all_gather_many", inputs)
+            self._validate_many_capacity(inputs)
+            self._extension.deterministic_collective_all_gather_many(
+                self._handle,
+                list(inputs),
+                outputs,
+            )
+        return tuple(outputs)
 
     def reduce_scatter(
         self,

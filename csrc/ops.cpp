@@ -104,12 +104,19 @@ int64_t deterministic_collective_create(
 void deterministic_collective_destroy(int64_t handle);
 void deterministic_collective_stage(int64_t handle, torch::Tensor& input);
 void deterministic_collective_all_reduce(int64_t handle, torch::Tensor& output);
+void deterministic_collective_prepare_staged(int64_t handle, torch::Tensor& input);
+void deterministic_collective_all_reduce_staged(
+    int64_t handle, torch::Tensor& input, torch::Tensor& output);
 void deterministic_collective_all_reduce_fused(
     int64_t handle, torch::Tensor& input, torch::Tensor& output);
 void deterministic_collective_reduce_scatter(int64_t handle, torch::Tensor& output);
 void deterministic_collective_all_gather(int64_t handle, torch::Tensor& output);
 void deterministic_collective_all_gather_fused(
     int64_t handle, torch::Tensor& input, torch::Tensor& output);
+void deterministic_collective_all_gather_many(
+    int64_t handle,
+    std::vector<torch::Tensor> inputs,
+    std::vector<torch::Tensor> outputs);
 
 // Batch-Invariant Deterministic GEMM Declarations
 bool det_gemm_sm90_compiled();
@@ -447,6 +454,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &deterministic_collective_all_reduce,
         "Run the TP=8 deterministic fixed-tree all-reduce kernel");
     m.def(
+        "deterministic_collective_prepare_staged",
+        &deterministic_collective_prepare_staged,
+        "Reserve the local IPC payload for direct GEMM output");
+    m.def(
+        "deterministic_collective_all_reduce_staged",
+        &deterministic_collective_all_reduce_staged,
+        "Reduce a GEMM result already resident in the local IPC payload");
+    m.def(
         "deterministic_collective_all_reduce_fused",
         &deterministic_collective_all_reduce_fused,
         "Run a fused small-message deterministic fixed-tree all-reduce");
@@ -462,6 +477,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "deterministic_collective_all_gather_fused",
         &deterministic_collective_all_gather_fused,
         "Run a fused small-message deterministic rank-ordered all-gather");
+    m.def(
+        "deterministic_collective_all_gather_many",
+        &deterministic_collective_all_gather_many,
+        "Gather multiple tensors with one deterministic staging handshake");
 
     // Prefix-shared attention uses NVIDIA PTX and falls back to PyTorch SDPA on ROCm.
 #if !defined(USE_ROCM)

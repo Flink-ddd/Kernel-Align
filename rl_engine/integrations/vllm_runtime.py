@@ -16,6 +16,8 @@ from rl_engine.distributed.collectives import (
     DETERMINISTIC_ALL_REDUCE_OP,
     collective_for_group,
     deterministic_all_reduce_inplace,
+    deterministic_all_reduce_staged,
+    deterministic_staging_reserve,
 )
 from rl_engine.integrations.ablation import (
     Implementation,
@@ -46,6 +48,7 @@ _STRICT_ROTARY_INIT_MARKER = "__rl_kernel_original_strict_rotary_init__"
 _STRICT_LM_HEAD_LINEAR_PATCH_MARKER = "__rl_kernel_original_lm_head_linear_apply__"
 _STRICT_O_PROJ_COLLECTIVE_MARKER = "__rl_kernel_o_proj_collective__"
 _STRICT_ROW_PARALLEL_PATCH_MARKER = "__rl_kernel_original_row_parallel_forward__"
+_STRICT_DIRECT_STAGING_MARKER = "__rl_kernel_direct_staging_active__"
 _RLK_ATTENTION_BACKEND: type[Any] | None = None
 _RLK_ATTENTION_IMPL: type[Any] | None = None
 _RLK_ATTENTION_BUILDER: type[Any] | None = None
@@ -412,11 +415,24 @@ def _patch_qwen3_strict_model(
             return unquantized_apply(method, layer, x, bias)
         x_2d = x.reshape(-1, x.shape[-1])
         linear = getattr(det_gemm, "linear", None)
+        collective = getattr(layer, _STRICT_O_PROJ_COLLECTIVE_MARKER, None)
+        direct_output = None
+        if collective is not None and bias is None and linear is not None:
+            direct_output = collective.direct_staging_view(
+                (x_2d.size(0), layer.weight.shape[0]),
+                dtype=x.dtype,
+            )
+            if direct_output is not None:
+                deterministic_staging_reserve(
+                    direct_output,
+                    collective_handle=int(collective._handle),
+                )
         output_2d = (
-            linear(x_2d, layer.weight)
+            linear(x_2d, layer.weight, out=direct_output)
             if linear is not None
             else det_gemm(x_2d, layer.weight.t().contiguous())
         )
+        setattr(layer, _STRICT_DIRECT_STAGING_MARKER, direct_output is not None)
         output = output_2d.reshape(*x.shape[:-1], layer.weight.shape[0])
         return output if bias is None else output + bias
 
@@ -453,6 +469,15 @@ def _patch_qwen3_strict_model(
         collective = collective_for_group(group)
         if collective is None:
             raise RuntimeError("strict rollout o_proj requires an initialized TP process group")
+        max_capture = int(os.getenv("RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE", "0"))
+        if max_capture <= 0:
+            raise RuntimeError(
+                "strict rollout direct staging requires a positive graph capture size"
+            )
+        collective.prepare_direct_staging_views(
+            ((batch, int(module.weight.shape[0])) for batch in range(1, max_capture + 1)),
+            dtype=module.weight.dtype,
+        )
         setattr(module, _STRICT_O_PROJ_COLLECTIVE_MARKER, collective)
 
     if row_parallel_cls is not None and not hasattr(
@@ -483,11 +508,17 @@ def _patch_qwen3_strict_model(
             output_parallel = instance.quant_method.apply(instance, input_parallel, bias_)
 
             if instance.reduce_results and instance.tp_size > 1:
-                deterministic_all_reduce_inplace(
-                    output_parallel,
-                    collective_handle=int(collective._handle),
-                )
-                output = output_parallel
+                if bool(getattr(instance, _STRICT_DIRECT_STAGING_MARKER, False)):
+                    output = deterministic_all_reduce_staged(
+                        output_parallel,
+                        collective_handle=int(collective._handle),
+                    )
+                else:
+                    deterministic_all_reduce_inplace(
+                        output_parallel,
+                        collective_handle=int(collective._handle),
+                    )
+                    output = output_parallel
             else:
                 output = output_parallel
 

@@ -242,6 +242,33 @@ def _linear_dw(a: Tensor, grad_output: Tensor, *, disable_split_k: bool) -> Tens
         return torch.matmul(grad_output.t().contiguous(), a)
 
 
+def _cp_sharded_linear_dw(
+    a: Tensor,
+    grad_output: Tensor,
+    *,
+    collective: Any,
+    disable_split_k: bool,
+) -> Tensor:
+    """Compute disjoint output rows, then reconstruct the exact full wgrad."""
+
+    world_size = int(collective.world_size)
+    output_rows = int(grad_output.size(1))
+    if output_rows % world_size != 0:
+        raise ValueError(
+            "CP-sharded weight-gradient rows must divide evenly across ranks, "
+            f"got {output_rows} rows and world_size={world_size}."
+        )
+    rows_per_rank = output_rows // world_size
+    row_start = int(collective.rank) * rows_per_rank
+    grad_output_shard = grad_output.narrow(1, row_start, rows_per_rank).contiguous()
+    local_weight_gradient = _linear_dw(
+        a,
+        grad_output_shard,
+        disable_split_k=disable_split_k,
+    )
+    return collective.all_gather(local_weight_gradient.contiguous())
+
+
 def _require_parallel_group(group: Any, name: str):
     if group is None:
         return None
@@ -503,19 +530,22 @@ class _DeterministicFFNFunction(torch.autograd.Function):
                 grad_up,
                 collective=cp_collective,
             )
-            grad_down_weight = _linear_dw(
+            grad_down_weight = _cp_sharded_linear_dw(
                 activated_full,
                 grad_output_full,
+                collective=cp_collective,
                 disable_split_k=disable_split_k,
             )
-            grad_gate_weight = _linear_dw(
+            grad_gate_weight = _cp_sharded_linear_dw(
                 rmsnorm_full,
                 grad_gate_full,
+                collective=cp_collective,
                 disable_split_k=disable_split_k,
             )
-            grad_up_weight = _linear_dw(
+            grad_up_weight = _cp_sharded_linear_dw(
                 rmsnorm_full,
                 grad_up_full,
+                collective=cp_collective,
                 disable_split_k=disable_split_k,
             )
         else:
