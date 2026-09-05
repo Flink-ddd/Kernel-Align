@@ -56,7 +56,7 @@ differences enter the policy ratios and KL terms used by RL algorithms.
 - **Current integration:** VIME is the supported RL orchestration layer, with vLLM for
   rollout and Megatron-LM for training. RL-Kernel supplies the operators beneath them.
 - **Current accelerator targets:** NVIDIA SM90 (H100, H200, and GH200) and AMD gfx942
-  (MI300A, MI300X, and MI325X) are the supported targets. Ascend `dav_c220` has partial
+  (MI300A, MI300X, and MI325X) are the supported targets. Ascend dav_c220 has partial
   operator coverage; other hardware models are being adapted.
 
 ## Architecture
@@ -145,7 +145,7 @@ or extend the current end-to-end model claim beyond Qwen3-8B Dense on H100.
 | :--- | :--- | :--- | :--- | :--- |
 | **NVIDIA** | SM90 (compute capability 9.0) | H100, H200, GH200 | CUDA | **Supported**, dense-model strict path. Published end-to-end results use H100. |
 | **AMD** | gfx942 (CDNA 3) | Instinct MI300A, MI300X, MI325X | ROCm | **Supported**, native extension loading and backend checks verified on MI300X. |
-| **Huawei** | `dav_c220` (CANN `dav-2201` target) | Ascend `dav_c220` | CANN 9.1.0 / Ascend C | **Partially adapted**, selected operators are available. Other Ascend models are being adapted. |
+| **Huawei** | dav_c220 (CANN dav-2201 target) | Ascend dav_c220 | CANN 9.1.0 / Ascend C | **Partially adapted**, selected operators are available. Other Ascend models are being adapted. |
 | **Moore Threads** | Under adaptation | Not specified | MUSA | **In progress**, hardware adaptation and dense-model integration are underway. |
 
 Support applies to the listed architecture targets and implemented dense-model paths;
@@ -164,7 +164,7 @@ cd RL-Kernel
 
 ### NVIDIA CUDA
 
-Build against a visible NVIDIA GPU. Set `TORCH_CUDA_ARCH_LIST` when you want to pin the
+Build against a visible NVIDIA GPU. Set TORCH_CUDA_ARCH_LIST when you want to pin the
 target architecture instead of relying on device detection.
 
 ```bash
@@ -202,10 +202,10 @@ python3 -c "import torch, rl_engine._C as C; print('GPU:', torch.cuda.get_device
 ```
 
 The native extension load and environment checks have been validated on an AMD Instinct
-MI300X reporting `gfx942`. Other ROCm architectures are being adapted.
+MI300X reporting gfx942. Other ROCm architectures are being adapted.
 
-For CPU-only or pure-Python development, use `python3 -m pip install -e .`. Ascend support
-is currently limited to partial operator coverage on `dav_c220` (CANN `dav-2201` target);
+For CPU-only or pure-Python development, use an editable pip installation. Ascend support
+is currently limited to partial operator coverage on dav_c220 (CANN dav-2201 target);
 other Ascend models are being adapted. Moore Threads support is also under development.
 Neither backend has a general-purpose Quick Start build command yet. See the [installation
 guide](./docs/getting_started/installation.md) for backend dependencies and troubleshooting.
