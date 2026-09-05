@@ -195,8 +195,7 @@ Set the target explicitly. The supported gfx942 target corresponds to AMD Instin
 MI300X, and MI325X:
 
 ```bash
-RL_KERNEL_REQUIRE_EXT=1 PYTORCH_ROCM_ARCH=gfx942 \
-  python3 -m pip install --no-build-isolation --no-deps -e .
+PYTORCH_ROCM_ARCH=gfx942 python3 setup.py develop
 ```
 
 Verify the ROCm environment and required native symbol:
