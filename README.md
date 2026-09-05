@@ -170,7 +170,8 @@ target architecture instead of relying on device detection.
 
 ```bash
 # H100 / H200 (SM90)
-TORCH_CUDA_ARCH_LIST="9.0+PTX" python3 setup.py develop
+RL_KERNEL_REQUIRE_EXT=1 TORCH_CUDA_ARCH_LIST="9.0+PTX" \
+  python3 -m pip install --no-build-isolation --no-deps -e .
 ```
 
 Common CUDA targets are `8.0` for A100, `8.6` for A10/A40, and `9.0+PTX` for H100/H200.
@@ -180,14 +181,16 @@ Common CUDA targets are `8.0` for A100, `8.6` for A10/A40, and `9.0+PTX` for H10
 Set the target explicitly. The current MI300/MI325 build command is:
 
 ```bash
-PYTORCH_ROCM_ARCH=gfx942 python3 setup.py develop
+RL_KERNEL_REQUIRE_EXT=1 PYTORCH_ROCM_ARCH=gfx942 \
+  python3 -m pip install --no-build-isolation --no-deps -e .
 ```
 
 Common ROCm targets are `gfx90a` for MI200, `gfx942` for MI300/MI325, and `gfx950` for
 MI350/MI355. A portable build can target more than one architecture:
 
 ```bash
-PYTORCH_ROCM_ARCH='gfx90a;gfx942;gfx950' python3 setup.py develop
+RL_KERNEL_REQUIRE_EXT=1 PYTORCH_ROCM_ARCH='gfx90a;gfx942;gfx950' \
+  python3 -m pip install --no-build-isolation --no-deps -e .
 ```
 
 ### Verify the Native Extension
