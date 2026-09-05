@@ -35,6 +35,11 @@ from rl_engine.utils.logger import logger
 
 # Pinned. NOT autotuned (autotune picks per-shape configs -> breaks invariance).
 _BLOCK_M, _BLOCK_N, _BLOCK_K = 64, 64, 32
+# Keep the intermediate tree workspace bounded.  A VLLM warmup can present a
+# very large flattened token dimension; allocating ``node_count * M * N`` in
+# one shot would otherwise create a multi-terabyte virtual tensor on ROCm.
+# Chunking over M preserves the exact K-tree and BF16 rounding contract.
+_MAX_TREE_WORKSPACE_ELEMENTS = 128 * 1024 * 1024
 _TREE_PLANS: dict[tuple[int, int], "_DeviceTreePlan"] = {}
 _TREE_PLAN_LOCK = threading.Lock()
 
@@ -277,9 +282,12 @@ if _TRITON_AVAILABLE:
             pid_n = tl.program_id(2)
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        leaf_start = tl.load(leaf_starts_ptr + leaf)
-        leaf_length = tl.load(leaf_lengths_ptr + leaf)
-        leaf_node = tl.load(leaf_nodes_ptr + leaf)
+        # Qwen prefill workspaces can exceed 2**31 elements.  ROCm Triton
+        # otherwise keeps the index expression in i32 and wraps addresses,
+        # causing GPU memory faults for large M*N trees.
+        leaf_start = tl.load(leaf_starts_ptr + leaf).to(tl.int64)
+        leaf_length = tl.load(leaf_lengths_ptr + leaf).to(tl.int64)
+        leaf_node = tl.load(leaf_nodes_ptr + leaf).to(tl.int64)
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         # Keep the leaf's ascending scalar FMA order identical to the native
         # gfx942 correctness kernel.  A tl.dot/MFMA leaf is topology-stable but
@@ -298,13 +306,21 @@ if _TRITON_AVAILABLE:
                 other=0.0,
             ).to(tl.float32)
             acc += a[:, None] * b[None, :]
-        output_offsets = leaf_node * M * N + offs_m[:, None] * N + offs_n[None, :]
+        output_offsets = (
+            leaf_node * (M * N)
+            + offs_m[:, None].to(tl.int64) * N
+            + offs_n[None, :].to(tl.int64)
+        )
         output_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
         tl.store(
             workspace_ptr + output_offsets,
             acc.to(workspace_ptr.dtype.element_ty),
             mask=output_mask,
         )
+
+    # Preserve the WS1 manifest's historical kernel symbol while retaining the
+    # more descriptive implementation name used by the optimized tree path.
+    _det_gemm_kernel = _det_gemm_tree_leaf_kernel
 
     @triton.jit
     def _det_gemm_tree_reduce_kernel(
@@ -318,12 +334,12 @@ if _TRITON_AVAILABLE:
     ):
         operation = tl.program_id(0)
         block = tl.program_id(1)
-        offsets = block * BLOCK + tl.arange(0, BLOCK)
+        offsets = (block * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
         elements = M * N
         mask = offsets < elements
-        lower_node = tl.load(lower_nodes_ptr + operation)
-        upper_node = tl.load(upper_nodes_ptr + operation)
-        output_node = tl.load(output_nodes_ptr + operation)
+        lower_node = tl.load(lower_nodes_ptr + operation).to(tl.int64)
+        upper_node = tl.load(upper_nodes_ptr + operation).to(tl.int64)
+        output_node = tl.load(output_nodes_ptr + operation).to(tl.int64)
         lower = tl.load(
             workspace_ptr + lower_node * elements + offsets,
             mask=mask,
@@ -349,7 +365,7 @@ if _TRITON_AVAILABLE:
         elements,
         BLOCK: tl.constexpr,
     ):
-        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        offsets = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
         mask = offsets < elements
         values = tl.load(workspace_ptr + root * elements + offsets, mask=mask)
         tl.store(output_ptr + offsets, values, mask=mask)
@@ -364,8 +380,8 @@ if _TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
-        offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-        offsets_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+        offsets_m = (tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+        offsets_n = (tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
         elements = M * N
         mask = (offsets_m[:, None] < M) & (offsets_n[None, :] < N)
         values = tl.load(
@@ -457,6 +473,21 @@ def _triton_gemm_fp32(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return c
 
 
+def _triton_gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Compatibility entry point for canonical Triton linear operators."""
+
+    if output_dtype is None or output_dtype == torch.bfloat16:
+        return _triton_tree_gemm(a, b)
+    if output_dtype == torch.float32:
+        return _triton_gemm_fp32(a, b)
+    raise TypeError(f"unsupported deterministic Triton GEMM output dtype: {output_dtype}")
+
+
 def _triton_tree_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -484,6 +515,24 @@ def _triton_tree_gemm(
     b = b.contiguous()
     m_size, k_size = a.shape
     n_size = b.size(1)
+    plan = _device_tree_plan(k_size, a.device)
+    workspace_elements = plan.host.node_count * m_size * n_size
+    if workspace_elements > _MAX_TREE_WORKSPACE_ELEMENTS and out is None:
+        rows_per_chunk = max(
+            1,
+            _MAX_TREE_WORKSPACE_ELEMENTS // (plan.host.node_count * n_size),
+        )
+        chunks = []
+        for start in range(0, m_size, rows_per_chunk):
+            stop = min(m_size, start + rows_per_chunk)
+            chunk = _triton_tree_gemm(
+                a[start:stop],
+                b,
+                transpose_output=transpose_output,
+                preserve_a_strides=preserve_a_strides,
+            )
+            chunks.append(chunk)
+        return torch.cat(chunks, dim=1 if transpose_output else 0)
     result_shape = (n_size, m_size) if transpose_output else (m_size, n_size)
     if out is None:
         result = torch.empty(result_shape, dtype=torch.bfloat16, device=a.device)
@@ -504,7 +553,6 @@ def _triton_tree_gemm(
         if out.requires_grad:
             raise ValueError("Triton tree GEMM output buffer must not require gradients")
         result = out
-    plan = _device_tree_plan(k_size, a.device)
     workspace = torch.empty(
         (plan.host.node_count, m_size, n_size),
         dtype=torch.bfloat16,
@@ -525,7 +573,7 @@ def _triton_tree_gemm(
         if leaf_config.n_fastest
         else (len(plan.host.leaf_nodes), tiles_m, tiles_n)
     )
-    _det_gemm_tree_leaf_kernel[leaf_grid](
+    _det_gemm_kernel[leaf_grid](
         a,
         b,
         workspace,

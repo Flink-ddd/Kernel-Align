@@ -27,7 +27,7 @@ Two things differ from the CUDA runtime and both are load-bearing:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -39,9 +39,10 @@ from rl_engine.kernels.attention_contract import (
 )
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     AttentionCPBlockMetadata,
+    AttentionCPCommunicationUnavailable,
     AttentionCPCommunicationPlan,
     AttentionParallelSpec,
-    RCCLAGRSAttentionCPCommunication,
+    CUDAAGRSAttentionCPCommunication,
 )
 from rl_engine.kernels.ops.cuda.attention.strict_runtime import StrictCUDAAttentionRuntime
 from rl_engine.kernels.ops.rocm.attention.flash_attn import StrictRocmAiterCKAttentionCore
@@ -53,6 +54,37 @@ _sort_by_position = StrictCUDAAttentionRuntime._sort_by_position
 _gather_sequence = StrictCUDAAttentionRuntime._gather_sequence
 _validate_local_positions = StrictCUDAAttentionRuntime._validate_local_positions
 _validate_global_positions = StrictCUDAAttentionRuntime._validate_global_positions
+
+
+class RCCLAGRSAttentionCPCommunication(CUDAAGRSAttentionCPCommunication):
+    """ROCm adapter over the shared deterministic fixed-tree collective."""
+
+    backend_id = "rccl_ag_rs"
+    collective_label = "self-owned RCCL AG/RS"
+    supports_autograd = True
+    transport_only = True
+    supports_async_overlap = False
+    supports_compute_communication_fusion = False
+
+    def _dist(self):
+        import torch.distributed as dist
+
+        if not dist.is_available() or not dist.is_initialized():
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned RCCL AG/RS requires initialized torch.distributed"
+            )
+        return dist
+
+    def _validate_cuda_plan(self, plan: AttentionCPCommunicationPlan) -> None:
+        if plan.backend != "rccl_ag_rs" or plan.status != "implemented":
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned RCCL AG/RS requires an implemented rccl_ag_rs plan"
+            )
+        replace(plan, backend="cuda_ag_rs").validate()
+        if torch.version.hip is None or not torch.cuda.is_available():
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned RCCL AG/RS requires an available ROCm device"
+            )
 
 
 @dataclass(frozen=True)

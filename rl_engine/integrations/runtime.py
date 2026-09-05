@@ -124,7 +124,16 @@ class FrameworkOperatorIntegration:
         if _contains_profile_only(raw_provenance):
             self.record_profile_call(normalized)
         else:
-            self.record_execution(normalized, selected)
+            self.record_execution(
+                normalized,
+                selected,
+                execution_provenance=_execution_provenance(
+                    selected=selected,
+                    args=args,
+                    kwargs=kwargs,
+                    result=result,
+                ),
+            )
         return result
 
     def record_profile_call(self, module: str) -> None:
@@ -145,6 +154,7 @@ class FrameworkOperatorIntegration:
         selected: Callable[..., Any],
         *,
         execution_mode: str = "eager",
+        execution_provenance: Mapping[str, Any] | None = None,
     ) -> None:
         """Record one eager or custom-op execution outside Dynamo tracing."""
 
@@ -166,8 +176,13 @@ class FrameworkOperatorIntegration:
                 if implementation is Implementation.PRODUCTION
                 else f"rlkernel.{normalized}.unidentified"
             )
-        raw_provenance = getattr(selected, "provenance", {})
-        provenance = dict(raw_provenance) if isinstance(raw_provenance, Mapping) else {}
+        if execution_provenance is None:
+            raw_provenance = getattr(selected, "provenance", {})
+            provenance = (
+                dict(raw_provenance) if isinstance(raw_provenance, Mapping) else {}
+            )
+        else:
+            provenance = dict(execution_provenance)
         actual_backend = _actual_backend(provenance) or backend_id
         fallback = _contains_fallback(provenance)
         should_report = False
@@ -210,7 +225,9 @@ class FrameworkOperatorIntegration:
                 flush=True,
             )
         if implementation is Implementation.RL_KERNEL and fallback:
-            self.record_fallback(normalized, f"operator provenance selected {actual_backend}")
+            self.record_fallback(
+                normalized, f"operator provenance selected {actual_backend}"
+            )
             raise RuntimeError(
                 f"{self.framework} {normalized} strict RL-Kernel route reported fallback"
             )
@@ -225,7 +242,8 @@ class FrameworkOperatorIntegration:
                 "fallbacks": list(self._fallbacks),
                 "profile_calls": dict(self._profile_counts),
                 "operators": {
-                    module: readback.to_dict() for module, readback in self._readbacks.items()
+                    module: readback.to_dict()
+                    for module, readback in self._readbacks.items()
                 },
             }
 
@@ -368,6 +386,78 @@ def _runtime_platform(value: Any) -> str | None:
         nested = _runtime_platform(item)
         if nested is not None:
             return nested
+    return None
+
+
+def _execution_provenance(
+    *,
+    selected: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+    result: Any,
+) -> dict[str, Any]:
+    """Capture backend evidence from the callable, result, and real tensors."""
+
+    raw = getattr(selected, "provenance", {})
+    provenance = dict(raw) if isinstance(raw, Mapping) else {}
+    result_provenance = getattr(result, "provenance", {})
+    if isinstance(result_provenance, Mapping) and result_provenance:
+        if not provenance:
+            provenance.update(result_provenance)
+        else:
+            provenance.setdefault("result", dict(result_provenance))
+    if _runtime_platform(provenance) is None:
+        inferred = _infer_runtime_platform((args, kwargs, result))
+        if inferred is not None:
+            provenance["runtime_platform"] = inferred
+    return provenance
+
+
+def _infer_runtime_platform(value: Any) -> str | None:
+    """Infer the device from bounded traversal of execution inputs and outputs."""
+
+    platforms: set[str] = set()
+    seen: set[int] = set()
+    structural_fields = (
+        "context",
+        "hidden",
+        "hidden_states",
+        "logits",
+        "target_ids",
+        "logp",
+        "entropy",
+    )
+
+    def visit(item: Any, depth: int) -> None:
+        if depth > 4 or len(seen) > 256:
+            return
+        if isinstance(item, torch.Tensor):
+            platforms.add(item.device.type)
+            return
+        item_id = id(item)
+        if item_id in seen:
+            return
+        seen.add(item_id)
+        if isinstance(item, Mapping):
+            for nested in item.values():
+                visit(nested, depth + 1)
+            return
+        if isinstance(item, (list, tuple)):
+            for nested in item:
+                visit(nested, depth + 1)
+            return
+        for field_name in structural_fields:
+            try:
+                nested = getattr(item, field_name)
+            except (AttributeError, RuntimeError):
+                continue
+            visit(nested, depth + 1)
+
+    visit(value, 0)
+    if "cuda" in platforms:
+        return "cuda"
+    if len(platforms) == 1:
+        return next(iter(platforms))
     return None
 
 

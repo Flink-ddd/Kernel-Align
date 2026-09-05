@@ -1143,7 +1143,7 @@ def _strict_tp_run(
     return logp, lse, hidden_2d, weight, target, logits, temp
 
 
-def sm90_deterministic_logp_from_local_logits_tp(
+def _strict_logp_from_local_logits_tp_run(
     local_logits: torch.Tensor,
     target_ids: torch.Tensor,
     *,
@@ -1152,8 +1152,8 @@ def sm90_deterministic_logp_from_local_logits_tp(
     real_vocab_size: int = -1,
     temperature: Optional[torch.Tensor] = None,
     tp_group: Any,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge a deterministic TP LM-head result without recomputing its GEMM."""
+):
+    """Raw strict TP logp over a previously materialized deterministic LM head."""
 
     required = "linear_logp_local_bf16_forward"
     if not (_EXT_AVAILABLE and hasattr(_C, required)):
@@ -1179,6 +1179,7 @@ def sm90_deterministic_logp_from_local_logits_tp(
     _assert_global_targets_async(target, real_vocab)
 
     logits = local_logits
+    temp = local_logits.new_empty(0, dtype=torch.float32)
     if temperature is not None:
         temp = temperature.to(device=logits.device, dtype=torch.float32).reshape(-1)
         if temp.numel() == 1:
@@ -1202,6 +1203,87 @@ def sm90_deterministic_logp_from_local_logits_tp(
     )
     logp, lse = _merge_tp_local_logp(local_lse, local_target, tp_group=tp_group)
     lead_shape = target_ids.shape
+    return logp, lse, target, logits, temp, lead_shape
+
+
+class _StrictLocalLogitsTPAutograd(torch.autograd.Function):
+    """Differentiate strict selected-logp through a reused TP LM-head result."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        local_logits,
+        target_ids,
+        vocab_start_index,
+        global_vocab_size,
+        real_vocab_size,
+        temperature,
+        tp_group,
+    ):
+        logp, lse, target, logits, temp, lead_shape = _strict_logp_from_local_logits_tp_run(
+            local_logits,
+            target_ids,
+            vocab_start_index=vocab_start_index,
+            global_vocab_size=global_vocab_size,
+            real_vocab_size=real_vocab_size,
+            temperature=temperature,
+            tp_group=tp_group,
+        )
+        ctx.save_for_backward(target, logits, lse, temp)
+        ctx.vocab_start = int(vocab_start_index)
+        ctx.input_shape = local_logits.shape
+        ctx.set_materialize_grads(False)
+        return logp.reshape(lead_shape), lse.reshape(lead_shape)
+
+    @staticmethod
+    def backward(ctx, grad_logp, grad_lse):
+        target, logits, lse, temp = ctx.saved_tensors
+        if grad_logp is None and grad_lse is None:
+            return (None, None, None, None, None, None, None)
+        logp_grad = torch.zeros_like(lse) if grad_logp is None else grad_logp.reshape(-1).float()
+        dlogits = torch.empty_like(logits)
+        _C.linear_logp_logits_bf16_to_dlogits(
+            logits, dlogits, target, logp_grad, lse, ctx.vocab_start
+        )
+        if grad_lse is not None:
+            probs = torch.exp(logits.float() - lse.reshape(-1, 1))
+            dlogits = (dlogits.float() + probs * grad_lse.reshape(-1, 1).float()).to(torch.bfloat16)
+        if temp.numel():
+            dlogits = (dlogits.float() / temp.reshape(-1, 1)).to(torch.bfloat16)
+        return dlogits.reshape(ctx.input_shape).contiguous(), None, None, None, None, None, None
+
+
+def sm90_deterministic_logp_from_local_logits_tp(
+    local_logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    *,
+    vocab_start_index: int,
+    global_vocab_size: int,
+    real_vocab_size: int = -1,
+    temperature: Optional[torch.Tensor] = None,
+    tp_group: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge a deterministic TP LM-head result without recomputing its GEMM."""
+
+    if torch.is_grad_enabled() and local_logits.requires_grad:
+        return _StrictLocalLogitsTPAutograd.apply(
+            local_logits,
+            target_ids,
+            int(vocab_start_index),
+            int(global_vocab_size),
+            int(real_vocab_size),
+            temperature,
+            tp_group,
+        )
+    logp, lse, _target, _logits, _temp, lead_shape = _strict_logp_from_local_logits_tp_run(
+        local_logits,
+        target_ids,
+        vocab_start_index=vocab_start_index,
+        global_vocab_size=global_vocab_size,
+        real_vocab_size=real_vocab_size,
+        temperature=temperature,
+        tp_group=tp_group,
+    )
     return logp.reshape(lead_shape), lse.reshape(lead_shape)
 
 

@@ -370,17 +370,11 @@ class RocmAttentionPreprocessor(H100AttentionPreprocessor):
         if self.device.index is None:
             self.device = torch.device("cuda", current_device)
 
-        from rl_engine.kernels.ops.cuda.rotary_embedding import rope as rope_module
+        from rl_engine.kernels.ops.rocm.rotary_embedding.rope import RocmDeterministicRoPEOp
         from rl_engine.kernels.ops.triton.rmsnorm_triton import RMSNormTritonOp
 
-        rocm_rope_type = getattr(rope_module, "RocmDeterministicRoPEOp", None)
-        if rocm_rope_type is None:
-            raise RuntimeError(
-                "ROCm Attention preprocessing requires RocmDeterministicRoPEOp "
-                "from the ROCm Attention integration"
-            )
         self.rmsnorm = RMSNormTritonOp()
-        self.rope = rocm_rope_type()
+        self.rope = RocmDeterministicRoPEOp()
         self.deterministic_backend_ids = ROCM_ATTENTION_PREPROCESS_BACKENDS
         self.device_capability = (0, 0)
         if native_qk_norm is None and reuse_transformer_engine_qk_norm:

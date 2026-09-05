@@ -338,6 +338,165 @@ class _AllGatherSequence(torch.autograd.Function):
         return grad_local.movedim(0, ctx.sequence_dim).contiguous(), None, None
 
 
+class _AllGatherKVSequence(torch.autograd.Function):
+    """Gather equal-shape K/V shards through one deterministic collective."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        local_k: torch.Tensor,
+        local_v: torch.Tensor,
+        collective: Any,
+        sequence_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ctx.collective = collective
+        ctx.sequence_dim = int(sequence_dim)
+        packed = torch.stack(
+            (
+                local_k.movedim(ctx.sequence_dim, 0),
+                local_v.movedim(ctx.sequence_dim, 0),
+            ),
+            dim=1,
+        )
+        gathered = collective.all_gather(packed)
+        return (
+            gathered[:, 0].movedim(0, ctx.sequence_dim).contiguous(),
+            gathered[:, 1].movedim(0, ctx.sequence_dim).contiguous(),
+        )
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_global_k: torch.Tensor,
+        grad_global_v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, None, None]:
+        packed = torch.stack(
+            (
+                grad_global_k.movedim(ctx.sequence_dim, 0),
+                grad_global_v.movedim(ctx.sequence_dim, 0),
+            ),
+            dim=1,
+        )
+        local = ctx.collective.reduce_scatter(packed)
+        return (
+            local[:, 0].movedim(0, ctx.sequence_dim).contiguous(),
+            local[:, 1].movedim(0, ctx.sequence_dim).contiguous(),
+            None,
+            None,
+        )
+
+
+class _AllGatherSequenceFirst(torch.autograd.Function):
+    """Gather a local Attention tensor and keep the sequence-leading result."""
+
+    @staticmethod
+    def forward(ctx, local: torch.Tensor, collective: Any, sequence_dim: int) -> torch.Tensor:
+        ctx.collective = collective
+        ctx.sequence_dim = int(sequence_dim)
+        packed = local.movedim(ctx.sequence_dim, 0).contiguous()
+        return collective.all_gather(packed)
+
+    @staticmethod
+    def backward(ctx, grad_global: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        grad_local = ctx.collective.reduce_scatter(grad_global.contiguous())
+        return grad_local.movedim(0, ctx.sequence_dim).contiguous(), None, None
+
+
+class _AllGatherKVSequenceFirst(torch.autograd.Function):
+    """Gather K/V together and retain sequence-leading views for direct reorder."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        local_k: torch.Tensor,
+        local_v: torch.Tensor,
+        collective: Any,
+        sequence_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ctx.collective = collective
+        ctx.sequence_dim = int(sequence_dim)
+        packed = torch.stack(
+            (
+                local_k.movedim(ctx.sequence_dim, 0),
+                local_v.movedim(ctx.sequence_dim, 0),
+            ),
+            dim=1,
+        )
+        gathered = collective.all_gather(packed)
+        return gathered[:, 0], gathered[:, 1]
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_global_k: torch.Tensor,
+        grad_global_v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, None, None]:
+        packed = torch.stack((grad_global_k, grad_global_v), dim=1)
+        local = ctx.collective.reduce_scatter(packed)
+        return (
+            local[:, 0].movedim(0, ctx.sequence_dim).contiguous(),
+            local[:, 1].movedim(0, ctx.sequence_dim).contiguous(),
+            None,
+            None,
+        )
+
+
+class _AllGatherQKVSequenceFirst(torch.autograd.Function):
+    """Gather Q/K/V through one collective and expose sequence-leading views."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        local_q: torch.Tensor,
+        local_k: torch.Tensor,
+        local_v: torch.Tensor,
+        collective: Any,
+        sequence_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ctx.collective = collective
+        ctx.sequence_dim = int(sequence_dim)
+        ctx.q_heads = int(local_q.size(1))
+        ctx.kv_heads = int(local_k.size(1))
+        packed = torch.cat(
+            (
+                local_q.movedim(ctx.sequence_dim, 0),
+                local_k.movedim(ctx.sequence_dim, 0),
+                local_v.movedim(ctx.sequence_dim, 0),
+            ),
+            dim=2,
+        )
+        gathered = collective.all_gather(packed)
+        k_start = ctx.q_heads
+        v_start = k_start + ctx.kv_heads
+        return (
+            gathered[:, :, :k_start],
+            gathered[:, :, k_start:v_start],
+            gathered[:, :, v_start:],
+        )
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_global_q: torch.Tensor,
+        grad_global_k: torch.Tensor,
+        grad_global_v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None]:
+        packed = torch.cat(
+            (grad_global_q, grad_global_k, grad_global_v),
+            dim=2,
+        )
+        local = ctx.collective.reduce_scatter(packed)
+        k_start = ctx.q_heads
+        v_start = k_start + ctx.kv_heads
+        return (
+            local[:, :, :k_start].movedim(0, ctx.sequence_dim).contiguous(),
+            local[:, :, k_start:v_start].movedim(0, ctx.sequence_dim).contiguous(),
+            local[:, :, v_start:].movedim(0, ctx.sequence_dim).contiguous(),
+            None,
+            None,
+        )
+
+
 class _RootReduceScatterSequence(torch.autograd.Function):
     """Scatter one authoritative full result and gather its gradient back to the root."""
 
@@ -372,6 +531,35 @@ class _RootReduceScatterSequence(torch.autograd.Function):
         # backward is the dual gather of every rank's local output gradient;
         # non-root full inputs were zeroed in forward and receive no gradient.
         grad_full = ctx.collective.all_gather(packed).movedim(0, ctx.sequence_dim).contiguous()
+        if ctx.rank != ctx.root:
+            grad_full.zero_()
+        return grad_full, None, None, None, None
+
+
+class _RootReduceScatterSequenceFirst(torch.autograd.Function):
+    """RS an already sequence-leading full tensor without another layout copy."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        full: torch.Tensor,
+        collective: Any,
+        output_sequence_dim: int,
+        rank: int,
+        root: int,
+    ) -> torch.Tensor:
+        ctx.collective = collective
+        ctx.output_sequence_dim = int(output_sequence_dim)
+        ctx.rank = int(rank)
+        ctx.root = int(root)
+        packed = full if ctx.rank == ctx.root else torch.zeros_like(full)
+        local = collective.reduce_scatter(packed)
+        return local.movedim(0, ctx.output_sequence_dim).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_local: torch.Tensor) -> tuple[torch.Tensor, None, None, None, None]:
+        packed = grad_local.movedim(ctx.output_sequence_dim, 0).contiguous()
+        grad_full = ctx.collective.all_gather(packed)
         if ctx.rank != ctx.root:
             grad_full.zero_()
         return grad_full, None, None, None, None
@@ -448,9 +636,75 @@ class CUDAAGRSAttentionCPCommunication:
         _validate_local_kv_shard(local_k, local_v, plan)
         _require_equal_kv_owner_widths(plan, "self-owned CUDA AG")
         collective = self._get_collective(plan)
-        global_k = self._all_gather_sequence_tensor(local_k, collective, sequence_dim=2)
-        global_v = self._all_gather_sequence_tensor(local_v, collective, sequence_dim=2)
-        return global_k, global_v
+        return _AllGatherKVSequence.apply(local_k, local_v, collective, 2)
+
+    def all_gather_query_sequence_first(
+        self,
+        local_q: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> torch.Tensor:
+        """Gather Q without copying the sequence-leading collective result back."""
+
+        self._validate_cuda_plan(plan)
+        _validate_query_shard(local_q, plan)
+        ranges = plan.query_token_ranges
+        if len({end - start for start, end in ranges}) != 1:
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned CUDA AG requires equal query shard lengths"
+            )
+        return _AllGatherSequenceFirst.apply(local_q, self._get_collective(plan), 2)
+
+    def all_gather_kv_sequence_first(
+        self,
+        local_k: torch.Tensor,
+        local_v: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather K/V once and expose sequence-leading views to strict FA4."""
+
+        self._validate_cuda_plan(plan)
+        _validate_local_kv_shard(local_k, local_v, plan)
+        _require_equal_kv_owner_widths(plan, "self-owned CUDA AG")
+        return _AllGatherKVSequenceFirst.apply(
+            local_k,
+            local_v,
+            self._get_collective(plan),
+            2,
+        )
+
+    def all_gather_qkv_sequence_first(
+        self,
+        local_q: torch.Tensor,
+        local_k: torch.Tensor,
+        local_v: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather equal-length Q/K/V shards with one collective invocation."""
+
+        self._validate_cuda_plan(plan)
+        _validate_query_shard(local_q, plan)
+        _validate_local_kv_shard(local_k, local_v, plan)
+        _require_equal_kv_owner_widths(plan, "self-owned CUDA AG")
+        ranges = plan.query_token_ranges
+        if len({end - start for start, end in ranges}) != 1:
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned CUDA AG requires equal query shard lengths"
+            )
+        if (
+            local_q.size(0) != local_k.size(0)
+            or local_q.size(2) != local_k.size(2)
+            or local_q.size(3) != local_k.size(3)
+        ):
+            raise AttentionCPCommunicationUnavailable(
+                "fused Q/K/V gather requires matching batch, sequence, and head dimensions"
+            )
+        return _AllGatherQKVSequenceFirst.apply(
+            local_q,
+            local_k,
+            local_v,
+            self._get_collective(plan),
+            2,
+        )
 
     def all_gather_position_ids(
         self,
@@ -462,6 +716,11 @@ class CUDAAGRSAttentionCPCommunication:
         _validate_local_position_ids(local_query_positions, local_key_positions, plan)
         _require_equal_kv_owner_widths(plan, "self-owned CUDA AG")
         collective = self._get_collective(plan)
+        if local_query_positions is local_key_positions:
+            positions = self._all_gather_sequence_tensor(
+                local_query_positions, collective, sequence_dim=1
+            )
+            return positions, positions
         query_positions = self._all_gather_sequence_tensor(
             local_query_positions, collective, sequence_dim=1
         )
@@ -565,6 +824,53 @@ class CUDAAGRSAttentionCPCommunication:
                 2,
                 plan.parallel.cp_rank,
                 plan.merge_root_cp_rank,
+            ),
+        )
+        result.validate()
+        return result
+
+    def reduce_scatter_strict_result_sequence_first(
+        self,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> AttentionCPOutputShard:
+        """RS strict outputs already laid out as [S, B, H, ...]."""
+
+        self._validate_cuda_plan(plan)
+        ranges = plan.query_token_ranges
+        if len({end - start for start, end in ranges}) != 1:
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned CUDA RS requires equal contiguous query ranges"
+            )
+        full_tokens = ranges[-1][1]
+        if (
+            out.ndim != 4
+            or lse.ndim != 3
+            or out.size(0) != full_tokens
+            or lse.size(0) != full_tokens
+            or out.shape[1:3] != lse.shape[1:3]
+        ):
+            raise ValueError("sequence-first strict outputs must use [S,B,H,D] and [S,B,H]")
+        if not out.is_cuda or not lse.is_cuda or not out.is_contiguous() or not lse.is_contiguous():
+            raise ValueError("sequence-first strict outputs must be contiguous CUDA tensors")
+        collective = self._get_collective(plan)
+        rank = plan.parallel.cp_rank
+        root = plan.merge_root_cp_rank
+        result = AttentionCPOutputShard(
+            out=_RootReduceScatterSequenceFirst.apply(
+                out,
+                collective,
+                2,
+                rank,
+                root,
+            ),
+            lse=_RootReduceScatterSequenceFirst.apply(
+                lse,
+                collective,
+                2,
+                rank,
+                root,
             ),
         )
         result.validate()
@@ -694,18 +1000,6 @@ class RCCLAGRSAttentionCPCommunication(CUDAAGRSAttentionCPCommunication):
     transport_only = True
     supports_async_overlap = False
     supports_compute_communication_fusion = False
-
-    def _get_collective(self, plan: AttentionCPCommunicationPlan):
-        if self._collective is None:
-            self._collective = _RCCLRankOrderedTransport(
-                process_group=self._process_group,
-                root=plan.merge_root_cp_rank,
-            )
-        if self._collective.world_size != plan.parallel.cp_world_size:
-            raise AttentionCPCommunicationUnavailable(
-                "self-owned RCCL world size does not match the CP plan"
-            )
-        return self._collective
 
     def _dist(self):
         import torch.distributed as dist

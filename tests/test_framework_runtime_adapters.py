@@ -30,6 +30,8 @@ from rl_engine.integrations.framework_operators import (
     _vllm_kv_cache_views,
 )
 from rl_engine.integrations.megatron_runtime import (
+    _deterministic_reduce_from_tensor_model_parallel_region,
+    _install_torch_dist_object_compatibility,
     _patch_strict_attention_projections,
     install_megatron_integration,
 )
@@ -50,12 +52,44 @@ from rl_engine.kernels.attention_contract import (
     ReductionSpec,
     ShardingSpec,
 )
-from rl_engine.kernels.ops.cuda.attention.strict_runtime import StrictCUDAAttentionRuntime
+from rl_engine.kernels.ops.cuda.attention.strict_runtime import (
+    StrictCUDAAttentionRuntime,
+)
+
+
+def test_torch_dist_object_compatibility_deserializes_scalar_bytes_io(monkeypatch):
+    strategy_name = "megatron.core.dist_checkpointing.strategies.torch"
+    strategy = ModuleType(strategy_name)
+    calls = []
+
+    def replace(state_dict, flat_mapping, rename_mapping):
+        calls.append((state_dict, flat_mapping, rename_mapping))
+        return state_dict
+
+    strategy._replace_sharded_keys_with_state_dict_keys = replace
+    monkeypatch.setitem(sys.modules, strategy_name, strategy)
+
+    _install_torch_dist_object_compatibility()
+    installed = strategy._replace_sharded_keys_with_state_dict_keys
+    _install_torch_dist_object_compatibility()
+    payload = __import__("io").BytesIO()
+    torch.save([{"recipe": "checkpoint object"}], payload)
+
+    assert strategy._replace_sharded_keys_with_state_dict_keys is installed
+    assert installed({"state": payload}, "flat", "rename") == {
+        "state": [{"recipe": "checkpoint object"}]
+    }
+    assert calls == [
+        ({"state": [{"recipe": "checkpoint object"}]}, "flat", "rename")
+    ]
 
 
 def test_framework_adapters_do_not_construct_registered_kernels_directly():
     source_path = (
-        Path(__file__).parents[1] / "rl_engine" / "integrations" / "framework_operators.py"
+        Path(__file__).parents[1]
+        / "rl_engine"
+        / "integrations"
+        / "framework_operators.py"
     )
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
     forbidden = {
@@ -129,7 +163,8 @@ def test_vllm_rlkernel_attention_overrides_selected_flash_attn_backend(
 
     configure_vllm_environment(plan)
 
-    assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASH_ATTN"
+    expected = "ROCM_AITER_FA" if torch.version.hip is not None else "FLASH_ATTN"
+    assert os.environ["VLLM_ATTENTION_BACKEND"] == expected
 
 
 def test_vllm_rocm_attention_selects_aiter_metadata_backend(monkeypatch):
@@ -451,6 +486,22 @@ def test_vllm_current_flash_attention_kv_cache_layout_is_materialized():
     assert torch.equal(value, cache.transpose(1, 2)[..., 5:])
 
 
+def test_vllm_rocm_native_kv_cache_with_two_heads_is_not_treated_as_pair_axis():
+    cache = torch.arange(3 * 2 * 4 * 10).reshape(3, 2, 4, 10)
+
+    key, value = _vllm_kv_cache_views(
+        cache,
+        head_size=5,
+        num_kv_heads=2,
+        platform="rocm",
+    )
+
+    assert key.shape == (3, 4, 2, 5)
+    assert value.shape == (3, 4, 2, 5)
+    assert torch.equal(key, cache.transpose(1, 2)[..., :5])
+    assert torch.equal(value, cache.transpose(1, 2)[..., 5:])
+
+
 def test_vllm_rocm_kv_cache_pair_axis_is_materialized():
     cache = torch.arange(3 * 2 * 4 * 1 * 5).reshape(3, 2, 4, 1, 5)
 
@@ -479,17 +530,17 @@ def test_vllm_rocm_lhbnc_kv_cache_is_normalized_to_block_major():
 
 
 def test_vllm_rocm_flattened_kv_cache_is_unpacked():
-    cache = torch.arange(3 * 2 * 4 * 10).reshape(3, 2, 4, 10)
+    cache = torch.arange(3 * 2 * 4 * 15).reshape(3, 2, 4, 15)
 
     key, value = _vllm_kv_cache_views(
         cache,
         head_size=5,
-        num_kv_heads=2,
+        num_kv_heads=3,
         platform="rocm",
     )
 
-    assert key.shape == (3, 4, 2, 5)
-    assert value.shape == (3, 4, 2, 5)
+    assert key.shape == (3, 4, 3, 5)
+    assert value.shape == (3, 4, 3, 5)
     assert torch.equal(key.flatten(2), cache[:, 0])
     assert torch.equal(value.flatten(2), cache[:, 1])
 
@@ -535,6 +586,72 @@ def test_megatron_strict_attention_projections_install_without_debug_environment
     assert torch.equal(projection, qkv)
     assert torch.equal(native, torch.full((1, 3), -1.0))
     assert attention.linear_qkv.allreduce_dgrad is False
+
+
+def test_megatron_te_attention_projection_uses_injected_strict_tp_reduce():
+    calls: list[torch.Tensor] = []
+
+    class ColumnLinear:
+        def __init__(self):
+            self.layer_norm_weight = torch.ones(2)
+            self.weight = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+        def _forward_impl(self, input, weight, *args, **kwargs):
+            del args, kwargs
+            return input @ weight.t()
+
+    class RowLinear:
+        def __init__(self):
+            self.weight = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+        def _forward_impl(self, input, weight, *args, **kwargs):
+            del args, kwargs
+            return input @ weight.t()
+
+    class SelfAttention:
+        def __init__(self):
+            self.linear_qkv = ColumnLinear()
+            self.linear_proj = RowLinear()
+
+    def reduce_from_tp(value: torch.Tensor) -> torch.Tensor:
+        calls.append(value)
+        return value * 4
+
+    _patch_strict_attention_projections(
+        self_attention_cls=SelfAttention,
+        column_linear_cls=ColumnLinear,
+        row_linear_cls=RowLinear,
+        det_gemm=lambda lhs, rhs: lhs @ rhs,
+        copy_to_tp=lambda value: value,
+        reduce_from_tp=reduce_from_tp,
+    )
+    attention = SelfAttention()
+    value = torch.tensor([[1.0, 2.0]])
+
+    output, bias = attention.linear_proj.forward(value)
+
+    assert bias is None
+    assert len(calls) == 1
+    assert torch.equal(calls[0], value)
+    assert torch.equal(output, value * 4)
+
+
+def test_megatron_deterministic_tp_reduce_keeps_identity_backward(monkeypatch):
+    class Collective:
+        def all_reduce(self, value):
+            return value * 4
+
+    monkeypatch.setattr(
+        "rl_engine.distributed.collectives.collective_for_group",
+        lambda group, min_size_bytes: Collective(),
+    )
+    value = torch.tensor([1.0, 2.0], requires_grad=True)
+
+    output = _deterministic_reduce_from_tensor_model_parallel_region(value, object())
+    output.sum().backward()
+
+    assert torch.equal(output, value.detach() * 4)
+    assert torch.equal(value.grad, torch.ones_like(value))
 
 
 def test_vllm_qwen3_strict_model_installs_without_debug_environment(monkeypatch):
@@ -775,3 +892,43 @@ def test_strict_readback_accepts_rocm_without_triton():
     integration.execute("attention", lambda value: value, "x")
 
     integration.assert_strict_ready()
+
+
+def test_production_readback_infers_platform_from_real_execution_tensors():
+    plan = IntegrationPlan.from_case_ids(attention="P/P")
+    integration = FrameworkOperatorIntegration(
+        framework="megatron",
+        target="training",
+        plan=plan,
+        rl_kernel_operators={},
+    )
+    value = torch.zeros(2)
+
+    integration.execute("attention", lambda tensor: tensor + 1, value)
+
+    readback = integration.readback()["operators"]["attention"]
+    assert readback["implementation"] == "production"
+    assert readback["provenance"]["runtime_platform"] == "cpu"
+
+
+def test_production_readback_uses_structural_result_provenance():
+    plan = IntegrationPlan.from_case_ids(logp="P/P")
+    integration = FrameworkOperatorIntegration(
+        framework="megatron",
+        target="training",
+        plan=plan,
+        rl_kernel_operators={},
+    )
+    request = SimpleNamespace(logits=torch.zeros(2, 4), target_ids=torch.zeros(2))
+
+    def native(actual_request):
+        return SimpleNamespace(
+            logp=actual_request.logits[:, :1],
+            provenance={"actual_backend": "production.logp.test"},
+        )
+
+    integration.execute("logp", native, request)
+
+    provenance = integration.readback()["operators"]["logp"]["provenance"]
+    assert provenance["actual_backend"] == "production.logp.test"
+    assert provenance["runtime_platform"] == "cpu"

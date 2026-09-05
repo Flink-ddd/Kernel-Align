@@ -10,6 +10,7 @@ import torch
 
 import rl_engine.distributed as distributed
 import rl_engine.distributed.collectives as collectives
+import rl_engine.distributed.rocm_collectives as rocm_collectives
 from rl_engine.distributed import (
     RCCLDeterministicCollective,
     TorchDistributedDeterministicCollective,
@@ -121,7 +122,7 @@ def _make_collective(
         peer_signatures=peer_signatures,
         peer_capacities=peer_capacities,
     )
-    monkeypatch.setattr(collectives, "dist", fake_dist)
+    monkeypatch.setattr(rocm_collectives, "dist", fake_dist)
     collective = TorchDistributedDeterministicCollective(
         group=object(),
         device="cpu",
@@ -332,7 +333,7 @@ def test_reduce_scatter_many_rejects_oversized_packed_input(
         peers,
         max_size_bytes=32,
     )
-    monkeypatch.setattr(collectives, "_PACKED_REDUCE_SCATTER_MAX_BYTES", 1024)
+    monkeypatch.setattr(rocm_collectives, "_PACKED_REDUCE_SCATTER_MAX_BYTES", 1024)
 
     with pytest.raises(ValueError, match="packed input requires"):
         collective.reduce_scatter_many((peers[0], peers[0]))
@@ -344,7 +345,7 @@ def test_reduce_scatter_many_uses_separate_calls_for_large_payloads(
 ) -> None:
     peers = [torch.ones(4, 2, dtype=torch.float32) for _ in range(2)]
     collective, fake_dist = _make_collective(monkeypatch, peers)
-    monkeypatch.setattr(collectives, "_PACKED_REDUCE_SCATTER_MAX_BYTES", 1)
+    monkeypatch.setattr(rocm_collectives, "_PACKED_REDUCE_SCATTER_MAX_BYTES", 1)
 
     outputs = collective.reduce_scatter_many((peers[0], peers[0]))
 
@@ -422,14 +423,14 @@ def test_unsupported_world_size_is_rejected(
     world_size: int,
 ) -> None:
     fake_dist = _FakeDistributed([torch.ones(1)] * world_size)
-    monkeypatch.setattr(collectives, "dist", fake_dist)
+    monkeypatch.setattr(rocm_collectives, "dist", fake_dist)
 
     with pytest.raises(ValueError, match="world_size in"):
         TorchDistributedDeterministicCollective(group=object(), device="cpu")
 
 
 def test_rccl_class_requires_rocm_build(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(collectives.torch.version, "hip", None, raising=False)
+    monkeypatch.setattr(rocm_collectives.torch.version, "hip", None, raising=False)
 
     with pytest.raises(RuntimeError, match="ROCm PyTorch build"):
         RCCLDeterministicCollective(group=object(), device="cuda:0")
@@ -437,10 +438,10 @@ def test_rccl_class_requires_rocm_build(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_rccl_class_requires_nccl_process_group(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_dist = _FakeDistributed([torch.ones(1)], backend="gloo")
-    monkeypatch.setattr(collectives, "dist", fake_dist)
-    monkeypatch.setattr(collectives.torch.version, "hip", "6.3", raising=False)
-    monkeypatch.setattr(collectives.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(collectives.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(rocm_collectives, "dist", fake_dist)
+    monkeypatch.setattr(rocm_collectives.torch.version, "hip", "6.3", raising=False)
+    monkeypatch.setattr(rocm_collectives.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(rocm_collectives.torch.cuda, "current_device", lambda: 0)
 
     with pytest.raises(RuntimeError, match="NCCL process-group API"):
         RCCLDeterministicCollective(group=object(), device="cuda:0")
@@ -449,8 +450,8 @@ def test_rccl_class_requires_nccl_process_group(monkeypatch: pytest.MonkeyPatch)
 def test_rccl_class_rejects_cpu_before_process_group_exchange(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(collectives.torch.version, "hip", "6.3", raising=False)
-    monkeypatch.setattr(collectives.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(rocm_collectives.torch.version, "hip", "6.3", raising=False)
+    monkeypatch.setattr(rocm_collectives.torch.cuda, "is_available", lambda: True)
 
     with pytest.raises(ValueError, match="ROCm device"):
         RCCLDeterministicCollective(group=object(), device="cpu")
