@@ -324,7 +324,7 @@ def _patch_strict_rocm_rope() -> None:
     attention_module = importlib.import_module("megatron.core.transformer.attention")
     if hasattr(attention_module, _STRICT_ROCM_ROPE_PATCH_MARKER):
         return
-    from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RocmDeterministicRoPEOp
+    from rl_engine.kernels.ops.rocm.rotary_embedding.rope import RocmDeterministicRoPEOp
 
     operator = RocmDeterministicRoPEOp()
     original = attention_module.apply_rotary_pos_emb

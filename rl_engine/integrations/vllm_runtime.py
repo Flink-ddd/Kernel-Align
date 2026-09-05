@@ -500,7 +500,7 @@ def _patch_strict_rocm_rotary_embedding(rotary_cls: type[Any]) -> None:
 
     if torch.version.hip is None or hasattr(rotary_cls, _STRICT_ROCM_ROPE_PATCH_MARKER):
         return
-    from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RocmDeterministicRoPEOp
+    from rl_engine.kernels.ops.rocm.rotary_embedding.rope import RocmDeterministicRoPEOp
 
     operator = RocmDeterministicRoPEOp()
     original = rotary_cls.forward_cuda
