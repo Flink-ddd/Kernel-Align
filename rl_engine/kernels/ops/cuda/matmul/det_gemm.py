@@ -21,6 +21,7 @@ _BACKEND_ENV = "RL_KERNEL_DET_GEMM_BACKEND"
 _AUTO_BACKEND = "auto"
 _SM90_BACKEND = "sm90"
 _CUBLASLT_BACKEND = "cublaslt_nosplitk"
+_TRITON_BACKEND = "triton"
 _CUBLASLT_CONFIGURED = False
 _ROUTE_REPORTED = False
 _ROUTE_REPORT_LOCK = Lock()
@@ -31,9 +32,10 @@ def _requested_det_gemm_backend() -> str:
     aliases = {
         "cuda": _SM90_BACKEND,
         "cublaslt": _CUBLASLT_BACKEND,
+        "rocm": _TRITON_BACKEND,
     }
     value = aliases.get(value, value)
-    if value not in {_AUTO_BACKEND, _SM90_BACKEND, _CUBLASLT_BACKEND}:
+    if value not in {_AUTO_BACKEND, _SM90_BACKEND, _CUBLASLT_BACKEND, _TRITON_BACKEND}:
         raise RuntimeError(
             f"{_BACKEND_ENV} must be '{_AUTO_BACKEND}', '{_SM90_BACKEND}', "
             f"or '{_CUBLASLT_BACKEND}', got {value!r}"
@@ -50,6 +52,8 @@ def det_gemm_backend() -> str:
     """
 
     value = _requested_det_gemm_backend()
+    if torch.version.hip is not None and value == _AUTO_BACKEND:
+        return _TRITON_BACKEND
     if value == _AUTO_BACKEND:
         return _CUBLASLT_BACKEND if _cublaslt_contract_ready() else _SM90_BACKEND
     return value
@@ -73,6 +77,8 @@ def det_gemm_fallback_reason() -> str | None:
 
 def det_gemm_backend_id() -> str:
     backend = det_gemm_backend()
+    if backend == _TRITON_BACKEND:
+        return "rlkernel.det_gemm.triton_tree_rocm.v1"
     if backend == _CUBLASLT_BACKEND:
         return "rlkernel.det_gemm.cublaslt_nosplitk.v1"
     return "rlkernel.det_gemm.sm90.v1"
@@ -143,6 +149,11 @@ def det_gemm_linear(
 ) -> torch.Tensor:
     """Apply a native [N,K] weight through the selected strict backend."""
 
+    if det_gemm_backend() == _TRITON_BACKEND:
+        from rl_engine.kernels.ops.triton.matmul.det_gemm import _triton_tree_gemm
+        if out is not None:
+            return _triton_tree_gemm(a, weight.t().contiguous(), out=out)
+        return _triton_tree_gemm(a, weight.t().contiguous())
     if det_gemm_backend() == _CUBLASLT_BACKEND:
         _configure_cublaslt_nosplitk(a)
         _report_strict_route_once()
@@ -164,6 +175,9 @@ def det_gemm_linear_input_gradient(
 ) -> torch.Tensor:
     """Compute ``dX = dY @ weight`` through the selected strict backend."""
 
+    if det_gemm_backend() == _TRITON_BACKEND:
+        from rl_engine.kernels.ops.triton.matmul.det_gemm import deterministic_gemm_triton
+        return deterministic_gemm_triton(grad_output, weight)
     if det_gemm_backend() == _CUBLASLT_BACKEND:
         _configure_cublaslt_nosplitk(grad_output)
         _report_strict_route_once()
@@ -183,6 +197,11 @@ def det_gemm_linear_weight_gradient(
 ) -> torch.Tensor:
     """Compute ``dWeight = dY.T @ X`` through the selected strict backend."""
 
+    if det_gemm_backend() == _TRITON_BACKEND:
+        from rl_engine.kernels.ops.triton.matmul.det_gemm import deterministic_gemm_triton
+        return deterministic_gemm_triton(
+            a.t().contiguous(), grad_output
+        ).t().contiguous()
     if det_gemm_backend() == _CUBLASLT_BACKEND:
         _configure_cublaslt_nosplitk(a)
         _report_strict_route_once()
@@ -316,6 +335,12 @@ class DetGemmOp:
     def __init__(self):
         self.has_hardware_op = False
         backend = det_gemm_backend()
+        if backend == _TRITON_BACKEND:
+            from rl_engine.kernels.ops.triton.matmul.det_gemm import TritonDetGemmOp
+            self._triton = TritonDetGemmOp()
+            self.op = self._triton
+            self.has_hardware_op = True
+            return
         if backend == _CUBLASLT_BACKEND:
             _configure_cublaslt_nosplitk()
         required = (
@@ -350,6 +375,9 @@ class DetGemmOp:
                 "DetGemmOp: compiled _C.det_gemm kernel unavailable; no "
                 "batch-invariant fallback exists. Build the extension first."
             )
+        if det_gemm_backend() == _TRITON_BACKEND:
+            from rl_engine.kernels.ops.triton.matmul.det_gemm import deterministic_gemm_triton
+            return deterministic_gemm_triton(a.contiguous(), b.contiguous())
         return _DetGemmFn.apply(a.contiguous(), b.contiguous(), False)
 
     def linear(
@@ -362,6 +390,14 @@ class DetGemmOp:
         """Apply a native [N,K] linear weight without materializing weight.T."""
         assert a.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, "BF16 only"
         assert a.is_cuda and weight.is_cuda, "Inputs must be on CUDA device"
+        a = a.contiguous()
+        weight = weight.contiguous()
+        if out is not None:
+            if torch.is_grad_enabled() and (a.requires_grad or weight.requires_grad):
+                raise RuntimeError("direct-output deterministic GEMM is inference-only")
+            return det_gemm_linear(a, weight, out=out)
+        if det_gemm_backend() == _TRITON_BACKEND:
+            return _DetLinearFn.apply(a, weight)
         required = (
             "det_gemm_fwd_rhs_transposed",
             "det_gemm_fwd",
@@ -369,17 +405,14 @@ class DetGemmOp:
         )
         if not self.has_hardware_op or any(not hasattr(_C, name) for name in required):
             raise RuntimeError("DetGemmOp.linear requires the rebuilt native-weight CUDA extension")
-        a = a.contiguous()
-        weight = weight.contiguous()
-        if out is not None:
-            if torch.is_grad_enabled() and (a.requires_grad or weight.requires_grad):
-                raise RuntimeError("direct-output deterministic GEMM is inference-only")
-            return det_gemm_linear(a, weight, out=out)
         return _DetLinearFn.apply(a, weight)
 
     def forward_fp32(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         assert a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16, "BF16 only"
         assert a.is_cuda and b.is_cuda, "Inputs must be on CUDA device"
+        if det_gemm_backend() == _TRITON_BACKEND:
+            from rl_engine.kernels.ops.triton.matmul.det_gemm import _triton_gemm_fp32
+            return _triton_gemm_fp32(a, b)
         if not self.has_hardware_op:
             raise RuntimeError("DetGemmOp: compiled CUDA extension unavailable")
         return _DetGemmFn.apply(a.contiguous(), b.contiguous(), True)
@@ -391,6 +424,9 @@ class DetGemmOp:
         ):
             raise TypeError("FP32-accumulation GEMM requires BF16 or FP32 inputs")
         assert a.is_cuda and b.is_cuda, "Inputs must be on CUDA device"
+        if det_gemm_backend() == _TRITON_BACKEND:
+            from rl_engine.kernels.ops.triton.matmul.det_gemm import _triton_gemm_fp32
+            return _triton_gemm_fp32(a, b).to(a.dtype)
         return _DetGemmAccumFn.apply(a.contiguous(), b.contiguous())
 
     def parameter_vjp_contributions_fp32(self, *, a, b, grad_output):

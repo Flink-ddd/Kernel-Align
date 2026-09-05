@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import pathlib
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -8,6 +10,138 @@ from typing import Any
 import torch
 
 from rl_engine.integrations.ablation import operator_ablation_case
+from rl_engine.kernels.logprob_contract import (
+    LogprobContract,
+    LogprobDType,
+    LogprobRole,
+    MaskSpec,
+    ReductionSpec,
+    ShardingSpec,
+)
+from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import DEFAULT_NUM_VOCAB_TILES
+
+
+_ALIGNMENT_DIAGNOSTIC_LOCK = threading.Lock()
+_ALIGNMENT_DIAGNOSTIC_CALLS = 0
+
+
+def _alignment_diagnostics_enabled() -> bool:
+    return os.getenv("RL_KERNEL_ALIGNMENT_DIAGNOSTICS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _alignment_diagnostic_rank() -> int:
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_rank())
+    except (RuntimeError, ValueError):
+        pass
+    try:
+        return int(os.getenv("RANK", "0"))
+    except ValueError:
+        return 0
+
+
+def _alignment_tensor_summary(value: torch.Tensor) -> dict[str, Any]:
+    detached = value.detach()
+    flat = detached.reshape(-1)
+    first = flat[:16].to(device="cpu")
+    last = flat[-16:].to(device="cpu") if flat.numel() else first
+    summary: dict[str, Any] = {
+        "shape": list(detached.shape),
+        "dtype": str(detached.dtype).replace("torch.", ""),
+        "device": str(detached.device),
+        "first16": first.tolist(),
+        "last16": last.tolist(),
+    }
+    if detached.numel():
+        values = detached.float()
+        summary.update(
+            {
+                "sum_fp32": float(values.sum().item()),
+                "abs_sum_fp32": float(values.abs().sum().item()),
+                "min_fp32": float(values.min().item()),
+                "max_fp32": float(values.max().item()),
+            }
+        )
+    return summary
+
+
+def _record_alignment_diagnostics(
+    *,
+    target: str,
+    local_logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    result: torch.Tensor,
+    lse: torch.Tensor,
+    vocab_start_index: int,
+    hidden: torch.Tensor | None = None,
+    lm_head_weight: torch.Tensor | None = None,
+) -> None:
+    """Persist bounded row diagnostics only when explicitly enabled.
+
+    This branch performs device-to-host copies and reductions for debugging;
+    production runs leave it cold and do no additional tensor work.
+    """
+
+    if not _alignment_diagnostics_enabled():
+        return
+    root = os.getenv("RL_KERNEL_ALIGNMENT_DIAGNOSTICS_DIR", "").strip()
+    if not root:
+        return
+    global _ALIGNMENT_DIAGNOSTIC_CALLS
+    with _ALIGNMENT_DIAGNOSTIC_LOCK:
+        call_index = _ALIGNMENT_DIAGNOSTIC_CALLS
+        _ALIGNMENT_DIAGNOSTIC_CALLS += 1
+    detached_logits = local_logits.detach()
+    ids = target_ids.detach().to(device="cpu", dtype=torch.int64)
+    local_ids = target_ids.detach().to(dtype=torch.long) - int(vocab_start_index)
+    local_mask = (local_ids >= 0) & (local_ids < detached_logits.size(1))
+    safe_ids = local_ids.clamp(0, max(int(detached_logits.size(1)) - 1, 0))
+    selected_local = detached_logits.gather(1, safe_ids.reshape(-1, 1)).reshape(-1)
+    selected_local = torch.where(
+        local_mask,
+        selected_local,
+        torch.full_like(selected_local, float("nan")),
+    )
+    row_sum = detached_logits.float().sum(dim=1)
+    row_abs_sum = detached_logits.float().abs().sum(dim=1)
+    payload = {
+        "schema_version": "rlkernel.linear_logp_alignment_diagnostic.v1",
+        "target": target,
+        "rank": _alignment_diagnostic_rank(),
+        "pid": os.getpid(),
+        "call_index": call_index,
+        "vocab_start_index": int(vocab_start_index),
+        "target_ids": ids,
+        "selected_local_logits": selected_local.cpu(),
+        "result": result.detach().cpu(),
+        "lse": lse.detach().cpu(),
+        "row_sum_fp32": row_sum.cpu(),
+        "row_abs_sum_fp32": row_abs_sum.cpu(),
+        "logits_head": detached_logits[:, :8].cpu(),
+        "logits_tail": detached_logits[:, -8:].cpu(),
+        "logits_summary": _alignment_tensor_summary(detached_logits),
+    }
+    if hidden is not None:
+        payload["hidden"] = hidden.detach().cpu()
+        payload["hidden_summary"] = _alignment_tensor_summary(hidden)
+    if lm_head_weight is not None:
+        detached_weight = lm_head_weight.detach()
+        payload["lm_head_weight_head"] = detached_weight[:8].cpu()
+        payload["lm_head_weight_tail"] = detached_weight[-8:].cpu()
+        payload["lm_head_weight_summary"] = _alignment_tensor_summary(detached_weight)
+    output_dir = pathlib.Path(root)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / (
+        f"{target}-pid{os.getpid()}-rank{_alignment_diagnostic_rank():05d}-"
+        f"call{call_index:08d}.pt"
+    )
+    torch.save(payload, path)
 
 
 @dataclass(frozen=True)
@@ -101,6 +235,8 @@ class LinearLogpWrapper:
     def __init__(self) -> None:
         self._op: Any | None = None
         self._tp_op: Any | None = None
+        self._rocm_op: Any | None = None
+        self._rocm_linear: Any | None = None
         self._last_provenance: dict[str, Any] = {}
 
     @property
@@ -142,6 +278,22 @@ class LinearLogpWrapper:
         else:
             self._op = op
         return op
+
+    def _resolve_rocm(self) -> Any:
+        if self._rocm_op is None:
+            from rl_engine.kernels.ops.rocm.loss.vocab_parallel_logp import (
+                RocmVocabParallelLogprobOp,
+            )
+
+            self._rocm_op = RocmVocabParallelLogprobOp()
+        return self._rocm_op
+
+    def _resolve_rocm_linear(self) -> Any:
+        if self._rocm_linear is None:
+            from rl_engine.kernels.ops.cuda.matmul.det_gemm import DetGemmOp
+
+            self._rocm_linear = DetGemmOp()
+        return self._rocm_linear
 
     @staticmethod
     def _tp_coordinates(tp_group: Any) -> tuple[int, int]:
@@ -219,12 +371,12 @@ class LinearLogpWrapper:
             raise ValueError(
                 f"linear_logp wrapper expects hidden [tokens, hidden], got {tuple(hidden.shape)}"
             )
-        if not hidden.is_cuda or torch.version.hip is not None:
-            raise RuntimeError("strict linear_logp requires NVIDIA CUDA tensors")
+        if not hidden.is_cuda:
+            raise RuntimeError("strict linear_logp requires CUDA/ROCm GPU tensors")
         if lm_head_weight.ndim != 2:
             raise ValueError("linear_logp LM-head weight must be [vocab_local, hidden]")
         if hidden.dtype != torch.bfloat16 or lm_head_weight.dtype != torch.bfloat16:
-            raise TypeError("strict SM90 linear_logp requires bfloat16 hidden and LM-head")
+            raise TypeError("strict linear_logp requires bfloat16 hidden and LM-head")
         if lm_head_weight.device != hidden.device:
             raise ValueError("linear_logp hidden and LM-head must share a device")
         if hidden.size(1) != lm_head_weight.size(1):
@@ -268,6 +420,108 @@ class LinearLogpWrapper:
         cls._validate_targets(target_ids, rows=hidden.size(0), real_vocab_size=real)
         return tensor_parallel, requested_global, real
 
+    @staticmethod
+    def _rocm_contract(
+        local_logits: torch.Tensor,
+        *,
+        rank: int,
+        world: int,
+        global_vocab_size: int,
+        real_vocab_size: int,
+        target: str,
+    ) -> LogprobContract:
+        local_vocab = int(local_logits.size(1))
+        dtype = {
+            torch.bfloat16: LogprobDType.BF16,
+            torch.float16: LogprobDType.FP16,
+            torch.float32: LogprobDType.FP32,
+        }.get(local_logits.dtype)
+        if dtype is None:
+            raise TypeError(f"unsupported ROCm linear_logp dtype {local_logits.dtype}")
+        role = LogprobRole.TRAIN if target == "training" else LogprobRole.INFER
+        return LogprobContract(
+            role=role,
+            dtype=dtype,
+            mask=MaskSpec(
+                num_tokens=int(local_logits.size(0)),
+                active_mask=(True,) * int(local_logits.size(0)),
+            ),
+            sharding=ShardingSpec(
+                tp_rank=rank,
+                tp_world_size=world,
+                vocab_shard_bounds=tuple(
+                    (index * local_vocab, (index + 1) * local_vocab)
+                    for index in range(world)
+                ),
+                real_vocab_size=real_vocab_size,
+                padded_vocab_size=global_vocab_size,
+            ),
+            reduction=ReductionSpec(),
+        )
+
+    def _rocm_from_local_logits(
+        self,
+        local_logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        *,
+        tp_group: Any,
+        rank: int,
+        world: int,
+        global_vocab_size: int,
+        real_vocab_size: int,
+        target: str,
+        temperature: float | torch.Tensor | None,
+        diagnostics_hidden: torch.Tensor | None = None,
+        diagnostics_lm_head_weight: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, str]:
+        if temperature is None or (
+            not isinstance(temperature, torch.Tensor) and float(temperature) == 1.0
+        ):
+            effective_logits = local_logits.contiguous()
+            # Megatron exposes the materialized TP LM-head through a squeezed
+            # view.  The loss path may reuse that storage while autograd still
+            # needs it for the logp backward.  Keep one gradient-preserving
+            # snapshot for the strict training kernel; rollout is inference
+            # only and remains zero-copy.
+            if target == "training" and effective_logits.requires_grad:
+                effective_logits = effective_logits.clone()
+        else:
+            temperature_tensor = self._temperature_tensor(
+                temperature,
+                rows=local_logits.size(0),
+                device=local_logits.device,
+            )
+            assert temperature_tensor is not None
+            effective_logits = local_logits.float() / temperature_tensor.unsqueeze(1)
+        contract = self._rocm_contract(
+            effective_logits,
+            rank=rank,
+            world=world,
+            global_vocab_size=global_vocab_size,
+            real_vocab_size=real_vocab_size,
+            target=target,
+        )
+        op = self._resolve_rocm()
+        result, lse = op.apply(
+            effective_logits,
+            target_ids,
+            contract=contract,
+            tp_group=tp_group,
+            num_vocab_tiles=DEFAULT_NUM_VOCAB_TILES,
+            deterministic=True,
+        )
+        _record_alignment_diagnostics(
+            target=target,
+            local_logits=effective_logits,
+            target_ids=target_ids,
+            result=result,
+            lse=lse,
+            vocab_start_index=rank * int(effective_logits.size(1)),
+            hidden=diagnostics_hidden,
+            lm_head_weight=diagnostics_lm_head_weight,
+        )
+        return result, lse, str(op.backend_id)
+
     def from_local_logits(
         self,
         local_logits: torch.Tensor,
@@ -280,18 +534,22 @@ class LinearLogpWrapper:
         target: str = "rollout",
         temperature: float | torch.Tensor | None = None,
         return_lse: bool = False,
+        diagnostics_hidden: torch.Tensor | None = None,
+        diagnostics_lm_head_weight: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Score deterministic local LM-head logits without a duplicate GEMM."""
 
-        if local_logits.ndim != 2 or local_logits.dtype != torch.bfloat16:
-            raise TypeError("strict reused LM-head logits must be 2-D bfloat16")
-        if not local_logits.is_cuda or torch.version.hip is not None:
-            raise RuntimeError("strict reused LM-head logits require NVIDIA CUDA")
+        if local_logits.ndim != 2 or local_logits.dtype not in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+        ):
+            raise TypeError("strict reused LM-head logits must be 2-D bf16/fp16/fp32")
+        if not local_logits.is_cuda:
+            raise RuntimeError("strict reused LM-head logits require CUDA/ROCm")
         if target_ids.device != local_logits.device:
             raise ValueError("linear_logp target_ids must share the logits device")
         rank, world = self._tp_coordinates(tp_group)
-        if tp_group is None or world <= 1:
-            raise ValueError("reused rollout LM-head logits require a multi-rank TP group")
         local_vocab = int(local_logits.size(1))
         requested_global = int(global_vocab_size)
         expected_global = local_vocab * world
@@ -306,32 +564,59 @@ class LinearLogpWrapper:
             rows=local_logits.size(0),
             real_vocab_size=real,
         )
-        temperature_tensor = self._temperature_tensor(
-            temperature,
-            rows=local_logits.size(0),
-            device=local_logits.device,
-        )
-        from rl_engine.kernels.ops.cuda.loss.linear_logp import (
-            sm90_deterministic_logp_from_local_logits_tp,
-        )
+        if torch.version.hip is not None:
+            result, lse, kernel_backend = self._rocm_from_local_logits(
+                local_logits,
+                target_ids,
+                tp_group=tp_group,
+                rank=rank,
+                world=world,
+                global_vocab_size=requested_global,
+                real_vocab_size=real,
+                target=target,
+                temperature=temperature,
+                diagnostics_hidden=diagnostics_hidden,
+                diagnostics_lm_head_weight=diagnostics_lm_head_weight,
+            )
+            runtime_platform = "rocm"
+            strict_entrypoint = (
+                "rocm_deterministic_linear_logp_tp"
+                if target == "training"
+                else "rocm_vocab_parallel_logp_from_local_logits_tp"
+            )
+            contract_version = "rocm-det-gemm-vocab-parallel-logp-ws2-v1"
+        else:
+            temperature_tensor = self._temperature_tensor(
+                temperature,
+                rows=local_logits.size(0),
+                device=local_logits.device,
+            )
+            from rl_engine.kernels.ops.cuda.loss.linear_logp import (
+                sm90_deterministic_logp_from_local_logits_tp,
+            )
 
-        result, lse = sm90_deterministic_logp_from_local_logits_tp(
-            local_logits.contiguous(),
-            target_ids,
-            tp_group=tp_group,
-            vocab_start_index=int(vocab_start_index),
-            global_vocab_size=requested_global,
-            real_vocab_size=real,
-            temperature=temperature_tensor,
-        )
+            result, lse = sm90_deterministic_logp_from_local_logits_tp(
+                local_logits.contiguous(),
+                target_ids,
+                tp_group=tp_group,
+                vocab_start_index=int(vocab_start_index),
+                global_vocab_size=requested_global,
+                real_vocab_size=real,
+                temperature=temperature_tensor,
+            )
+            kernel_backend = self.backend_id
+            runtime_platform = "cuda"
+            strict_entrypoint = "sm90_deterministic_logp_from_local_logits_tp"
+            contract_version = "cuda-det-gemm-linear-logp-sm90-contract-v2"
         self._last_provenance = {
             **self._mismatch_provenance(),
             "target": target,
-            "runtime_platform": "cuda",
-            "triton_used": False,
+            "runtime_platform": runtime_platform,
+            "triton_used": runtime_platform == "rocm",
             "actual_backend": self.backend_id,
+            "logprob_kernel_backend": kernel_backend,
             "deterministic_linear_logp": True,
-            "strict_entrypoint": "sm90_deterministic_logp_from_local_logits_tp",
+            "strict_entrypoint": strict_entrypoint,
             "local_logits_shape": list(local_logits.shape),
             "target_shape": list(target_ids.shape),
             "tp_group_present": True,
@@ -339,7 +624,7 @@ class LinearLogpWrapper:
             "global_vocab_size": requested_global,
             "real_vocab_size": real,
             "temperature": None if temperature is None else "provided",
-            "contract_version": "cuda-det-gemm-linear-logp-sm90-contract-v2",
+            "contract_version": contract_version,
             "logits_materialized": True,
             "lm_head_result_reused": True,
         }
@@ -401,31 +686,60 @@ class LinearLogpWrapper:
         )
         effective_weight = lm_head_weight
         effective_bias = bias
-        temperature_tensor = self._temperature_tensor(
-            temperature, rows=hidden.size(0), device=hidden.device
-        )
-        op = self._resolve(tensor_parallel=tensor_parallel)
-        if tensor_parallel:
-            result, _lse = op(
-                hidden,
-                effective_weight,
+        if torch.version.hip is not None:
+            local_logits = self._resolve_rocm_linear().linear(hidden, effective_weight)
+            if effective_bias is not None:
+                local_logits = local_logits + effective_bias
+            result, _lse, kernel_backend = self._rocm_from_local_logits(
+                local_logits,
                 target_ids,
-                effective_bias,
                 tp_group=tp_group,
-                vocab_start_index=int(vocab_start_index),
+                rank=self._tp_coordinates(tp_group)[0],
+                world=self._tp_coordinates(tp_group)[1],
                 global_vocab_size=requested_global_vocab,
                 real_vocab_size=real,
-                temperature=temperature_tensor,
+                target=target,
+                temperature=temperature,
+                diagnostics_hidden=hidden,
+                diagnostics_lm_head_weight=effective_weight,
             )
+            runtime_platform = "rocm"
+            strict_entrypoint = "rocm_deterministic_linear_logp_tp"
+            contract_version = "rocm-det-gemm-vocab-parallel-logp-ws2-v1"
         else:
-            result, _lse = op(
-                hidden,
-                effective_weight,
-                target_ids,
-                effective_bias,
-                real_vocab_size=real,
-                temperature=temperature_tensor,
+            temperature_tensor = self._temperature_tensor(
+                temperature, rows=hidden.size(0), device=hidden.device
             )
+            op = self._resolve(tensor_parallel=tensor_parallel)
+            if tensor_parallel:
+                result, _lse = op(
+                    hidden,
+                    effective_weight,
+                    target_ids,
+                    effective_bias,
+                    tp_group=tp_group,
+                    vocab_start_index=int(vocab_start_index),
+                    global_vocab_size=requested_global_vocab,
+                    real_vocab_size=real,
+                    temperature=temperature_tensor,
+                )
+            else:
+                result, _lse = op(
+                    hidden,
+                    effective_weight,
+                    target_ids,
+                    effective_bias,
+                    real_vocab_size=real,
+                    temperature=temperature_tensor,
+                )
+            kernel_backend = self.backend_id
+            runtime_platform = "cuda"
+            strict_entrypoint = (
+                "sm90_deterministic_linear_logp_tp"
+                if tensor_parallel
+                else "sm90_deterministic_linear_logp"
+            )
+            contract_version = "cuda-det-gemm-linear-logp-sm90-contract-v2"
         if not isinstance(result, torch.Tensor):
             raise RuntimeError("linear_logp backend returned a non-tensor result")
         if result.numel() != hidden.size(0):
@@ -438,15 +752,12 @@ class LinearLogpWrapper:
         self._last_provenance = {
             **self._mismatch_provenance(),
             "target": target,
-            "runtime_platform": "cuda",
-            "triton_used": False,
+            "runtime_platform": runtime_platform,
+            "triton_used": runtime_platform == "rocm",
             "actual_backend": actual_backend,
+            "logprob_kernel_backend": kernel_backend,
             "deterministic_linear_logp": True,
-            "strict_entrypoint": (
-                "sm90_deterministic_linear_logp_tp"
-                if tensor_parallel
-                else "sm90_deterministic_linear_logp"
-            ),
+            "strict_entrypoint": strict_entrypoint,
             "hidden_shape": list(hidden.shape),
             "hidden_dtype": str(hidden.dtype).replace("torch.", ""),
             "lm_head_weight_shape": list(lm_head_weight.shape),
@@ -458,7 +769,7 @@ class LinearLogpWrapper:
             "real_vocab_size": real,
             "requested_real_vocab_size": None if real_vocab_size is None else int(real_vocab_size),
             "temperature": None if temperature is None else "provided",
-            "contract_version": "cuda-det-gemm-linear-logp-sm90-contract-v2",
+            "contract_version": contract_version,
             "logits_materialized": True,
         }
         return result

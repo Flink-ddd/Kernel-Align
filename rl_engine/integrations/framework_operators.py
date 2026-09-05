@@ -14,7 +14,7 @@ import os
 from dataclasses import replace
 from functools import lru_cache
 from threading import Lock
-from typing import Any, Mapping, cast
+from typing import Any, Callable, Mapping, cast
 
 import torch
 
@@ -33,6 +33,7 @@ from rl_engine.kernels.attention_contract import (
 from rl_engine.kernels.attention_contract import ReductionSpec as AttentionReductionSpec
 from rl_engine.kernels.attention_contract import ShardingSpec as AttentionShardingSpec
 from rl_engine.kernels.attention_contract import SplitKVSpec
+from rl_engine.kernels.attention_projection import ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID
 from rl_engine.kernels.logprob_contract import LogprobContract, LogprobDType, LogprobRole, MaskSpec
 from rl_engine.kernels.logprob_contract import ReductionSpec as LogprobReductionSpec
 from rl_engine.kernels.logprob_contract import ShardingSpec as LogprobShardingSpec
@@ -45,6 +46,10 @@ from rl_engine.runtime_mode import strict_contract_enabled
 
 ATTENTION_BACKEND_ID = "rlkernel.attention.deterministic.v1"
 FFN_BACKEND_ID = "rlkernel.ffn.qwen3.deterministic.v1"
+_MEGATRON_TP_QKV_DGRAD_COLLECTIVE_ATTR = "__rl_kernel_tp_qkv_dgrad_collective_backend__"
+_MEGATRON_TP_OUTPUT_PROJECTION_COLLECTIVE_ATTR = (
+    "__rl_kernel_tp_output_projection_collective_backend__"
+)
 
 
 def _device_name(tensor: torch.Tensor) -> str:
@@ -119,8 +124,8 @@ def _attention_dtype(tensor: torch.Tensor) -> AttentionDType:
 
 
 def _require_nvidia_cuda(tensor: torch.Tensor, module: str) -> None:
-    if tensor.device.type != "cuda" or torch.version.hip is not None:
-        raise RuntimeError(f"strict {module} R/R requires NVIDIA CUDA tensors")
+    if tensor.device.type != "cuda":
+        raise RuntimeError(f"strict {module} R/R requires CUDA/ROCm GPU tensors")
 
 
 def _require_attention_accelerator(tensor: torch.Tensor) -> str:
@@ -145,6 +150,38 @@ def _strict_attention_platform_contract(platform: str) -> tuple[str, str, str]:
             "cuda_ag_rs",
         )
     raise RuntimeError(f"unsupported strict Attention platform {platform!r}")
+
+
+def _strict_attention_projection_backend_id(platform: str) -> str:
+    if platform == "rocm":
+        return ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID
+    if platform == "cuda":
+        return det_gemm_backend_id()
+    raise RuntimeError(f"unsupported Attention projection platform {platform!r}")
+
+
+def _strict_attention_projection_provenance(platform: str) -> dict[str, Any]:
+    return {
+        "backend_id": _strict_attention_projection_backend_id(platform),
+        "deterministic": True,
+        "accumulation_dtype": "fp32",
+        "reduction_order": "k_ascending",
+        "split_k": False,
+        "roles": ["qkv", "o_proj"],
+        "triton_used": platform == "rocm",
+    }
+
+
+def _strict_attention_projection_op() -> Any:
+    """Construct the deterministic projection selected for this PyTorch build."""
+
+    if torch.version.hip is not None:
+        from rl_engine.kernels.ops.triton.matmul.det_gemm import TritonDetGemmOp
+
+        return TritonDetGemmOp()
+    from rl_engine.kernels.ops.cuda.matmul.det_gemm import DetGemmOp
+
+    return DetGemmOp()
 
 
 class SemanticOperatorHandle:
@@ -440,6 +477,13 @@ class MegatronAttentionOperator:
         self._packed_layout_value: tuple[tuple[int, ...], tuple[int, ...]] | None = None
         self._position_ids_cache: dict[tuple[Any, ...], torch.Tensor] = {}
 
+    @staticmethod
+    def _tp_collective_backend(module: Any, attribute: str, tp_world: int) -> str:
+        value = getattr(module, attribute, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return "none" if tp_world == 1 else "unbound"
+
     def _position_ids(
         self,
         positions: tuple[int, ...],
@@ -697,9 +741,19 @@ class MegatronAttentionOperator:
             "cp_world_size": cp_world,
             "tp_world_size": tp_world,
             "runtime_platform": runtime_platform,
-            "triton_used": False,
-            "tp_output_projection_collective": (
-                "deterministic_all_reduce.ipc_localized_fixed_tree.v1"
+            "triton_used": runtime_platform == "rocm",
+            "deterministic_projection": _strict_attention_projection_provenance(
+                runtime_platform
+            ),
+            "tp_qkv_dgrad_collective": self._tp_collective_backend(
+                module,
+                _MEGATRON_TP_QKV_DGRAD_COLLECTIVE_ATTR,
+                tp_world,
+            ),
+            "tp_output_projection_collective": self._tp_collective_backend(
+                module,
+                _MEGATRON_TP_OUTPUT_PROJECTION_COLLECTIVE_ATTR,
+                tp_world,
             ),
             **execution_provenance,
         }
@@ -785,12 +839,19 @@ class MegatronFFNOperator:
             "framework_layout": "megatron_sequence_parallel",
             "cp_world_size": cp_world,
             "tp_world_size": tp_world,
-            "runtime_platform": "cuda",
-            "actual_backend": "rlkernel.cuda.det_gemm_swiglu",
+            "runtime_platform": _device_name(hidden_states),
+            "actual_backend": "rlkernel.rocm.det_gemm_swiglu" if torch.version.hip is not None else "rlkernel.cuda.det_gemm_swiglu",
             "gemm_backend": det_gemm_backend_id(),
             "fallback": False,
             "gate_up_projection": "separate_strict_launches",
-            "triton_used": False,
+            "deterministic_all_reduce_backend": (
+                "none"
+                if tp_world == 1
+                else "rocm_ipc_fixed_tree"
+                if torch.version.hip is not None
+                else "deterministic_all_reduce.ipc_localized_fixed_tree.v1"
+            ),
+            "triton_used": torch.version.hip is not None,
         }
         return output, None
 
@@ -833,6 +894,10 @@ def _vllm_kv_cache_views(
             "vLLM K/V cache layout does not expose the declared number of KV heads"
         )
 
+    # Match vLLM's native AITER layout before the legacy flattened layout.
+    # With two KV heads both layouts otherwise look like [B, 2, N, 2 * head].
+    if kv_cache.ndim == 4 and kv_cache.size(-1) == 2 * head_size:
+        return kv_cache.transpose(1, 2).split(head_size, dim=-1)
     if (
         kv_cache.ndim == 4
         and platform == "rocm"
@@ -846,8 +911,6 @@ def _vllm_kv_cache_views(
             key_cache.view(blocks, block_size, num_kv_heads, head_size),
             value_cache.view(blocks, block_size, num_kv_heads, head_size),
         )
-    if kv_cache.ndim == 4 and kv_cache.size(-1) == 2 * head_size:
-        return kv_cache.transpose(1, 2).split(head_size, dim=-1)
     # The K/V axis is leading in CUDA FlashAttention caches and follows the
     # block axis in the ROCm AITER layouts.  Prefer the platform convention in
     # the ambiguous two-block case where both dimensions happen to equal two.
@@ -882,10 +945,16 @@ class VllmAttentionOperator:
 
     backend_id = ATTENTION_BACKEND_ID
 
-    def __init__(self, handle: SemanticOperatorHandle | None = None) -> None:
+    def __init__(
+        self,
+        handle: SemanticOperatorHandle | None = None,
+        *,
+        projection_collective_backend: Callable[[], str | None] | None = None,
+    ) -> None:
         self._handle = handle or SemanticOperatorHandle(
             target="rollout", semantic_op="attention", backend_id=self.backend_id
         )
+        self._projection_collective_backend = projection_collective_backend
         self._last_provenance: dict[str, Any] = {}
         self._tp_coordinates: tuple[int, int, Any] | None = None
         self._metadata_cache_key: tuple[Any, ...] | None = None
@@ -1131,6 +1200,13 @@ class VllmAttentionOperator:
             else:
                 output_heads.index_copy_(0, query_indices, result.out.squeeze(2))
             last_operator_provenance = _compact_attention_provenance(result.provenance)
+        projection_collective_backend = "none"
+        if runtime_platform == "rocm" and tp_world > 1:
+            projection_collective_backend = "unbound"
+            if self._projection_collective_backend is not None:
+                projection_collective_backend = (
+                    self._projection_collective_backend() or "unbound"
+                )
         self._last_provenance = {
             "framework_layout": "vllm_paged_kv",
             "materialization": (
@@ -1141,7 +1217,11 @@ class VllmAttentionOperator:
             "tp_world_size": tp_world,
             "tp_group_bound": tp_group is not None,
             "runtime_platform": runtime_platform,
-            "triton_used": False,
+            "triton_used": runtime_platform == "rocm",
+            "deterministic_projection": _strict_attention_projection_provenance(
+                runtime_platform
+            ),
+            "deterministic_all_reduce_backend": projection_collective_backend,
             "direct_output_buffer": direct_output_buffer,
             **metadata_summary,
             "operator": last_operator_provenance,
@@ -1208,16 +1288,17 @@ class VllmFFNOperator:
     def _set_runtime_provenance(
         self, tp_world: int, deterministic_all_reduce_backend: str = "unbound"
     ) -> None:
+        runtime_platform = "rocm" if torch.version.hip is not None else "cuda"
         self._last_provenance = {
             "framework_layout": "vllm_tensor_parallel",
             "tp_world_size": tp_world,
-            "runtime_platform": "cuda",
-            "actual_backend": "rlkernel.cuda.det_gemm_swiglu",
+            "runtime_platform": runtime_platform,
+            "actual_backend": f"rlkernel.{runtime_platform}.det_gemm_swiglu",
             "gemm_backend": det_gemm_backend_id(),
             "fallback": False,
             "gate_up_projection": "packed_single_launch",
             "deterministic_all_reduce_backend": deterministic_all_reduce_backend,
-            "triton_used": False,
+            "triton_used": runtime_platform == "rocm",
         }
 
     def __call__(self, module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1267,7 +1348,7 @@ class VllmFFNOperator:
 
 
 class MegatronLogpOperator:
-    """Require CUDA while reusing the structural Vime Logp provider."""
+    """Route structural Vime logp requests through the strict GPU backend."""
 
     def __init__(
         self,
@@ -1306,8 +1387,8 @@ class MegatronLogpOperator:
                 "operator": self.backend_id,
                 "actual_backend": self.backend_id,
                 "fallback": False,
-                "runtime_platform": "cuda",
-                "triton_used": False,
+                "runtime_platform": _device_name(hidden),
+                "triton_used": torch.version.hip is not None,
                 "provider": dict(getattr(result, "provenance", {})),
                 "linear_logp": dict(self._linear_logp.provenance),
                 "logits_materialized": False,
@@ -1326,8 +1407,8 @@ class MegatronLogpOperator:
             "operator": self.backend_id,
             "actual_backend": self.backend_id,
             "fallback": False,
-            "runtime_platform": "cuda",
-            "triton_used": False,
+            "runtime_platform": _device_name(logits),
+            "triton_used": torch.version.hip is not None,
             "provider": dict(getattr(result, "provenance", {})),
         }
         return result
@@ -1570,13 +1651,20 @@ class VllmLogpOperator:
                 real_vocab_size=context.real_vocab_size,
                 temperature=float(os.getenv("RL_KERNEL_VLLM_TEMPERATURE", "1.0")),
                 target="rollout",
+                diagnostics_hidden=context.hidden,
+                diagnostics_lm_head_weight=context.lm_head_weight,
             )
             strict_provenance = self._linear_logp.provenance
+            expected_entrypoint = (
+                "rocm_vocab_parallel_logp_from_local_logits_tp"
+                if torch.version.hip is not None
+                else "sm90_deterministic_logp_from_local_logits_tp"
+            )
             if (
                 strict_provenance.get("deterministic_linear_logp") is not True
                 or strict_provenance.get("actual_backend") != self._linear_logp.backend_id
                 or strict_provenance.get("strict_entrypoint")
-                != "sm90_deterministic_logp_from_local_logits_tp"
+                != expected_entrypoint
             ):
                 raise RuntimeError(
                     "strict vLLM rollout linear_logp did not execute the deterministic "
@@ -1584,8 +1672,8 @@ class VllmLogpOperator:
                 )
             provenance = {
                 **dict(strict_provenance),
-                "runtime_platform": "cuda",
-                "triton_used": False,
+                "runtime_platform": _device_name(local_logits),
+                "triton_used": torch.version.hip is not None,
                 "execution": {
                     "role": "vllm_rollout_linear_logprob",
                     "strict_backend": True,
@@ -1697,8 +1785,8 @@ class VllmLogpOperator:
 
         provenance = {
             **dict(dispatch.provenance),
-            "runtime_platform": "cuda",
-            "triton_used": False,
+            "runtime_platform": _device_name(source_logits),
+            "triton_used": torch.version.hip is not None,
             "source_logits_shape": list(source_logits.shape),
             "source_logits_dtype": _dtype_name(source_logits),
             "contract_real_vocab_size": contract.sharding.real_vocab_size,

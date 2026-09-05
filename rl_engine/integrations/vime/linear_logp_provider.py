@@ -278,6 +278,25 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> LinearLogpResult
         if partition is None:
             raise RuntimeError("linear_logp context must expose vocab_partition")
         reuse_local_logits = bool(getattr(context, "reuse_local_logits", False))
+        # Megatron's strict output-layer patch materializes the same local
+        # padded-vocabulary logits that vLLM serves.  The Vime context type in
+        # this revision predates the explicit ``local_logits`` field, so use
+        # the request tensor when it is the matching ROCm TP shard.  This
+        # avoids a second GEMM and keeps the backward graph attached to the
+        # output projection.
+        request_logits = getattr(request, "logits", None)
+        materialized_local_logits = (
+            torch.version.hip is not None
+            and isinstance(request_logits, torch.Tensor)
+            and request_logits.ndim == 2
+            and request_logits.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and request_logits.shape == (
+                hidden.size(0),
+                projection.weight.size(0),
+            )
+        )
+        if materialized_local_logits:
+            reuse_local_logits = True
         with_entropy = bool(getattr(request, "with_entropy", False))
         with_entropy_grad = bool(getattr(request, "with_entropy_grad", False))
         fast_metric_entropy = (
@@ -288,7 +307,10 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> LinearLogpResult
         )
         strict_lse = None
         if reuse_local_logits:
-            if not isinstance(getattr(context, "local_logits", None), torch.Tensor):
+            local_logits = getattr(context, "local_logits", None)
+            if materialized_local_logits:
+                local_logits = request_logits
+            if not isinstance(local_logits, torch.Tensor):
                 raise RuntimeError("strict reusable LM-head context is missing local logits")
             from_local_logits = getattr(linear_logp, "from_local_logits", None)
             if not callable(from_local_logits):
@@ -296,7 +318,7 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> LinearLogpResult
                     "strict reusable LM-head logits require a from_local_logits provider"
                 )
             scored = from_local_logits(
-                context.local_logits,
+                local_logits,
                 request.target_ids,
                 tp_group=getattr(request, "tensor_parallel_group", None),
                 vocab_start_index=int(partition.local_start),
@@ -305,6 +327,8 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> LinearLogpResult
                 target="training",
                 temperature=getattr(request, "temperature", None),
                 return_lse=fast_metric_entropy,
+                diagnostics_hidden=hidden,
+                diagnostics_lm_head_weight=projection.weight,
             )
             if fast_metric_entropy:
                 logp, strict_lse = scored
@@ -328,7 +352,7 @@ def _provider_impl(request: Any, *, linear_logp: Any = None) -> LinearLogpResult
             if strict_lse is None:
                 raise RuntimeError("metric-only entropy requires the strict local-logits LSE")
             entropy = _metric_entropy_from_strict_lse(
-                context.local_logits,
+                local_logits,
                 strict_lse,
                 vocab_start_index=int(partition.local_start),
                 real_vocab_size=int(partition.real_size),

@@ -154,6 +154,15 @@ def qwen3_ffn_packed_inference(
             fused_gate_up_weight,
             down_weight,
         )
+    if getattr(torch.version, "hip", None) is not None:
+        if collective is None:
+            raise RuntimeError("packed ROCm rollout FFN requires a bound TP collective")
+        output = _qwen3_ffn_packed_inference(
+            rmsnorm_output,
+            fused_gate_up_weight,
+            down_weight,
+        )
+        return collective.all_reduce(output, out=output)
     if collective_handle <= 0:
         raise RuntimeError("packed rollout FFN requires a bound TP collective")
     input_shape = rmsnorm_output.shape
@@ -719,6 +728,10 @@ class Qwen3FFNOp:
             tp_group,
             min_size_bytes=min_size_bytes,
         )
+        if getattr(torch.version, "hip", None) is not None:
+            collective_handle = int(collective._handle)
+            self._packed_inference_collectives[collective_handle] = collective
+            return collective_handle, tp_world_size
         max_capture = int(os.getenv("RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE", "0"))
         if max_capture <= 0:
             raise RuntimeError("packed rollout FFN requires a positive graph capture size")
@@ -729,6 +742,18 @@ class Qwen3FFNOp:
         collective_handle = int(collective._handle)
         self._packed_inference_collectives[collective_handle] = collective
         return collective_handle, tp_world_size
+
+    def packed_inference_backend_id(self, collective_handle: int) -> str:
+        collective = self._packed_inference_collectives.get(collective_handle)
+        if collective is None:
+            raise RuntimeError("packed rollout FFN collective is not bound")
+        return str(
+            getattr(
+                collective,
+                "backend_id",
+                "deterministic_all_reduce.ipc_localized_fixed_tree.v1",
+            )
+        )
 
     def packed_inference(
         self,

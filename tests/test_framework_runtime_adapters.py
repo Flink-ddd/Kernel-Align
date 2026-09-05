@@ -31,6 +31,7 @@ from rl_engine.integrations.framework_operators import (
 )
 from rl_engine.integrations.megatron_runtime import (
     _deterministic_reduce_from_tensor_model_parallel_region,
+    _install_torch_dist_object_compatibility,
     _patch_strict_attention_projections,
     install_megatron_integration,
 )
@@ -54,6 +55,33 @@ from rl_engine.kernels.attention_contract import (
 from rl_engine.kernels.ops.cuda.attention.strict_runtime import (
     StrictCUDAAttentionRuntime,
 )
+
+
+def test_torch_dist_object_compatibility_deserializes_scalar_bytes_io(monkeypatch):
+    strategy_name = "megatron.core.dist_checkpointing.strategies.torch"
+    strategy = ModuleType(strategy_name)
+    calls = []
+
+    def replace(state_dict, flat_mapping, rename_mapping):
+        calls.append((state_dict, flat_mapping, rename_mapping))
+        return state_dict
+
+    strategy._replace_sharded_keys_with_state_dict_keys = replace
+    monkeypatch.setitem(sys.modules, strategy_name, strategy)
+
+    _install_torch_dist_object_compatibility()
+    installed = strategy._replace_sharded_keys_with_state_dict_keys
+    _install_torch_dist_object_compatibility()
+    payload = __import__("io").BytesIO()
+    torch.save([{"recipe": "checkpoint object"}], payload)
+
+    assert strategy._replace_sharded_keys_with_state_dict_keys is installed
+    assert installed({"state": payload}, "flat", "rename") == {
+        "state": [{"recipe": "checkpoint object"}]
+    }
+    assert calls == [
+        ({"state": [{"recipe": "checkpoint object"}]}, "flat", "rename")
+    ]
 
 
 def test_framework_adapters_do_not_construct_registered_kernels_directly():
@@ -135,7 +163,8 @@ def test_vllm_rlkernel_attention_overrides_selected_flash_attn_backend(
 
     configure_vllm_environment(plan)
 
-    assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASH_ATTN"
+    expected = "ROCM_AITER_FA" if torch.version.hip is not None else "FLASH_ATTN"
+    assert os.environ["VLLM_ATTENTION_BACKEND"] == expected
 
 
 def test_vllm_rocm_attention_selects_aiter_metadata_backend(monkeypatch):
@@ -457,6 +486,22 @@ def test_vllm_current_flash_attention_kv_cache_layout_is_materialized():
     assert torch.equal(value, cache.transpose(1, 2)[..., 5:])
 
 
+def test_vllm_rocm_native_kv_cache_with_two_heads_is_not_treated_as_pair_axis():
+    cache = torch.arange(3 * 2 * 4 * 10).reshape(3, 2, 4, 10)
+
+    key, value = _vllm_kv_cache_views(
+        cache,
+        head_size=5,
+        num_kv_heads=2,
+        platform="rocm",
+    )
+
+    assert key.shape == (3, 4, 2, 5)
+    assert value.shape == (3, 4, 2, 5)
+    assert torch.equal(key, cache.transpose(1, 2)[..., :5])
+    assert torch.equal(value, cache.transpose(1, 2)[..., 5:])
+
+
 def test_vllm_rocm_kv_cache_pair_axis_is_materialized():
     cache = torch.arange(3 * 2 * 4 * 1 * 5).reshape(3, 2, 4, 1, 5)
 
@@ -485,17 +530,17 @@ def test_vllm_rocm_lhbnc_kv_cache_is_normalized_to_block_major():
 
 
 def test_vllm_rocm_flattened_kv_cache_is_unpacked():
-    cache = torch.arange(3 * 2 * 4 * 10).reshape(3, 2, 4, 10)
+    cache = torch.arange(3 * 2 * 4 * 15).reshape(3, 2, 4, 15)
 
     key, value = _vllm_kv_cache_views(
         cache,
         head_size=5,
-        num_kv_heads=2,
+        num_kv_heads=3,
         platform="rocm",
     )
 
-    assert key.shape == (3, 4, 2, 5)
-    assert value.shape == (3, 4, 2, 5)
+    assert key.shape == (3, 4, 3, 5)
+    assert value.shape == (3, 4, 3, 5)
     assert torch.equal(key.flatten(2), cache[:, 0])
     assert torch.equal(value.flatten(2), cache[:, 1])
 

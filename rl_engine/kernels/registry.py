@@ -273,7 +273,7 @@ def _default_semantic_descriptors() -> tuple[OperatorBackendDescriptor, ...]:
             semantic_op="ffn",
             backend_id="rlkernel.ffn.qwen3.deterministic.v1",
             supported_targets=frozenset({"rollout", "training"}),
-            supported_devices=frozenset({"cuda"}),
+            supported_devices=frozenset({"cuda", "rocm"}),
             supported_dtypes=frozenset({"bfloat16"}),
             supported_topologies={"*": "*"},
             determinism_or_alignment_properties={
