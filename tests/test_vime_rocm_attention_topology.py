@@ -5,8 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import torch
 
 from examples.vime_rocm_attention_ablation.run import MatrixConfig, build_plan
+from rl_engine.kernels.ops.cuda.attention.cp_comm import (
+    AttentionCPCommunicationPlan,
+    AttentionParallelSpec,
+)
+from rl_engine.kernels.ops.rocm.attention.strict_runtime import (
+    RCCLAGRSAttentionCPCommunication,
+)
 
 ROOT = Path(__file__).parents[1]
 
@@ -78,6 +86,26 @@ def test_router_requires_at_least_one_request_per_engine(tmp_path):
     )
     with pytest.raises(ValueError, match="one request per rollout engine"):
         config.validate(require_paths=False)
+
+
+def test_rocm_cp_adapter_accepts_rccl_plan_without_widening_cuda_contract(monkeypatch):
+    plan = AttentionCPCommunicationPlan(
+        parallel=AttentionParallelSpec(
+            tp_world_size=4,
+            tp_rank=0,
+            cp_world_size=2,
+            cp_rank=0,
+        ),
+        backend="rccl_ag_rs",
+        status="implemented",
+    )
+    communication = object.__new__(RCCLAGRSAttentionCPCommunication)
+    monkeypatch.setattr(torch.version, "hip", "test")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    communication._validate_cuda_plan(plan)
+
+    assert plan.backend == "rccl_ag_rs"
 
 
 def test_dashboard_cannot_overlap_ray_worker_port_range(tmp_path):

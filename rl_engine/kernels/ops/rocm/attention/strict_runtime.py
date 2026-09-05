@@ -27,7 +27,7 @@ Two things differ from the CUDA runtime and both are load-bearing:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -76,11 +76,11 @@ class RCCLAGRSAttentionCPCommunication(CUDAAGRSAttentionCPCommunication):
         return dist
 
     def _validate_cuda_plan(self, plan: AttentionCPCommunicationPlan) -> None:
-        plan.validate()
         if plan.backend != "rccl_ag_rs" or plan.status != "implemented":
             raise AttentionCPCommunicationUnavailable(
                 "self-owned RCCL AG/RS requires an implemented rccl_ag_rs plan"
             )
+        replace(plan, backend="cuda_ag_rs").validate()
         if torch.version.hip is None or not torch.cuda.is_available():
             raise AttentionCPCommunicationUnavailable(
                 "self-owned RCCL AG/RS requires an available ROCm device"
