@@ -318,6 +318,10 @@ if _TRITON_AVAILABLE:
             mask=output_mask,
         )
 
+    # Preserve the WS1 manifest's historical kernel symbol while retaining the
+    # more descriptive implementation name used by the optimized tree path.
+    _det_gemm_kernel = _det_gemm_tree_leaf_kernel
+
     @triton.jit
     def _det_gemm_tree_reduce_kernel(
         workspace_ptr,
@@ -469,6 +473,21 @@ def _triton_gemm_fp32(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return c
 
 
+def _triton_gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Compatibility entry point for canonical Triton linear operators."""
+
+    if output_dtype is None or output_dtype == torch.bfloat16:
+        return _triton_tree_gemm(a, b)
+    if output_dtype == torch.float32:
+        return _triton_gemm_fp32(a, b)
+    raise TypeError(f"unsupported deterministic Triton GEMM output dtype: {output_dtype}")
+
+
 def _triton_tree_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -554,7 +573,7 @@ def _triton_tree_gemm(
         if leaf_config.n_fastest
         else (len(plan.host.leaf_nodes), tiles_m, tiles_n)
     )
-    _det_gemm_tree_leaf_kernel[leaf_grid](
+    _det_gemm_kernel[leaf_grid](
         a,
         b,
         workspace,

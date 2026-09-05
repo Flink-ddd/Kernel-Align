@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""CUDA deterministic standard-softmax attention (issue #147).
+"""Deterministic standard-softmax attention for CUDA and ROCm (issue #147).
 
 Forward: QK → masked softmax+LSE → PV (all FP32 intermediate).
 Backward: dP → softmax_bwd → dQ/dK/dV with §4.1 fixed GQA order.
@@ -28,6 +28,8 @@ from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 from rl_engine.utils.logger import logger
 
 _HEAD_DIM = 128
+_IS_ROCM = torch.version.hip is not None
+_GPU_PLATFORM = "ROCm" if _IS_ROCM else "CUDA"
 
 
 @dataclass(frozen=True)
@@ -92,7 +94,7 @@ class _DeterministicAttentionFn(Function):
 
 
 class DeterministicAttentionOp:
-    """Batch-invariant standard softmax attention on CUDA.
+    """Batch-invariant standard softmax attention on a CUDA or ROCm GPU.
 
     Materializes full FP32 scores/P. Public surface matches NativeAttentionOp
     so #108 harness can call forward(**inputs) with key_padding_mask.
@@ -105,13 +107,13 @@ class DeterministicAttentionOp:
     def __init__(self) -> None:
         if not _EXT_AVAILABLE or not hasattr(_C, "deterministic_attention_forward"):
             raise RuntimeError(
-                "Deterministic CUDA attention kernel is unavailable. "
-                "Rebuild the extension with `pip install -e .` on a CUDA build."
+                f"Deterministic {_GPU_PLATFORM} attention kernel is unavailable. "
+                "Rebuild the native extension for the active GPU platform."
             )
         if not hasattr(_C, "deterministic_attention_backward"):
             raise RuntimeError(
-                "Deterministic CUDA attention backward kernel is unavailable. "
-                "Rebuild the extension with `pip install -e .` on a CUDA build."
+                f"Deterministic {_GPU_PLATFORM} attention backward kernel is unavailable. "
+                "Rebuild the native extension for the active GPU platform."
             )
         logger.info("Successfully linked to _C.deterministic_attention_forward/backward.")
 
@@ -208,7 +210,7 @@ class DeterministicAttentionOp:
         if k.dtype != q.dtype or v.dtype != q.dtype:
             raise ValueError("q, k, v must share the same dtype")
         if not (q.is_cuda and k.is_cuda and v.is_cuda):
-            raise ValueError("q, k, v must be CUDA tensors")
+            raise ValueError("q, k, v must be GPU tensors")
         if key_padding_mask is not None:
             if key_padding_mask.dtype != torch.bool:
                 raise ValueError("key_padding_mask must be bool")
@@ -222,15 +224,19 @@ class DeterministicAttentionOp:
 
 
 class RLKernelDeterministicAttentionCore:
-    """Materializing CUDA reference core shared by training and rollout.
+    """Materializing GPU reference core shared by training and rollout.
 
-    This remains useful for correctness and capability-gap diagnosis. The
-    production default is the shared FA4 CuTe core with ``num_splits=1``.
+    Production uses FA4 CuTe on CUDA and AITER CK dense MHA on ROCm. This core
+    remains useful for correctness and capability-gap diagnosis.
     """
 
     core_id = STRICT_ATTENTION_CORE_ID
     strict_schedule = STRICT_ATTENTION_SCHEDULE_ID
-    backend_id = "rlkernel.cuda.deterministic_attention"
+    backend_id = (
+        "rlkernel.rocm.deterministic_attention"
+        if _IS_ROCM
+        else "rlkernel.cuda.deterministic_attention"
+    )
     merge_order = "global_block_index"
     accum_dtype = "fp32"
     downcast_at = "final_write"
@@ -248,7 +254,7 @@ class RLKernelDeterministicAttentionCore:
         if not isinstance(requested, SplitKVSpec):
             raise TypeError("split_kv must be a SplitKVSpec")
         if requested.mode is not SplitKVMode.DISABLED:
-            raise ValueError("the strict CUDA Attention core requires Split-KV to be disabled")
+            raise ValueError("the strict GPU Attention core requires Split-KV to be disabled")
         self.split_kv = requested
         self._op = DeterministicAttentionOp()
 
@@ -324,7 +330,7 @@ class RLKernelDeterministicAttentionCore:
             return
         if query_position_ids is None or key_position_ids is None:
             raise ValueError(
-                "strict CUDA Attention requires query_position_ids and " "key_position_ids"
+                "strict GPU Attention requires query_position_ids and " "key_position_ids"
             )
         expected_q_shape = (q.size(0), q.size(2))
         expected_k_shape = (k.size(0), k.size(2))
@@ -349,6 +355,6 @@ class RLKernelDeterministicAttentionCore:
             raise ValueError("key_position_ids must be contiguous and increasing")
         if not torch.equal(query_position_ids, key_position_ids[:, -q.size(2) :]):
             raise ValueError(
-                "strict CUDA Attention requires queries to be the trailing "
+                "strict GPU Attention requires queries to be the trailing "
                 "contiguous positions of the logical KV sequence"
             )

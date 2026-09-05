@@ -134,6 +134,11 @@ def test_provider_structural_path_returns_linear_logp_result(monkeypatch):
                 torch.arange(target_ids.size(0)), target_ids
             ]
 
+        def from_local_logits(self, local_logits, target_ids, **_kwargs):
+            return torch.log_softmax(local_logits[:, :7], dim=-1)[
+                torch.arange(target_ids.size(0)), target_ids
+            ]
+
     import rl_engine.integrations.vime.linear_logp_provider as provider_module
 
     monkeypatch.setattr(

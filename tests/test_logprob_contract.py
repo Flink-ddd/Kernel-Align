@@ -248,13 +248,16 @@ def test_ignore_index_must_not_collide_with_the_real_vocabulary():
 
 
 def _restrict_to_ws1_candidates(registry: KernelRegistry) -> None:
-    """Drop the #241 PR3 vocab-parallel reference so only WS1 backends remain."""
+    """Drop all WS2 vocab-parallel backends so only WS1 backends remain."""
 
     platform = registry._platform()
+    ws2_backends = {
+        OpBackend.PYTORCH_VOCAB_PARALLEL_LOGP,
+        OpBackend.ROCM_VOCAB_PARALLEL_LOGP,
+        OpBackend.TRITON_VOCAB_PARALLEL_LOGP,
+    }
     registry._logprob_candidates[platform] = [
-        backend
-        for backend in registry._logprob_candidates[platform]
-        if backend is not OpBackend.PYTORCH_VOCAB_PARALLEL_LOGP
+        backend for backend in registry._logprob_candidates[platform] if backend not in ws2_backends
     ]
 
 
@@ -297,7 +300,7 @@ def test_ws1_rejections_recorded_when_vocab_parallel_reference_resolves():
     candidates.remove(OpBackend.PYTORCH_VOCAB_PARALLEL_LOGP)
     candidates.append(OpBackend.PYTORCH_VOCAB_PARALLEL_LOGP)
 
-    result = registry.get_logprob_op(_contract())
+    result = registry.get_logprob_op(_contract(), requested_backend="reference")
     assert result.capability.backend_id == "pytorch-vocab-parallel-logp-ws2"
     assert result.provenance["fallback"] is True
     rejections = " | ".join(result.provenance["prior_rejections"])

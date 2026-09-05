@@ -32,7 +32,7 @@ def _silu_fwd_kernel(x_ptr, y_ptr, n_elements, BLOCK: tl.constexpr):
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n_elements
     x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    s = 1.0 / (1.0 + tl.exp(-x))
+    s = tl.div_rn(1.0, 1.0 + tl.exp(-x))
     y = x * s
     tl.store(y_ptr + offs, y.to(y_ptr.dtype.element_ty), mask=mask)
 
@@ -44,7 +44,7 @@ def _silu_bwd_kernel(dy_ptr, x_ptr, dx_ptr, n_elements, BLOCK: tl.constexpr):
     mask = offs < n_elements
     dy = tl.load(dy_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    s = 1.0 / (1.0 + tl.exp(-x))
+    s = tl.div_rn(1.0, 1.0 + tl.exp(-x))
     # silu'(x) = s * (1 + x * (1 - s))
     dx = dy * s * (1.0 + x * (1.0 - s))
     tl.store(dx_ptr + offs, dx.to(dx_ptr.dtype.element_ty), mask=mask)
@@ -57,26 +57,42 @@ def _swiglu_fwd_kernel(gate_ptr, up_ptr, y_ptr, n_elements, BLOCK: tl.constexpr)
     mask = offs < n_elements
     g = tl.load(gate_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     u = tl.load(up_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    s = 1.0 / (1.0 + tl.exp(-g))
+    s = tl.div_rn(1.0, 1.0 + tl.exp(-g))
     y = (g * s) * u
     tl.store(y_ptr + offs, y.to(y_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
 def _swiglu_bwd_kernel(
-    dy_ptr, gate_ptr, up_ptr, d_gate_ptr, d_up_ptr, n_elements, BLOCK: tl.constexpr
+    dy_ptr, gate_ptr, silu_grad_ptr, d_up_ptr, n_elements, BLOCK: tl.constexpr
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n_elements
     dy = tl.load(dy_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     g = tl.load(gate_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    u = tl.load(up_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    s = 1.0 / (1.0 + tl.exp(-g))
+    s = tl.div_rn(1.0, 1.0 + tl.exp(-g))
     silu_g = g * s
     d_up = dy * silu_g
-    d_gate = dy * u * s * (1.0 + g * (1.0 - s))
+    silu_grad = s * (1.0 + g * (1.0 - s))
     tl.store(d_up_ptr + offs, d_up.to(d_up_ptr.dtype.element_ty), mask=mask)
+    tl.store(silu_grad_ptr + offs, silu_grad, mask=mask)
+
+
+@triton.jit
+def _swiglu_dgate_kernel(
+    dy_ptr, up_ptr, silu_grad_ptr, d_gate_ptr, n_elements, BLOCK: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_elements
+    dy = tl.load(dy_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    u = tl.load(up_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    silu_grad = tl.load(silu_grad_ptr + offs, mask=mask, other=0.0)
+    # The native HIP source evaluates (dy * up) * silu_grad.  Persisting the
+    # latter as FP32 prevents LLVM from reassociating the expression across
+    # the function boundary and changing a BF16 tie at rare elements.
+    d_gate = (dy * u) * silu_grad
     tl.store(d_gate_ptr + offs, d_gate.to(d_gate_ptr.dtype.element_ty), mask=mask)
 
 
@@ -124,11 +140,27 @@ def _launch_swiglu_bwd(dy: Tensor, gate: Tensor, up: Tensor) -> tuple[Tensor, Te
     up_c = up.contiguous()
     d_gate = torch.empty_like(gate_c)
     d_up = torch.empty_like(up_c)
+    silu_grad = torch.empty_like(gate_c, dtype=torch.float32)
     n = gate_c.numel()
     if n == 0:
         return d_gate, d_up
     grid = (triton.cdiv(n, _BLOCK),)
-    _swiglu_bwd_kernel[grid](dy_c, gate_c, up_c, d_gate, d_up, n, BLOCK=_BLOCK)
+    _swiglu_bwd_kernel[grid](
+        dy_c,
+        gate_c,
+        silu_grad,
+        d_up,
+        n,
+        BLOCK=_BLOCK,
+    )
+    _swiglu_dgate_kernel[grid](
+        dy_c,
+        up_c,
+        silu_grad,
+        d_gate,
+        n,
+        BLOCK=_BLOCK,
+    )
     return d_gate, d_up
 
 

@@ -1,14 +1,23 @@
-from .deterministic_attn import DeterministicAttentionOp
+# File: rl_engine/kernels/ops/cuda/attention/__init__.py
+
+from .deterministic_attn import (
+    DeterministicAttentionCoreResult,
+    DeterministicAttentionOp,
+    RLKernelDeterministicAttentionCore,
+)
 from .flash_attn import FlashAttentionOp, StrictFlashAttention4Core, StrictFlashAttentionUnavailable
 from .prefix_shared_attn import PrefixSharedAttentionOp
 
 __all__ = [
+    "DeterministicAttentionCoreResult",
     "DeterministicAttentionOp",
+    "RLKernelDeterministicAttentionCore",
     "FlashAttentionOp",
     "PrefixSharedAttentionOp",
     "StrictFlashAttention4Core",
     "StrictFlashAttentionUnavailable",
 ]
+
 
 # CP communication and FlashInfer are optional layers owned by later WS2 PRs.
 # Keep the base Attention package importable while those PRs are developed or
@@ -27,6 +36,7 @@ try:
         CPCommunicationStatus,
         CUDAAGRSAttentionCPCommunication,
         P2PNCCLAttentionCPCommunication,
+        RCCLAGRSAttentionCPCommunication,
         sort_attention_cp_partial_states,
     )
 except ModuleNotFoundError as exc:
@@ -46,6 +56,7 @@ else:
         "CPCommunicationStatus",
         "CUDAAGRSAttentionCPCommunication",
         "P2PNCCLAttentionCPCommunication",
+        "RCCLAGRSAttentionCPCommunication",
         "sort_attention_cp_partial_states",
     ]
 

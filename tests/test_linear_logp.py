@@ -1261,8 +1261,301 @@ def test_registry_dispatch_matches_native():
     from rl_engine.platforms.device import device_ctx
 
     op = kernel_registry.get_op("linear_logp")
-    device = device_ctx.device if device_ctx.device_type == "cuda" else "cpu"
+    # ROCm reports device_type "rocm" but tensors still live on torch "cuda"
+    # devices; only true CPU hosts fall back to CPU inputs.
+    device = device_ctx.device if device_ctx.device_type in ("cuda", "rocm") else "cpu"
     hidden, weight, target, bias = _inputs(6, device=device)
     out = op(hidden, weight, target, bias)
     ref = NativeLinearLogpOp()(hidden, weight, target, bias)
     assert torch.allclose(out.cpu(), ref.cpu(), atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic (strict-contract) Triton linear_logp
+
+
+def _det_triton_inputs(seed, *, n=96, d=192, v=4096, dtype=torch.bfloat16, bias=True):
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    hidden = (torch.randn(n, d, generator=generator) * 0.5).to("cuda", dtype)
+    weight = (torch.randn(v, d, generator=generator) * 0.05).to("cuda", dtype)
+    bias_t = (torch.randn(v, generator=generator) * 0.1).to("cuda", dtype) if bias else None
+    target = torch.randint(0, v, (n,), generator=generator).to("cuda")
+    return hidden, weight, target, bias_t
+
+
+@requires_triton_cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_triton_det_contract_is_bitwise_batch_invariant(dtype):
+    from rl_engine.kernels.ops.triton.loss.linear_logp import (
+        TRITON_LINEAR_LOGP_CONTRACT_VERSION,
+        TRITON_N_SPLIT_CONTRACT,
+        triton_deterministic_linear_logp,
+    )
+
+    hidden, weight, target, bias = _det_triton_inputs(220, dtype=dtype)
+    real_vocab = weight.size(0) - 27
+    target = target.remainder(real_vocab)
+    temperature = torch.linspace(0.7, 1.3, hidden.size(0), device="cuda", dtype=torch.float32)
+
+    full_logp, full_lse = triton_deterministic_linear_logp(
+        hidden, weight, target, bias, temperature=temperature, real_vocab_size=real_vocab
+    )
+    row = 37
+    row_logp, row_lse = triton_deterministic_linear_logp(
+        hidden[row : row + 1],
+        weight,
+        target[row : row + 1],
+        bias,
+        temperature=temperature[row : row + 1],
+        real_vocab_size=real_vocab,
+    )
+    again_logp, again_lse = triton_deterministic_linear_logp(
+        hidden, weight, target, bias, temperature=temperature, real_vocab_size=real_vocab
+    )
+
+    assert TRITON_LINEAR_LOGP_CONTRACT_VERSION == "triton-fused-linear-logp-contract-v1"
+    assert TRITON_N_SPLIT_CONTRACT == 64
+    assert torch.equal(full_logp[row : row + 1].view(torch.int32), row_logp.view(torch.int32))
+    assert torch.equal(full_lse[row : row + 1].view(torch.int32), row_lse.view(torch.int32))
+    assert torch.equal(full_logp.view(torch.int32), again_logp.view(torch.int32))
+    assert torch.equal(full_lse.view(torch.int32), again_lse.view(torch.int32))
+
+
+@requires_triton_cuda
+def test_triton_det_contract_logits_return_and_padding_do_not_change_logp_bits():
+    from rl_engine.kernels.ops.triton.loss.linear_logp import triton_deterministic_linear_logp
+
+    hidden, weight, target, bias = _det_triton_inputs(221)
+    real_vocab = weight.size(0) - 27
+    target = target.remainder(real_vocab)
+    temperature = torch.full((hidden.size(0),), 0.85, device="cuda", dtype=torch.float32)
+
+    plain_logp, plain_lse = triton_deterministic_linear_logp(
+        hidden, weight, target, bias, temperature=temperature, real_vocab_size=real_vocab
+    )
+    logits_logp, logits_lse, logits = triton_deterministic_linear_logp(
+        hidden,
+        weight,
+        target,
+        bias,
+        temperature=temperature,
+        return_logits=True,
+        real_vocab_size=real_vocab,
+    )
+
+    assert torch.equal(plain_logp.view(torch.int32), logits_logp.view(torch.int32))
+    assert torch.equal(plain_lse.view(torch.int32), logits_lse.view(torch.int32))
+    assert torch.isneginf(logits[:, real_vocab:]).all()
+    assert bool((plain_logp <= 0).all())
+
+    # Stored logits are unscaled: bias applied, temperature never applied.
+    reference_logits = torch.nn.functional.linear(
+        hidden.float(), weight[:real_vocab].float(), bias[:real_vocab].float()
+    )
+    assert torch.allclose(logits[:, :real_vocab], reference_logits, atol=2e-2, rtol=2e-2)
+    reference_logp = torch.log_softmax(reference_logits / temperature[:, None], dim=-1)
+    reference_logp = reference_logp.gather(1, target[:, None]).squeeze(1)
+    assert torch.allclose(plain_logp, reference_logp, atol=2e-2, rtol=2e-2)
+
+
+@requires_triton_cuda
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
+def test_triton_det_contract_backward_matches_logp_and_lse_reference(with_bias):
+    from rl_engine.kernels.ops.triton.loss.linear_logp import triton_deterministic_linear_logp
+
+    hidden, weight, target, bias = _det_triton_inputs(222, bias=with_bias)
+    real_vocab = weight.size(0) - 27
+    target = target.remainder(real_vocab)
+    n = hidden.size(0)
+    hidden = hidden.detach().requires_grad_(True)
+    weight = weight.detach().requires_grad_(True)
+    if with_bias:
+        bias = bias.detach().requires_grad_(True)
+    temperature = torch.full((n,), 0.9, device="cuda", dtype=torch.float32)
+    grad_logp = torch.linspace(-0.5, 0.5, n, device="cuda")
+    grad_lse = torch.linspace(0.25, -0.25, n, device="cuda")
+
+    logp, lse = triton_deterministic_linear_logp(
+        hidden, weight, target, bias, temperature=temperature, real_vocab_size=real_vocab
+    )
+    torch.autograd.backward((logp, lse), (grad_logp, grad_lse))
+
+    ref_hidden = hidden.detach().float().requires_grad_(True)
+    ref_weight = weight.detach().float().requires_grad_(True)
+    ref_bias = bias.detach().float().requires_grad_(True) if with_bias else None
+    ref_logits = torch.nn.functional.linear(ref_hidden, ref_weight, ref_bias)
+    ref_logits = ref_logits / temperature[:, None]
+    columns = torch.arange(ref_logits.size(1), device="cuda")
+    ref_logits = ref_logits.masked_fill(columns[None, :] >= real_vocab, float("-inf"))
+    ref_lse = torch.logsumexp(ref_logits, dim=-1)
+    ref_logp = ref_logits.gather(1, target[:, None]).squeeze(1) - ref_lse
+    torch.autograd.backward((ref_logp, ref_lse), (grad_logp, grad_lse))
+
+    assert torch.allclose(hidden.grad.float(), ref_hidden.grad, atol=2e-1, rtol=5e-2)
+    assert torch.allclose(weight.grad.float(), ref_weight.grad, atol=2e-1, rtol=5e-2)
+    if with_bias:
+        assert torch.allclose(bias.grad.float(), ref_bias.grad, atol=2e-2, rtol=5e-2)
+
+
+@requires_triton_cuda
+def test_triton_det_rejects_bad_inputs():
+    from rl_engine.kernels.ops.triton.loss.linear_logp import triton_deterministic_linear_logp
+
+    hidden, weight, target, bias = _det_triton_inputs(223, n=4, v=128)
+    with pytest.raises(ValueError, match="real_vocab_size"):
+        triton_deterministic_linear_logp(hidden, weight, target, bias, real_vocab_size=0)
+    with pytest.raises(ValueError, match="temperature"):
+        triton_deterministic_linear_logp(
+            hidden, weight, target, bias, temperature=torch.zeros(1, device="cuda")
+        )
+    with pytest.raises(ValueError, match="real vocabulary"):
+        triton_deterministic_linear_logp(
+            hidden, weight, torch.full_like(target, weight.size(0)), bias
+        )
+
+
+def _det_triton_tp_worker(rank, world_size, init_method, result_queue):
+    try:
+        torch.cuda.set_device(rank)
+        device = torch.device("cuda", rank)
+        torch.distributed.init_process_group(
+            backend="nccl", init_method=init_method, rank=rank, world_size=world_size
+        )
+        from rl_engine.kernels.ops.triton.loss.linear_logp import (
+            triton_deterministic_linear_logp,
+            triton_deterministic_linear_logp_tp,
+        )
+
+        generator = torch.Generator(device="cpu").manual_seed(224)
+        n, d, vocab = 48, 128, 2048
+        real_vocab = vocab - 50
+        hidden = (torch.randn(n, d, generator=generator) * 0.5).to(device, torch.bfloat16)
+        weight = (torch.randn(vocab, d, generator=generator) * 0.05).to(device, torch.bfloat16)
+        bias = (torch.randn(vocab, generator=generator) * 0.1).to(device, torch.bfloat16)
+        target = torch.randint(0, real_vocab, (n,), generator=generator).to(device)
+        temperature = torch.linspace(0.8, 1.2, n).to(device)
+        shard = vocab // world_size
+        vocab_start = rank * shard
+
+        hidden_leaf = hidden.clone().requires_grad_(True)
+        weight_shard = weight[vocab_start : vocab_start + shard].contiguous().requires_grad_(True)
+        logp, lse = triton_deterministic_linear_logp_tp(
+            hidden_leaf,
+            weight_shard,
+            target,
+            bias[vocab_start : vocab_start + shard].contiguous(),
+            vocab_start_index=vocab_start,
+            global_vocab_size=vocab,
+            real_vocab_size=real_vocab,
+            temperature=temperature,
+            tp_group=torch.distributed.group.WORLD,
+        )
+        (logp.sum() + 0.5 * lse.sum()).backward()
+
+        again_logp, again_lse = triton_deterministic_linear_logp_tp(
+            hidden,
+            weight_shard.detach(),
+            target,
+            bias[vocab_start : vocab_start + shard].contiguous(),
+            vocab_start_index=vocab_start,
+            global_vocab_size=vocab,
+            real_vocab_size=real_vocab,
+            temperature=temperature,
+            tp_group=torch.distributed.group.WORLD,
+        )
+        single_logp, single_lse = triton_deterministic_linear_logp(
+            hidden, weight, target, bias, temperature=temperature, real_vocab_size=real_vocab
+        )
+
+        ref_hidden = hidden.float().requires_grad_(True)
+        ref_weight = weight.float().requires_grad_(True)
+        ref_logits = torch.nn.functional.linear(ref_hidden, ref_weight, bias.float())
+        ref_logits = ref_logits / temperature[:, None]
+        columns = torch.arange(vocab, device=device)
+        ref_logits = ref_logits.masked_fill(columns[None, :] >= real_vocab, float("-inf"))
+        ref_lse = torch.logsumexp(ref_logits, dim=-1)
+        ref_logp = ref_logits.gather(1, target[:, None]).squeeze(1) - ref_lse
+        (ref_logp.sum() + 0.5 * ref_lse.sum()).backward()
+
+        result_queue.put(
+            {
+                "ok": True,
+                "rank": rank,
+                "repeat_bitwise": bool(
+                    torch.equal(logp.detach().view(torch.int32), again_logp.view(torch.int32))
+                    and torch.equal(lse.detach().view(torch.int32), again_lse.view(torch.int32))
+                ),
+                "close_to_reference": bool(
+                    torch.allclose(logp.detach(), ref_logp.detach(), atol=2e-2, rtol=2e-2)
+                ),
+                "close_to_single_rank": bool(
+                    torch.allclose(logp.detach(), single_logp, atol=1e-4, rtol=1e-5)
+                    and torch.allclose(lse.detach(), single_lse, atol=1e-4, rtol=1e-5)
+                ),
+                "grad_hidden_close": bool(
+                    torch.allclose(hidden_leaf.grad.float(), ref_hidden.grad, atol=2e-1, rtol=5e-2)
+                ),
+                "grad_weight_close": bool(
+                    torch.allclose(
+                        weight_shard.grad.float(),
+                        ref_weight.grad[vocab_start : vocab_start + shard],
+                        atol=2e-1,
+                        rtol=5e-2,
+                    )
+                ),
+                "logp_bits": logp.detach().contiguous().view(torch.int32).cpu().tolist(),
+            }
+        )
+    except Exception:  # pragma: no cover - forwarded to the parent
+        result_queue.put({"ok": False, "rank": rank, "tb": traceback.format_exc()})
+        raise
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
+@requires_triton_cuda
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="strict TP test needs two GPUs")
+@pytest.mark.parametrize(
+    "world_size",
+    [2, pytest.param(4, marks=pytest.mark.skipif(torch.cuda.device_count() < 4, reason="4 GPUs"))],
+)
+def test_triton_det_tp_matches_single_rank_and_replicates(world_size):
+    context = mp.get_context("spawn")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_method = (Path(tmpdir) / "det_tp_init").as_uri()
+        result_queue = context.Queue()
+        processes = [
+            context.Process(
+                target=_det_triton_tp_worker,
+                args=(rank, world_size, init_method, result_queue),
+            )
+            for rank in range(world_size)
+        ]
+        results = []
+        try:
+            for process in processes:
+                process.start()
+            for _ in range(world_size):
+                try:
+                    results.append(result_queue.get(timeout=300))
+                except queue.Empty:
+                    for process in processes:
+                        if process.is_alive():
+                            process.terminate()
+                    pytest.fail("timed out waiting for strict TP linear_logp workers")
+        finally:
+            for process in processes:
+                process.join(timeout=30)
+                if process.is_alive():
+                    process.terminate()
+    for result in results:
+        assert result["ok"], result.get("tb")
+        assert result["repeat_bitwise"]
+        assert result["close_to_reference"]
+        assert result["close_to_single_rank"]
+        assert result["grad_hidden_close"]
+        assert result["grad_weight_close"]
+    # Outputs are replicated: every rank holds identical bits.
+    for other in results[1:]:
+        assert results[0]["logp_bits"] == other["logp_bits"]

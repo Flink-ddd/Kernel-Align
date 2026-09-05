@@ -28,6 +28,8 @@ from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_CORE_ID,
     STRICT_ATTENTION_FA4_SCHEDULE_ID,
     STRICT_ATTENTION_PRODUCTION_CORE_ID,
+    STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
+    STRICT_ATTENTION_ROCM_SCHEDULE_ID,
     STRICT_ATTENTION_SCHEDULE_ID,
     AttentionContractError,
     SplitKVExecutionPlan,
@@ -776,7 +778,8 @@ class FlashInferQwen3PagedAttentionOp:
             communication, "supports_autograd", False
         ):
             raise FlashInferUnavailable(
-                "strict training requires the autograd-capable self-owned CUDA AG/RS backend"
+                "strict training requires an autograd-capable self-owned CUDA AG/RS "
+                "or ROCm RCCL AG/RS backend"
             )
         query_start, query_end = plan.query_token_ranges[plan.parallel.cp_rank]
         key_start, key_end = _cp_owner_ranges(plan)[plan.parallel.cp_rank]
@@ -1464,13 +1467,12 @@ def _validate_strict_core(core: Any) -> None:
         raise ValueError("strict Attention core must implement forward_with_lse")
     expected_schedules = {
         STRICT_ATTENTION_PRODUCTION_CORE_ID: STRICT_ATTENTION_FA4_SCHEDULE_ID,
+        STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID: STRICT_ATTENTION_ROCM_SCHEDULE_ID,
         STRICT_ATTENTION_CORE_ID: STRICT_ATTENTION_SCHEDULE_ID,
     }
     core_id = getattr(core, "core_id", None)
     if core_id not in expected_schedules:
-        raise ValueError(
-            "strict Attention core ID must identify the FA4 production core or explicit reference"
-        )
+        raise ValueError("strict Attention core ID is not an exact supported identity")
     if getattr(core, "strict_schedule", None) != expected_schedules[core_id]:
         raise ValueError("strict Attention core schedule does not match its exact core identity")
     required = {
@@ -1486,9 +1488,8 @@ def _validate_strict_core(core: Any) -> None:
         raise ValueError(
             "strict Attention core has incompatible arithmetic identity: " + ", ".join(mismatches)
         )
-    if core_id == STRICT_ATTENTION_PRODUCTION_CORE_ID:
+    if core_id in {STRICT_ATTENTION_PRODUCTION_CORE_ID, STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID}:
         production_required = {
-            "backend_id": "flash_attention_4.cute",
             "native_attention_arithmetic": True,
             "num_splits": 1,
             "deterministic_backward": True,
@@ -1502,14 +1503,28 @@ def _validate_strict_core(core: Any) -> None:
         ]
         if production_mismatches:
             raise ValueError(
-                "strict FA4 production core has incompatible controls: "
+                "strict production core has incompatible controls: "
                 + ", ".join(production_mismatches)
             )
+    if (
+        core_id == STRICT_ATTENTION_PRODUCTION_CORE_ID
+        and getattr(core, "backend_id", None) != "flash_attention_4.cute"
+    ):
+        raise ValueError("strict CUDA production core must be FlashAttention-4 CuTe")
+    if core_id == STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID:
+        if getattr(core, "backend_id", None) != "aiter.rocm.ck_dense_mha":
+            raise ValueError("strict ROCm production core must be AITER CK dense MHA")
+        if getattr(core, "split_kv_control", None) != "dense_non_split_api":
+            raise ValueError("strict ROCm production core must use the non-Split-K CK API")
 
 
 def _resolve_strict_core(cfg: FlashInferPagedAttentionConfig) -> Any:
     if cfg.deterministic_core is not None:
         return cfg.deterministic_core
+    if torch.version.hip is not None:
+        from rl_engine.kernels.ops.rocm.attention.flash_attn import StrictRocmAiterCKAttentionCore
+
+        return StrictRocmAiterCKAttentionCore(split_kv=cfg.split_kv)
     return StrictFlashAttention4Core(split_kv=cfg.split_kv)
 
 
@@ -1551,12 +1566,17 @@ def _resolve_strict_rope(cfg: FlashInferPagedAttentionConfig) -> Any:
     if cfg.strict_rope_op is not None:
         return cfg.strict_rope_op
     try:
-        from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RoPESM90Op
+        from rl_engine.kernels.ops.cuda.rotary_embedding.rope import (
+            RocmDeterministicRoPEOp,
+            RoPESM90Op,
+        )
 
+        if torch.version.hip is not None:
+            return RocmDeterministicRoPEOp()
         return RoPESM90Op()
     except (ImportError, RuntimeError) as exc:
         raise FlashInferUnavailable(
-            "strict Attention requires the RL-Kernel WS1 RoPE CUDA operator"
+            "strict Attention requires the RL-Kernel deterministic RoPE operator"
         ) from exc
 
 
@@ -1566,7 +1586,7 @@ def _apply_strict_rope(
     position_ids: torch.Tensor,
     theta: float,
 ) -> torch.Tensor:
-    """RoPESM90Op accepts shared 1-D positions, so execute one batch row at a time."""
+    """Execute one batch row at a time to preserve the strict row schedule."""
 
     if position_ids.shape != (x.size(0), x.size(2)):
         raise ValueError("strict RoPE position IDs must have shape [B,S]")
@@ -1705,6 +1725,7 @@ def _strict_attention_provenance(
     communication_backend = (
         "self_owned_cuda_ag_rs" if communication_id == "cuda_ag_rs" else communication_id
     )
+    expected_communication = "rccl_ag_rs" if torch.version.hip is not None else "cuda_ag_rs"
     return {
         "attention_backend": core_provenance["attention_backend"],
         "requested_backend": "flashinfer_layout_adapter",
@@ -1722,12 +1743,15 @@ def _strict_attention_provenance(
         "strict_schedule": core_provenance["strict_schedule"],
         "accum_dtype": core_provenance["accum_dtype"],
         "downcast_at": core_provenance["downcast_at"],
-        "arithmetic_plan_source": core_provenance.get("fa_api_source", "rlkernel_reference_core"),
+        "arithmetic_plan_source": core_provenance.get(
+            "fa_api_source",
+            core_provenance.get("aiter_api_source", "rlkernel_reference_core"),
+        ),
         "arithmetic_semantics_verified": True,
         "native_attention_arithmetic": core_provenance["native_attention_arithmetic"],
         "fallback": False,
         "fallback_reason": None,
-        "rope_backend": getattr(rope, "backend_id", "rlkernel.cuda.rope_sm90"),
+        "rope_backend": getattr(rope, "backend_id", "rlkernel.unknown.rope"),
         "rope_theta": float(cfg.rope.rope_theta),
         "rotary_dim": cfg.rope.rotary_dim,
         "rope_fusion": False,
@@ -1736,17 +1760,19 @@ def _strict_attention_provenance(
         "k_cache_rope_state": "post_rope",
         "batch_invariant_claim": "strict_runtime_verified",
         "cp_comm_required": cp_required,
-        "communication_backend": (communication_backend if cp_required else "none"),
+        "communication_backend": communication_backend if cp_required else "none",
+        "platform": core_provenance.get("platform", "cuda"),
         "num_splits": core_provenance.get("num_splits"),
+        "split_kv_control": core_provenance.get("split_kv_control"),
         "deterministic_backward": core_provenance.get("deterministic_backward"),
         "fa_api_source": core_provenance.get("fa_api_source"),
         "fa_package_version": core_provenance.get("fa_package_version"),
+        "aiter_api_source": core_provenance.get("aiter_api_source"),
+        "aiter_source_sha256": core_provenance.get("aiter_source_sha256"),
         "reference_only": bool(core_provenance.get("reference_only", False)),
         "production_ready": bool(
             core_provenance.get("production_ready", False)
-            and (
-                not cp_required or getattr(cfg.cp_communication, "backend_id", None) == "cuda_ag_rs"
-            )
+            and (not cp_required or communication_id == expected_communication)
         ),
     }
 

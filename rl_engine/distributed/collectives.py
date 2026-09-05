@@ -543,10 +543,6 @@ def create_deterministic_collective(
     """Create the deterministic collective for the active accelerator."""
 
     if getattr(torch.version, "hip", None) is not None:
-        from rl_engine.distributed.rocm_collectives import (
-            RCCLDeterministicCollective,
-        )
-
         return RCCLDeterministicCollective(
             group=group,
             device=device,
@@ -604,3 +600,24 @@ def collective_for_group(
     )
     _COLLECTIVES[key] = collective
     return collective
+
+
+# Keep the public API provided by the ROCm test branch while leaving the CUDA
+# implementation above identical to PR377. The ROCm classes own no device
+# resources until constructed, so importing their definitions has no hot-path
+# or accelerator side effect.
+from rl_engine.distributed.rocm_collectives import (  # noqa: E402
+    RCCLDeterministicCollective,
+    TorchDistributedDeterministicCollective,
+)
+
+
+__all__ = [
+    "DETERMINISTIC_ALL_REDUCE_OP",
+    "DeterministicCollective",
+    "RCCLDeterministicCollective",
+    "TorchDistributedDeterministicCollective",
+    "collective_for_group",
+    "create_deterministic_collective",
+    "deterministic_all_reduce_inplace",
+]

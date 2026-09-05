@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Custom CUDA RoPE op for SM90 (GPT-NeoX rotate-half), matching NativeRoPEOp.
+"""Deterministic GPU RoPE ops (GPT-NeoX rotate-half), matching NativeRoPEOp.
 
 cos/sin are built in fp32 with the exact reference math and passed to a small
 CUDA kernel (``_C.rope_apply_sm90``) that does the per-position rotation. Backward
@@ -77,7 +77,7 @@ class _RoPEFunction(torch.autograd.Function):
         ctx.save_for_backward(cos, sin)
         ctx.x_shape = tuple(x.shape)
         ctx.pos_dim = positions.dim()
-        out_2d = _C.rope_apply_sm90(x_2d, cos, sin, 1.0)
+        out_2d = _rope_apply(x_2d, cos, sin, 1.0)
         return _restore_rope(out_2d, x, positions)
 
     @staticmethod
@@ -87,7 +87,7 @@ class _RoPEFunction(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             if ctx.pos_dim == 2 and len(ctx.x_shape) == 4:
                 g_2d = grad_out.permute(1, 0, 2, 3).contiguous().reshape(-1, ctx.x_shape[-1])
-                out_2d = _C.rope_apply_sm90(g_2d, cos, sin, -1.0)
+                out_2d = _rope_apply(g_2d, cos, sin, -1.0)
                 heads, batch, seq, dim = (
                     ctx.x_shape[1],
                     ctx.x_shape[0],
@@ -97,8 +97,14 @@ class _RoPEFunction(torch.autograd.Function):
                 grad_x = out_2d.reshape(heads, batch, seq, dim).permute(1, 0, 2, 3).contiguous()
             else:
                 g_2d = grad_out.contiguous().reshape(-1, grad_out.shape[-1])
-                grad_x = _C.rope_apply_sm90(g_2d, cos, sin, -1.0).reshape(grad_out.shape)
+                grad_x = _rope_apply(g_2d, cos, sin, -1.0).reshape(grad_out.shape)
         return grad_x, None, None
+
+
+def _rope_apply(x: Tensor, cos: Tensor, sin: Tensor, sin_sign: float) -> Tensor:
+    if torch.version.hip is not None:
+        return _C.deterministic_rope_apply_rocm(x, cos, sin, sin_sign)
+    return _C.rope_apply_sm90(x, cos, sin, sin_sign)
 
 
 def _is_hopper(device: torch.device) -> bool:
@@ -138,3 +144,32 @@ class RoPESM90Op:
                 f"got compute capability {torch.cuda.get_device_capability(x.device)}"
             )
         return _RoPEFunction.apply(x, positions, theta)
+
+
+class RocmDeterministicRoPEOp:
+    """Precompiled HIP RoPE path shared by ROCm training and rollout."""
+
+    backend_id = "rlkernel.rocm.deterministic_rope"
+    op_class = "elementwise"
+    fallback = False
+
+    def __init__(self) -> None:
+        if torch.version.hip is None:
+            raise RuntimeError("RocmDeterministicRoPEOp requires a ROCm PyTorch build")
+        if not _EXT_AVAILABLE or not hasattr(_C, "deterministic_rope_apply_rocm"):
+            raise RuntimeError(
+                "ROCm deterministic RoPE is unavailable; rebuild rl_engine._C for ROCm"
+            )
+
+    def __call__(self, x: Tensor, positions: Tensor, *, theta: float = 1_000_000.0) -> Tensor:
+        return self.forward(x, positions, theta=theta)
+
+    def forward(self, x: Tensor, positions: Tensor, *, theta: float = 1_000_000.0) -> Tensor:
+        if not x.is_cuda:
+            raise RuntimeError("ROCm deterministic RoPE requires a GPU tensor")
+        if x.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("ROCm deterministic RoPE requires FP16 or BF16")
+        return _RoPEFunction.apply(x, positions, theta)
+
+
+__all__ = ["RoPESM90Op", "RocmDeterministicRoPEOp"]

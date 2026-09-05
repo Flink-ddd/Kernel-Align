@@ -40,6 +40,18 @@ from rl_engine.platforms.device import device_ctx
 from rl_engine.utils.logger import logger
 
 
+def _rocm_vocab_logprob_native_available() -> bool:
+    """Return whether the strict ROCm tile kernel is actually loadable."""
+
+    if torch.version.hip is None:
+        return False
+    try:
+        from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
+    except ImportError:
+        return False
+    return bool(_EXT_AVAILABLE and hasattr(_C, "deterministic_logp_tile_stats"))
+
+
 class _KernelEnumMeta(EnumMeta):
     """Metaclass to provide enhanced error messaging for backend lookups."""
 
@@ -71,6 +83,12 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     ROCM_AITER = "rl_engine.kernels.ops.rocm.aiter.AiterOp"
     ROCM_CK = "rl_engine.kernels.ops.rocm.composable_kernel.CKOp"
     ROCM_FLASH_ATTN = "rl_engine.kernels.ops.rocm.attention.flash_attn.RocmFlashAttentionOp"
+    # WS2 strict ROCm attention core (AITER/CK dense MHA, Split-KV disabled).
+    # Reachable only through ``get_attention_op``: it is not a drop-in for the
+    # SDPA-shaped ``attn`` wrappers and must never be a silent fallback.
+    ROCM_STRICT_ATTENTION = (
+        "rl_engine.kernels.ops.rocm.attention.flash_attn.StrictRocmAiterCKAttentionCore"
+    )
 
     # GRPO loss (group reward normalization + clipped surrogate + KL)
     TRITON_GRPO_LOSS = "rl_engine.kernels.ops.triton.loss.grpo_loss.TritonGRPOLossOp"
@@ -110,6 +128,16 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     # Deterministic vocab-parallel TP logprob reference (WS2 #241 PR3)
     PYTORCH_VOCAB_PARALLEL_LOGP = (
         "rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp.VocabParallelLogprobOp"
+    )
+    ROCM_VOCAB_PARALLEL_LOGP = (
+        "rl_engine.kernels.ops.rocm.loss.vocab_parallel_logp.RocmVocabParallelLogprobOp"
+    )
+    TRITON_VOCAB_PARALLEL_LOGP = (
+        "rl_engine.kernels.ops.triton.loss.vocab_parallel_logp.TritonVocabParallelLogprobOp"
+    )
+    # Deterministic GRPO loss on the TP-aware logprob path (WS2 #241 PR5)
+    PYTORCH_DISTRIBUTED_GRPO_LOSS = (
+        "rl_engine.kernels.ops.pytorch.loss.distributed_grpo_loss.DistributedGRPOLossOp"
     )
 
     # RMSNorm(pre-norm / QK-Norm) - pure Pytorch reference(ws1 ground-truth)
@@ -306,6 +334,18 @@ def _default_semantic_descriptors() -> tuple[OperatorBackendDescriptor, ...]:
     )
 
 
+def _triton_vocab_logprob_available() -> bool:
+    """Return whether the Triton WS2 vocab-parallel kernels can run here."""
+
+    if not torch.cuda.is_available():
+        return False
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def resolve_logp_op_type(
     logp_backend: Optional[str] = None,
     *,
@@ -351,6 +391,27 @@ def resolve_logp_op_type(
                 f"got {logp_backend!r}"
             )
     return op_type
+
+
+def _rocm_strict_attention_available() -> bool:
+    """Return whether the strict ROCm AITER/CK attention core can actually load.
+
+    True only when this process can really execute the strict arithmetic, so an
+    unavailable vendor stack leaves the backend unregistered rather than
+    registered-but-failing at materialization time.
+    """
+
+    if torch.version.hip is None:
+        return False
+    try:
+        from rl_engine.kernels.ops.rocm.attention.flash_attn import _load_aiter_ck_ops
+    except ImportError:
+        return False
+    try:
+        _load_aiter_ck_ops()
+    except Exception:  # StrictRocmAttentionUnavailable and vendor import errors
+        return False
+    return True
 
 
 class KernelRegistry:
@@ -674,6 +735,131 @@ class KernelRegistry:
                 prepend=True,
             )
 
+        # Triton WS2 vocab-parallel production backend: one source for CUDA and
+        # ROCm, registered ahead of the reference wherever Triton can run.
+        triton_vocab_logprob_capability = LogprobBackendCapability(
+            backend_id="triton-vocab-parallel-logp-ws2",
+            roles=common_logprob_roles,
+            dtypes=common_logprob_dtypes,
+            tp_world_sizes=None,
+            cp_world_sizes=None,
+            supports_vocab_padding=True,
+            mask_modes=frozenset({MaskMode.EXPLICIT_ACTIVE_MASK, MaskMode.IGNORE_INDEX}),
+            exports_vocab_lse=True,
+            determinism_scopes=frozenset(
+                {DeterminismScope.CROSS_TP_BITWISE, DeterminismScope.FIXED_TOPOLOGY}
+            ),
+            implementation_kind="production",
+        )
+        if _triton_vocab_logprob_available():
+            for triton_platform in ("cuda", "rocm"):
+                if triton_platform in self._priority_map:
+                    self.register_logprob_backend(
+                        OpBackend.TRITON_VOCAB_PARALLEL_LOGP,
+                        triton_vocab_logprob_capability,
+                        platform=triton_platform,
+                        prepend=True,
+                    )
+
+        rocm_vocab_logprob_capability = LogprobBackendCapability(
+            backend_id="rocm-vocab-parallel-logp-ws2",
+            roles=common_logprob_roles,
+            dtypes=common_logprob_dtypes,
+            tp_world_sizes=None,
+            cp_world_sizes=None,
+            supports_vocab_padding=True,
+            mask_modes=frozenset({MaskMode.EXPLICIT_ACTIVE_MASK, MaskMode.IGNORE_INDEX}),
+            exports_vocab_lse=True,
+            determinism_scopes=frozenset(
+                {DeterminismScope.CROSS_TP_BITWISE, DeterminismScope.FIXED_TOPOLOGY}
+            ),
+            implementation_kind="production",
+        )
+        if _rocm_vocab_logprob_native_available():
+            self.register_logprob_backend(
+                OpBackend.ROCM_VOCAB_PARALLEL_LOGP,
+                rocm_vocab_logprob_capability,
+                platform="rocm",
+                prepend=True,
+            )
+
+        # Strict ROCm production core: AITER/CK dense MHA, Split-KV disabled.
+        # Registered only when the vendor entry points genuinely load, so an
+        # explicit request on a machine without AITER fails loudly in
+        # ``get_attention_op`` instead of resolving to different arithmetic.
+        if _rocm_strict_attention_available():
+            self.register_attention_backend(
+                OpBackend.ROCM_STRICT_ATTENTION,
+                AttentionBackendCapability(
+                    backend_id="aiter.rocm.ck_dense_mha",
+                    roles=frozenset({AttentionRole.TRAIN, AttentionRole.INFER}),
+                    # DECODE is deliberately absent. StrictRocmAttentionRuntime
+                    # has a paged entry point, but no caller routes to it: the
+                    # Vime request carries no page table and builds its contract
+                    # with kv_cache=None. Declaring the mode before a dispatch
+                    # path reaches it would let the binding layer pass on a
+                    # decode path nothing executes.
+                    modes=frozenset({AttentionMode.PREFILL, AttentionMode.CHUNKED_PREFILL}),
+                    dtypes=frozenset({AttentionDType.BF16, AttentionDType.FP16}),
+                    # The core itself is single-rank arithmetic. CP is supplied
+                    # by StrictRocmAttentionRuntime, which wraps this core in
+                    # the RCCL AG/RS transport; the sizes mirror the world
+                    # sizes RCCLDeterministicCollective accepts. The merge
+                    # order is that collective's fixed balanced rank tree, not
+                    # RCCL's own reduction, so the CP merge is deterministic.
+                    cp_world_sizes=(1, 2, 4, 8),
+                    tp_world_sizes=None,
+                    exports_attention_lse=True,
+                    deterministic_cp_merge=True,
+                    supports_packed_varlen=False,
+                    supports_kv_cache=False,
+                    supports_rope_metadata=True,
+                    supports_fused_rope_attention=False,
+                    supports_split_kv_disabled=True,
+                    supports_split_kv_fixed=False,
+                    supports_split_kv_auto=False,
+                    reports_actual_split_kv_plan=True,
+                    implementation_kind="production",
+                ),
+                platform="rocm",
+                prepend=True,
+            )
+
+    def register_attention_backend(
+        self,
+        backend: OpBackend,
+        capability: AttentionBackendCapability,
+        *,
+        platform: Optional[str] = None,
+        prepend: bool = False,
+    ) -> None:
+        """Register (or replace) a backend for WS2 contract-aware attention dispatch.
+
+        The supported seam for a backend that only exists on some machines: the
+        static ``ws2_attention`` priority lists cannot express "present only when
+        the vendor stack loads", so a conditional backend registers itself here.
+        Re-registering the same backend replaces its capability without
+        duplicating the candidate entry.
+        """
+
+        if not isinstance(backend, OpBackend):
+            raise AttentionContractError("backend must be an OpBackend")
+        if not isinstance(capability, AttentionBackendCapability):
+            raise AttentionContractError("capability must be an AttentionBackendCapability")
+        resolved_platform = platform if platform is not None else self._platform()
+        if resolved_platform not in self._priority_map:
+            raise AttentionContractError(
+                f"unsupported platform {resolved_platform!r}; expected one of "
+                f"{sorted(self._priority_map)}"
+            )
+        self._attention_capabilities[backend] = capability
+        candidates = self._priority_map[resolved_platform].setdefault("ws2_attention", [])
+        if backend not in candidates:
+            if prepend:
+                candidates.insert(0, backend)
+            else:
+                candidates.append(backend)
+
     def _adjust_priority_from_env(self):
         rocm_attn_backend = os.getenv("RL_KERNEL_ROCM_ATTN_BACKEND", "").strip().lower()
         if rocm_attn_backend in {"flash_attn", "flash-attn", "flash_attention"}:
@@ -938,27 +1124,46 @@ class KernelRegistry:
         if not isinstance(requested_backend, str) or not requested_backend.strip():
             raise AttentionContractError("requested_backend must be a non-empty string")
         requested_backend = requested_backend.strip().lower()
+        if requested_backend == "auto" and contract.sharding.cp_world_size > 1:
+            raise AttentionContractError(
+                "Unsafe dispatch: requested_backend='auto' is not permitted when "
+                "cp_world_size > 1 without explicit cross-rank preflighting; name a "
+                "policy or backend id and agree on "
+                "AttentionContract.cross_rank_fingerprint() across ranks."
+            )
 
         platform = self._platform()
         candidates = self._priority_map.get(platform, {}).get("ws2_attention", [])
         rejected: list[str] = []
+        # A candidate skipped only because it does not satisfy the caller's
+        # explicit backend/policy request is not a fallback. Count only an
+        # otherwise eligible candidate that failed capability or loading.
+        capability_rejections = 0
 
         for backend in candidates:
             capability = self._attention_capabilities.get(backend)
             if capability is None:
                 rejected.append(f"{backend.name}: no AttentionBackendCapability declared")
+                capability_rejections += 1
                 continue
-            incompatibilities = list(capability.incompatibilities(contract))
             policy_mismatch = self._attention_policy_mismatch(requested_backend, capability)
+            incompatibilities = list(capability.incompatibilities(contract))
             if policy_mismatch is not None:
+                # Still report capability details for diagnostics, but this
+                # candidate was excluded by the caller's policy, so those
+                # details must not turn the selected backend into a fallback.
                 incompatibilities.append(policy_mismatch)
+                rejected.append(f"{backend.name}: " + "; ".join(incompatibilities))
+                continue
             if incompatibilities:
                 rejected.append(f"{backend.name}: " + "; ".join(incompatibilities))
+                capability_rejections += 1
                 continue
 
             op = self._get_or_create_backend(backend)
             if op is None:
                 rejected.append(f"{backend.name}: backend could not be loaded or instantiated")
+                capability_rejections += 1
                 continue
 
             return AttentionDispatchResult(
@@ -969,7 +1174,7 @@ class KernelRegistry:
                     "actual_backend": capability.backend_id,
                     "backend_enum": backend.name,
                     "platform": platform,
-                    "fallback": bool(rejected),
+                    "fallback": capability_rejections > 0,
                     "prior_rejections": list(rejected),
                     "contract": contract.to_dict(),
                     "capability": capability.to_dict(),
