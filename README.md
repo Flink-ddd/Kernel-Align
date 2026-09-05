@@ -143,18 +143,14 @@ or extend the current end-to-end model claim beyond Qwen3-8B Dense on H100.
 
 | Vendor | Architecture target | Corresponding hardware models | Software stack | Coverage / progress |
 | :--- | :--- | :--- | :--- | :--- |
-| **NVIDIA** | SM90 (compute capability 9.0) | H100, H200, GH200 | CUDA | ✅ **Supported** — dense-model strict path; published end-to-end results use H100 |
-| **AMD** | gfx942 (CDNA 3) | Instinct MI300A, MI300X, MI325X | ROCm | ✅ **Supported** — native extension loading and backend checks verified on MI300X |
-| **Huawei** | `dav_c220` (CANN `dav-2201` target) | Ascend `dav_c220` | CANN 9.1.0 / Ascend C | 🟡 **Partially adapted** — selected operators are available; other Ascend models are being adapted |
-| **Moore Threads** | Under adaptation | — | MUSA | 🚧 **In progress** — hardware adaptation and dense-model integration are underway |
-
-✅ **Supported** · 🟡 **Partial adaptation** · 🚧 **Active development**
+| **NVIDIA** | SM90 (compute capability 9.0) | H100, H200, GH200 | CUDA | **Supported**, dense-model strict path. Published end-to-end results use H100. |
+| **AMD** | gfx942 (CDNA 3) | Instinct MI300A, MI300X, MI325X | ROCm | **Supported**, native extension loading and backend checks verified on MI300X. |
+| **Huawei** | `dav_c220` (CANN `dav-2201` target) | Ascend `dav_c220` | CANN 9.1.0 / Ascend C | **Partially adapted**, selected operators are available. Other Ascend models are being adapted. |
+| **Moore Threads** | Under adaptation | Not specified | MUSA | **In progress**, hardware adaptation and dense-model integration are underway. |
 
 Support applies to the listed architecture targets and implemented dense-model paths;
 model, dtype, operator, and parallelism coverage varies by backend. The performance
 numbers above are CUDA/H100 measurements. **Other hardware models are being adapted.**
-See the [installation guide](./docs/getting_started/installation.md) and [operator
-catalog](./docs/operators/README.md) for backend requirements and contracts.
 
 ## Quick Start
 
