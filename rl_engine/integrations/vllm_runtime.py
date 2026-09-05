@@ -12,7 +12,13 @@ from typing import Any
 
 import torch
 
-from rl_engine.distributed.collectives import DETERMINISTIC_ALL_REDUCE_OP
+from rl_engine.distributed.collectives import (
+    DETERMINISTIC_ALL_REDUCE_OP,
+    collective_for_group,
+    deterministic_all_reduce_inplace,
+    deterministic_all_reduce_staged,
+    deterministic_staging_reserve,
+)
 from rl_engine.integrations.ablation import (
     Implementation,
     IntegrationPlan,
@@ -40,6 +46,9 @@ _STRICT_FFN_INIT_MARKER = "__rl_kernel_original_strict_ffn_init__"
 _STRICT_RMS_NORM_INIT_MARKER = "__rl_kernel_original_strict_rms_norm_init__"
 _STRICT_ROTARY_INIT_MARKER = "__rl_kernel_original_strict_rotary_init__"
 _STRICT_LM_HEAD_LINEAR_PATCH_MARKER = "__rl_kernel_original_lm_head_linear_apply__"
+_STRICT_O_PROJ_COLLECTIVE_MARKER = "__rl_kernel_o_proj_collective__"
+_STRICT_ROW_PARALLEL_PATCH_MARKER = "__rl_kernel_original_row_parallel_forward__"
+_STRICT_DIRECT_STAGING_MARKER = "__rl_kernel_direct_staging_active__"
 _RLK_ATTENTION_BACKEND: type[Any] | None = None
 _RLK_ATTENTION_IMPL: type[Any] | None = None
 _RLK_ATTENTION_BUILDER: type[Any] | None = None
@@ -367,6 +376,7 @@ def _patch_qwen3_strict_model(
     rotary_cls: type[Any] | None = None,
     linear_method_cls: type[Any] | None = None,
     attention_cls: type[Any] | None = None,
+    row_parallel_cls: type[Any] | None = None,
     det_gemm: Any | None = None,
 ) -> None:
     """Align vLLM's RMSNorm and Attention projections with Megatron."""
@@ -374,7 +384,7 @@ def _patch_qwen3_strict_model(
     production_classes = rms_norm_cls is None or linear_method_cls is None or attention_cls is None
     if production_classes:
         from vllm.model_executor.layers.layernorm import RMSNorm
-        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        from vllm.model_executor.layers.linear import RowParallelLinear, UnquantizedLinearMethod
         from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
         from vllm.model_executor.models.qwen3 import Qwen3Attention
 
@@ -382,6 +392,7 @@ def _patch_qwen3_strict_model(
         rotary_cls = RotaryEmbedding
         linear_method_cls = UnquantizedLinearMethod
         attention_cls = Qwen3Attention
+        row_parallel_cls = RowParallelLinear
     assert rms_norm_cls is not None
     assert linear_method_cls is not None
     assert attention_cls is not None
@@ -404,11 +415,24 @@ def _patch_qwen3_strict_model(
             return unquantized_apply(method, layer, x, bias)
         x_2d = x.reshape(-1, x.shape[-1])
         linear = getattr(det_gemm, "linear", None)
+        collective = getattr(layer, _STRICT_O_PROJ_COLLECTIVE_MARKER, None)
+        direct_output = None
+        if collective is not None and bias is None and linear is not None:
+            direct_output = collective.direct_staging_view(
+                (x_2d.size(0), layer.weight.shape[0]),
+                dtype=x.dtype,
+            )
+            if direct_output is not None:
+                deterministic_staging_reserve(
+                    direct_output,
+                    collective_handle=int(collective._handle),
+                )
         output_2d = (
-            linear(x_2d, layer.weight)
+            linear(x_2d, layer.weight, out=direct_output)
             if linear is not None
             else det_gemm(x_2d, layer.weight.t().contiguous())
         )
+        setattr(layer, _STRICT_DIRECT_STAGING_MARKER, direct_output is not None)
         output = output_2d.reshape(*x.shape[:-1], layer.weight.shape[0])
         return output if bias is None else output + bias
 
@@ -434,6 +458,77 @@ def _patch_qwen3_strict_model(
             weight,
             eps=instance.variance_epsilon,
         )
+
+    def bind_o_proj_collective(module: Any) -> None:
+        if int(getattr(module, "tp_size", 1)) <= 1:
+            return
+        from vllm.distributed.parallel_state import get_tp_group
+
+        coordinator = get_tp_group()
+        group = getattr(coordinator, "device_group", coordinator)
+        collective = collective_for_group(group)
+        if collective is None:
+            raise RuntimeError("strict rollout o_proj requires an initialized TP process group")
+        max_capture = int(os.getenv("RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE", "0"))
+        if max_capture <= 0:
+            raise RuntimeError(
+                "strict rollout direct staging requires a positive graph capture size"
+            )
+        collective.prepare_direct_staging_views(
+            ((batch, int(module.weight.shape[0])) for batch in range(1, max_capture + 1)),
+            dtype=module.weight.dtype,
+        )
+        setattr(module, _STRICT_O_PROJ_COLLECTIVE_MARKER, collective)
+
+    if row_parallel_cls is not None and not hasattr(
+        row_parallel_cls, _STRICT_ROW_PARALLEL_PATCH_MARKER
+    ):
+        row_parallel_forward = row_parallel_cls.forward
+
+        def strict_row_parallel_forward(instance: Any, input_: torch.Tensor) -> Any:
+            collective = getattr(instance, _STRICT_O_PROJ_COLLECTIVE_MARKER, None)
+            if collective is None:
+                return row_parallel_forward(instance, input_)
+
+            if instance.input_is_parallel:
+                input_parallel = input_
+            else:
+                from vllm.distributed import split_tensor_along_last_dim
+
+                input_parallel = split_tensor_along_last_dim(
+                    input_, num_partitions=instance.tp_size
+                )[instance.tp_rank].contiguous()
+
+            assert instance.quant_method is not None
+            bias_ = (
+                None
+                if (instance.tp_rank > 0 or instance.skip_bias_add)
+                else instance.bias
+            )
+            output_parallel = instance.quant_method.apply(instance, input_parallel, bias_)
+
+            if instance.reduce_results and instance.tp_size > 1:
+                if bool(getattr(instance, _STRICT_DIRECT_STAGING_MARKER, False)):
+                    output = deterministic_all_reduce_staged(
+                        output_parallel,
+                        collective_handle=int(collective._handle),
+                    )
+                else:
+                    deterministic_all_reduce_inplace(
+                        output_parallel,
+                        collective_handle=int(collective._handle),
+                    )
+                    output = output_parallel
+            else:
+                output = output_parallel
+
+            if not instance.return_bias:
+                return output
+            output_bias = instance.bias if instance.skip_bias_add else None
+            return output, output_bias
+
+        setattr(row_parallel_cls, _STRICT_ROW_PARALLEL_PATCH_MARKER, row_parallel_forward)
+        row_parallel_cls.forward = strict_row_parallel_forward
 
     if not hasattr(rms_norm_cls, _STRICT_RMS_NORM_INIT_MARKER):
         rms_norm_init = rms_norm_cls.__init__
@@ -463,6 +558,7 @@ def _patch_qwen3_strict_model(
         attention_init(instance, *args, **kwargs)
         setattr(instance.qkv_proj, _STRICT_PROJECTION_MARKER, "qkv")
         setattr(instance.o_proj, _STRICT_PROJECTION_MARKER, "o_proj")
+        bind_o_proj_collective(instance.o_proj)
 
     setattr(attention_cls, _STRICT_MODEL_PATCH_MARKER, attention_init)
     linear_method_cls.apply = deterministic_linear_apply
