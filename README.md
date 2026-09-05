@@ -162,6 +162,9 @@ git clone https://github.com/RL-Align/RL-Kernel.git
 cd RL-Kernel
 ```
 
+For the Qwen3-8B train–rollout command and setup for VIME with RL-Kernel, see the
+[8×H100 integration runbook](https://github.com/RL-Align/RL-Kernel/issues/342).
+
 ### NVIDIA CUDA
 
 Build against a visible NVIDIA GPU. Set TORCH_CUDA_ARCH_LIST when you want to pin the
