@@ -109,7 +109,7 @@ Items in development or on the roadmap are not yet part of the supported path.
 
 ## Benchmark Highlights
 
-### VIME native operators vs. VIME + RL-Kernel
+### VIME native vs. RL-Kernel + VIME
 
 The completed experiment in [PR #377](https://github.com/RL-Align/RL-Kernel/pull/377)
 compares **G10**, VIME's native production operator path, with **optimized G11**, the
