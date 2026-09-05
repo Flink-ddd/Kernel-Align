@@ -209,7 +209,7 @@ are welcome. See the [contributing guide](./docs/contributing/README.md).
 ## Acknowledgments
 
 RL-Kernel builds on the work of the open-source AI infrastructure community, including
-[VIME](https://github.com/RL-Align/vime), [vLLM](https://github.com/vllm-project/vllm),
+[VIME](https://github.com/vllm-project/vime), [vLLM](https://github.com/vllm-project/vllm),
 [Megatron-LM](https://github.com/NVIDIA/Megatron-LM),
 [DeepSpeed](https://github.com/deepspeedai/DeepSpeed), and
 [FlashInfer](https://github.com/flashinfer-ai/flashinfer).
