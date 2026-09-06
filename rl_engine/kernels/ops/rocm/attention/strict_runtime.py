@@ -502,7 +502,23 @@ class StrictRocmAttentionRuntime:
             elif not bool(bounds_ok.item()):
                 raise ValueError("page_table entries are outside the KV cache")
 
+        use_head_major_gather = (
+            not torch.is_grad_enabled()
+            and not k_cache.requires_grad
+            and not v_cache.requires_grad
+            # With either singleton dimension, the legacy transpose is already
+            # contiguous and does not pay the second materialization copy.
+            and k_cache.size(2) > 1
+            and cached_length > 1
+        )
+
         def _gather(cache: torch.Tensor) -> torch.Tensor:
+            if use_head_major_gather:
+                # Index the non-contiguous [H, pages, page, D] view directly.
+                # index_select writes head-major storage, leaving only views
+                # before the runtime slices one contiguous KV group at a time.
+                selected = cache.permute(2, 0, 1, 3).index_select(1, pages)
+                return selected.flatten(1, 2)[:, :cached_length].unsqueeze(0)
             selected = cache.index_select(0, pages)
             flat = selected.reshape(page_count * page_size, cache.size(2), cache.size(3))
             return flat[:cached_length].permute(1, 0, 2).unsqueeze(0).contiguous()

@@ -86,6 +86,28 @@ def _cache(pages: int, kv_heads: int = 1) -> torch.Tensor:
     )
 
 
+def _packed_cache_views(
+    pages: int,
+    kv_heads: int = 2,
+    dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    total = pages * kv_heads * _PAGE_SIZE * 2 * _HEAD_DIM
+    packed = (
+        torch.arange(total, dtype=torch.float32)
+        .reshape(pages, kv_heads, _PAGE_SIZE, 2 * _HEAD_DIM)
+        .to(dtype)
+    )
+    return packed.transpose(1, 2).split(_HEAD_DIM, dim=-1)
+
+
+def _legacy_gather(cache, page_row, cached_length):
+    page_size = cache.size(1)
+    page_count = (cached_length + page_size - 1) // page_size
+    selected = cache.index_select(0, page_row[:page_count])
+    flat = selected.reshape(page_count * page_size, cache.size(2), cache.size(3))
+    return flat[:cached_length].permute(1, 0, 2).unsqueeze(0).contiguous()
+
+
 def _paged_call(
     runtime,
     *,
@@ -165,6 +187,107 @@ def test_paged_decode_truncates_to_the_cached_length() -> None:
     # The launch is non-causal, so the core is handed no position ids; the
     # truncation above is what bounds the launch to the cached prefix.
     assert core.calls[0]["key_position_ids"] is None
+
+
+@pytest.mark.parametrize("page_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("cache_dtype", [torch.float16, torch.bfloat16])
+def test_paged_decode_head_major_gather_matches_legacy_bytes(page_dtype, cache_dtype) -> None:
+    k_cache, v_cache = _packed_cache_views(4, dtype=cache_dtype)
+    page_row = torch.tensor([2, 0], dtype=page_dtype)
+    cached_length = 5
+
+    with torch.no_grad():
+        actual_k, actual_v = StrictRocmAttentionRuntime._gather_paged_row(
+            k_cache,
+            v_cache,
+            page_row,
+            cached_length,
+        )
+    expected_k = _legacy_gather(k_cache, page_row, cached_length)
+    expected_v = _legacy_gather(v_cache, page_row, cached_length)
+
+    assert torch.equal(actual_k.contiguous().view(torch.uint8), expected_k.view(torch.uint8))
+    assert torch.equal(actual_v.contiguous().view(torch.uint8), expected_v.view(torch.uint8))
+    assert not actual_k.is_contiguous()
+    assert not actual_v.is_contiguous()
+    for group in range(k_cache.size(2)):
+        assert actual_k[:, group : group + 1].transpose(1, 2).is_contiguous()
+        assert actual_v[:, group : group + 1].transpose(1, 2).is_contiguous()
+
+
+@pytest.mark.parametrize(
+    ("kv_heads", "cached_length"),
+    [(1, 5), (2, 1)],
+)
+def test_paged_decode_head_major_gather_keeps_small_legacy_cases_contiguous(
+    kv_heads,
+    cached_length,
+) -> None:
+    k_cache, v_cache = _packed_cache_views(2, kv_heads=kv_heads)
+    page_row = torch.tensor([1, 0], dtype=torch.int32)
+
+    with torch.no_grad():
+        actual_k, actual_v = StrictRocmAttentionRuntime._gather_paged_row(
+            k_cache,
+            v_cache,
+            page_row,
+            cached_length,
+        )
+
+    assert actual_k.is_contiguous()
+    assert actual_v.is_contiguous()
+    assert torch.equal(actual_k, _legacy_gather(k_cache, page_row, cached_length))
+    assert torch.equal(actual_v, _legacy_gather(v_cache, page_row, cached_length))
+
+
+def test_paged_decode_head_major_gather_keeps_grad_enabled_layout() -> None:
+    k_cache, v_cache = _packed_cache_views(2)
+    page_row = torch.tensor([1, 0], dtype=torch.int32)
+
+    assert torch.is_grad_enabled()
+    actual_k, actual_v = StrictRocmAttentionRuntime._gather_paged_row(
+        k_cache,
+        v_cache,
+        page_row,
+        5,
+    )
+
+    assert actual_k.is_contiguous()
+    assert actual_v.is_contiguous()
+    assert torch.equal(actual_k, _legacy_gather(k_cache, page_row, 5))
+    assert torch.equal(actual_v, _legacy_gather(v_cache, page_row, 5))
+
+
+def test_paged_decode_head_major_gather_preserves_gradient_path_bytes() -> None:
+    k_source, v_source = _packed_cache_views(4)
+    actual_k_cache = k_source.detach().clone().requires_grad_()
+    actual_v_cache = v_source.detach().clone().requires_grad_()
+    expected_k_cache = k_source.detach().clone().requires_grad_()
+    expected_v_cache = v_source.detach().clone().requires_grad_()
+    page_row = torch.tensor([2, 0, 2], dtype=torch.int64)
+    cached_length = 10
+
+    actual_k, actual_v = StrictRocmAttentionRuntime._gather_paged_row(
+        actual_k_cache,
+        actual_v_cache,
+        page_row,
+        cached_length,
+    )
+    expected_k = _legacy_gather(expected_k_cache, page_row, cached_length)
+    expected_v = _legacy_gather(expected_v_cache, page_row, cached_length)
+    (actual_k.float().sum() + actual_v.float().sum()).backward()
+    (expected_k.float().sum() + expected_v.float().sum()).backward()
+
+    assert actual_k.is_contiguous()
+    assert actual_v.is_contiguous()
+    assert torch.equal(actual_k.view(torch.uint8), expected_k.view(torch.uint8))
+    assert torch.equal(actual_v.view(torch.uint8), expected_v.view(torch.uint8))
+    assert torch.equal(
+        actual_k_cache.grad.view(torch.uint8), expected_k_cache.grad.view(torch.uint8)
+    )
+    assert torch.equal(
+        actual_v_cache.grad.view(torch.uint8), expected_v_cache.grad.view(torch.uint8)
+    )
 
 
 def test_paged_decode_is_not_causal_within_a_launch() -> None:
