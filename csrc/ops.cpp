@@ -130,7 +130,21 @@ torch::Tensor swiglu_packed_forward_cuda(torch::Tensor gate_up);
 std::vector<torch::Tensor> swiglu_packed_backward_cuda(
     torch::Tensor dy,
     torch::Tensor gate_up);
+// P5-2 ClampSwiGLU weighted declarations
+std::vector<torch::Tensor> clamp_swiglu_weighted_forward_cuda(
+    torch::Tensor gate,
+    torch::Tensor up,
+    torch::optional<torch::Tensor> p_s);
 
+std::vector<torch::Tensor> clamp_swiglu_weighted_backward_cuda(
+    torch::Tensor dh,
+    torch::Tensor gate,
+    torch::Tensor up,
+    torch::Tensor g,
+    torch::Tensor u,
+    torch::Tensor sig,
+    torch::Tensor silu,
+    torch::optional<torch::Tensor> p_s);
 // RMSNorm Declarations & Wrappers
 
 void rmsnorm_forward_cuda(
@@ -293,6 +307,35 @@ std::vector<torch::Tensor> swiglu_packed_backward(
   return swiglu_packed_backward_cuda(dy, gate_up);
 }
 
+std::vector<torch::Tensor> clamp_swiglu_weighted_forward(
+    torch::Tensor gate,
+    torch::Tensor up,
+    torch::optional<torch::Tensor> p_s) {
+  return clamp_swiglu_weighted_forward_cuda(
+      gate,
+      up,
+      p_s);
+}
+
+std::vector<torch::Tensor> clamp_swiglu_weighted_backward(
+    torch::Tensor dh,
+    torch::Tensor gate,
+    torch::Tensor up,
+    torch::Tensor g,
+    torch::Tensor u,
+    torch::Tensor sig,
+    torch::Tensor silu,
+    torch::optional<torch::Tensor> p_s) {
+  return clamp_swiglu_weighted_backward_cuda(
+      dh,
+      gate,
+      up,
+      g,
+      u,
+      sig,
+      silu,
+      p_s);
+}
 // Deterministic standard-softmax attention (issue #147)
 std::vector<torch::Tensor> deterministic_attention_forward(
     torch::Tensor q,
@@ -502,7 +545,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Batch-invariant SwiGLU forward for [rows, 2 * intermediate]");
     m.def("swiglu_packed_backward", &swiglu_packed_backward,
           "Batch-invariant SwiGLU backward for [rows, 2 * intermediate]");
+    m.def(
+        "clamp_swiglu_weighted_forward",
+        &clamp_swiglu_weighted_forward,
+        "P5 clamp_swiglu_weighted forward CUDA");
 
+    m.def(
+        "clamp_swiglu_weighted_backward",
+        &clamp_swiglu_weighted_backward,
+        "P5 clamp_swiglu_weighted backward CUDA");
     // Deterministic standard-softmax attention (issue #147)
     m.def(
         "deterministic_attention_forward",
