@@ -358,6 +358,40 @@ if _TRITON_AVAILABLE:
         )
 
     @triton.jit
+    def _det_gemm_tree_reduce_to_output_kernel(
+        workspace_ptr,
+        output_ptr,
+        lower_nodes_ptr,
+        upper_nodes_ptr,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        offsets = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+        elements = M * N
+        mask = offsets < elements
+        lower_node = tl.load(lower_nodes_ptr).to(tl.int64)
+        upper_node = tl.load(upper_nodes_ptr).to(tl.int64)
+        lower = tl.load(
+            workspace_ptr + lower_node * elements + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        upper = tl.load(
+            workspace_ptr + upper_node * elements + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        result = lower + upper
+        # Preserve the canonical root's FP32 add and BF16 store boundary; only
+        # its destination changes, avoiding a device-to-device copy launch.
+        tl.store(
+            output_ptr + offsets,
+            result.to(output_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+    @triton.jit
     def _copy_tree_root_kernel(
         workspace_ptr,
         output_ptr,
@@ -594,21 +628,42 @@ def _triton_tree_gemm(
         num_warps=leaf_config.num_warps,
     )
     reduction_block = 256
-    for operations, (lower, upper, output) in zip(
-        plan.host.reduction_levels,
-        plan.reduction_levels,
-        strict=True,
-    ):
-        grid = (len(operations), triton.cdiv(m_size * n_size, reduction_block))
-        _det_gemm_tree_reduce_kernel[grid](
-            workspace,
-            lower,
-            upper,
-            output,
-            M=m_size,
-            N=n_size,
-            BLOCK=reduction_block,
+    device_index = a.device.index if a.device.index is not None else torch.cuda.current_device()
+    direct_root_output = not transpose_output and _device_arch(device_index) == "gfx942"
+    for level_index, (operations, (lower, upper, output)) in enumerate(
+        zip(
+            plan.host.reduction_levels,
+            plan.reduction_levels,
+            strict=True,
         )
+    ):
+        write_final_output = (
+            direct_root_output and level_index == len(plan.host.reduction_levels) - 1
+        )
+        if write_final_output and len(operations) != 1:
+            raise RuntimeError("the final deterministic GEMM tree level must contain one root")
+        if write_final_output:
+            grid = (triton.cdiv(m_size * n_size, reduction_block),)
+            _det_gemm_tree_reduce_to_output_kernel[grid](
+                workspace,
+                result,
+                lower,
+                upper,
+                M=m_size,
+                N=n_size,
+                BLOCK=reduction_block,
+            )
+        else:
+            grid = (len(operations), triton.cdiv(m_size * n_size, reduction_block))
+            _det_gemm_tree_reduce_kernel[grid](
+                workspace,
+                lower,
+                upper,
+                output,
+                M=m_size,
+                N=n_size,
+                BLOCK=reduction_block,
+            )
 
     copy_block = 256
     if transpose_output:
@@ -626,7 +681,7 @@ def _triton_tree_gemm(
             BLOCK_M=transpose_block,
             BLOCK_N=transpose_block,
         )
-    else:
+    elif not direct_root_output or not plan.host.reduction_levels:
         _copy_tree_root_kernel[(triton.cdiv(result.numel(), copy_block),)](
             workspace,
             result,

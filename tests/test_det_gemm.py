@@ -25,7 +25,10 @@ try:
         _GFX942_QWEN_TP_SHARD_FORWARD_LEAF_CONFIGS,
         _GFX942_QWEN_TP_SHARD_WGRAD_LEAF_CONFIGS,
         _GFX942_QWEN_WGRAD_LEAF_CONFIGS,
+        _copy_tree_root_kernel,
         _det_gemm_tree_leaf_kernel,
+        _det_gemm_tree_reduce_kernel,
+        _det_gemm_tree_reduce_to_output_kernel,
         _device_tree_plan,
         _gfx942_qwen_tree_leaf_config,
         _triton_tree_gemm,
@@ -536,6 +539,68 @@ def test_triton_tree_matches_python_reference_backward_bitwise():
     )
     for expected_grad, triton_input in zip(expected, triton_inputs, strict=True):
         assert torch.equal(expected_grad, triton_input.grad)
+
+
+@pytest.mark.skipif(not _HAS_TRITON, reason="Triton is unavailable")
+def test_triton_final_tree_level_direct_output_matches_legacy_copy_raw_bytes():
+    """Changing the root destination must not change its BF16 bit pattern."""
+
+    m_size, n_size = 3, 97
+    workspace = _special_bf16((3, m_size, n_size), offset=5)
+    legacy_workspace = workspace.clone()
+    lower = torch.tensor([0], device=DEV, dtype=torch.int64)
+    upper = torch.tensor([1], device=DEV, dtype=torch.int64)
+    root = torch.tensor([2], device=DEV, dtype=torch.int64)
+    block = 256
+    grid = (1, triton.cdiv(m_size * n_size, block))
+    _det_gemm_tree_reduce_kernel[grid](
+        legacy_workspace,
+        lower,
+        upper,
+        root,
+        M=m_size,
+        N=n_size,
+        BLOCK=block,
+    )
+    expected = torch.empty((m_size, n_size), device=DEV, dtype=torch.bfloat16)
+    _copy_tree_root_kernel[(triton.cdiv(expected.numel(), block),)](
+        legacy_workspace,
+        expected,
+        2,
+        expected.numel(),
+        BLOCK=block,
+    )
+
+    actual = torch.empty_like(expected)
+    _det_gemm_tree_reduce_to_output_kernel[(triton.cdiv(actual.numel(), block),)](
+        workspace,
+        actual,
+        lower,
+        upper,
+        M=m_size,
+        N=n_size,
+        BLOCK=block,
+    )
+    _assert_same_raw_bytes(actual, expected)
+
+
+@pytest.mark.skipif(not _HAS_TRITON, reason="Triton is unavailable")
+@pytest.mark.parametrize("k_size", (31, 65))
+def test_triton_forward_out_buffer_preserves_identity_version_and_raw_bytes(k_size):
+    """Caller storage works for both the leaf-root and reduced-root paths."""
+
+    torch.manual_seed(51 + k_size)
+    a = _rand(3, k_size)
+    b = _rand(k_size, 17)
+    expected = _triton_tree_gemm(a, b)
+    output_buffer = torch.empty_like(expected)
+    version_before = output_buffer._version
+
+    actual = _triton_tree_gemm(a, b, out=output_buffer)
+
+    assert actual is output_buffer
+    assert output_buffer._version == version_before + 1
+    _assert_same_raw_bytes(actual, expected)
 
 
 @pytest.mark.skipif(not _HAS_TRITON, reason="Triton is unavailable")
