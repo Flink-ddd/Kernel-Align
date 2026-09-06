@@ -27,6 +27,7 @@ Two things differ from the CUDA runtime and both are load-bearing:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -251,6 +252,7 @@ class StrictRocmAttentionRuntime:
         max_seqlen_k: int,
         scale: float | None,
         out: torch.Tensor | None = None,
+        cached_lengths: Sequence[int] | None = None,
     ) -> StrictRocmAttentionResult:
         """Run strict decode Attention over a paged KV cache.
 
@@ -288,43 +290,46 @@ class StrictRocmAttentionRuntime:
             if not out.is_contiguous():
                 raise ValueError("paged Attention out must be contiguous")
 
-        row_outs: list[torch.Tensor] = []
-        row_lses: list[torch.Tensor] = []
-        core_provenance: dict[str, Any] | None = None
-        launches = 0
-        for row in range(q.size(0)):
-            cached_length = int(seqused_k[row].item())
+        if cached_lengths is None:
+            cached_lengths = tuple(int(value) for value in seqused_k.tolist())
+        else:
+            cached_lengths = tuple(int(value) for value in cached_lengths)
+        if len(cached_lengths) != q.size(0):
+            raise ValueError("cached_lengths must carry one length per query")
+        for row, cached_length in enumerate(cached_lengths):
             if cached_length <= 0 or cached_length > max_seqlen_k:
                 raise ValueError(
                     "seqused_k entries must be positive and within max_seqlen_k; "
                     f"row {row} requested {cached_length}"
                 )
+
+        row_outs: list[torch.Tensor] = []
+        row_lses: list[torch.Tensor] = []
+        core_provenance: dict[str, Any] | None = None
+        launches = 0
+        for row, cached_length in enumerate(cached_lengths):
             k_row, v_row = self._gather_paged_row(
                 k_cache,
                 v_cache,
                 page_table[row],
                 cached_length,
             )
-            # Decode attends over the whole cached prefix, so the mask is not
-            # causal within this launch. The logical positions are still passed
-            # for provenance-grade auditing of what each launch consumed.
-            key_positions = torch.arange(
-                cached_length,
-                dtype=torch.int64,
-                device=q.device,
-            ).unsqueeze(0)
-            query_positions = key_positions[:, -q.size(2) :]
+            # Decode attends over the whole cached prefix, so neither the mask
+            # nor the AITER call consumes position IDs. Avoid allocating two
+            # dead tensors for every row of every decoder layer.
             row_out, row_lse, row_provenance, row_launches = self._run_core(
                 q[row : row + 1],
                 k_row,
                 v_row,
                 causal=False,
                 scale=scale,
-                query_position_ids=query_positions,
-                key_position_ids=key_positions,
+                query_position_ids=None,
+                key_position_ids=None,
                 output_dtype=q.dtype,
+                out=None if out is None else out[row : row + 1],
             )
-            row_outs.append(row_out)
+            if out is None:
+                row_outs.append(row_out)
             row_lses.append(row_lse)
             launches += row_launches
             if core_provenance is None:
@@ -333,11 +338,8 @@ class StrictRocmAttentionRuntime:
         if core_provenance is None:
             raise RuntimeError("strict ROCm paged Attention executed no core launch")
 
-        result_out = torch.cat(row_outs, dim=0)
+        result_out = out if out is not None else torch.cat(row_outs, dim=0)
         result_lse = torch.cat(row_lses, dim=0)
-        if out is not None:
-            out.copy_(result_out)
-            result_out = out
         self.communication_executed = False
 
         backend = (
@@ -395,8 +397,14 @@ class StrictRocmAttentionRuntime:
         page_count = (cached_length + page_size - 1) // page_size
         if page_count > page_row.numel():
             raise ValueError("page_table row is shorter than the cached length requires")
-        pages = page_row[:page_count].to(dtype=torch.int64)
-        if int(pages.min().item()) < 0 or int(pages.max().item()) >= k_cache.size(0):
+        pages = page_row[:page_count]
+        bounds_ok = torch.all((pages >= 0) & (pages < k_cache.size(0)))
+        if pages.is_cuda:
+            # Keep malformed metadata fail-closed without synchronizing the host
+            # twice per row. vLLM page tables are already int32, which
+            # index_select accepts directly on ROCm.
+            torch._assert_async(bounds_ok, "page_table entries are outside the KV cache")
+        elif not bool(bounds_ok.item()):
             raise ValueError("page_table entries are outside the KV cache")
 
         def _gather(cache: torch.Tensor) -> torch.Tensor:
@@ -449,9 +457,10 @@ class StrictRocmAttentionRuntime:
         *,
         causal: bool,
         scale: float | None,
-        query_position_ids: torch.Tensor,
-        key_position_ids: torch.Tensor,
+        query_position_ids: torch.Tensor | None,
+        key_position_ids: torch.Tensor | None,
         output_dtype: torch.dtype,
+        out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], int]:
         """Launch the core once per ``(batch row, KV group)`` and concatenate.
 
@@ -471,8 +480,12 @@ class StrictRocmAttentionRuntime:
         core_provenance: dict[str, Any] | None = None
         launches = 0
         for row in range(q.size(0)):
-            row_query_positions = query_position_ids[row : row + 1]
-            row_key_positions = key_position_ids[row : row + 1]
+            row_query_positions = (
+                None if query_position_ids is None else query_position_ids[row : row + 1]
+            )
+            row_key_positions = (
+                None if key_position_ids is None else key_position_ids[row : row + 1]
+            )
             group_outs: list[torch.Tensor] = []
             group_lses: list[torch.Tensor] = []
             for group in range(local_kv_heads):
@@ -493,13 +506,16 @@ class StrictRocmAttentionRuntime:
                 launches += 1
                 if core_provenance is None:
                     core_provenance = dict(result.provenance)
-            row_outs.append(torch.cat(group_outs, dim=1))
+            if out is None:
+                row_outs.append(torch.cat(group_outs, dim=1))
+            else:
+                torch.cat(group_outs, dim=1, out=out[row : row + 1])
             row_lses.append(torch.cat(group_lses, dim=1))
 
         if core_provenance is None:
             raise RuntimeError("strict ROCm Attention runtime executed no core launch")
         return (
-            torch.cat(row_outs, dim=0),
+            out if out is not None else torch.cat(row_outs, dim=0),
             torch.cat(row_lses, dim=0),
             core_provenance,
             launches,

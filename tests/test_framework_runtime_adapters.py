@@ -468,11 +468,58 @@ def test_vllm_attention_routes_paged_cache_to_rocm_runtime(monkeypatch):
     assert output.shape == (1, 16)
     assert len(runtime_calls) == 1
     assert runtime_calls[0][0].shape == (1, 2, 1, 8)
+    assert runtime_calls[0][3]["cached_lengths"] == (1,)
     assert adapter.provenance["execution"]["runtime_platform"] == "rocm"
     assert (
         adapter.provenance["execution"]["materialization"]
         == "logical_paged_kv_to_aiter_ck_dense"
     )
+
+
+def test_vllm_rocm_host_lengths_are_materialized_once_across_layers(monkeypatch):
+    original_tolist = torch.Tensor.tolist
+    tolist_calls = 0
+
+    def counting_tolist(tensor):
+        nonlocal tolist_calls
+        tolist_calls += 1
+        return original_tolist(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "tolist", counting_tolist)
+    query = torch.zeros(2, 2, 8, dtype=torch.bfloat16)
+    block_table = torch.tensor([[0], [1]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([3, 5], dtype=torch.int32),
+        max_seq_len=5,
+    )
+    adapter = VllmAttentionOperator()
+    first_layer = object()
+    second_layer = object()
+
+    first, _ = adapter._materialization_groups(
+        metadata,
+        query=query,
+        block_table=block_table,
+        block_size=8,
+        num_actual=2,
+        cache_owner=first_layer,
+        include_host_lengths=True,
+    )
+    second, summary = adapter._materialization_groups(
+        metadata,
+        query=query,
+        block_table=block_table,
+        block_size=8,
+        num_actual=2,
+        cache_owner=second_layer,
+        include_host_lengths=True,
+    )
+
+    assert first is second
+    assert first[0]["cached_lengths"] == (3, 5)
+    assert tolist_calls == 1
+    assert summary["metadata_reused_across_layers"] is True
 
 
 def test_vllm_current_flash_attention_kv_cache_layout_is_materialized():

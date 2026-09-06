@@ -231,6 +231,28 @@ def test_paged_decode_rejects_a_mismatched_out_buffer() -> None:
         )
 
 
+def test_paged_decode_writes_into_the_callers_output_buffer() -> None:
+    runtime = _runtime()
+    k_cache = _cache(2)
+    q = torch.zeros(1, 1, 1, _HEAD_DIM, dtype=torch.bfloat16)
+    out = torch.full_like(q, 7)
+
+    result = runtime.forward_paged_with_lse(
+        q,
+        k_cache,
+        k_cache + 1,
+        page_table=torch.tensor([[0]], dtype=torch.int32),
+        seqused_k=torch.tensor([4], dtype=torch.int32),
+        max_seqlen_k=_PAGE_SIZE,
+        scale=None,
+        out=out,
+        cached_lengths=(4,),
+    )
+
+    assert result.out is out
+    assert torch.equal(out, torch.zeros_like(out))
+
+
 def test_rocm_registry_does_not_claim_decode_before_a_caller_routes_to_it() -> None:
     """The paged entry point exists, but nothing dispatches to it yet.
 

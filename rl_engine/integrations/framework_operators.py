@@ -999,6 +999,7 @@ class VllmAttentionOperator:
         block_size: int,
         num_actual: int,
         cache_owner: Any | None = None,
+        include_host_lengths: bool = False,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Build one paged launch from vLLM's graph-replayable GPU metadata."""
 
@@ -1026,6 +1027,7 @@ class VllmAttentionOperator:
             num_actual,
             block_size,
             page_count,
+            include_host_lengths,
         )
         owner_id = id(cache_owner) if cache_owner is not None else None
         # Resolve the cross-layer cache before scheduling any GPU metadata work.
@@ -1057,6 +1059,11 @@ class VllmAttentionOperator:
             seqused_k,
             torch.ones_like(seqused_k),
         )
+        cached_lengths = (
+            tuple(int(value) for value in seqused_k.tolist())
+            if include_host_lengths
+            else None
+        )
 
         pages = (
             block_table.index_select(0, request_indices)[:, :page_count]
@@ -1072,6 +1079,7 @@ class VllmAttentionOperator:
                 "query_count": num_actual,
                 "query_contiguous": True,
                 "seqused_k": seqused_k,
+                "cached_lengths": cached_lengths,
             }
         ]
         summary = {
@@ -1155,6 +1163,7 @@ class VllmAttentionOperator:
             block_size=block_size,
             num_actual=num_actual,
             cache_owner=layer,
+            include_host_lengths=runtime_platform == "rocm",
         )
         last_operator_provenance: dict[str, Any] = {}
         next_query_row = 0
@@ -1171,26 +1180,36 @@ class VllmAttentionOperator:
             page_count = int(group["page_count"])
             pages = group["pages"]
             query_indices = group["query_indices"]
+            runtime_out = None
+            output_group = None
             if group["query_contiguous"]:
                 query_start = int(group["query_start"])
                 query_count = int(group["query_count"])
                 q_ready = query.narrow(0, query_start, query_count).unsqueeze(2)
+                output_group = output_heads.narrow(0, query_start, query_count)
+                runtime_out = output_group.unsqueeze(2)
             else:
                 q_ready = query.index_select(0, query_indices).unsqueeze(2).contiguous()
+            runtime_kwargs = {
+                "page_table": pages,
+                "seqused_k": group["seqused_k"],
+                "max_seqlen_k": page_count * block_size,
+                "scale": float(impl.scale),
+                "out": runtime_out,
+            }
+            if runtime_platform == "rocm":
+                runtime_kwargs["cached_lengths"] = group["cached_lengths"]
             result = runtime.forward_paged_with_lse(
                 q_ready,
                 key_cache,
                 value_cache,
-                page_table=pages,
-                seqused_k=group["seqused_k"],
-                max_seqlen_k=page_count * block_size,
-                scale=float(impl.scale),
+                **runtime_kwargs,
             )
             result_output = result.out.squeeze(2)
             if group["query_contiguous"]:
-                output_heads.narrow(0, int(group["query_start"]), int(group["query_count"])).copy_(
-                    result_output
-                )
+                assert output_group is not None
+                if result_output.data_ptr() != output_group.data_ptr():
+                    output_group.copy_(result_output)
             else:
                 output_heads.index_copy_(0, query_indices, result.out.squeeze(2))
             last_operator_provenance = _compact_attention_provenance(result.provenance)
