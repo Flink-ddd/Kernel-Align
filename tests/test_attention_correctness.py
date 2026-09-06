@@ -596,6 +596,73 @@ def test_strict_rocm_aiter_ck_direct_decode_uses_callers_output(monkeypatch):
     assert result.provenance["core_output_staging"] == "aiter_direct_caller_group"
 
 
+def test_strict_rocm_aiter_ck_reuses_immutable_provenance_inputs(monkeypatch):
+    def fake_fwd(q, k, v, *_args, out=None):
+        out.copy_(q)
+        return (
+            out,
+            torch.zeros(q.size(0), q.size(2), q.size(1), dtype=torch.float32),
+            torch.empty(0),
+            torch.zeros(2, dtype=torch.int64),
+        )
+
+    core = StrictRocmAiterCKAttentionCore(
+        _mha_fwd=fake_fwd,
+        _mha_bwd=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(core, "_validate_inputs", lambda *_args: None)
+    device_lookups = 0
+
+    def fake_device_properties(_device):
+        nonlocal device_lookups
+        device_lookups += 1
+        return type("Props", (), {"name": "test-gpu", "gcnArchName": "gfx-test"})()
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", fake_device_properties)
+    split_resolves = 0
+    split_type = type(core.split_kv)
+    original_resolve = split_type.resolve
+
+    def counted_resolve(self, total_kv_tokens, *, backend):
+        nonlocal split_resolves
+        split_resolves += 1
+        return original_resolve(self, total_kv_tokens, backend=backend)
+
+    monkeypatch.setattr(split_type, "resolve", counted_resolve)
+    q = torch.randn(1, 4, 1, 8, dtype=torch.bfloat16)
+
+    def run(kv_tokens):
+        k = torch.randn(1, 1, kv_tokens, 8, dtype=torch.bfloat16)
+        with torch.no_grad():
+            return core.forward_decode_with_lse_into(q, k, k.clone(), out=torch.empty_like(q))
+
+    first = run(7)
+    repeated = run(7)
+    changed_length = run(9)
+    restored_length = run(7)
+
+    assert device_lookups == 1
+    assert split_resolves == 3
+    assert first.provenance == repeated.provenance
+    assert first.provenance is not repeated.provenance
+    assert first.provenance["split_kv"] is not repeated.provenance["split_kv"]
+    first_boundaries = first.provenance["split_kv"]["actual_split_boundaries"]
+    repeated_boundaries = repeated.provenance["split_kv"]["actual_split_boundaries"]
+    assert first_boundaries is not repeated_boundaries
+    assert first_boundaries[0] is not repeated_boundaries[0]
+    assert changed_length.provenance["split_kv"]["actual_split_boundaries"] == [[0, 9]]
+    assert restored_length.provenance["split_kv"]["actual_split_boundaries"] == [[0, 7]]
+    first_boundaries[0][0] = 3
+    assert repeated_boundaries == [[0, 7]]
+    after_mutation = run(7)
+    assert after_mutation.provenance["split_kv"]["actual_split_boundaries"] == [[0, 7]]
+    assert split_resolves == 3
+
+    assert core._device_description(torch.device("cuda:1")) == ("test-gpu", "gfx-test")
+    assert core._device_description(torch.device("cuda:1")) == ("test-gpu", "gfx-test")
+    assert device_lookups == 2
+
+
 def test_strict_rocm_aiter_ck_direct_decode_rejects_ignored_output(monkeypatch):
     def fake_fwd(q, k, v, *_args, out=None):
         return (
@@ -614,9 +681,12 @@ def test_strict_rocm_aiter_ck_direct_decode_rejects_ignored_output(monkeypatch):
     k = torch.randn(1, 1, 7, 8, dtype=torch.bfloat16)
     out = torch.empty_like(q)
 
-    with torch.no_grad(), pytest.raises(
-        StrictRocmAttentionUnavailable,
-        match="requested output buffer",
+    with (
+        torch.no_grad(),
+        pytest.raises(
+            StrictRocmAttentionUnavailable,
+            match="requested output buffer",
+        ),
     ):
         core.forward_decode_with_lse_into(q, k, k, out=out)
 

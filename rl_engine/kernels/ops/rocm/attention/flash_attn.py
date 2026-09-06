@@ -18,6 +18,7 @@ from torch.autograd.function import once_differentiable
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
     STRICT_ATTENTION_ROCM_SCHEDULE_ID,
+    SplitKVExecutionPlan,
     SplitKVMode,
     SplitKVSpec,
 )
@@ -308,6 +309,14 @@ class StrictRocmAiterCKAttentionCore:
         self.source_sha256 = source_sha256
         self._mha_fwd = mha_fwd
         self._mha_bwd = mha_bwd
+        # Decode invokes this core once per KV group. Keep only the last
+        # immutable lookup result so every new sequence length still resolves
+        # once, while remaining same-length groups/layers avoid duplicate host
+        # work.
+        self._device_description_cache: tuple[torch.device, tuple[str, str]] | None = None
+        self._split_kv_plan_cache: (
+            tuple[tuple[SplitKVSpec, int, str], SplitKVExecutionPlan] | None
+        ) = None
 
     def forward_with_lse(
         self,
@@ -412,7 +421,8 @@ class StrictRocmAiterCKAttentionCore:
             raise StrictRocmAttentionUnavailable("AITER CK output shape/dtype changed")
         if tuple(lse.shape) != expected_lse_shape or lse.dtype != torch.float32:
             raise StrictRocmAttentionUnavailable("AITER CK must export [B,H,Sq] FP32 LSE")
-        device_properties = torch.cuda.get_device_properties(q.device)
+        gpu_name, gpu_arch = self._device_description(q.device)
+        split_kv_plan = self._resolve_split_kv_plan(k.size(2))
         provenance: dict[str, object] = {
             "strict_core_id": self.core_id,
             "strict_schedule": self.strict_schedule,
@@ -420,15 +430,17 @@ class StrictRocmAiterCKAttentionCore:
             "platform": "rocm",
             "torch_version": torch.__version__,
             "rocm_version": torch.version.hip,
-            "gpu_name": device_properties.name,
-            "gpu_arch": getattr(device_properties, "gcnArchName", "unknown"),
+            "gpu_name": gpu_name,
+            "gpu_arch": gpu_arch,
             "aiter_api_source": self.api_source,
             "aiter_source_sha256": self.source_sha256,
             "num_splits": self.num_splits,
             "split_kv_control": self.split_kv_control,
             "deterministic_backward": self.deterministic_backward,
             "dropout_p": 0.0,
-            "split_kv": self.split_kv.resolve(k.size(2), backend=self.backend_id).to_dict(),
+            # to_dict deliberately remains per result: callers receive fresh
+            # mutable dictionaries/lists even though the frozen plan is reused.
+            "split_kv": split_kv_plan.to_dict(),
             "merge_order": self.merge_order,
             "accum_dtype": self.accum_dtype,
             "downcast_at": self.downcast_at,
@@ -445,6 +457,24 @@ class StrictRocmAiterCKAttentionCore:
             lse=lse,
             provenance=provenance,
         )
+
+    def _device_description(self, device: torch.device) -> tuple[str, str]:
+        cached = self._device_description_cache
+        if cached is not None and cached[0] == device:
+            return cached[1]
+        properties = torch.cuda.get_device_properties(device)
+        description = (properties.name, getattr(properties, "gcnArchName", "unknown"))
+        self._device_description_cache = (device, description)
+        return description
+
+    def _resolve_split_kv_plan(self, total_kv_tokens: int) -> SplitKVExecutionPlan:
+        key = (self.split_kv, total_kv_tokens, self.backend_id)
+        cached = self._split_kv_plan_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        plan = self.split_kv.resolve(total_kv_tokens, backend=self.backend_id)
+        self._split_kv_plan_cache = (key, plan)
+        return plan
 
     @staticmethod
     def _validate_direct_output(
