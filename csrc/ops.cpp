@@ -546,9 +546,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("swiglu_packed_backward", &swiglu_packed_backward,
           "Batch-invariant SwiGLU backward for [rows, 2 * intermediate]");
     m.def(
-        "clamp_swiglu_weighted_forward",
-        &clamp_swiglu_weighted_forward,
-        "P5 clamp_swiglu_weighted forward CUDA");
+      "clamp_swiglu_weighted_backward",
+      &clamp_swiglu_weighted_backward,
+      py::arg("dh"),
+      py::arg("gate"),
+      py::arg("up"),
+      py::arg("g"),
+      py::arg("u"),
+      py::arg("sig"),
+      py::arg("silu"),
+      py::arg("p_s") = py::none(),
+      "P5 clamp_swiglu_weighted backward CUDA");
 
     m.def(
         "clamp_swiglu_weighted_backward",
