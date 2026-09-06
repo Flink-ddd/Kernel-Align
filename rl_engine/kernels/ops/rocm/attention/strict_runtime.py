@@ -417,7 +417,9 @@ class StrictRocmAttentionRuntime:
             raise RuntimeError("strict ROCm paged Attention executed no core launch")
 
         result_out = out if out is not None else torch.cat(row_outs, dim=0)
-        result_lse = torch.cat(row_lses, dim=0)
+        result_lse = (
+            row_lses[0] if direct_core_out and len(row_lses) == 1 else torch.cat(row_lses, dim=0)
+        )
         self.communication_executed = False
         if resolved_epoch is not None and not bounds_reused:
             assert bounds_signature is not None
@@ -671,13 +673,17 @@ class StrictRocmAttentionRuntime:
                 row_outs.append(torch.cat(group_outs, dim=1))
             elif not direct_core_out:
                 torch.cat(group_outs, dim=1, out=out[row : row + 1])
-            row_lses.append(torch.cat(group_lses, dim=1))
+            row_lses.append(
+                group_lses[0]
+                if direct_core_out and len(group_lses) == 1
+                else torch.cat(group_lses, dim=1)
+            )
 
         if core_provenance is None:
             raise RuntimeError("strict ROCm Attention runtime executed no core launch")
         return (
             out if out is not None else torch.cat(row_outs, dim=0),
-            torch.cat(row_lses, dim=0),
+            (row_lses[0] if direct_core_out and len(row_lses) == 1 else torch.cat(row_lses, dim=0)),
             core_provenance,
             launches,
         )

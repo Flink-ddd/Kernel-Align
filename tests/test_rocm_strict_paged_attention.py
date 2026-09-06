@@ -501,6 +501,49 @@ def test_paged_decode_writes_into_the_callers_output_buffer() -> None:
     assert result.provenance["core_output_staging"] == "aiter_direct_caller_group"
 
 
+@pytest.mark.parametrize(
+    ("q_heads", "kv_heads", "expected_lse_cat_parts"),
+    [(1, 1, []), (4, 2, [2])],
+)
+def test_paged_direct_decode_skips_only_singleton_lse_cats(
+    monkeypatch,
+    q_heads,
+    kv_heads,
+    expected_lse_cat_parts,
+) -> None:
+    original_cat = torch.cat
+    lse_cat_parts = []
+
+    def recording_cat(tensors, *args, **kwargs):
+        tensors = tuple(tensors)
+        if tensors and tensors[0].dtype == torch.float32:
+            lse_cat_parts.append(len(tensors))
+        return original_cat(tensors, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "cat", recording_cat)
+    runtime = _runtime()
+    k_cache = _cache(2, kv_heads=kv_heads)
+    q = torch.zeros(1, q_heads, 1, _HEAD_DIM, dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        result = runtime.forward_paged_with_lse(
+            q,
+            k_cache,
+            k_cache + 1,
+            page_table=torch.tensor([[0]], dtype=torch.int32),
+            seqused_k=torch.tensor([4], dtype=torch.int32),
+            max_seqlen_k=_PAGE_SIZE,
+            scale=None,
+            out=torch.empty_like(q),
+            cached_lengths=(4,),
+        )
+
+    assert lse_cat_parts == expected_lse_cat_parts
+    assert result.lse.shape == (1, q_heads, 1)
+    assert result.lse.is_contiguous()
+    assert torch.equal(result.lse, torch.zeros_like(result.lse))
+
+
 def test_paged_decode_writes_each_kv_group_directly_to_its_output_slice() -> None:
     core = _RecordingCore()
     runtime = StrictRocmAttentionRuntime(core=core)
@@ -551,6 +594,36 @@ def test_paged_decode_keeps_staging_when_gradient_mode_is_enabled() -> None:
     assert result.out is out
     assert core.calls[0]["out"] is None
     assert result.provenance["core_output_staging"] == "runtime_group_cat"
+
+
+def test_paged_staged_decode_keeps_singleton_lse_cats(monkeypatch) -> None:
+    original_cat = torch.cat
+    lse_cat_parts = []
+
+    def recording_cat(tensors, *args, **kwargs):
+        tensors = tuple(tensors)
+        if tensors and tensors[0].dtype == torch.float32:
+            lse_cat_parts.append(len(tensors))
+        return original_cat(tensors, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "cat", recording_cat)
+    runtime = _runtime()
+    k_cache = _cache(2)
+    q = torch.zeros(1, 1, 1, _HEAD_DIM, dtype=torch.bfloat16)
+    result = runtime.forward_paged_with_lse(
+        q,
+        k_cache,
+        k_cache + 1,
+        page_table=torch.tensor([[0]], dtype=torch.int32),
+        seqused_k=torch.tensor([4], dtype=torch.int32),
+        max_seqlen_k=_PAGE_SIZE,
+        scale=None,
+        out=torch.empty_like(q),
+        cached_lengths=(4,),
+    )
+
+    assert lse_cat_parts == [1, 1, 1]
+    assert result.lse.shape == (1, 1, 1)
 
 
 def test_paged_decode_keeps_staging_when_output_aliases_an_input() -> None:
