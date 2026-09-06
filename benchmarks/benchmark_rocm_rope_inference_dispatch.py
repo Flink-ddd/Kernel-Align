@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Benchmark bypassing the unused ROCm RoPE autograd wrapper in rollout.
+"""Benchmark ROCm RoPE rollout dispatch and static-frequency preparation.
 
-Both arms build the same FP32 cos/sin table and launch the same deterministic
-HIP kernels. The baseline reproduces the previous ``Function.apply`` path;
-the candidate calls the shared forward arithmetic directly under inference
-mode. Query and key outputs must remain byte-identical.
+The three arms reproduce the old autograd path, direct inference with a freshly
+built ``inv_freq``, and direct inference with that position-independent vector
+cached. All arms rebuild position-dependent cos/sin and launch the same two
+deterministic HIP kernels. Query and key outputs must remain byte-identical.
 
 Example on one MI300X:
 
     HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 \
       python benchmarks/benchmark_rocm_rope_inference_dispatch.py \
-      --tokens 1,2,32 --blocks 10 --iterations 400
+      --tokens 1,2,32 --blocks 12 --iterations 400
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import torch
 
 from rl_engine.kernels.ops.rocm.rotary_embedding.rope import (
     RocmDeterministicRoPEOp,
+    _forward_rope_pair,
     _RocmRoPEPairFunction,
 )
 
@@ -97,61 +98,95 @@ def _benchmark_tokens(
         return query_out, key_out
 
     @torch.inference_mode()
-    def inference_direct() -> tuple[torch.Tensor, torch.Tensor]:
+    def inference_direct_rebuild() -> tuple[torch.Tensor, torch.Tensor]:
+        operator._validate_input(query)
+        operator._validate_input(key)
+        if query.device != key.device or query.dtype != key.dtype:
+            raise ValueError("paired ROCm RoPE Q/K must share one device and dtype")
+        if query.shape[-1] != key.shape[-1]:
+            raise ValueError("paired ROCm RoPE Q/K must share one head dimension")
+        query_out, key_out, _cos, _sin = _forward_rope_pair(
+            query,
+            key,
+            positions,
+            1_000_000.0,
+        )
+        return query_out, key_out
+
+    @torch.inference_mode()
+    def inference_cached() -> tuple[torch.Tensor, torch.Tensor]:
         return operator.forward_pair(query, key, positions)
 
     for _ in range(warmup):
         autograd_wrapper()
-        inference_direct()
+        inference_direct_rebuild()
+        inference_cached()
     torch.cuda.synchronize()
 
     baseline_out = autograd_wrapper()
-    candidate_out = inference_direct()
-    repeated_out = inference_direct()
+    direct_out = inference_direct_rebuild()
+    candidate_out = inference_cached()
+    repeated_out = inference_cached()
     torch.cuda.synchronize()
     exact = all(
-        torch.equal(expected.view(torch.uint8), actual.view(torch.uint8))
+        torch.equal(expected.view(torch.uint8), direct.view(torch.uint8))
+        and torch.equal(direct.view(torch.uint8), actual.view(torch.uint8))
         and torch.equal(actual.view(torch.uint8), repeated.view(torch.uint8))
-        for expected, actual, repeated in zip(
+        for expected, direct, actual, repeated in zip(
             baseline_out,
+            direct_out,
             candidate_out,
             repeated_out,
             strict=True,
         )
     )
     if not exact:
-        raise AssertionError("direct inference RoPE differs from the autograd baseline")
+        raise AssertionError("ROCm RoPE benchmark arms differ in output bytes")
 
-    samples: dict[str, list[float]] = {"autograd_wrapper": [], "inference_direct": []}
+    samples: dict[str, list[float]] = {
+        "autograd_wrapper": [],
+        "inference_direct_rebuild": [],
+        "inference_cached": [],
+    }
     functions = {
         "autograd_wrapper": autograd_wrapper,
-        "inference_direct": inference_direct,
+        "inference_direct_rebuild": inference_direct_rebuild,
+        "inference_cached": inference_cached,
     }
     for block in range(blocks):
-        order = (
-            ("autograd_wrapper", "inference_direct")
-            if block % 2 == 0
-            else ("inference_direct", "autograd_wrapper")
+        orders = (
+            ("autograd_wrapper", "inference_direct_rebuild", "inference_cached"),
+            ("autograd_wrapper", "inference_cached", "inference_direct_rebuild"),
+            ("inference_direct_rebuild", "autograd_wrapper", "inference_cached"),
+            ("inference_direct_rebuild", "inference_cached", "autograd_wrapper"),
+            ("inference_cached", "autograd_wrapper", "inference_direct_rebuild"),
+            ("inference_cached", "inference_direct_rebuild", "autograd_wrapper"),
         )
-        for name in order:
+        for name in orders[block % len(orders)]:
             samples[name].append(_elapsed_ms(functions[name], iterations))
 
-    baseline_ms = statistics.median(samples["autograd_wrapper"])
-    candidate_ms = statistics.median(samples["inference_direct"])
+    autograd_ms = statistics.median(samples["autograd_wrapper"])
+    direct_ms = statistics.median(samples["inference_direct_rebuild"])
+    cached_ms = statistics.median(samples["inference_cached"])
     return {
         "tokens": tokens,
         "query_heads": query_heads,
         "key_heads": key_heads,
         "head_dim": head_dim,
-        "autograd_wrapper_ms": baseline_ms,
-        "inference_direct_ms": candidate_ms,
-        "latency_reduction_percent": 100.0 * (baseline_ms - candidate_ms) / baseline_ms,
-        "speedup": baseline_ms / candidate_ms,
+        "autograd_wrapper_ms": autograd_ms,
+        "inference_direct_rebuild_ms": direct_ms,
+        "inference_cached_ms": cached_ms,
+        "dispatch_latency_reduction_percent": 100.0 * (autograd_ms - direct_ms) / autograd_ms,
+        "inv_freq_cache_latency_reduction_percent": 100.0 * (direct_ms - cached_ms) / direct_ms,
+        "combined_latency_reduction_percent": 100.0 * (autograd_ms - cached_ms) / autograd_ms,
+        "inv_freq_cache_speedup": direct_ms / cached_ms,
+        "combined_speedup": autograd_ms / cached_ms,
         "raw_bytes_equal": exact,
         "query_sha256": _digest(candidate_out[0]),
         "key_sha256": _digest(candidate_out[1]),
         "autograd_wrapper_samples_ms": samples["autograd_wrapper"],
-        "inference_direct_samples_ms": samples["inference_direct"],
+        "inference_direct_rebuild_samples_ms": samples["inference_direct_rebuild"],
+        "inference_cached_samples_ms": samples["inference_cached"],
     }
 
 
@@ -162,7 +197,7 @@ def main() -> None:
     parser.add_argument("--key-heads", type=int, default=2)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=100)
-    parser.add_argument("--blocks", type=int, default=10)
+    parser.add_argument("--blocks", type=int, default=12)
     parser.add_argument("--iterations", type=int, default=400)
     args = parser.parse_args()
 

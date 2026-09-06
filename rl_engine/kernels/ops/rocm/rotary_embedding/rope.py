@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from threading import Lock
+
 import torch
 from torch import Tensor
 
@@ -16,12 +18,36 @@ def _forward_rope_pair(
     key: Tensor,
     positions: Tensor,
     theta: float,
+    *,
+    inv_freq: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Run the paired forward arithmetic and return its shared table."""
 
     if positions.dim() != 1:
         raise ValueError("paired ROCm RoPE requires a flat position tensor")
-    query_2d, cos, sin = _rope_table(query, positions, theta)
+    if inv_freq is None:
+        query_2d, cos, sin = _rope_table(query, positions, theta)
+    else:
+        head_dim = query.shape[-1]
+        if head_dim % 2 != 0:
+            raise ValueError(f"RoPE head_dim must be even, got {head_dim}")
+        table_len = int(positions.shape[0])
+        query_2d = query.contiguous().reshape(-1, head_dim)
+        if query_2d.shape[0] % table_len != 0:
+            raise ValueError(
+                f"row count {query_2d.shape[0]} not divisible by seq length {table_len}; "
+                "expected a [..., S, D] contiguous layout."
+            )
+        if (
+            inv_freq.shape != (head_dim // 2,)
+            or inv_freq.dtype != torch.float32
+            or inv_freq.device != query.device
+        ):
+            raise RuntimeError("cached ROCm RoPE inv_freq does not match the input")
+        position_rows = positions.to(device=query.device, dtype=torch.float32).reshape(-1, 1)
+        frequencies = position_rows * inv_freq
+        cos = frequencies.cos().contiguous()
+        sin = frequencies.sin().contiguous()
     key_2d = key.contiguous().reshape(-1, key.shape[-1])
     if key_2d.size(0) % cos.size(0):
         raise ValueError(
@@ -114,6 +140,8 @@ class RocmDeterministicRoPEOp:
             raise RuntimeError(
                 "ROCm deterministic RoPE is unavailable; rebuild rl_engine._C for ROCm"
             )
+        self._inference_inv_freq_cache: dict[tuple[torch.device, object, int, str], Tensor] = {}
+        self._inference_inv_freq_lock = Lock()
 
     def __call__(self, x: Tensor, positions: Tensor, *, theta: float = 1_000_000.0) -> Tensor:
         return self.forward(x, positions, theta=theta)
@@ -138,6 +166,8 @@ class RocmDeterministicRoPEOp:
             raise ValueError("paired ROCm RoPE Q/K must share one device and dtype")
         if query.shape[-1] != key.shape[-1]:
             raise ValueError("paired ROCm RoPE Q/K must share one head dimension")
+        if positions.dim() != 1:
+            raise ValueError("paired ROCm RoPE requires a flat position tensor")
         if not torch.is_grad_enabled():
             # vLLM executes rollout under inference/no-grad mode. Calling the
             # custom autograd Function there cannot contribute a backward but
@@ -149,6 +179,7 @@ class RocmDeterministicRoPEOp:
                 key,
                 positions,
                 theta,
+                inv_freq=self._cached_inference_inv_freq(query, theta),
             )
             return query_out, key_out
         query_out, key_out = _RocmRoPEPairFunction.apply(query, key, positions, theta)
@@ -159,6 +190,39 @@ class RocmDeterministicRoPEOp:
         if not key.requires_grad:
             key_out = key_out.detach()
         return query_out, key_out
+
+    def _cached_inference_inv_freq(self, query: Tensor, theta: float) -> Tensor:
+        """Reuse only the position-independent FP32 part of the RoPE table."""
+
+        head_dim = query.shape[-1]
+        if head_dim % 2 != 0:
+            raise ValueError(f"RoPE head_dim must be even, got {head_dim}")
+        resolved_theta = float(theta)
+        # ``float.hex`` keeps +0.0 and -0.0 distinct, unlike float equality.
+        stream = torch.cuda.current_stream(query.device)
+        key = (query.device, stream, head_dim, resolved_theta.hex())
+        cached = self._inference_inv_freq_cache.get(key)
+        if cached is not None:
+            return cached
+        half = head_dim // 2
+        inv_freq = 1.0 / (
+            resolved_theta
+            ** (
+                torch.arange(
+                    0,
+                    half,
+                    dtype=torch.float32,
+                    device=query.device,
+                )
+                / half
+            )
+        )
+        # Build outside the lock, then publish once. The dict never evicts:
+        # keys retain their streams and values remain alive for any HIP graph
+        # that captured them. A same-key race returns the first published
+        # tensor, whose producer and consumers all use that key's stream.
+        with self._inference_inv_freq_lock:
+            return self._inference_inv_freq_cache.setdefault(key, inv_freq)
 
     @staticmethod
     def _validate_input(x: Tensor) -> None:

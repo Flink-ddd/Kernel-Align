@@ -856,6 +856,127 @@ def test_rocm_rope_pair_inference_bypasses_autograd_raw_bytes(monkeypatch, dtype
 
 
 @ROCM_ONLY
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_rocm_rope_pair_inference_reuses_only_position_independent_frequency(dtype):
+    from rl_engine.kernels.ops.rocm.rotary_embedding.rope import _forward_rope_pair
+
+    generator = torch.Generator(device="cpu").manual_seed(814)
+    query = torch.randn(8, 3, D, dtype=dtype, generator=generator).to(DEVICE)
+    key = torch.randn(2, 3, D, dtype=dtype, generator=generator).to(DEVICE)
+    first_positions = torch.tensor([0, 17, 2048], device=DEVICE)
+    second_positions = torch.tensor([4095, 3, 29], device=DEVICE)
+    rope = RocmDeterministicRoPEOp()
+
+    with torch.inference_mode():
+        first = rope.forward_pair(query, key, first_positions)
+        assert len(rope._inference_inv_freq_cache) == 1
+        cached_inv_freq = next(iter(rope._inference_inv_freq_cache.values()))
+        expected_second = _forward_rope_pair(
+            query,
+            key,
+            second_positions,
+            1_000_000.0,
+        )
+        cached_second = _forward_rope_pair(
+            query,
+            key,
+            second_positions,
+            1_000_000.0,
+            inv_freq=cached_inv_freq,
+        )
+    with torch.no_grad():
+        second = rope.forward_pair(query, key, second_positions)
+
+    assert len(rope._inference_inv_freq_cache) == 1
+    assert next(iter(rope._inference_inv_freq_cache.values())) is cached_inv_freq
+    assert not torch.equal(first[0].view(torch.uint8), second[0].view(torch.uint8))
+    for expected_tensor, cached_tensor in zip(expected_second, cached_second, strict=True):
+        assert torch.equal(expected_tensor.view(torch.uint8), cached_tensor.view(torch.uint8))
+    for expected_tensor, actual_tensor in zip(expected_second[:2], second, strict=True):
+        assert torch.equal(expected_tensor.view(torch.uint8), actual_tensor.view(torch.uint8))
+
+
+@ROCM_ONLY
+def test_rocm_rope_pair_inference_frequency_cache_keys_shape_and_theta():
+    from rl_engine.kernels.ops.rocm.rotary_embedding.rope import _forward_rope_pair
+
+    rope = RocmDeterministicRoPEOp()
+    positions = torch.tensor([1, 2], device=DEVICE)
+
+    def run(head_dim, theta):
+        query = torch.randn(2, 2, head_dim, dtype=torch.bfloat16, device=DEVICE)
+        key = torch.randn(1, 2, head_dim, dtype=torch.bfloat16, device=DEVICE)
+        with torch.inference_mode():
+            expected = _forward_rope_pair(query, key, positions, theta)[:2]
+            actual = rope.forward_pair(query, key, positions, theta=theta)
+        for expected_tensor, actual_tensor in zip(expected, actual, strict=True):
+            assert torch.equal(expected_tensor.view(torch.uint8), actual_tensor.view(torch.uint8))
+        return rope._cached_inference_inv_freq(query, theta)
+
+    grad_query = torch.randn(2, 2, D, dtype=torch.bfloat16, device=DEVICE).requires_grad_()
+    grad_key = torch.randn(1, 2, D, dtype=torch.bfloat16, device=DEVICE).requires_grad_()
+    rope.forward_pair(grad_query, grad_key, positions)
+    assert not rope._inference_inv_freq_cache
+
+    initial = run(D, 1_000_000.0)
+    assert run(D, 1_000_000.0) is initial
+    changed_theta = run(D, 10_000.0)
+    assert changed_theta is not initial
+    changed_shape = run(D // 2, 10_000.0)
+    assert changed_shape is not changed_theta
+    assert changed_shape.numel() == D // 4
+
+    cache_entries = len(rope._inference_inv_freq_cache)
+    trained_query = grad_query.detach().clone().requires_grad_()
+    trained_key = grad_key.detach().clone().requires_grad_()
+    trained_out = rope.forward_pair(trained_query, trained_key, positions)
+    (trained_out[0].float().sum() + trained_out[1].float().sum()).backward()
+    assert trained_query.grad is not None
+    assert trained_key.grad is not None
+    assert len(rope._inference_inv_freq_cache) == cache_entries
+
+
+@ROCM_ONLY
+def test_rocm_rope_pair_inference_frequency_cache_is_stream_local():
+    from rl_engine.kernels.ops.rocm.rotary_embedding.rope import _forward_rope_pair
+
+    rope = RocmDeterministicRoPEOp()
+    query = torch.randn(2, 2, D, dtype=torch.bfloat16, device=DEVICE)
+    key = torch.randn(1, 2, D, dtype=torch.bfloat16, device=DEVICE)
+    positions = torch.tensor([7, 31], device=DEVICE)
+    streams = (torch.cuda.Stream(device=DEVICE), torch.cuda.Stream(device=DEVICE))
+    outputs = []
+    repeated_outputs = []
+    expected = []
+    torch.cuda.synchronize(DEVICE)
+
+    for stream in streams:
+        theta = 1_000_000.0
+        with torch.cuda.stream(stream), torch.inference_mode():
+            expected.append(_forward_rope_pair(query, key, positions, theta)[:2])
+            outputs.append(rope.forward_pair(query, key, positions, theta=theta))
+            repeated_outputs.append(rope.forward_pair(query, key, positions, theta=theta))
+    torch.cuda.synchronize(DEVICE)
+
+    assert len(rope._inference_inv_freq_cache) == 2
+    assert len({id(value) for value in rope._inference_inv_freq_cache.values()}) == 2
+    for expected_pair, actual_pair, repeated_pair in zip(
+        expected,
+        outputs,
+        repeated_outputs,
+        strict=True,
+    ):
+        for expected_tensor, actual_tensor, repeated_tensor in zip(
+            expected_pair,
+            actual_pair,
+            repeated_pair,
+            strict=True,
+        ):
+            assert torch.equal(expected_tensor.view(torch.uint8), actual_tensor.view(torch.uint8))
+            assert torch.equal(actual_tensor.view(torch.uint8), repeated_tensor.view(torch.uint8))
+
+
+@ROCM_ONLY
 @pytest.mark.parametrize("tokens", (2, 32))
 def test_vllm_rocm_rope_pair_adapter_matches_legacy_raw_bytes(tokens):
     from rl_engine.integrations.vllm_runtime import _patch_strict_rocm_rotary_embedding
