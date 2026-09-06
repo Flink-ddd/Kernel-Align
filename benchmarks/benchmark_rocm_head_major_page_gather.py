@@ -2,11 +2,13 @@
 # Copyright (c) 2026 RL-Kernel Contributors
 """Benchmark one-pass head-major page gathers for ROCm paged decode.
 
-Both arms consume vLLM's native AITER packed-last KV layout. The legacy arm
-first copies pages in token-major order and then copies again to transpose them;
-the candidate indexes a head-major view and materializes the final order in one
-pass. AITER CK launch count/order and all arithmetic remain unchanged. This is
-an isolated strict-runtime timing, not an end-to-end VIME result.
+By default both arms consume the pair-axis layout used by the vLLM revision in
+the ROCm VIME image: ``[blocks, 2, block, kv_heads, head_dim]``. The adapter's
+packed-last compatibility layout can be selected explicitly. The legacy arm
+first copies pages in token-major order and then copies again to transpose
+them; the candidate indexes a head-major view and materializes the final order
+in one pass. AITER CK launch count/order and all arithmetic remain unchanged.
+This is an isolated strict-runtime timing, not an end-to-end VIME result.
 
 The candidate is active only for gradient-free ``key_heads > 1`` and
 ``cached_length > 1``. Singleton cases intentionally retain the legacy path
@@ -95,6 +97,7 @@ def _benchmark_length(
     key_heads: int,
     head_dim: int,
     page_size: int,
+    kv_layout: str,
     dtype: torch.dtype,
     warmup: int,
     blocks: int,
@@ -113,18 +116,34 @@ def _benchmark_length(
         dtype=dtype,
         generator=generator,
     ).cuda()
-    # Native AITER layout: [blocks, kv_heads, page, 2 * head_dim]. The runtime
-    # receives the strided [blocks, page, kv_heads, head_dim] K/V views.
-    packed_kv = torch.randn(
-        layers,
-        total_pages,
-        key_heads,
-        page_size,
-        2 * head_dim,
-        dtype=dtype,
-        generator=generator,
-    ).cuda()
-    k_caches, v_caches = packed_kv.transpose(2, 3).split(head_dim, dim=-1)
+    if kv_layout == "vllm-rocm-5d":
+        # vLLM ROCM_AITER_FA: [blocks, 2, block, kv_heads, head_dim]. Keep a
+        # leading simulated-layer axis while preserving each layer's strides.
+        packed_kv = torch.randn(
+            layers,
+            total_pages,
+            2,
+            page_size,
+            key_heads,
+            head_dim,
+            dtype=dtype,
+            generator=generator,
+        ).cuda()
+        k_caches, v_caches = packed_kv.unbind(2)
+    elif kv_layout == "packed-last":
+        # Adapter compatibility layout: [blocks, kv_heads, block, 2 * head_dim].
+        packed_kv = torch.randn(
+            layers,
+            total_pages,
+            key_heads,
+            page_size,
+            2 * head_dim,
+            dtype=dtype,
+            generator=generator,
+        ).cuda()
+        k_caches, v_caches = packed_kv.transpose(2, 3).split(head_dim, dim=-1)
+    else:  # pragma: no cover - argparse owns the public validation.
+        raise ValueError(f"unknown KV layout {kv_layout!r}")
     page_table = (
         torch.arange(total_pages, device="cuda", dtype=torch.int32)
         .reshape(batch, pages_per_row)
@@ -255,6 +274,8 @@ def _benchmark_length(
         "key_heads": key_heads,
         "head_dim": head_dim,
         "dtype": str(dtype).removeprefix("torch."),
+        "kv_layout": kv_layout,
+        "kv_cache_stride": list(k_caches[0].stride()),
         "head_major_active": key_heads > 1 and cached_length > 1,
         "distinct_kv_cache_per_layer": True,
         "benchmark_scope": "strict_runtime_native_vllm_kv_simulated_layers",
@@ -295,6 +316,11 @@ def main() -> None:
     parser.add_argument("--key-heads", type=int, default=2)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--page-size", type=int, default=16)
+    parser.add_argument(
+        "--kv-layout",
+        choices=("vllm-rocm-5d", "packed-last"),
+        default="vllm-rocm-5d",
+    )
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--blocks", type=int, default=10)
@@ -329,6 +355,7 @@ def main() -> None:
             key_heads=args.key_heads,
             head_dim=args.head_dim,
             page_size=args.page_size,
+            kv_layout=args.kv_layout,
             dtype=dtype,
             warmup=args.warmup,
             blocks=args.blocks,
@@ -343,6 +370,7 @@ def main() -> None:
                 "torch": torch.__version__,
                 "hip": torch.version.hip,
                 "dtype": args.dtype,
+                "kv_layout": args.kv_layout,
                 "blocks": args.blocks,
                 "iterations_per_block": args.iterations,
                 "results": results,
