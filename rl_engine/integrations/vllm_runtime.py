@@ -525,23 +525,33 @@ def _patch_strict_rocm_rotary_embedding(rotary_cls: type[Any]) -> None:
             )
         flat_positions = positions.reshape(-1).to(device=query.device, dtype=torch.int64)
 
-        def apply(value: torch.Tensor | None) -> torch.Tensor | None:
-            if value is None:
-                return None
+        def head_major(value: torch.Tensor) -> torch.Tensor:
             if value.ndim != 2 or value.shape[1] % head_size:
                 raise RuntimeError(
                     "strict ROCm vLLM RoPE expects flattened [tokens, heads*head_dim] tensors"
                 )
             tokens = value.shape[0]
+            if tokens != flat_positions.numel():
+                raise RuntimeError("strict ROCm vLLM RoPE Q/K must share the position count")
             heads = value.shape[1] // head_size
             # The HIP kernel indexes one position table across rows. A
             # head-major view avoids duplicating the table for every head and
             # keeps the dispatch to one deterministic launch per Q/K tensor.
-            head_major = value.view(tokens, heads, head_size).permute(1, 0, 2).contiguous()
-            rotated = operator(head_major, flat_positions)
-            return rotated.permute(1, 0, 2).reshape_as(value).contiguous()
+            return value.view(tokens, heads, head_size).permute(1, 0, 2).contiguous()
 
-        return apply(query), apply(key)
+        def restore(rotated: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+            return rotated.permute(1, 0, 2).reshape_as(reference).contiguous()
+
+        query_head_major = head_major(query)
+        if key is None:
+            return restore(operator(query_head_major, flat_positions), query), None
+        key_head_major = head_major(key)
+        rotated_query, rotated_key = operator.forward_pair(
+            query_head_major,
+            key_head_major,
+            flat_positions,
+        )
+        return restore(rotated_query, query), restore(rotated_key, key)
 
     strict_forward_cuda.__name__ = getattr(original, "__name__", "forward_cuda")
     setattr(rotary_cls, _STRICT_ROCM_ROPE_PATCH_MARKER, original)

@@ -47,7 +47,7 @@ except (ImportError, RuntimeError):
     _OP_AVAILABLE = False
 
 if IS_ROCM:
-    from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RocmDeterministicRoPEOp
+    from rl_engine.kernels.ops.rocm.rotary_embedding.rope import RocmDeterministicRoPEOp
 
 pytestmark = [
     pytestmark,
@@ -783,6 +783,113 @@ def test_rocm_rope_matches_fp32_rotate_half_reference():
         dim=-1,
     ).to(x.dtype)
     torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
+@ROCM_ONLY
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("tokens", (1, 2, 7, 32))
+def test_rocm_rope_pair_matches_two_single_calls_raw_bytes(dtype, tokens):
+    generator = torch.Generator(device="cpu").manual_seed(810 + tokens)
+    query = torch.randn(8, tokens, D, dtype=dtype, generator=generator).to(DEVICE)
+    key = torch.randn(2, tokens, D, dtype=dtype, generator=generator).to(DEVICE)
+    position_storage = torch.arange(tokens * 2, device=DEVICE, dtype=torch.int64)
+    positions = position_storage[::2]
+    assert not positions.is_contiguous() or tokens == 1
+    rope = RocmDeterministicRoPEOp()
+
+    expected = (rope(query, positions), rope(key, positions))
+    actual = rope.forward_pair(query, key, positions)
+    repeated = rope.forward_pair(query, key, positions)
+    for expected_tensor, actual_tensor, repeated_tensor in zip(
+        expected,
+        actual,
+        repeated,
+        strict=True,
+    ):
+        assert torch.equal(
+            expected_tensor.contiguous().view(torch.uint8),
+            actual_tensor.contiguous().view(torch.uint8),
+        )
+        assert torch.equal(
+            actual_tensor.contiguous().view(torch.uint8),
+            repeated_tensor.contiguous().view(torch.uint8),
+        )
+
+
+@ROCM_ONLY
+@pytest.mark.parametrize("tokens", (2, 32))
+def test_vllm_rocm_rope_pair_adapter_matches_legacy_raw_bytes(tokens):
+    from rl_engine.integrations.vllm_runtime import _patch_strict_rocm_rotary_embedding
+
+    generator = torch.Generator(device="cpu").manual_seed(812 + tokens)
+    query = torch.randn(tokens, 8 * D, dtype=torch.bfloat16, generator=generator).to(DEVICE)
+    key = torch.randn(tokens, 2 * D, dtype=torch.bfloat16, generator=generator).to(DEVICE)
+    positions = torch.arange(tokens, device=DEVICE, dtype=torch.int64)
+    rope = RocmDeterministicRoPEOp()
+
+    def legacy(value):
+        heads = value.shape[1] // D
+        head_major = value.view(tokens, heads, D).permute(1, 0, 2).contiguous()
+        return rope(head_major, positions).permute(1, 0, 2).reshape_as(value).contiguous()
+
+    class Rotary:
+        head_size = D
+        rotary_dim = D
+
+        def forward_cuda(self, positions, query, key=None):
+            return query, key
+
+    expected = legacy(query), legacy(key)
+    _patch_strict_rocm_rotary_embedding(Rotary)
+    actual = Rotary().forward_cuda(positions, query, key)
+    for expected_tensor, actual_tensor in zip(expected, actual, strict=True):
+        assert torch.equal(expected_tensor.view(torch.uint8), actual_tensor.view(torch.uint8))
+
+
+@ROCM_ONLY
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_rocm_rope_pair_backward_matches_two_single_calls_raw_bytes(dtype):
+    generator = torch.Generator(device="cpu").manual_seed(811)
+    positions = torch.tensor([9, 2, 41, 2, 77, 5, 103], device=DEVICE)
+    query = torch.randn(8, positions.numel(), D, dtype=dtype, generator=generator)
+    key = torch.randn(2, positions.numel(), D, dtype=dtype, generator=generator)
+    query = query.to(DEVICE)
+    key = key.to(DEVICE)
+    query_grad = torch.randn(query.shape, dtype=query.dtype, generator=generator).to(DEVICE)
+    key_grad = torch.randn(key.shape, dtype=key.dtype, generator=generator).to(DEVICE)
+    rope = RocmDeterministicRoPEOp()
+
+    expected_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in (query, key))
+    expected_outputs = tuple(rope(tensor, positions) for tensor in expected_inputs)
+    (expected_outputs[0].float() * query_grad.float()).sum().backward()
+    (expected_outputs[1].float() * key_grad.float()).sum().backward()
+
+    actual_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in (query, key))
+    actual_outputs = rope.forward_pair(actual_inputs[0], actual_inputs[1], positions)
+    loss = (actual_outputs[0].float() * query_grad.float()).sum()
+    loss = loss + (actual_outputs[1].float() * key_grad.float()).sum()
+    loss.backward()
+
+    for expected_input, actual_input in zip(expected_inputs, actual_inputs, strict=True):
+        assert torch.equal(
+            expected_input.grad.contiguous().view(torch.uint8),
+            actual_input.grad.contiguous().view(torch.uint8),
+        )
+
+
+@ROCM_ONLY
+@pytest.mark.parametrize("query_requires_grad", (False, True))
+def test_rocm_rope_pair_preserves_independent_autograd_semantics(query_requires_grad):
+    positions = torch.tensor([1, 3], device=DEVICE)
+    query = torch.randn(8, 2, D, device=DEVICE, dtype=torch.bfloat16)
+    key = torch.randn(2, 2, D, device=DEVICE, dtype=torch.bfloat16)
+    query.requires_grad_(query_requires_grad)
+    key.requires_grad_(not query_requires_grad)
+
+    query_out, key_out = RocmDeterministicRoPEOp().forward_pair(query, key, positions)
+
+    assert query_out.requires_grad is query_requires_grad
+    assert key_out.requires_grad is (not query_requires_grad)
 
 
 def test_strict_core_rejects_split_k():

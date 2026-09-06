@@ -39,6 +39,7 @@ from rl_engine.integrations.runtime import FrameworkOperatorIntegration
 from rl_engine.integrations.state import clear_active_integration
 from rl_engine.integrations.vllm_runtime import (
     _patch_qwen3_strict_model,
+    _patch_strict_rocm_rotary_embedding,
     _register_attention_backend,
     configure_vllm_environment,
 )
@@ -757,6 +758,48 @@ def test_vllm_qwen3_strict_model_installs_without_debug_environment(monkeypatch)
         norm.forward_cuda(value),
         torch.nn.functional.rms_norm(value, (2,), norm.weight, 1e-6),
     )
+
+
+def test_vllm_rocm_rotary_reuses_one_table_for_query_and_key(monkeypatch):
+    calls = []
+
+    class FakeOperator:
+        def __call__(self, value, positions):
+            calls.append(("single", tuple(value.shape), positions.clone()))
+            return value + 1
+
+        def forward_pair(self, query, key, positions):
+            calls.append(("pair", tuple(query.shape), tuple(key.shape), positions.clone()))
+            return query + 2, key + 3
+
+    class Rotary:
+        head_size = 4
+        rotary_dim = 4
+
+        def forward_cuda(self, positions, query, key=None):
+            return query, key
+
+    monkeypatch.setattr(torch.version, "hip", "test")
+    monkeypatch.setattr(
+        "rl_engine.kernels.ops.rocm.rotary_embedding.rope.RocmDeterministicRoPEOp",
+        FakeOperator,
+    )
+    _patch_strict_rocm_rotary_embedding(Rotary)
+    rotary = Rotary()
+    positions = torch.tensor([7, 2])
+    query = torch.arange(24, dtype=torch.float32).reshape(2, 12)
+    key = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    query_out, key_out = rotary.forward_cuda(positions, query, key)
+    assert torch.equal(query_out, query + 2)
+    assert torch.equal(key_out, key + 3)
+    assert calls[0][0] == "pair"
+    assert calls[0][1:3] == ((3, 2, 4), (1, 2, 4))
+
+    query_only, absent_key = rotary.forward_cuda(positions, query)
+    assert torch.equal(query_only, query + 1)
+    assert absent_key is None
+    assert calls[1][0] == "single"
 
 
 def test_vllm_logp_replaces_every_duplicate_sampled_token_column():
