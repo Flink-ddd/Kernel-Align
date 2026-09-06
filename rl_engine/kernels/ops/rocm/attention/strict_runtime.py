@@ -289,6 +289,21 @@ class StrictRocmAttentionRuntime:
                 raise ValueError("paged Attention out must match the Q dtype and device")
             if not out.is_contiguous():
                 raise ValueError("paged Attention out must be contiguous")
+        direct_core_out = (
+            out is not None
+            and not torch.is_grad_enabled()
+            and not any(tensor.requires_grad for tensor in (q, k_cache, v_cache, out))
+            and q.size(2) == 1
+            and callable(getattr(self._core, "forward_decode_with_lse_into", None))
+            and self._storage_is_disjoint(
+                out,
+                q,
+                k_cache,
+                v_cache,
+                page_table,
+                seqused_k,
+            )
+        )
 
         if cached_lengths is None:
             cached_lengths = tuple(int(value) for value in seqused_k.tolist())
@@ -327,6 +342,7 @@ class StrictRocmAttentionRuntime:
                 key_position_ids=None,
                 output_dtype=q.dtype,
                 out=None if out is None else out[row : row + 1],
+                direct_core_out=direct_core_out,
             )
             if out is None:
                 row_outs.append(row_out)
@@ -375,6 +391,9 @@ class StrictRocmAttentionRuntime:
                 "core_batch_size": q.size(0),
                 "core_query_length": q.size(2),
                 "core_actual_backends": [] if backend is None else [str(backend)],
+                "core_output_staging": (
+                    "aiter_direct_caller_group" if direct_core_out else "runtime_group_cat"
+                ),
                 "core": core_provenance,
             },
         )
@@ -461,6 +480,7 @@ class StrictRocmAttentionRuntime:
         key_position_ids: torch.Tensor | None,
         output_dtype: torch.dtype,
         out: torch.Tensor | None = None,
+        direct_core_out: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], int]:
         """Launch the core once per ``(batch row, KV group)`` and concatenate.
 
@@ -474,6 +494,15 @@ class StrictRocmAttentionRuntime:
                 f"local Q heads={q.size(1)} must be divisible by local KV heads={local_kv_heads}"
             )
         group_size = q.size(1) // local_kv_heads
+        if direct_core_out:
+            if out is None or causal or q.size(2) != 1:
+                raise RuntimeError("direct ROCm core output is only valid for paged decode")
+            if torch.is_grad_enabled() or any(
+                tensor.requires_grad for tensor in (q, k, v, out)
+            ):
+                raise RuntimeError("direct ROCm core output requires disabled gradient mode")
+            if not callable(getattr(self._core, "forward_decode_with_lse_into", None)):
+                raise RuntimeError("strict ROCm core has no direct decode output entry point")
 
         row_outs: list[torch.Tensor] = []
         row_lses: list[torch.Tensor] = []
@@ -490,25 +519,40 @@ class StrictRocmAttentionRuntime:
             group_lses: list[torch.Tensor] = []
             for group in range(local_kv_heads):
                 q_lo, q_hi = group * group_size, (group + 1) * group_size
-                result = self._core.forward_with_lse(
-                    q[row : row + 1, q_lo:q_hi],
-                    k[row : row + 1, group : group + 1],
-                    v[row : row + 1, group : group + 1],
-                    causal=causal,
-                    scale=scale,
-                    key_padding_mask=None,
-                    query_position_ids=row_query_positions if causal else None,
-                    key_position_ids=row_key_positions if causal else None,
-                    output_dtype=output_dtype,
-                )
-                group_outs.append(result.out)
+                group_out = None
+                if direct_core_out:
+                    group_out = out[row : row + 1, q_lo:q_hi]
+                    result = self._core.forward_decode_with_lse_into(
+                        q[row : row + 1, q_lo:q_hi],
+                        k[row : row + 1, group : group + 1],
+                        v[row : row + 1, group : group + 1],
+                        out=group_out,
+                        scale=scale,
+                        output_dtype=output_dtype,
+                    )
+                else:
+                    result = self._core.forward_with_lse(
+                        q[row : row + 1, q_lo:q_hi],
+                        k[row : row + 1, group : group + 1],
+                        v[row : row + 1, group : group + 1],
+                        causal=causal,
+                        scale=scale,
+                        key_padding_mask=None,
+                        query_position_ids=row_query_positions if causal else None,
+                        key_position_ids=row_key_positions if causal else None,
+                        output_dtype=output_dtype,
+                    )
+                if group_out is None:
+                    group_outs.append(result.out)
+                elif result.out.data_ptr() != group_out.data_ptr():
+                    raise RuntimeError("strict ROCm core did not write to its output slice")
                 group_lses.append(result.lse)
                 launches += 1
                 if core_provenance is None:
                     core_provenance = dict(result.provenance)
             if out is None:
                 row_outs.append(torch.cat(group_outs, dim=1))
-            else:
+            elif not direct_core_out:
                 torch.cat(group_outs, dim=1, out=out[row : row + 1])
             row_lses.append(torch.cat(group_lses, dim=1))
 
@@ -520,6 +564,11 @@ class StrictRocmAttentionRuntime:
             core_provenance,
             launches,
         )
+
+    @staticmethod
+    def _storage_is_disjoint(output: torch.Tensor, *inputs: torch.Tensor) -> bool:
+        output_storage = output.untyped_storage().data_ptr()
+        return all(tensor.untyped_storage().data_ptr() != output_storage for tensor in inputs)
 
     @staticmethod
     def _require_rocm(tensor: torch.Tensor) -> None:

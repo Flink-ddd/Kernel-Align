@@ -558,6 +558,69 @@ def test_strict_rocm_aiter_ck_core_fixes_forward_and_backward_contract(monkeypat
     assert q.grad is not None and k.grad is not None and v.grad is not None
 
 
+def test_strict_rocm_aiter_ck_direct_decode_uses_callers_output(monkeypatch):
+    seen_out = None
+
+    def fake_fwd(q, k, v, *_args, out=None):
+        nonlocal seen_out
+        seen_out = out
+        out.copy_(q)
+        return (
+            out,
+            torch.zeros(q.size(0), q.size(2), q.size(1), dtype=torch.float32),
+            torch.empty(0),
+            torch.zeros(2, dtype=torch.int64),
+        )
+
+    core = StrictRocmAiterCKAttentionCore(
+        _mha_fwd=fake_fwd,
+        _mha_bwd=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(core, "_validate_inputs", lambda *_args: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: type("Props", (), {"name": "test-gpu", "gcnArchName": "gfx-test"})(),
+    )
+    q = torch.randn(1, 4, 1, 8, dtype=torch.bfloat16)
+    k = torch.randn(1, 1, 7, 8, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+
+    with torch.no_grad():
+        result = core.forward_decode_with_lse_into(q, k, v, out=out, scale=0.125)
+
+    assert seen_out is not None and seen_out.data_ptr() == out.data_ptr()
+    assert result.out is out
+    assert torch.equal(out, q)
+    assert result.provenance["core_output_staging"] == "aiter_direct_caller_group"
+
+
+def test_strict_rocm_aiter_ck_direct_decode_rejects_ignored_output(monkeypatch):
+    def fake_fwd(q, k, v, *_args, out=None):
+        return (
+            q.clone(),
+            torch.zeros(q.size(0), q.size(2), q.size(1), dtype=torch.float32),
+            torch.empty(0),
+            torch.zeros(2, dtype=torch.int64),
+        )
+
+    core = StrictRocmAiterCKAttentionCore(
+        _mha_fwd=fake_fwd,
+        _mha_bwd=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(core, "_validate_inputs", lambda *_args: None)
+    q = torch.randn(1, 4, 1, 8, dtype=torch.bfloat16)
+    k = torch.randn(1, 1, 7, 8, dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+
+    with torch.no_grad(), pytest.raises(
+        StrictRocmAttentionUnavailable,
+        match="requested output buffer",
+    ):
+        core.forward_decode_with_lse_into(q, k, k, out=out)
+
+
 def test_strict_rocm_aiter_ck_core_rejects_non_fp32_lse(monkeypatch):
     def fake_fwd(q, k, v, *_args):
         return (

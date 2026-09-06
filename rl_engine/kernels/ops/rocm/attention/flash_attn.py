@@ -51,6 +51,7 @@ _AITER_FWD_POSITIONAL_CONTRACT = (
     "return_softmax_lse",
     "return_dropout_randval",
 )
+_AITER_FWD_REQUIRED_KEYWORDS = frozenset({"out"})
 _AITER_BWD_POSITIONAL_CONTRACT = (
     "dout",
     "q",
@@ -134,7 +135,11 @@ def _load_aiter_ck_ops() -> tuple[Callable[..., Any], Callable[..., Any], str]:
         ) from exc
     if not callable(mha_fwd) or not callable(mha_bwd):
         raise StrictRocmAttentionUnavailable("AITER CK MHA entry points are not callable")
-    _validate_aiter_schema("mha_fwd", _AITER_FWD_POSITIONAL_CONTRACT)
+    _validate_aiter_schema(
+        "mha_fwd",
+        _AITER_FWD_POSITIONAL_CONTRACT,
+        required_keywords=_AITER_FWD_REQUIRED_KEYWORDS,
+    )
     _validate_aiter_schema(
         "mha_bwd",
         _AITER_BWD_POSITIONAL_CONTRACT,
@@ -145,6 +150,40 @@ def _load_aiter_ck_ops() -> tuple[Callable[..., Any], Callable[..., Any], str]:
         raise StrictRocmAttentionUnavailable("cannot fingerprint the AITER MHA source module")
     source_sha256 = hashlib.sha256(Path(module_file).read_bytes()).hexdigest()
     return mha_fwd, mha_bwd, source_sha256
+
+
+def _call_aiter_mha_fwd_into(
+    mha_fwd: Callable[..., Any],
+    q_fa: torch.Tensor,
+    k_fa: torch.Tensor,
+    v_fa: torch.Tensor,
+    *,
+    causal: bool,
+    scale: float,
+    out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    result = mha_fwd(
+        q_fa,
+        k_fa,
+        v_fa,
+        0.0,
+        float(scale),
+        bool(causal),
+        -1,
+        -1,
+        0,
+        True,
+        False,
+        out=out,
+    )
+    if not isinstance(result, (tuple, list)) or len(result) != 4:
+        raise StrictRocmAttentionUnavailable(
+            "AITER mha_fwd must return (out, lse, dropout_mask, rng_state)"
+        )
+    out_fa, lse, _dropout_mask, rng_state = result
+    if not all(isinstance(item, torch.Tensor) for item in (out_fa, lse, rng_state)):
+        raise StrictRocmAttentionUnavailable("AITER mha_fwd returned non-tensor state")
+    return out_fa, lse, rng_state
 
 
 class _AiterCKAttentionFn(Function):
@@ -295,7 +334,7 @@ class StrictRocmAiterCKAttentionCore:
         if resolved_dtype != q.dtype:
             raise ValueError("strict Attention output_dtype must match the Q/K/V input dtype")
         resolved_scale = 1.0 / math.sqrt(q.size(-1)) if scale is None else float(scale)
-        out, lse = _AiterCKAttentionFn.apply(
+        result_out, lse = _AiterCKAttentionFn.apply(
             q,
             k,
             v,
@@ -304,41 +343,131 @@ class StrictRocmAiterCKAttentionCore:
             self._mha_fwd,
             self._mha_bwd,
         )
+        return self._finish_result(q, k, result_out, lse, resolved_dtype)
+
+    def forward_decode_with_lse_into(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        out: torch.Tensor,
+        scale: float | None = None,
+        output_dtype: torch.dtype | None = None,
+    ) -> DeterministicAttentionCoreResult:
+        """Run single-token no-grad decode directly into a caller buffer."""
+
+        self._validate_inputs(q, k, v, None)
+        self._validate_direct_output(out, q, k, v)
+        resolved_dtype = q.dtype if output_dtype is None else output_dtype
+        if resolved_dtype != q.dtype:
+            raise ValueError("strict Attention output_dtype must match the Q/K/V input dtype")
+        resolved_scale = 1.0 / math.sqrt(q.size(-1)) if scale is None else float(scale)
+        q_fa = q.transpose(1, 2).contiguous()
+        k_fa = k.transpose(1, 2).contiguous()
+        v_fa = v.transpose(1, 2).contiguous()
+        out_fa = out.transpose(1, 2)
+        returned_out, lse, _rng_state = _call_aiter_mha_fwd_into(
+            self._mha_fwd,
+            q_fa,
+            k_fa,
+            v_fa,
+            causal=False,
+            scale=resolved_scale,
+            out=out_fa,
+        )
+        if (
+            returned_out.data_ptr() != out_fa.data_ptr()
+            or returned_out.shape != out_fa.shape
+            or returned_out.dtype != out_fa.dtype
+            or returned_out.device != out_fa.device
+        ):
+            raise StrictRocmAttentionUnavailable(
+                "AITER CK did not write to the requested output buffer"
+            )
+        return self._finish_result(
+            q,
+            k,
+            out,
+            lse.contiguous(),
+            resolved_dtype,
+            extra_provenance={
+                "output_buffer_reused": True,
+                "core_output_staging": "aiter_direct_caller_group",
+            },
+        )
+
+    def _finish_result(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        resolved_dtype: torch.dtype,
+        *,
+        extra_provenance: dict[str, object] | None = None,
+    ) -> DeterministicAttentionCoreResult:
         expected_lse_shape = (q.size(0), q.size(1), q.size(2))
         if out.shape != q.shape or out.dtype != resolved_dtype:
             raise StrictRocmAttentionUnavailable("AITER CK output shape/dtype changed")
         if tuple(lse.shape) != expected_lse_shape or lse.dtype != torch.float32:
             raise StrictRocmAttentionUnavailable("AITER CK must export [B,H,Sq] FP32 LSE")
         device_properties = torch.cuda.get_device_properties(q.device)
+        provenance: dict[str, object] = {
+            "strict_core_id": self.core_id,
+            "strict_schedule": self.strict_schedule,
+            "attention_backend": self.backend_id,
+            "platform": "rocm",
+            "torch_version": torch.__version__,
+            "rocm_version": torch.version.hip,
+            "gpu_name": device_properties.name,
+            "gpu_arch": getattr(device_properties, "gcnArchName", "unknown"),
+            "aiter_api_source": self.api_source,
+            "aiter_source_sha256": self.source_sha256,
+            "num_splits": self.num_splits,
+            "split_kv_control": self.split_kv_control,
+            "deterministic_backward": self.deterministic_backward,
+            "dropout_p": 0.0,
+            "split_kv": self.split_kv.resolve(k.size(2), backend=self.backend_id).to_dict(),
+            "merge_order": self.merge_order,
+            "accum_dtype": self.accum_dtype,
+            "downcast_at": self.downcast_at,
+            "fallback": self.fallback,
+            "fallback_reason": None,
+            "native_attention_arithmetic": self.native_attention_arithmetic,
+            "production_ready": self.production_ready,
+            "reference_only": self.reference_only,
+        }
+        if extra_provenance is not None:
+            provenance.update(extra_provenance)
         return DeterministicAttentionCoreResult(
             out=out,
             lse=lse,
-            provenance={
-                "strict_core_id": self.core_id,
-                "strict_schedule": self.strict_schedule,
-                "attention_backend": self.backend_id,
-                "platform": "rocm",
-                "torch_version": torch.__version__,
-                "rocm_version": torch.version.hip,
-                "gpu_name": device_properties.name,
-                "gpu_arch": getattr(device_properties, "gcnArchName", "unknown"),
-                "aiter_api_source": self.api_source,
-                "aiter_source_sha256": self.source_sha256,
-                "num_splits": self.num_splits,
-                "split_kv_control": self.split_kv_control,
-                "deterministic_backward": self.deterministic_backward,
-                "dropout_p": 0.0,
-                "split_kv": self.split_kv.resolve(k.size(2), backend=self.backend_id).to_dict(),
-                "merge_order": self.merge_order,
-                "accum_dtype": self.accum_dtype,
-                "downcast_at": self.downcast_at,
-                "fallback": self.fallback,
-                "fallback_reason": None,
-                "native_attention_arithmetic": self.native_attention_arithmetic,
-                "production_ready": self.production_ready,
-                "reference_only": self.reference_only,
-            },
+            provenance=provenance,
         )
+
+    @staticmethod
+    def _validate_direct_output(
+        out: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        if torch.is_grad_enabled():
+            raise ValueError("AITER CK direct output requires disabled gradient mode")
+        if q.size(2) != 1:
+            raise ValueError("AITER CK direct output is restricted to single-token decode")
+        if k.size(1) != 1:
+            raise ValueError("AITER CK direct output requires exactly one KV group")
+        if out.shape != q.shape or out.dtype != q.dtype or out.device != q.device:
+            raise ValueError("AITER CK direct output must match the Q shape, dtype, and device")
+        if not out.is_contiguous():
+            raise ValueError("AITER CK direct output must be contiguous")
+        if out.requires_grad or any(tensor.requires_grad for tensor in (q, k, v)):
+            raise ValueError("AITER CK direct output is restricted to no-grad decode")
+        output_storage = out.untyped_storage().data_ptr()
+        if any(tensor.untyped_storage().data_ptr() == output_storage for tensor in (q, k, v)):
+            raise ValueError("AITER CK direct output must not alias Q/K/V storage")
 
     @staticmethod
     def _validate_inputs(

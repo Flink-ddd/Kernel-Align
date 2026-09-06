@@ -37,23 +37,40 @@ class _RecordingCore:
         self.calls: list[dict[str, Any]] = []
 
     def forward_with_lse(self, q, k, v, **kwargs) -> Any:
+        requested_out = kwargs.get("out")
         self.calls.append(
             {
                 "q": q,
                 "k": k.clone(),
                 "v": v.clone(),
+                "out": requested_out,
                 "causal": kwargs.get("causal"),
                 "query_position_ids": kwargs.get("query_position_ids"),
                 "key_position_ids": kwargs.get("key_position_ids"),
             }
         )
 
+        result_out = torch.zeros(
+            q.size(0),
+            q.size(1),
+            q.size(2),
+            _HEAD_DIM,
+            dtype=q.dtype,
+        )
+        if requested_out is not None:
+            requested_out.copy_(result_out)
+            result_out = requested_out
+
         class _Result:
-            out = torch.zeros(q.size(0), q.size(1), q.size(2), _HEAD_DIM, dtype=q.dtype)
             lse = torch.zeros(q.size(0), q.size(1), q.size(2), dtype=torch.float32)
             provenance = {"attention_backend": "aiter.rocm.ck_dense_mha"}
 
-        return _Result()
+        result = _Result()
+        result.out = result_out
+        return result
+
+    def forward_decode_with_lse_into(self, q, k, v, *, out, **kwargs) -> Any:
+        return self.forward_with_lse(q, k, v, out=out, causal=False, **kwargs)
 
 
 def _runtime() -> StrictRocmAttentionRuntime:
@@ -232,7 +249,62 @@ def test_paged_decode_rejects_a_mismatched_out_buffer() -> None:
 
 
 def test_paged_decode_writes_into_the_callers_output_buffer() -> None:
-    runtime = _runtime()
+    core = _RecordingCore()
+    runtime = StrictRocmAttentionRuntime(core=core)
+    k_cache = _cache(2)
+    q = torch.zeros(1, 1, 1, _HEAD_DIM, dtype=torch.bfloat16)
+    out = torch.full_like(q, 7)
+
+    with torch.no_grad():
+        result = runtime.forward_paged_with_lse(
+            q,
+            k_cache,
+            k_cache + 1,
+            page_table=torch.tensor([[0]], dtype=torch.int32),
+            seqused_k=torch.tensor([4], dtype=torch.int32),
+            max_seqlen_k=_PAGE_SIZE,
+            scale=None,
+            out=out,
+            cached_lengths=(4,),
+        )
+
+    assert result.out is out
+    assert torch.equal(out, torch.zeros_like(out))
+    assert core.calls[0]["out"].data_ptr() == out.data_ptr()
+    assert result.provenance["core_output_staging"] == "aiter_direct_caller_group"
+
+
+def test_paged_decode_writes_each_kv_group_directly_to_its_output_slice() -> None:
+    core = _RecordingCore()
+    runtime = StrictRocmAttentionRuntime(core=core)
+    k_cache = _cache(2, kv_heads=2)
+    q = torch.zeros(1, 4, 1, _HEAD_DIM, dtype=torch.bfloat16)
+    out = torch.full_like(q, 7)
+
+    with torch.no_grad():
+        result = runtime.forward_paged_with_lse(
+            q,
+            k_cache,
+            k_cache + 1,
+            page_table=torch.tensor([[0]], dtype=torch.int32),
+            seqused_k=torch.tensor([4], dtype=torch.int32),
+            max_seqlen_k=_PAGE_SIZE,
+            scale=None,
+            out=out,
+            cached_lengths=(4,),
+        )
+
+    assert result.out is out
+    assert len(core.calls) == 2
+    assert core.calls[0]["out"].data_ptr() == out[:, :2].data_ptr()
+    assert core.calls[1]["out"].data_ptr() == out[:, 2:].data_ptr()
+    assert torch.equal(out, torch.zeros_like(out))
+    assert result.provenance["core_output_staging"] == "aiter_direct_caller_group"
+
+
+def test_paged_decode_keeps_staging_when_gradient_mode_is_enabled() -> None:
+    core = _RecordingCore()
+    runtime = StrictRocmAttentionRuntime(core=core)
     k_cache = _cache(2)
     q = torch.zeros(1, 1, 1, _HEAD_DIM, dtype=torch.bfloat16)
     out = torch.full_like(q, 7)
@@ -250,7 +322,32 @@ def test_paged_decode_writes_into_the_callers_output_buffer() -> None:
     )
 
     assert result.out is out
-    assert torch.equal(out, torch.zeros_like(out))
+    assert core.calls[0]["out"] is None
+    assert result.provenance["core_output_staging"] == "runtime_group_cat"
+
+
+def test_paged_decode_keeps_staging_when_output_aliases_an_input() -> None:
+    core = _RecordingCore()
+    runtime = StrictRocmAttentionRuntime(core=core)
+    k_cache = _cache(2)
+    q = torch.zeros(1, 1, 1, _HEAD_DIM, dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        result = runtime.forward_paged_with_lse(
+            q,
+            k_cache,
+            k_cache + 1,
+            page_table=torch.tensor([[0]], dtype=torch.int32),
+            seqused_k=torch.tensor([4], dtype=torch.int32),
+            max_seqlen_k=_PAGE_SIZE,
+            scale=None,
+            out=q,
+            cached_lengths=(4,),
+        )
+
+    assert result.out is q
+    assert core.calls[0]["out"] is None
+    assert result.provenance["core_output_staging"] == "runtime_group_cat"
 
 
 def test_rocm_registry_does_not_claim_decode_before_a_caller_routes_to_it() -> None:

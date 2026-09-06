@@ -892,6 +892,40 @@ def test_rocm_rope_pair_preserves_independent_autograd_semantics(query_requires_
     assert key_out.requires_grad is (not query_requires_grad)
 
 
+@ROCM_ONLY
+@pytest.mark.parametrize("cached_length", (32, 127, 512))
+def test_rocm_aiter_decode_direct_output_matches_staged_raw_bytes(cached_length):
+    from rl_engine.kernels.ops.rocm.attention.flash_attn import (
+        StrictRocmAiterCKAttentionCore,
+    )
+
+    generator = torch.Generator(device="cpu").manual_seed(820 + cached_length)
+    q = torch.randn(1, 4, 1, D, dtype=torch.bfloat16, generator=generator).to(DEVICE)
+    k = torch.randn(1, 1, cached_length, D, dtype=torch.bfloat16, generator=generator).to(DEVICE)
+    v = torch.randn(1, 1, cached_length, D, dtype=torch.bfloat16, generator=generator).to(DEVICE)
+    core = StrictRocmAiterCKAttentionCore()
+
+    with torch.inference_mode():
+        staged = core.forward_with_lse(q, k, v, causal=False)
+        caller_out = torch.empty_like(q)
+        direct = core.forward_decode_with_lse_into(q, k, v, out=caller_out)
+        repeated_out = torch.empty_like(q)
+        repeated = core.forward_decode_with_lse_into(q, k, v, out=repeated_out)
+
+    assert direct.out is caller_out
+    assert direct.out.data_ptr() == caller_out.data_ptr()
+    assert direct.provenance["core_output_staging"] == "aiter_direct_caller_group"
+    for expected, actual, replay in (
+        (staged.out, direct.out, repeated.out),
+        (staged.lse, direct.lse, repeated.lse),
+    ):
+        expected_bytes = expected.contiguous().view(torch.uint8)
+        actual_bytes = actual.contiguous().view(torch.uint8)
+        replay_bytes = replay.contiguous().view(torch.uint8)
+        assert torch.equal(expected_bytes, actual_bytes)
+        assert torch.equal(actual_bytes, replay_bytes)
+
+
 def test_strict_core_rejects_split_k():
     with pytest.raises(ValueError, match="Split-KV"):
         RLKernelDeterministicAttentionCore(split_kv=SplitKVSpec.fixed(32))
