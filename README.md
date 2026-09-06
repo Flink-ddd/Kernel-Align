@@ -121,6 +121,8 @@ cost for a net saving of **20.72 seconds per end-to-end step**.
 
 ![Qwen3-8B performance comparison: stage times, throughput, and relative changes for vime native G10 and optimized RL-Kernel G11](./docs/assets/qwen3-8b-performance-summary.png)
 
+![Qwen3-8B training, reward, and train–rollout consistency curves for G10 and optimized G11](./examples/vime_qwen3_8b_tp4_cp2_200/results/scale_reference_s1234_g10_g11_optimized/consistency-reward.png)
+
 ## Hardware Support
 
 RL-Kernel currently supports the following hardware targets.
