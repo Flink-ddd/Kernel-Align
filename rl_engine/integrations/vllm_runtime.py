@@ -10,6 +10,7 @@ import os
 import pathlib
 import re
 import sys
+from dataclasses import dataclass
 from types import MethodType
 from typing import Any
 
@@ -52,6 +53,12 @@ _STRICT_ATTENTION_RMS_NORM_MARKER = "__rl_kernel_strict_attention_rms_norm__"
 _STRICT_ROTARY_INIT_MARKER = "__rl_kernel_original_strict_rotary_init__"
 _STRICT_ROCM_ROPE_PATCH_MARKER = "__rl_kernel_original_strict_rocm_rope_forward__"
 _STRICT_LM_HEAD_LINEAR_PATCH_MARKER = "__rl_kernel_original_lm_head_linear_apply__"
+_STRICT_LM_HEAD_PROCESS_PATCH_MARKER = "__rl_kernel_original_lm_head_process_weights__"
+_STRICT_LM_HEAD_TIE_PATCH_MARKER = "__rl_kernel_original_lm_head_tie_weights__"
+_STRICT_LM_HEAD_CACHE_BUFFER = "_rl_kernel_lm_head_weight_t"
+_STRICT_LM_HEAD_CACHE_STATE = "_rl_kernel_lm_head_weight_cache_state"
+_STRICT_LM_HEAD_CACHE_HOOK = "_rl_kernel_lm_head_weight_cache_state_dict_hook"
+_STRICT_LM_HEAD_TIED = "_rl_kernel_lm_head_tied_weight"
 _STRICT_O_PROJ_COLLECTIVE_MARKER = "__rl_kernel_o_proj_collective__"
 _STRICT_ROW_PARALLEL_PATCH_MARKER = "__rl_kernel_original_row_parallel_forward__"
 _STRICT_DIRECT_STAGING_MARKER = "__rl_kernel_direct_staging_active__"
@@ -63,6 +70,218 @@ _RLK_O_PROJ_COLLECTIVE_BACKEND: str | None = None
 _VLLM_LAYER_DIAGNOSTIC_BUFFER: dict[str, Any] | None = None
 _VLLM_LAYER_DIAGNOSTIC_CALLS = 0
 _VLLM_LAYER_DIAGNOSTIC_ACTIVE_LAYER: int | None = None
+
+
+@dataclass
+class _LmHeadWeightCacheState:
+    source: torch.Tensor
+    weight_t: torch.Tensor
+    source_data_ptr: int
+    source_shape: tuple[int, ...]
+    source_stride: tuple[int, ...]
+    source_dtype: torch.dtype
+    source_device: torch.device
+    source_version: int | None
+    cache_data_ptr: int
+    cache_version: int | None
+    generation: int
+    valid: bool
+    refresh_pending: bool
+
+
+def _tracked_tensor_version(value: torch.Tensor) -> int | None:
+    try:
+        return int(value._version)
+    except RuntimeError:
+        # Tensors created in inference mode do not carry a version counter.
+        return None
+
+
+def _invalidate_lm_head_weight_cache(weight: Any) -> None:
+    state = getattr(weight, _STRICT_LM_HEAD_CACHE_STATE, None)
+    if isinstance(state, _LmHeadWeightCacheState):
+        state.valid = False
+        state.refresh_pending = False
+
+
+def _mark_lm_head_weight_cache_refreshable(weight: Any) -> None:
+    state = getattr(weight, _STRICT_LM_HEAD_CACHE_STATE, None)
+    if isinstance(state, _LmHeadWeightCacheState):
+        state.refresh_pending = True
+
+
+def _keep_lm_head_cache_non_persistent(layer: Any, *_args: Any) -> None:
+    buffers = getattr(layer, "_buffers", {})
+    non_persistent = getattr(layer, "_non_persistent_buffers_set", None)
+    if _STRICT_LM_HEAD_CACHE_BUFFER in buffers and isinstance(non_persistent, set):
+        non_persistent.add(_STRICT_LM_HEAD_CACHE_BUFFER)
+
+
+def _record_lm_head_weight_cache_refresh(
+    state: _LmHeadWeightCacheState,
+    weight: torch.Tensor,
+) -> None:
+    state.source_data_ptr = int(weight.data_ptr())
+    state.source_shape = tuple(int(dim) for dim in weight.shape)
+    state.source_stride = tuple(int(stride) for stride in weight.stride())
+    state.source_dtype = weight.dtype
+    state.source_device = weight.device
+    state.source_version = _tracked_tensor_version(weight)
+    state.cache_data_ptr = int(state.weight_t.data_ptr())
+    state.cache_version = _tracked_tensor_version(state.weight_t)
+    state.generation += 1
+    state.valid = True
+    state.refresh_pending = False
+
+
+def _refresh_lm_head_weight_cache(
+    layer: Any,
+    prepare_weight: Any,
+) -> _LmHeadWeightCacheState:
+    weight = getattr(layer, "weight", None)
+    if not isinstance(weight, torch.Tensor):
+        raise RuntimeError("strict ROCm LM-head cache requires a tensor weight")
+    if bool(getattr(layer, _STRICT_LM_HEAD_TIED, False)):
+        raise RuntimeError("strict ROCm LM-head cache does not support tied embeddings")
+
+    state = getattr(layer, _STRICT_LM_HEAD_CACHE_STATE, None)
+    if state is None:
+        weight_t = prepare_weight(weight)
+        register_buffer = getattr(layer, "register_buffer", None)
+        if callable(register_buffer):
+            register_buffer(
+                _STRICT_LM_HEAD_CACHE_BUFFER,
+                weight_t,
+                persistent=False,
+            )
+        else:
+            # Kept for lightweight integration adapters used outside nn.Module.
+            setattr(layer, _STRICT_LM_HEAD_CACHE_BUFFER, weight_t)
+        register_state_dict_pre_hook = getattr(layer, "register_state_dict_pre_hook", None)
+        if callable(register_state_dict_pre_hook) and not hasattr(
+            layer, _STRICT_LM_HEAD_CACHE_HOOK
+        ):
+            handle = register_state_dict_pre_hook(_keep_lm_head_cache_non_persistent)
+            setattr(layer, _STRICT_LM_HEAD_CACHE_HOOK, handle)
+        state = _LmHeadWeightCacheState(
+            source=weight,
+            weight_t=weight_t,
+            source_data_ptr=0,
+            source_shape=(),
+            source_stride=(),
+            source_dtype=weight.dtype,
+            source_device=weight.device,
+            source_version=None,
+            cache_data_ptr=int(weight_t.data_ptr()),
+            cache_version=None,
+            generation=0,
+            valid=False,
+            refresh_pending=False,
+        )
+        setattr(layer, _STRICT_LM_HEAD_CACHE_STATE, state)
+    else:
+        if not isinstance(state, _LmHeadWeightCacheState):
+            raise RuntimeError("strict ROCm LM-head cache state has an invalid type")
+        if (
+            state.source is not weight
+            or getattr(layer, _STRICT_LM_HEAD_CACHE_BUFFER, None) is not state.weight_t
+        ):
+            # Checkpoint-format layerwise reload temporarily replaces every
+            # Parameter (and may remove derived buffers) before post-load
+            # processing, then copies the canonical weight back into the
+            # original stable storage.  Defer the transpose until the first
+            # forward observes that stable source again.  This also avoids
+            # depending on vLLM copying a non-persistent derived buffer.
+            state.valid = False
+            state.refresh_pending = True
+            return state
+        state.valid = False
+        state.refresh_pending = False
+        cache_data_ptr = int(state.weight_t.data_ptr())
+        refreshed = prepare_weight(weight, out=state.weight_t)
+        if refreshed is not state.weight_t or int(refreshed.data_ptr()) != cache_data_ptr:
+            raise RuntimeError("strict ROCm LM-head refresh replaced stable cache storage")
+        _record_lm_head_weight_cache_refresh(state, weight)
+
+    if state.generation == 0:
+        _record_lm_head_weight_cache_refresh(state, weight)
+    setattr(weight, _STRICT_LM_HEAD_CACHE_STATE, state)
+    return state
+
+
+def _validated_lm_head_weight_cache(
+    layer: Any,
+    prepare_weight: Any | None = None,
+) -> torch.Tensor:
+    weight = getattr(layer, "weight", None)
+    if bool(getattr(layer, _STRICT_LM_HEAD_TIED, False)):
+        raise RuntimeError("strict ROCm LM-head cache does not support tied embeddings")
+    _keep_lm_head_cache_non_persistent(layer)
+    if not isinstance(weight, torch.Tensor):
+        raise RuntimeError("strict ROCm LM-head cache was not prepared after model loading")
+    state_value = getattr(layer, _STRICT_LM_HEAD_CACHE_STATE, None)
+    if not isinstance(state_value, _LmHeadWeightCacheState):
+        raise RuntimeError("strict ROCm LM-head cache was not prepared after model loading")
+    state: _LmHeadWeightCacheState = state_value
+    cached_weight = state.weight_t
+    if not isinstance(cached_weight, torch.Tensor):
+        raise RuntimeError("strict ROCm LM-head cache state has an invalid weight")
+    if (
+        state.source is not weight
+        or getattr(weight, _STRICT_LM_HEAD_CACHE_STATE, None) is not state
+    ):
+        raise RuntimeError("strict ROCm LM-head cache is not bound to the active weight")
+    if getattr(layer, _STRICT_LM_HEAD_CACHE_BUFFER, None) is not cached_weight:
+        raise RuntimeError("strict ROCm LM-head cache buffer was replaced")
+
+    current_source = (
+        int(weight.data_ptr()),
+        tuple(int(dim) for dim in weight.shape),
+        tuple(int(stride) for stride in weight.stride()),
+        weight.dtype,
+        weight.device,
+        _tracked_tensor_version(weight),
+    )
+    expected_source = (
+        state.source_data_ptr,
+        state.source_shape,
+        state.source_stride,
+        state.source_dtype,
+        state.source_device,
+        state.source_version,
+    )
+    if current_source[:-1] != expected_source[:-1]:
+        state.valid = False
+        state.refresh_pending = False
+        raise RuntimeError("strict ROCm LM-head weight storage changed without a cache refresh")
+    if not cached_weight.is_contiguous() or int(cached_weight.data_ptr()) != state.cache_data_ptr:
+        state.valid = False
+        state.refresh_pending = False
+        raise RuntimeError("strict ROCm LM-head cache storage changed after refresh")
+    if state.valid:
+        if current_source[-1] != expected_source[-1]:
+            state.valid = False
+            state.refresh_pending = False
+            raise RuntimeError("strict ROCm LM-head weight changed without a cache refresh")
+        if _tracked_tensor_version(cached_weight) != state.cache_version:
+            state.valid = False
+            state.refresh_pending = False
+            raise RuntimeError("strict ROCm LM-head cache bytes changed after refresh")
+        return cached_weight
+
+    if not state.refresh_pending or prepare_weight is None:
+        raise RuntimeError("strict ROCm LM-head cache is invalid during weight update")
+    cache_data_ptr = int(cached_weight.data_ptr())
+    try:
+        refreshed = prepare_weight(weight, out=cached_weight)
+    except Exception:
+        state.refresh_pending = False
+        raise
+    if refreshed is not cached_weight or int(refreshed.data_ptr()) != cache_data_ptr:
+        state.refresh_pending = False
+        raise RuntimeError("strict ROCm LM-head refresh replaced stable cache storage")
+    _record_lm_head_weight_cache_refresh(state, weight)
+    return cached_weight
 
 
 def _alignment_diagnostics_enabled() -> bool:
@@ -90,6 +309,7 @@ def _patch_qwen3_layer_alignment_diagnostics() -> None:
     if not _alignment_diagnostics_enabled():
         return
     from vllm.model_executor.models.qwen3 import Qwen3Attention, Qwen3DecoderLayer
+
     from rl_engine.kernels.ops.rocm.attention.strict_runtime import StrictRocmAttentionRuntime
 
     if hasattr(Qwen3DecoderLayer, _STRICT_LAYER_DIAGNOSTIC_PATCH_MARKER):
@@ -178,9 +398,7 @@ def _patch_qwen3_layer_alignment_diagnostics() -> None:
             "outputs": torch.stack(buffer["outputs"]).cpu(),
         }
         if "layer0" in buffer:
-            payload["layer0"] = {
-                name: value.cpu() for name, value in buffer["layer0"].items()
-            }
+            payload["layer0"] = {name: value.cpu() for name, value in buffer["layer0"].items()}
         _VLLM_LAYER_DIAGNOSTIC_BUFFER = None
         root = os.getenv("RL_KERNEL_ALIGNMENT_DIAGNOSTICS_DIR", "").strip()
         if root:
@@ -188,11 +406,7 @@ def _patch_qwen3_layer_alignment_diagnostics() -> None:
             output_dir.mkdir(parents=True, exist_ok=True)
             torch.save(
                 payload,
-                output_dir
-                / (
-                    f"vllm-pid{os.getpid()}-rank{rank:05d}-"
-                    f"call{call_index:08d}.pt"
-                ),
+                output_dir / (f"vllm-pid{os.getpid()}-rank{rank:05d}-" f"call{call_index:08d}.pt"),
             )
         return result
 
@@ -215,15 +429,17 @@ def _patch_qwen3_layer_alignment_diagnostics() -> None:
         q, k = instance.rotary_emb(positions, q, k)
         attention_core = instance.attn(q, k, v)
         output, _ = instance.o_proj(attention_core)
-        buffer.setdefault("layer0", {}).update({
-            "attention_norm": hidden_states.detach(),
-            "qkv": qkv.detach(),
-            "query": q.view(*q.shape[:-1], -1, instance.head_dim).detach(),
-            "key": k.view(*k.shape[:-1], -1, instance.head_dim).detach(),
-            "value": v.view(*v.shape[:-1], -1, instance.head_dim).detach(),
-            "attention_core": attention_core.detach(),
-            "attention_output": output.detach(),
-        })
+        buffer.setdefault("layer0", {}).update(
+            {
+                "attention_norm": hidden_states.detach(),
+                "qkv": qkv.detach(),
+                "query": q.view(*q.shape[:-1], -1, instance.head_dim).detach(),
+                "key": k.view(*k.shape[:-1], -1, instance.head_dim).detach(),
+                "value": v.view(*v.shape[:-1], -1, instance.head_dim).detach(),
+                "attention_core": attention_core.detach(),
+                "attention_output": output.detach(),
+            }
+        )
         return output
 
     def gather_paged_row_wrapped(
@@ -347,8 +563,14 @@ def _patch_qwen_lm_head_padding() -> None:
     padding_size = padded_vocab - real_vocab
     original = ParallelLMHead.__init__
     original_weight_loader = VocabParallelEmbedding.weight_loader
+    original_tie_weights = getattr(ParallelLMHead, "tie_weights", None)
 
     def strict_weight_loader(instance: Any, param: Any, loaded_weight: torch.Tensor) -> None:
+        # vLLM loaders write through ``param.data``, which does not reliably
+        # advance the Parameter version counter.  Explicitly invalidate before
+        # any write so a failed or incomplete hot update cannot reuse old
+        # prepared LM-head bytes.
+        _invalidate_lm_head_weight_cache(param)
         strict_real_vocab = getattr(instance, "_rl_kernel_real_vocab_size", None)
         output_dim = getattr(param, "output_dim", None)
         packed_dim = getattr(param, "packed_dim", None)
@@ -368,8 +590,10 @@ def _patch_qwen_lm_head_padding() -> None:
                 param[available:shard_size].data.fill_(0)
             if shard_size < param.shape[0]:
                 param[shard_size:].data.fill_(0)
+            _mark_lm_head_weight_cache_refreshable(param)
             return
         original_weight_loader(instance, param, loaded_weight)
+        _mark_lm_head_weight_cache_refreshable(param)
 
     def wrapped(instance: Any, *args: Any, **kwargs: Any) -> None:
         if args:
@@ -382,6 +606,7 @@ def _patch_qwen_lm_head_padding() -> None:
         kwargs["padding_size"] = padding_size
         original(instance, *args, **kwargs)
         instance._rl_kernel_real_vocab_size = real_vocab
+        setattr(instance, _STRICT_PROJECTION_MARKER, "lm_head")
         if (
             int(getattr(instance, "org_vocab_size", -1)) != padded_vocab
             or int(getattr(instance, "num_embeddings_padded", -1)) != padded_vocab
@@ -392,6 +617,21 @@ def _patch_qwen_lm_head_padding() -> None:
             )
 
     setattr(ParallelLMHead, _PATCH_MARKER, original)
+    if callable(original_tie_weights) and not hasattr(
+        ParallelLMHead, _STRICT_LM_HEAD_TIE_PATCH_MARKER
+    ):
+
+        def strict_tie_weights(instance: Any, embed_tokens: Any) -> Any:
+            result = original_tie_weights(instance, embed_tokens)
+            setattr(instance, _STRICT_LM_HEAD_TIED, True)
+            return result
+
+        setattr(
+            ParallelLMHead,
+            _STRICT_LM_HEAD_TIE_PATCH_MARKER,
+            original_tie_weights,
+        )
+        setattr(ParallelLMHead, "tie_weights", strict_tie_weights)
     if not hasattr(VocabParallelEmbedding, "__rl_kernel_original_weight_loader__"):
         setattr(
             VocabParallelEmbedding,
@@ -425,6 +665,14 @@ def _patch_qwen_compute_logits(integration: VllmIntegration) -> None:
             lm_head = getattr(instance, "lm_head", None)
             if lm_head is None:
                 raise RuntimeError("strict rollout linear_logp requires a Qwen LM-head")
+            model = getattr(instance, "model", None)
+            if (
+                torch.version.hip is not None
+                and model is not None
+                and lm_head is getattr(model, "embed_tokens", None)
+            ):
+                setattr(lm_head, _STRICT_LM_HEAD_TIED, True)
+                raise RuntimeError("strict ROCm LM-head cache does not support tied embeddings")
             setattr(lm_head, _STRICT_PROJECTION_MARKER, "lm_head")
             logits = _original(instance, hidden_states)
             if not get_pp_group().is_last_rank:
@@ -459,6 +707,7 @@ def _patch_strict_lm_head_linear(
     *,
     linear_method_cls: type[Any] | None = None,
     det_gemm: Any | None = None,
+    prepare_weight: Any | None = None,
 ) -> None:
     """Route vLLM's existing LM-head projection through RL-Kernel det_gemm."""
 
@@ -473,6 +722,38 @@ def _patch_strict_lm_head_linear(
         from rl_engine.kernels.ops.matmul.det_gemm import DetGemmOp
 
         det_gemm = DetGemmOp()
+    if torch.version.hip is not None and prepare_weight is None:
+        from rl_engine.kernels.ops.rocm.matmul.det_gemm import prepare_det_gemm_linear_weight
+
+        prepare_weight = prepare_det_gemm_linear_weight
+
+    if not hasattr(linear_method_cls, _STRICT_LM_HEAD_PROCESS_PATCH_MARKER):
+        previous_process_weights = linear_method_cls.process_weights_after_loading
+
+        def process_weights_after_loading(
+            method: Any,
+            layer: Any,
+        ) -> Any:
+            result = previous_process_weights(method, layer)
+            if (
+                torch.version.hip is not None
+                and getattr(layer, _STRICT_PROJECTION_MARKER, None) == "lm_head"
+            ):
+                if prepare_weight is None:
+                    raise RuntimeError("strict ROCm LM-head weight preparation is unavailable")
+                _refresh_lm_head_weight_cache(layer, prepare_weight)
+            return result
+
+        setattr(
+            linear_method_cls,
+            _STRICT_LM_HEAD_PROCESS_PATCH_MARKER,
+            previous_process_weights,
+        )
+        setattr(
+            linear_method_cls,
+            "process_weights_after_loading",
+            process_weights_after_loading,
+        )
 
     def wrapped(
         method: Any,
@@ -483,7 +764,16 @@ def _patch_strict_lm_head_linear(
         if getattr(layer, _STRICT_PROJECTION_MARKER, None) != "lm_head":
             return previous_apply(method, layer, x, bias)
         x_2d = x.reshape(-1, x.shape[-1])
-        output_2d = det_gemm.linear(x_2d, layer.weight)
+        if torch.version.hip is not None:
+            linear_prepared = getattr(det_gemm, "linear_prepared", None)
+            if not callable(linear_prepared):
+                raise RuntimeError("strict ROCm LM-head prepared GEMM is unavailable")
+            output_2d = linear_prepared(
+                x_2d,
+                _validated_lm_head_weight_cache(layer, prepare_weight),
+            )
+        else:
+            output_2d = det_gemm.linear(x_2d, layer.weight)
         output = output_2d.reshape(*x.shape[:-1], layer.weight.size(0))
         return output if bias is None else output + bias
 
@@ -601,7 +891,8 @@ def _patch_qwen_ffn(integration: VllmIntegration) -> None:
             _handle, tp_world_size = operator.bind_packed_inference(instance)
             if not compiled_evidence_armed:
                 execution_mode = (
-                    "eager" if getattr(torch.version, "hip", None) is not None
+                    "eager"
+                    if getattr(torch.version, "hip", None) is not None
                     else "compiled_cuda_graph"
                 )
                 register_packed_inference_observer(
@@ -733,11 +1024,7 @@ def _patch_qwen3_strict_model(
     def require_rocm_eager_runtime() -> None:
         if not production_classes or torch.version.hip is None:
             return
-        from vllm.config import (
-            CUDAGraphMode,
-            CompilationMode,
-            get_current_vllm_config_or_none,
-        )
+        from vllm.config import CompilationMode, CUDAGraphMode, get_current_vllm_config_or_none
 
         config = get_current_vllm_config_or_none()
         model_config = None if config is None else config.model_config
@@ -1004,9 +1291,7 @@ def _register_attention_backend(integration: VllmIntegration) -> None:
 
     operator: VllmAttentionOperator | None = None
     if integration.plan.implementation_for("attention", "rollout") is Implementation.RL_KERNEL:
-        operator = VllmAttentionOperator(
-            projection_collective_backend=_o_proj_collective_backend
-        )
+        operator = VllmAttentionOperator(projection_collective_backend=_o_proj_collective_backend)
         integration.install_operator("attention", operator)
 
     class RlKernelAttentionImpl(PlatformAttentionImpl):
@@ -1102,8 +1387,7 @@ def install_vllm_integration(plan: IntegrationPlan) -> VllmIntegration:
         )
         integration.record_installed_hook(
             "logp",
-            "vllm.model_executor.models.qwen3.Qwen3ForCausalLM.compute_logits,"
-            f"{sampler_hook}",
+            "vllm.model_executor.models.qwen3.Qwen3ForCausalLM.compute_logits," f"{sampler_hook}",
         )
     return integration
 

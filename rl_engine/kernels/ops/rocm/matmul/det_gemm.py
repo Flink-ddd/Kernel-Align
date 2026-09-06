@@ -83,6 +83,78 @@ def det_gemm_linear(
     return _triton_tree_gemm(a, weight.t().contiguous(), out=out)
 
 
+def prepare_det_gemm_linear_weight(
+    weight: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Prepare a stable contiguous ``[K,N]`` inference weight.
+
+    ROCm's strict tree kernel consumes its RHS in ``[K,N]`` layout.  vLLM
+    stores an unquantized linear weight as ``[N,K]`` instead, so materializing
+    the transpose in every decode call is especially expensive for the
+    LM-head.  The caller owns freshness: create or refresh this tensor from a
+    verified model load/update lifecycle, never from a version-counter guess.
+    """
+
+    if weight.dim() != 2:
+        raise ValueError("prepared deterministic linear weights must be 2-D")
+    if weight.dtype != torch.bfloat16:
+        raise TypeError("prepared deterministic linear weights must be BF16")
+    if not weight.is_cuda:
+        raise RuntimeError("prepared deterministic linear weights must be on ROCm")
+    if not weight.is_contiguous():
+        raise ValueError("source deterministic linear weights must be contiguous")
+
+    expected_shape = (weight.size(1), weight.size(0))
+    if out is None:
+        # vLLM invokes post-load hooks from inference mode.  Allocate an
+        # ordinary tensor so later hot-weight refreshes may update it in place.
+        with torch.inference_mode(False), torch.no_grad():
+            out = torch.empty(
+                expected_shape,
+                dtype=weight.dtype,
+                device=weight.device,
+            )
+    else:
+        if tuple(out.shape) != expected_shape:
+            raise ValueError(
+                f"prepared deterministic linear weight must have shape "
+                f"{expected_shape}, got {tuple(out.shape)}"
+            )
+        if out.dtype != weight.dtype:
+            raise TypeError("prepared deterministic linear weight dtype must match its source")
+        if out.device != weight.device:
+            raise RuntimeError("prepared deterministic linear weight device must match its source")
+        if not out.is_contiguous():
+            raise ValueError("prepared deterministic linear weight must be contiguous")
+        if out.requires_grad:
+            raise ValueError("prepared deterministic linear weight must not require gradients")
+        if torch._C._overlaps(out, weight):
+            raise ValueError("prepared deterministic linear weight must not alias its source")
+
+    with torch.no_grad():
+        out.copy_(weight.t())
+    return out
+
+
+def det_gemm_linear_prepared(
+    a: torch.Tensor,
+    weight_t: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply a lifecycle-managed contiguous ``[K,N]`` inference weight."""
+
+    if torch.is_grad_enabled() and (a.requires_grad or weight_t.requires_grad):
+        raise RuntimeError("prepared deterministic linear GEMM is inference-only")
+    if not weight_t.is_contiguous():
+        raise ValueError("prepared deterministic linear weight must be contiguous")
+    if out is not None and (torch._C._overlaps(out, a) or torch._C._overlaps(out, weight_t)):
+        raise ValueError("prepared deterministic linear output must not alias its inputs")
+    return _triton_tree_gemm(a, weight_t, out=out)
+
+
 def det_gemm_linear_input_gradient(
     grad_output: torch.Tensor,
     weight: torch.Tensor,
@@ -124,16 +196,8 @@ class _DetLinearFn(torch.autograd.Function):
         grad_out = grad_out.contiguous()
         if grad_out.dtype != torch.bfloat16:
             grad_out = grad_out.to(torch.bfloat16)
-        da = (
-            det_gemm_linear_input_gradient(grad_out, weight)
-            if ctx.needs_input_grad[0]
-            else None
-        )
-        dweight = (
-            det_gemm_linear_weight_gradient(a, grad_out)
-            if ctx.needs_input_grad[1]
-            else None
-        )
+        da = det_gemm_linear_input_gradient(grad_out, weight) if ctx.needs_input_grad[0] else None
+        dweight = det_gemm_linear_weight_gradient(a, grad_out) if ctx.needs_input_grad[1] else None
         record_backward(
             "det_gemm",
             kernel_id=det_gemm_backend_id(),
@@ -177,6 +241,19 @@ class RocmDetGemmOp:
             return det_gemm_linear(a, weight, out=out)
         return _DetLinearFn.apply(a, weight)
 
+    def linear_prepared(
+        self,
+        a: torch.Tensor,
+        weight_t: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply a post-load prepared RHS without a hot-path transpose."""
+
+        assert a.dtype == torch.bfloat16 and weight_t.dtype == torch.bfloat16, "BF16 only"
+        assert a.is_cuda and weight_t.is_cuda, "Inputs must be on ROCm device"
+        return det_gemm_linear_prepared(a.contiguous(), weight_t, out=out)
+
     def forward_fp32(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         assert a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16, "BF16 only"
         assert a.is_cuda and b.is_cuda, "Inputs must be on ROCm device"
@@ -214,7 +291,9 @@ __all__ = [
     "det_gemm_backend_id",
     "det_gemm_fallback_reason",
     "det_gemm_linear",
+    "det_gemm_linear_prepared",
     "det_gemm_linear_input_gradient",
     "det_gemm_linear_weight_gradient",
     "deterministic_gemm",
+    "prepare_det_gemm_linear_weight",
 ]
