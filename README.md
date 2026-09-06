@@ -68,16 +68,12 @@ operators, and hardware backends fit together.
   <img src="docs/assets/RL-Kernel underlying operator library technical architecture.png" alt="RL-Kernel global architecture" width="800">
 </p>
 
-The smaller diagram shows the current vime integration and the planned Miles and AReaL
-integrations.
+The smaller diagram shows the current vime integration.
 
 ```mermaid
 flowchart TB
-    vime["vime · integrated"] --> ORCH["RL orchestration integration"]
-    MILES["Miles · roadmap"] -.-> ORCH
-    AREAL["AReaL · roadmap"] -.-> ORCH
-    ORCH --> VLLM["vLLM · rollout"]
-    ORCH --> MEGATRON["Megatron-LM · training"]
+    vime["vime · RL orchestration"] --> VLLM["vLLM · rollout"]
+    vime --> MEGATRON["Megatron-LM · training"]
     VLLM --> RLK["RL-Kernel · deterministic and optimized operators"]
     MEGATRON --> RLK
     RLK --> CUDA["CUDA · SM90<br/>H100, H200, GH200"]
