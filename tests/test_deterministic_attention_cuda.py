@@ -817,6 +817,45 @@ def test_rocm_rope_pair_matches_two_single_calls_raw_bytes(dtype, tokens):
 
 
 @ROCM_ONLY
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("tokens", (1, 2, 32))
+def test_rocm_rope_pair_inference_bypasses_autograd_raw_bytes(monkeypatch, dtype, tokens):
+    from rl_engine.kernels.ops.rocm.rotary_embedding.rope import _RocmRoPEPairFunction
+
+    generator = torch.Generator(device="cpu").manual_seed(813 + tokens)
+    position_storage = torch.arange(tokens * 2, device=DEVICE, dtype=torch.int64)
+    positions = position_storage[::2]
+    query = torch.randn(8, tokens, D, dtype=dtype, generator=generator).to(DEVICE)
+    key = torch.randn(2, tokens, D, dtype=dtype, generator=generator).to(DEVICE)
+    query.requires_grad_()
+    key.requires_grad_()
+    rope = RocmDeterministicRoPEOp()
+
+    with torch.inference_mode():
+        expected = _RocmRoPEPairFunction.apply(query, key, positions, 1_000_000.0)
+
+    def unexpected_apply(*args, **kwargs):
+        raise AssertionError("no-grad paired RoPE entered its autograd Function")
+
+    monkeypatch.setattr(_RocmRoPEPairFunction, "apply", unexpected_apply)
+    for mode in (torch.no_grad, torch.inference_mode):
+        with mode():
+            actual = rope.forward_pair(query, key, positions)
+            repeated = rope.forward_pair(query, key, positions)
+
+        for expected_tensor, actual_tensor, repeated_tensor in zip(
+            expected,
+            actual,
+            repeated,
+            strict=True,
+        ):
+            assert actual_tensor.requires_grad is False
+            assert actual_tensor.grad_fn is None
+            assert torch.equal(expected_tensor.view(torch.uint8), actual_tensor.view(torch.uint8))
+            assert torch.equal(actual_tensor.view(torch.uint8), repeated_tensor.view(torch.uint8))
+
+
+@ROCM_ONLY
 @pytest.mark.parametrize("tokens", (2, 32))
 def test_vllm_rocm_rope_pair_adapter_matches_legacy_raw_bytes(tokens):
     from rl_engine.integrations.vllm_runtime import _patch_strict_rocm_rotary_embedding
@@ -895,9 +934,7 @@ def test_rocm_rope_pair_preserves_independent_autograd_semantics(query_requires_
 @ROCM_ONLY
 @pytest.mark.parametrize("cached_length", (32, 127, 512))
 def test_rocm_aiter_decode_direct_output_matches_staged_raw_bytes(cached_length):
-    from rl_engine.kernels.ops.rocm.attention.flash_attn import (
-        StrictRocmAiterCKAttentionCore,
-    )
+    from rl_engine.kernels.ops.rocm.attention.flash_attn import StrictRocmAiterCKAttentionCore
 
     generator = torch.Generator(device="cpu").manual_seed(820 + cached_length)
     q = torch.randn(1, 4, 1, D, dtype=torch.bfloat16, generator=generator).to(DEVICE)

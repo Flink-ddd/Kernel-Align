@@ -11,6 +11,27 @@ from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 from rl_engine.kernels.ops.cuda.rotary_embedding.rope import _restore_rope, _rope_table
 
 
+def _forward_rope_pair(
+    query: Tensor,
+    key: Tensor,
+    positions: Tensor,
+    theta: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Run the paired forward arithmetic and return its shared table."""
+
+    if positions.dim() != 1:
+        raise ValueError("paired ROCm RoPE requires a flat position tensor")
+    query_2d, cos, sin = _rope_table(query, positions, theta)
+    key_2d = key.contiguous().reshape(-1, key.shape[-1])
+    if key_2d.size(0) % cos.size(0):
+        raise ValueError(
+            f"key row count {key_2d.size(0)} is not divisible by " f"position count {cos.size(0)}"
+        )
+    query_out = _C.deterministic_rope_apply_rocm(query_2d, cos, sin, 1.0)
+    key_out = _C.deterministic_rope_apply_rocm(key_2d, cos, sin, 1.0)
+    return query_out.reshape(query.shape), key_out.reshape(key.shape), cos, sin
+
+
 class _RocmRoPEFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: Tensor, positions: Tensor, theta: float) -> Tensor:
@@ -35,11 +56,7 @@ class _RocmRoPEFunction(torch.autograd.Function):
                     ctx.x_shape[2],
                     ctx.x_shape[3],
                 )
-                grad_x = (
-                    out_2d.reshape(heads, batch, seq, dim)
-                    .permute(1, 0, 2, 3)
-                    .contiguous()
-                )
+                grad_x = out_2d.reshape(heads, batch, seq, dim).permute(1, 0, 2, 3).contiguous()
             else:
                 g_2d = grad_out.contiguous().reshape(-1, grad_out.shape[-1])
                 grad_x = _C.deterministic_rope_apply_rocm(g_2d, cos, sin, -1.0).reshape(
@@ -60,21 +77,11 @@ class _RocmRoPEPairFunction(torch.autograd.Function):
         theta: float,
     ) -> tuple[Tensor, Tensor]:
         ctx.set_materialize_grads(False)
-        if positions.dim() != 1:
-            raise ValueError("paired ROCm RoPE requires a flat position tensor")
-        query_2d, cos, sin = _rope_table(query, positions, theta)
-        key_2d = key.contiguous().reshape(-1, key.shape[-1])
-        if key_2d.size(0) % cos.size(0):
-            raise ValueError(
-                f"key row count {key_2d.size(0)} is not divisible by "
-                f"position count {cos.size(0)}"
-            )
+        query_out, key_out, cos, sin = _forward_rope_pair(query, key, positions, theta)
         ctx.save_for_backward(cos, sin)
         ctx.query_shape = tuple(query.shape)
         ctx.key_shape = tuple(key.shape)
-        query_out = _C.deterministic_rope_apply_rocm(query_2d, cos, sin, 1.0)
-        key_out = _C.deterministic_rope_apply_rocm(key_2d, cos, sin, 1.0)
-        return query_out.reshape(query.shape), key_out.reshape(key.shape)
+        return query_out, key_out
 
     @staticmethod
     def backward(ctx, grad_query: Tensor, grad_key: Tensor):
@@ -131,6 +138,19 @@ class RocmDeterministicRoPEOp:
             raise ValueError("paired ROCm RoPE Q/K must share one device and dtype")
         if query.shape[-1] != key.shape[-1]:
             raise ValueError("paired ROCm RoPE Q/K must share one head dimension")
+        if not torch.is_grad_enabled():
+            # vLLM executes rollout under inference/no-grad mode. Calling the
+            # custom autograd Function there cannot contribute a backward but
+            # still pays its dispatcher/context cost in every decoder layer.
+            # Keep the exact same table construction and HIP launches while
+            # bypassing only that unused autograd wrapper.
+            query_out, key_out, _cos, _sin = _forward_rope_pair(
+                query,
+                key,
+                positions,
+                theta,
+            )
+            return query_out, key_out
         query_out, key_out = _RocmRoPEPairFunction.apply(query, key, positions, theta)
         # A multi-output autograd Function marks both outputs differentiable if
         # either input requires grad. Preserve the two independent-call API.
