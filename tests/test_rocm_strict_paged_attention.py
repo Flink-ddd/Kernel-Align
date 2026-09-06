@@ -86,7 +86,17 @@ def _cache(pages: int, kv_heads: int = 1) -> torch.Tensor:
     )
 
 
-def _paged_call(runtime, *, page_table, seqused_k, q_heads=1, kv_heads=1, pages=4):
+def _paged_call(
+    runtime,
+    *,
+    page_table,
+    seqused_k,
+    q_heads=1,
+    kv_heads=1,
+    pages=4,
+    cached_lengths=None,
+    page_bounds_epoch=None,
+):
     k_cache = _cache(pages, kv_heads)
     v_cache = _cache(pages, kv_heads) + 1
     q = torch.zeros(page_table.size(0), q_heads, 1, _HEAD_DIM, dtype=torch.bfloat16)
@@ -99,6 +109,8 @@ def _paged_call(runtime, *, page_table, seqused_k, q_heads=1, kv_heads=1, pages=
             seqused_k=seqused_k,
             max_seqlen_k=page_table.size(1) * _PAGE_SIZE,
             scale=None,
+            cached_lengths=cached_lengths,
+            page_bounds_epoch=page_bounds_epoch,
         ),
         k_cache,
         v_cache,
@@ -228,6 +240,221 @@ def test_paged_decode_fails_closed_on_bad_metadata(page_table, seqused_k, match)
     runtime = _runtime()
     with pytest.raises(ValueError, match=match):
         _paged_call(runtime, page_table=page_table, seqused_k=seqused_k)
+
+
+def test_paged_decode_reuses_only_runtime_scoped_page_bounds_validation(monkeypatch) -> None:
+    runtime = _runtime()
+    page_table = torch.tensor([[0]], dtype=torch.int32)
+    seqused_k = torch.tensor([4], dtype=torch.int32)
+    validation_flags = []
+    original = StrictRocmAttentionRuntime._gather_paged_row
+
+    def recording_gather(*args, validate_bounds=True, **kwargs):
+        validation_flags.append(validate_bounds)
+        return original(*args, validate_bounds=validate_bounds, **kwargs)
+
+    monkeypatch.setattr(
+        StrictRocmAttentionRuntime,
+        "_gather_paged_row",
+        staticmethod(recording_gather),
+    )
+    epoch = runtime.new_page_bounds_epoch()
+    first, _k, _v = _paged_call(
+        runtime,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        cached_lengths=(4,),
+        page_bounds_epoch=epoch,
+    )
+    second, _k, _v = _paged_call(
+        runtime,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        cached_lengths=(4,),
+        page_bounds_epoch=epoch,
+    )
+    next_epoch, _k, _v = _paged_call(
+        runtime,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        cached_lengths=(4,),
+        page_bounds_epoch=runtime.new_page_bounds_epoch(),
+    )
+    unscoped, _k, _v = _paged_call(
+        runtime,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        cached_lengths=(4,),
+    )
+
+    assert validation_flags == [True, False, True, True]
+    assert first.provenance["page_bounds_validation_reused"] is False
+    assert second.provenance["page_bounds_validation_reused"] is True
+    assert next_epoch.provenance["page_bounds_validation_reused"] is False
+    assert unscoped.provenance["page_bounds_validation_reused"] is False
+
+
+def test_paged_decode_page_bounds_proof_fails_closed_on_metadata_mutation() -> None:
+    runtime = _runtime()
+    page_table = torch.tensor([[0]], dtype=torch.int32)
+    seqused_k = torch.tensor([4], dtype=torch.int32)
+    epoch = runtime.new_page_bounds_epoch()
+    _paged_call(
+        runtime,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        cached_lengths=(4,),
+        page_bounds_epoch=epoch,
+    )
+
+    page_table.fill_(9)
+    with pytest.raises(ValueError, match="outside"):
+        _paged_call(
+            runtime,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            cached_lengths=(4,),
+            page_bounds_epoch=epoch,
+        )
+
+
+def test_paged_decode_revalidates_an_equivalent_metadata_tensor(monkeypatch) -> None:
+    runtime = _runtime()
+    page_table = torch.tensor([[0]], dtype=torch.int32)
+    seqused_k = torch.tensor([4], dtype=torch.int32)
+    validation_flags = []
+    original = StrictRocmAttentionRuntime._gather_paged_row
+
+    def recording_gather(*args, validate_bounds=True, **kwargs):
+        validation_flags.append(validate_bounds)
+        return original(*args, validate_bounds=validate_bounds, **kwargs)
+
+    monkeypatch.setattr(
+        StrictRocmAttentionRuntime,
+        "_gather_paged_row",
+        staticmethod(recording_gather),
+    )
+    epoch = runtime.new_page_bounds_epoch()
+    _paged_call(
+        runtime,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        cached_lengths=(4,),
+        page_bounds_epoch=epoch,
+    )
+    _paged_call(
+        runtime,
+        page_table=page_table.clone(),
+        seqused_k=seqused_k,
+        cached_lengths=(4,),
+        page_bounds_epoch=epoch,
+    )
+
+    assert validation_flags == [True, True]
+
+
+def test_paged_decode_validates_every_batch_row_only_once_per_epoch(monkeypatch) -> None:
+    runtime = _runtime()
+    page_table = torch.tensor([[0], [1]], dtype=torch.int32)
+    seqused_k = torch.tensor([4, 4], dtype=torch.int32)
+    validation_flags = []
+    original = StrictRocmAttentionRuntime._gather_paged_row
+
+    def recording_gather(*args, validate_bounds=True, **kwargs):
+        validation_flags.append(validate_bounds)
+        return original(*args, validate_bounds=validate_bounds, **kwargs)
+
+    monkeypatch.setattr(
+        StrictRocmAttentionRuntime,
+        "_gather_paged_row",
+        staticmethod(recording_gather),
+    )
+    epoch = runtime.new_page_bounds_epoch()
+    for _ in range(2):
+        _paged_call(
+            runtime,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            cached_lengths=(4, 4),
+            page_bounds_epoch=epoch,
+        )
+
+    assert validation_flags == [True, True, False, False]
+
+
+def test_paged_decode_does_not_cache_a_failed_page_bounds_validation() -> None:
+    runtime = _runtime()
+    page_table = torch.tensor([[9]], dtype=torch.int32)
+    seqused_k = torch.tensor([4], dtype=torch.int32)
+    epoch = runtime.new_page_bounds_epoch()
+
+    with pytest.raises(ValueError, match="outside"):
+        _paged_call(
+            runtime,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            cached_lengths=(4,),
+            page_bounds_epoch=epoch,
+        )
+
+    page_table.zero_()
+    first_valid, _k, _v = _paged_call(
+        runtime,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        cached_lengths=(4,),
+        page_bounds_epoch=epoch,
+    )
+    reused, _k, _v = _paged_call(
+        runtime,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        cached_lengths=(4,),
+        page_bounds_epoch=epoch,
+    )
+
+    assert first_valid.provenance["page_bounds_validation_reused"] is False
+    assert reused.provenance["page_bounds_validation_reused"] is True
+
+
+def test_paged_decode_revalidates_inference_metadata_in_a_new_epoch() -> None:
+    runtime = _runtime()
+    with torch.inference_mode():
+        page_table = torch.tensor([[0]], dtype=torch.int32)
+        seqused_k = torch.tensor([4], dtype=torch.int32)
+        _paged_call(
+            runtime,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            cached_lengths=(4,),
+            page_bounds_epoch=runtime.new_page_bounds_epoch(),
+        )
+
+        # Inference tensors have no version counter. The adapter's fresh epoch
+        # is therefore the fail-closed boundary between model forwards.
+        page_table.fill_(9)
+        with pytest.raises(ValueError, match="outside"):
+            _paged_call(
+                runtime,
+                page_table=page_table,
+                seqused_k=seqused_k,
+                cached_lengths=(4,),
+                page_bounds_epoch=runtime.new_page_bounds_epoch(),
+            )
+
+
+def test_paged_decode_rejects_page_bounds_epoch_from_another_runtime() -> None:
+    runtime = _runtime()
+    foreign_epoch = _runtime().new_page_bounds_epoch()
+
+    with pytest.raises(ValueError, match="not issued by this ROCm runtime"):
+        _paged_call(
+            runtime,
+            page_table=torch.tensor([[0]], dtype=torch.int32),
+            seqused_k=torch.tensor([4], dtype=torch.int32),
+            cached_lengths=(4,),
+            page_bounds_epoch=foreign_epoch,
+        )
 
 
 def test_paged_decode_rejects_a_mismatched_out_buffer() -> None:

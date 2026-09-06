@@ -447,12 +447,15 @@ def _patch_qwen3_layer_alignment_diagnostics() -> None:
         v_cache: torch.Tensor,
         page_row: torch.Tensor,
         cached_length: int,
+        *,
+        validate_bounds: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         key, value = original_gather_paged_row(
             k_cache,
             v_cache,
             page_row,
             cached_length,
+            validate_bounds=validate_bounds,
         )
         buffer = _VLLM_LAYER_DIAGNOSTIC_BUFFER
         if buffer is not None and _VLLM_LAYER_DIAGNOSTIC_ACTIVE_LAYER == 0:

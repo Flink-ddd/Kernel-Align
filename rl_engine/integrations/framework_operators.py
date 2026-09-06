@@ -736,9 +736,7 @@ class MegatronAttentionOperator:
             "tp_world_size": tp_world,
             "runtime_platform": runtime_platform,
             "triton_used": runtime_platform == "rocm",
-            "deterministic_projection": _strict_attention_projection_provenance(
-                runtime_platform
-            ),
+            "deterministic_projection": _strict_attention_projection_provenance(runtime_platform),
             "tp_qkv_dgrad_collective": self._tp_collective_backend(
                 module,
                 _MEGATRON_TP_QKV_DGRAD_COLLECTIVE_ATTR,
@@ -834,16 +832,22 @@ class MegatronFFNOperator:
             "cp_world_size": cp_world,
             "tp_world_size": tp_world,
             "runtime_platform": _device_name(hidden_states),
-            "actual_backend": "rlkernel.rocm.det_gemm_swiglu" if torch.version.hip is not None else "rlkernel.cuda.det_gemm_swiglu",
+            "actual_backend": (
+                "rlkernel.rocm.det_gemm_swiglu"
+                if torch.version.hip is not None
+                else "rlkernel.cuda.det_gemm_swiglu"
+            ),
             "gemm_backend": det_gemm_backend_id(),
             "fallback": False,
             "gate_up_projection": "separate_strict_launches",
             "deterministic_all_reduce_backend": (
                 "none"
                 if tp_world == 1
-                else "rocm_ipc_fixed_tree"
-                if torch.version.hip is not None
-                else "deterministic_all_reduce.ipc_localized_fixed_tree.v1"
+                else (
+                    "rocm_ipc_fixed_tree"
+                    if torch.version.hip is not None
+                    else "deterministic_all_reduce.ipc_localized_fixed_tree.v1"
+                )
             ),
             "triton_used": torch.version.hip is not None,
         }
@@ -884,9 +888,7 @@ def _vllm_kv_cache_views(
         if plane.size(0) == num_kv_heads:
             # [heads, blocks, block, head] (LHBNC after selecting K/V).
             return plane.permute(1, 2, 0, 3)
-        raise RuntimeError(
-            "vLLM K/V cache layout does not expose the declared number of KV heads"
-        )
+        raise RuntimeError("vLLM K/V cache layout does not expose the declared number of KV heads")
 
     # Match vLLM's native AITER layout before the legacy flattened layout.
     # With two KV heads both layouts otherwise look like [B, 2, N, 2 * head].
@@ -929,9 +931,7 @@ def _vllm_kv_cache_views(
             key_cache.view(blocks, block_size, num_kv_heads, head_size),
             value_cache.view(blocks, block_size, num_kv_heads, head_size),
         )
-    raise RuntimeError(
-        "vLLM Attention KV cache does not match a supported CUDA/ROCm paged layout"
-    )
+    raise RuntimeError("vLLM Attention KV cache does not match a supported CUDA/ROCm paged layout")
 
 
 class VllmAttentionOperator:
@@ -1000,6 +1000,7 @@ class VllmAttentionOperator:
         num_actual: int,
         cache_owner: Any | None = None,
         include_host_lengths: bool = False,
+        page_bounds_epoch_factory: Callable[[], object] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Build one paged launch from vLLM's graph-replayable GPU metadata."""
 
@@ -1028,6 +1029,11 @@ class VllmAttentionOperator:
             block_size,
             page_count,
             include_host_lengths,
+            (
+                None
+                if page_bounds_epoch_factory is None
+                else id(getattr(page_bounds_epoch_factory, "__self__", page_bounds_epoch_factory))
+            ),
         )
         owner_id = id(cache_owner) if cache_owner is not None else None
         # Resolve the cross-layer cache before scheduling any GPU metadata work.
@@ -1060,9 +1066,7 @@ class VllmAttentionOperator:
             torch.ones_like(seqused_k),
         )
         cached_lengths = (
-            tuple(int(value) for value in seqused_k.tolist())
-            if include_host_lengths
-            else None
+            tuple(int(value) for value in seqused_k.tolist()) if include_host_lengths else None
         )
 
         pages = (
@@ -1080,6 +1084,9 @@ class VllmAttentionOperator:
                 "query_contiguous": True,
                 "seqused_k": seqused_k,
                 "cached_lengths": cached_lengths,
+                "page_bounds_epoch": (
+                    None if page_bounds_epoch_factory is None else page_bounds_epoch_factory()
+                ),
             }
         ]
         summary = {
@@ -1156,6 +1163,11 @@ class VllmAttentionOperator:
             },
         )
         runtime = operator.bind_accelerator_runtime(query)
+        page_bounds_epoch_factory: Callable[[], object] | None = None
+        if runtime_platform == "rocm":
+            candidate_factory = getattr(runtime, "new_page_bounds_epoch", None)
+            if callable(candidate_factory):
+                page_bounds_epoch_factory = candidate_factory
         groups, metadata_summary = self._materialization_groups(
             attn_metadata,
             query=query,
@@ -1164,6 +1176,7 @@ class VllmAttentionOperator:
             num_actual=num_actual,
             cache_owner=layer,
             include_host_lengths=runtime_platform == "rocm",
+            page_bounds_epoch_factory=page_bounds_epoch_factory,
         )
         last_operator_provenance: dict[str, Any] = {}
         next_query_row = 0
@@ -1199,6 +1212,8 @@ class VllmAttentionOperator:
             }
             if runtime_platform == "rocm":
                 runtime_kwargs["cached_lengths"] = group["cached_lengths"]
+                if group["page_bounds_epoch"] is not None:
+                    runtime_kwargs["page_bounds_epoch"] = group["page_bounds_epoch"]
             result = runtime.forward_paged_with_lse(
                 q_ready,
                 key_cache,
@@ -1217,9 +1232,7 @@ class VllmAttentionOperator:
         if runtime_platform == "rocm" and tp_world > 1:
             projection_collective_backend = "unbound"
             if self._projection_collective_backend is not None:
-                projection_collective_backend = (
-                    self._projection_collective_backend() or "unbound"
-                )
+                projection_collective_backend = self._projection_collective_backend() or "unbound"
         self._last_provenance = {
             "framework_layout": "vllm_paged_kv",
             "materialization": (
@@ -1231,9 +1244,7 @@ class VllmAttentionOperator:
             "tp_group_bound": tp_group is not None,
             "runtime_platform": runtime_platform,
             "triton_used": runtime_platform == "rocm",
-            "deterministic_projection": _strict_attention_projection_provenance(
-                runtime_platform
-            ),
+            "deterministic_projection": _strict_attention_projection_provenance(runtime_platform),
             "deterministic_all_reduce_backend": projection_collective_backend,
             "direct_output_buffer": direct_output_buffer,
             **metadata_summary,
@@ -1676,8 +1687,7 @@ class VllmLogpOperator:
             if (
                 strict_provenance.get("deterministic_linear_logp") is not True
                 or strict_provenance.get("actual_backend") != self._linear_logp.backend_id
-                or strict_provenance.get("strict_entrypoint")
-                != expected_entrypoint
+                or strict_provenance.get("strict_entrypoint") != expected_entrypoint
             ):
                 raise RuntimeError(
                     "strict vLLM rollout linear_logp did not execute the deterministic "

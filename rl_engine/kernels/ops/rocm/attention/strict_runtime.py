@@ -40,8 +40,8 @@ from rl_engine.kernels.attention_contract import (
 )
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     AttentionCPBlockMetadata,
-    AttentionCPCommunicationUnavailable,
     AttentionCPCommunicationPlan,
+    AttentionCPCommunicationUnavailable,
     AttentionParallelSpec,
     CUDAAGRSAttentionCPCommunication,
 )
@@ -95,6 +95,23 @@ class StrictRocmAttentionResult:
     provenance: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class _PageBoundsEpoch:
+    """Opaque proof scope issued by one strict ROCm runtime."""
+
+    owner: object
+
+
+@dataclass(frozen=True)
+class _PageBoundsValidation:
+    """Keep validated metadata alive so object/address reuse cannot spoof a hit."""
+
+    epoch: _PageBoundsEpoch
+    page_table: torch.Tensor
+    seqused_k: torch.Tensor
+    signature: tuple[Any, ...]
+
+
 class StrictRocmAttentionRuntime:
     """Run one AITER/CK arithmetic identity at CP=1 or through RCCL AG/RS."""
 
@@ -127,6 +144,17 @@ class StrictRocmAttentionRuntime:
         if getattr(self._core, "strict_schedule", None) != self.strict_schedule:
             raise RuntimeError("strict ROCm Attention runtime requires the AITER/CK fixed schedule")
         self.communication_executed = False
+        self._page_bounds_epoch_owner = object()
+        self._page_bounds_validation: _PageBoundsValidation | None = None
+
+    def new_page_bounds_epoch(self) -> object:
+        """Issue a proof scope while its page table and lengths remain immutable.
+
+        vLLM creates fresh materialized metadata for the next model forward,
+        which must receive a fresh epoch as well.
+        """
+
+        return _PageBoundsEpoch(self._page_bounds_epoch_owner)
 
     def forward_with_lse(
         self,
@@ -253,6 +281,7 @@ class StrictRocmAttentionRuntime:
         scale: float | None,
         out: torch.Tensor | None = None,
         cached_lengths: Sequence[int] | None = None,
+        page_bounds_epoch: object | None = None,
     ) -> StrictRocmAttentionResult:
         """Run strict decode Attention over a paged KV cache.
 
@@ -318,6 +347,38 @@ class StrictRocmAttentionRuntime:
                     f"row {row} requested {cached_length}"
                 )
 
+        resolved_epoch: _PageBoundsEpoch | None
+        if page_bounds_epoch is None:
+            resolved_epoch = None
+        elif (
+            not isinstance(page_bounds_epoch, _PageBoundsEpoch)
+            or page_bounds_epoch.owner is not self._page_bounds_epoch_owner
+        ):
+            raise ValueError("page_bounds_epoch was not issued by this ROCm runtime")
+        else:
+            resolved_epoch = page_bounds_epoch
+        bounds_signature = (
+            None
+            if resolved_epoch is None
+            else self._page_bounds_signature(
+                page_table,
+                seqused_k,
+                cached_lengths=cached_lengths,
+                cache_pages=k_cache.size(0),
+                page_size=k_cache.size(1),
+                max_seqlen_k=max_seqlen_k,
+            )
+        )
+        cached_validation = self._page_bounds_validation
+        bounds_reused = bool(
+            resolved_epoch is not None
+            and cached_validation is not None
+            and cached_validation.epoch is resolved_epoch
+            and cached_validation.page_table is page_table
+            and cached_validation.seqused_k is seqused_k
+            and cached_validation.signature == bounds_signature
+        )
+
         row_outs: list[torch.Tensor] = []
         row_lses: list[torch.Tensor] = []
         core_provenance: dict[str, Any] | None = None
@@ -328,6 +389,7 @@ class StrictRocmAttentionRuntime:
                 v_cache,
                 page_table[row],
                 cached_length,
+                validate_bounds=not bounds_reused,
             )
             # Decode attends over the whole cached prefix, so neither the mask
             # nor the AITER call consumes position IDs. Avoid allocating two
@@ -357,6 +419,14 @@ class StrictRocmAttentionRuntime:
         result_out = out if out is not None else torch.cat(row_outs, dim=0)
         result_lse = torch.cat(row_lses, dim=0)
         self.communication_executed = False
+        if resolved_epoch is not None and not bounds_reused:
+            assert bounds_signature is not None
+            self._page_bounds_validation = _PageBoundsValidation(
+                epoch=resolved_epoch,
+                page_table=page_table,
+                seqused_k=seqused_k,
+                signature=bounds_signature,
+            )
 
         backend = (
             core_provenance.get("attention_backend")
@@ -394,6 +464,7 @@ class StrictRocmAttentionRuntime:
                 "core_output_staging": (
                     "aiter_direct_caller_group" if direct_core_out else "runtime_group_cat"
                 ),
+                "page_bounds_validation_reused": bounds_reused,
                 "core": core_provenance,
             },
         )
@@ -404,6 +475,8 @@ class StrictRocmAttentionRuntime:
         v_cache: torch.Tensor,
         page_row: torch.Tensor,
         cached_length: int,
+        *,
+        validate_bounds: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Materialize one row's cached KV in logical order as ``[1, H, S, D]``.
 
@@ -417,14 +490,15 @@ class StrictRocmAttentionRuntime:
         if page_count > page_row.numel():
             raise ValueError("page_table row is shorter than the cached length requires")
         pages = page_row[:page_count]
-        bounds_ok = torch.all((pages >= 0) & (pages < k_cache.size(0)))
-        if pages.is_cuda:
-            # Keep malformed metadata fail-closed without synchronizing the host
-            # twice per row. vLLM page tables are already int32, which
-            # index_select accepts directly on ROCm.
-            torch._assert_async(bounds_ok, "page_table entries are outside the KV cache")
-        elif not bool(bounds_ok.item()):
-            raise ValueError("page_table entries are outside the KV cache")
+        if validate_bounds:
+            bounds_ok = torch.all((pages >= 0) & (pages < k_cache.size(0)))
+            if pages.is_cuda:
+                # Keep malformed metadata fail-closed without synchronizing the host
+                # twice per row. vLLM page tables are already int32, which
+                # index_select accepts directly on ROCm.
+                torch._assert_async(bounds_ok, "page_table entries are outside the KV cache")
+            elif not bool(bounds_ok.item()):
+                raise ValueError("page_table entries are outside the KV cache")
 
         def _gather(cache: torch.Tensor) -> torch.Tensor:
             selected = cache.index_select(0, pages)
@@ -432,6 +506,47 @@ class StrictRocmAttentionRuntime:
             return flat[:cached_length].permute(1, 0, 2).unsqueeze(0).contiguous()
 
         return _gather(k_cache), _gather(v_cache)
+
+    @staticmethod
+    def _page_bounds_signature(
+        page_table: torch.Tensor,
+        seqused_k: torch.Tensor,
+        *,
+        cached_lengths: Sequence[int],
+        cache_pages: int,
+        page_size: int,
+        max_seqlen_k: int,
+    ) -> tuple[Any, ...]:
+        """Fingerprint metadata that can affect which physical pages are read."""
+
+        def tensor_signature(tensor: torch.Tensor) -> tuple[Any, ...]:
+            try:
+                version: int | None = tensor._version
+            except RuntimeError:
+                # Inference tensors have no version counter. Their lifetime is
+                # still fenced by the adapter-issued materialization epoch.
+                version = None
+            return (
+                id(tensor),
+                tensor.untyped_storage().data_ptr(),
+                tensor.storage_offset(),
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                tensor.dtype,
+                tensor.device,
+                version,
+            )
+
+        stream = torch.cuda.current_stream(page_table.device) if page_table.is_cuda else None
+        return (
+            tensor_signature(page_table),
+            tensor_signature(seqused_k),
+            tuple(cached_lengths),
+            int(cache_pages),
+            int(page_size),
+            int(max_seqlen_k),
+            stream,
+        )
 
     @staticmethod
     def _validate_paged_inputs(
@@ -494,11 +609,13 @@ class StrictRocmAttentionRuntime:
                 f"local Q heads={q.size(1)} must be divisible by local KV heads={local_kv_heads}"
             )
         group_size = q.size(1) // local_kv_heads
+        direct_output = q
         if direct_core_out:
             if out is None or causal or q.size(2) != 1:
                 raise RuntimeError("direct ROCm core output is only valid for paged decode")
+            direct_output = out
             if torch.is_grad_enabled() or any(
-                tensor.requires_grad for tensor in (q, k, v, out)
+                tensor.requires_grad for tensor in (q, k, v, direct_output)
             ):
                 raise RuntimeError("direct ROCm core output requires disabled gradient mode")
             if not callable(getattr(self._core, "forward_decode_with_lse_into", None)):
@@ -521,7 +638,7 @@ class StrictRocmAttentionRuntime:
                 q_lo, q_hi = group * group_size, (group + 1) * group_size
                 group_out = None
                 if direct_core_out:
-                    group_out = out[row : row + 1, q_lo:q_hi]
+                    group_out = direct_output[row : row + 1, q_lo:q_hi]
                     result = self._core.forward_decode_with_lse_into(
                         q[row : row + 1, q_lo:q_hi],
                         k[row : row + 1, group : group + 1],
