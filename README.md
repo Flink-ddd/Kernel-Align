@@ -68,7 +68,8 @@ operators, and hardware backends fit together.
   <img src="docs/assets/RL-Kernel underlying operator library technical architecture.png" alt="RL-Kernel global architecture" width="800">
 </p>
 
-The smaller diagram shows the current vime integration.
+The smaller diagram shows the current vime integration. Hardware support is listed
+separately below.
 
 ```mermaid
 flowchart TB
@@ -76,10 +77,6 @@ flowchart TB
     vime --> MEGATRON["Megatron-LM · training"]
     VLLM --> RLK["RL-Kernel · deterministic and optimized operators"]
     MEGATRON --> RLK
-    RLK --> CUDA["CUDA · SM90<br/>H100, H200, GH200"]
-    RLK --> ROCM["ROCm · gfx942<br/>MI300A, MI300X, MI325X"]
-    RLK -.-> ASCEND["Ascend · dav_c220<br/>partial adaptation"]
-    RLK -.-> MUSA["Moore Threads · MUSA · in progress"]
 ```
 
 The benchmark below uses **vime, vLLM, Megatron-LM, and CUDA**. See
@@ -124,7 +121,8 @@ cost for a net saving of **20.72 seconds per end-to-end step**.
 
 ## Hardware Support
 
-RL-Kernel currently supports the following hardware targets.
+The table below covers RL-Kernel hardware support. Framework support is tracked
+separately.
 
 | Hardware | Architecture | Software | Status |
 | :--- | :--- | :--- | :--- |
