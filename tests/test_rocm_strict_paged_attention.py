@@ -329,6 +329,54 @@ def test_paged_decode_keeps_one_kv_group_per_launch() -> None:
     assert result.provenance["tp_degree_invariant"] is True
 
 
+def test_paged_prefill_collapses_one_fresh_request_to_causal_sequence() -> None:
+    core = _RecordingCore()
+    runtime = StrictRocmAttentionRuntime(core=core)
+    page_table = torch.tensor([[1], [1], [1], [1]], dtype=torch.int32)
+    k_cache = _cache(2, kv_heads=2)
+    q = torch.zeros(4, 4, 1, _HEAD_DIM, dtype=torch.bfloat16)
+    out = torch.full_like(q, 7)
+
+    with torch.no_grad():
+        result = runtime.forward_paged_with_lse(
+            q,
+            k_cache,
+            k_cache + 1,
+            page_table=page_table,
+            seqused_k=torch.tensor([1, 2, 3, 4], dtype=torch.int32),
+            max_seqlen_k=_PAGE_SIZE,
+            scale=None,
+            out=out,
+            cached_lengths=(1, 2, 3, 4),
+        )
+
+    assert result.out is out
+    assert torch.equal(out, torch.zeros_like(out))
+    assert result.lse.shape == (4, 4, 1)
+    assert result.lse.is_contiguous()
+    assert len(core.calls) == 2
+    assert all(call["causal"] is True for call in core.calls)
+    assert all(call["q"].shape == (1, 2, 4, _HEAD_DIM) for call in core.calls)
+    assert all(call["k"].shape == (1, 1, 4, _HEAD_DIM) for call in core.calls)
+    assert torch.equal(core.calls[0]["query_position_ids"], torch.arange(4).unsqueeze(0))
+    assert result.provenance["core_launch_count"] == 2
+    assert result.provenance["query_schedule"] == "paged_causal_prefill_batch"
+    assert result.provenance["core_output_staging"] == "runtime_causal_prefill"
+
+
+def test_paged_prefill_fails_closed_when_rows_do_not_share_pages() -> None:
+    runtime = _runtime()
+    with torch.no_grad(), pytest.raises(ValueError, match="share one logical page table"):
+        _paged_call(
+            runtime,
+            page_table=torch.tensor([[0], [1]], dtype=torch.int32),
+            seqused_k=torch.tensor([1, 2], dtype=torch.int32),
+            q_heads=2,
+            kv_heads=1,
+            cached_lengths=(1, 2),
+        )
+
+
 def test_paged_decode_provenance_does_not_claim_a_paged_kernel() -> None:
     """The gather is the implementation; the provenance must say so."""
 

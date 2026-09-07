@@ -146,6 +146,7 @@ class StrictRocmAttentionRuntime:
         self.communication_executed = False
         self._page_bounds_epoch_owner = object()
         self._page_bounds_validation: _PageBoundsValidation | None = None
+        self._causal_prefill_position_cache: tuple[torch.device, int, torch.Tensor] | None = None
 
     def new_page_bounds_epoch(self) -> object:
         """Issue a proof scope while its page table and lengths remain immutable.
@@ -346,6 +347,13 @@ class StrictRocmAttentionRuntime:
                     "seqused_k entries must be positive and within max_seqlen_k; "
                     f"row {row} requested {cached_length}"
                 )
+        causal_prefill = (
+            q.size(0) > 1
+            and q.size(2) == 1
+            and not torch.is_grad_enabled()
+            and not any(tensor.requires_grad for tensor in (q, k_cache, v_cache))
+            and cached_lengths == tuple(range(1, q.size(0) + 1))
+        )
 
         resolved_epoch: _PageBoundsEpoch | None
         if page_bounds_epoch is None:
@@ -379,47 +387,89 @@ class StrictRocmAttentionRuntime:
             and cached_validation.signature == bounds_signature
         )
 
-        row_outs: list[torch.Tensor] = []
-        row_lses: list[torch.Tensor] = []
-        core_provenance: dict[str, Any] | None = None
-        launches = 0
-        for row, cached_length in enumerate(cached_lengths):
+        if causal_prefill:
+            required_pages = (cached_lengths[-1] + k_cache.size(1) - 1) // k_cache.size(1)
+            if not bounds_reused:
+                page_rows_equal = torch.all(
+                    page_table[:, :required_pages] == page_table[-1:, :required_pages]
+                )
+                if page_table.is_cuda:
+                    torch._assert_async(
+                        page_rows_equal,
+                        "causal prefill rows must share one logical page table",
+                    )
+                elif not bool(page_rows_equal.item()):
+                    raise ValueError("causal prefill rows must share one logical page table")
             k_row, v_row = self._gather_paged_row(
                 k_cache,
                 v_cache,
-                page_table[row],
-                cached_length,
+                page_table[-1],
+                cached_lengths[-1],
                 validate_bounds=not bounds_reused,
             )
-            # Decode attends over the whole cached prefix, so neither the mask
-            # nor the AITER call consumes position IDs. Avoid allocating two
-            # dead tensors for every row of every decoder layer.
-            row_out, row_lse, row_provenance, row_launches = self._run_core(
-                q[row : row + 1],
+            q_sequence = q.squeeze(2).permute(1, 0, 2).unsqueeze(0)
+            positions = self._causal_prefill_positions(q.size(0), q.device)
+            sequence_out, sequence_lse, core_provenance, launches = self._run_core(
+                q_sequence,
                 k_row,
                 v_row,
-                causal=False,
+                causal=True,
                 scale=scale,
-                query_position_ids=None,
-                key_position_ids=None,
+                query_position_ids=positions,
+                key_position_ids=positions,
                 output_dtype=q.dtype,
-                out=None if out is None else out[row : row + 1],
-                direct_core_out=direct_core_out,
             )
+            reordered_out = sequence_out.permute(2, 1, 0, 3)
             if out is None:
-                row_outs.append(row_out)
-            row_lses.append(row_lse)
-            launches += row_launches
+                result_out = reordered_out.contiguous()
+            else:
+                out.copy_(reordered_out)
+                result_out = out
+            result_lse = sequence_lse.permute(2, 1, 0).contiguous()
+        else:
+            row_outs: list[torch.Tensor] = []
+            row_lses: list[torch.Tensor] = []
+            core_provenance = None
+            launches = 0
+            for row, cached_length in enumerate(cached_lengths):
+                k_row, v_row = self._gather_paged_row(
+                    k_cache,
+                    v_cache,
+                    page_table[row],
+                    cached_length,
+                    validate_bounds=not bounds_reused,
+                )
+                # Decode attends over the whole cached prefix, so neither the mask
+                # nor the AITER call consumes position IDs. Avoid allocating two
+                # dead tensors for every row of every decoder layer.
+                row_out, row_lse, row_provenance, row_launches = self._run_core(
+                    q[row : row + 1],
+                    k_row,
+                    v_row,
+                    causal=False,
+                    scale=scale,
+                    query_position_ids=None,
+                    key_position_ids=None,
+                    output_dtype=q.dtype,
+                    out=None if out is None else out[row : row + 1],
+                    direct_core_out=direct_core_out,
+                )
+                if out is None:
+                    row_outs.append(row_out)
+                row_lses.append(row_lse)
+                launches += row_launches
+                if core_provenance is None:
+                    core_provenance = row_provenance
+
             if core_provenance is None:
-                core_provenance = row_provenance
+                raise RuntimeError("strict ROCm paged Attention executed no core launch")
 
-        if core_provenance is None:
-            raise RuntimeError("strict ROCm paged Attention executed no core launch")
-
-        result_out = out if out is not None else torch.cat(row_outs, dim=0)
-        result_lse = (
-            row_lses[0] if direct_core_out and len(row_lses) == 1 else torch.cat(row_lses, dim=0)
-        )
+            result_out = out if out is not None else torch.cat(row_outs, dim=0)
+            result_lse = (
+                row_lses[0]
+                if direct_core_out and len(row_lses) == 1
+                else torch.cat(row_lses, dim=0)
+            )
         self.communication_executed = False
         if resolved_epoch is not None and not bounds_reused:
             assert bounds_signature is not None
@@ -450,7 +500,9 @@ class StrictRocmAttentionRuntime:
                 "fallback_reason": None,
                 "reference_only": False,
                 "split_kv": "disabled",
-                "query_schedule": "paged_single_query_batch",
+                "query_schedule": (
+                    "paged_causal_prefill_batch" if causal_prefill else "paged_single_query_batch"
+                ),
                 # The dense core runs; the pages are gathered first. Recorded so
                 # a reader never mistakes this for a native paged kernel.
                 "paged_execution": "logical_kv_gather_then_dense_core",
@@ -460,16 +512,35 @@ class StrictRocmAttentionRuntime:
                 "invariance_mechanism": "one_kv_group_per_launch",
                 "core_row_count": q.size(0) * q.size(2),
                 "core_launch_count": launches,
-                "core_batch_size": q.size(0),
-                "core_query_length": q.size(2),
+                "core_batch_size": 1 if causal_prefill else q.size(0),
+                "core_query_length": q.size(0) if causal_prefill else q.size(2),
                 "core_actual_backends": [] if backend is None else [str(backend)],
                 "core_output_staging": (
-                    "aiter_direct_caller_group" if direct_core_out else "runtime_group_cat"
+                    "runtime_causal_prefill"
+                    if causal_prefill
+                    else ("aiter_direct_caller_group" if direct_core_out else "runtime_group_cat")
                 ),
+                "causal_prefill_collapsed": causal_prefill,
                 "page_bounds_validation_reused": bounds_reused,
                 "core": core_provenance,
             },
         )
+
+    def _causal_prefill_positions(
+        self,
+        token_count: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        cached = self._causal_prefill_position_cache
+        if cached is not None and cached[0] == device and cached[1] == token_count:
+            return cached[2]
+        positions = torch.arange(
+            token_count,
+            dtype=torch.int64,
+            device=device,
+        ).unsqueeze(0)
+        self._causal_prefill_position_cache = (device, token_count, positions)
+        return positions
 
     @staticmethod
     def _gather_paged_row(
