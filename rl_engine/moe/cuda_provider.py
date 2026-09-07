@@ -24,10 +24,6 @@ _SUPPORTED_DTYPES = (
 _SAVED_KEYS = (
     "gate32",
     "up32",
-    "g",
-    "u",
-    "sig",
-    "silu",
 )
 
 
@@ -121,7 +117,7 @@ class ClampSwiGLUWeightedCudaProvider(ReferenceProvider):
         up32 = up.float().contiguous()
         p_s32 = None if p_s is None else p_s.contiguous()
 
-        h, g, u, sig, silu = getattr(
+        (h,) = getattr(
             _C,
             _FORWARD_SYMBOL,
         )(
@@ -133,10 +129,6 @@ class ClampSwiGLUWeightedCudaProvider(ReferenceProvider):
         saved = {
             "gate32": gate32,
             "up32": up32,
-            "g": g,
-            "u": u,
-            "sig": sig,
-            "silu": silu,
         }
 
         if p_s32 is not None:
@@ -182,10 +174,6 @@ class ClampSwiGLUWeightedCudaProvider(ReferenceProvider):
             dh.contiguous(),
             gate32,
             saved["up32"],
-            saved["g"],
-            saved["u"],
-            saved["sig"],
-            saved["silu"],
             p_s,
         )
 

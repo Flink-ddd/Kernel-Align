@@ -36,6 +36,39 @@ def _assert_exact(
     assert torch.equal(got, want)
 
 
+def _assert_saved_state(
+    saved: dict[str, torch.Tensor],
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    p_s: torch.Tensor | None,
+) -> None:
+    expected_keys = {
+        "gate32",
+        "up32",
+    }
+
+    if p_s is not None:
+        expected_keys.add("p_s")
+
+    assert set(saved) == expected_keys
+
+    _assert_exact(
+        saved["gate32"],
+        gate.float().contiguous(),
+    )
+
+    _assert_exact(
+        saved["up32"],
+        up.float().contiguous(),
+    )
+
+    if p_s is not None:
+        _assert_exact(
+            saved["p_s"],
+            p_s.contiguous(),
+        )
+
+
 @requires_p5_cuda
 def test_boundary_fixture_is_byte_exact() -> None:
     provider = ClampSwiGLUWeightedCudaProvider()
@@ -71,11 +104,12 @@ def test_boundary_fixture_is_byte_exact() -> None:
 
     _assert_exact(h_got, h_ref)
 
-    for key in ("g", "u", "sig", "silu"):
-        _assert_exact(
-            saved_got[key],
-            saved_ref[key],
-        )
+    _assert_saved_state(
+        saved_got,
+        gate,
+        up,
+        p_s,
+    )
 
     for got, want in zip(
         grads_got,
@@ -130,8 +164,14 @@ def test_shared_variant_has_no_weight_no_clamp_and_no_dp_s() -> None:
     )
 
     _assert_exact(h_got, h_ref)
-    _assert_exact(saved_got["g"], gate)
-    _assert_exact(saved_got["u"], up)
+
+    _assert_saved_state(
+        saved_got,
+        gate,
+        up,
+        None,
+    )
+
     _assert_exact(dgate_got, dgate_ref)
     _assert_exact(dup_got, dup_ref)
 
@@ -189,6 +229,13 @@ def test_repeated_runs_are_byte_exact() -> None:
         saved_first,
     )
 
+    _assert_saved_state(
+        saved_first,
+        gate,
+        up,
+        p_s,
+    )
+
     for _ in range(4):
         h_repeat, saved_repeat = provider.clamp_swiglu_weighted_fwd(
             gate,
@@ -202,6 +249,13 @@ def test_repeated_runs_are_byte_exact() -> None:
         )
 
         _assert_exact(h_repeat, h_first)
+
+        _assert_saved_state(
+            saved_repeat,
+            gate,
+            up,
+            p_s,
+        )
 
         for got, want in zip(
             grads_repeat,
@@ -244,6 +298,13 @@ def test_empty_batch_and_fail_closed_validation() -> None:
     dgate, dup, dp_s = provider.clamp_swiglu_weighted_bwd(
         dh,
         saved,
+    )
+
+    _assert_saved_state(
+        saved,
+        empty,
+        empty,
+        p_s,
     )
 
     assert h.shape == (0, 32)

@@ -140,10 +140,6 @@ std::vector<torch::Tensor> clamp_swiglu_weighted_backward_cuda(
     torch::Tensor dh,
     torch::Tensor gate,
     torch::Tensor up,
-    torch::Tensor g,
-    torch::Tensor u,
-    torch::Tensor sig,
-    torch::Tensor silu,
     torch::optional<torch::Tensor> p_s);
 // RMSNorm Declarations & Wrappers
 
@@ -321,19 +317,11 @@ std::vector<torch::Tensor> clamp_swiglu_weighted_backward(
     torch::Tensor dh,
     torch::Tensor gate,
     torch::Tensor up,
-    torch::Tensor g,
-    torch::Tensor u,
-    torch::Tensor sig,
-    torch::Tensor silu,
     torch::optional<torch::Tensor> p_s) {
   return clamp_swiglu_weighted_backward_cuda(
       dh,
       gate,
       up,
-      g,
-      u,
-      sig,
-      silu,
       p_s);
 }
 // Deterministic standard-softmax attention (issue #147)
@@ -554,17 +542,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "P5 clamp_swiglu_weighted forward CUDA");
 
     m.def(
-        "clamp_swiglu_weighted_backward",
-        &clamp_swiglu_weighted_backward,
-        py::arg("dh"),
-        py::arg("gate"),
-        py::arg("up"),
-        py::arg("g"),
-        py::arg("u"),
-        py::arg("sig"),
-        py::arg("silu"),
-        py::arg("p_s") = py::none(),
-        "P5 clamp_swiglu_weighted backward CUDA");
+      "clamp_swiglu_weighted_backward",
+      &clamp_swiglu_weighted_backward,
+      py::arg("dh"),
+      py::arg("gate"),
+      py::arg("up"),
+      py::arg("p_s") = py::none(),
+      "P5 clamp_swiglu_weighted backward CUDA");
     // Deterministic standard-softmax attention (issue #147)
     m.def(
         "deterministic_attention_forward",

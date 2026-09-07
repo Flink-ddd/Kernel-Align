@@ -93,7 +93,7 @@ __global__ void swiglu_backward_kernel(
   d_gate[idx] = static_cast<scalar_t>(dyv * uv * silu_grad_f32(gv));
 }
 
-__device__ __forceinline__ float sigmoid_f32_strict(float x) { // new
+__device__ __forceinline__ float sigmoid_f32_strict(float x) {
   const float denominator = __fadd_rn(1.0f, expf(-x));
   return 1.0f / denominator;
 }
@@ -103,10 +103,6 @@ __global__ void clamp_swiglu_weighted_forward_kernel(
     const float* __restrict__ up,
     const float* __restrict__ p_s,
     at::BFloat16* __restrict__ h,
-    float* __restrict__ g_saved,
-    float* __restrict__ u_saved,
-    float* __restrict__ sig_saved,
-    float* __restrict__ silu_saved,
     const int64_t n,
     const int64_t width,
     const bool weighted) {
@@ -145,11 +141,6 @@ __global__ void clamp_swiglu_weighted_forward_kernel(
           : product;
 
   h[idx] = static_cast<at::BFloat16>(h32);
-
-  g_saved[idx] = g;
-  u_saved[idx] = u;
-  sig_saved[idx] = sig;
-  silu_saved[idx] = silu;
 }
 
 template <typename scalar_t>
@@ -157,10 +148,6 @@ __global__ void clamp_swiglu_weighted_backward_kernel(
     const scalar_t* __restrict__ dh,
     const float* __restrict__ gate,
     const float* __restrict__ up,
-    const float* __restrict__ g,
-    const float* __restrict__ u,
-    const float* __restrict__ sig,
-    const float* __restrict__ silu,
     const float* __restrict__ p_s,
     float* __restrict__ d_gate,
     float* __restrict__ d_up,
@@ -174,6 +161,27 @@ __global__ void clamp_swiglu_weighted_backward_kernel(
     return;
   }
 
+  const float gate_value = gate[idx];
+  const float up_value = up[idx];
+
+  float g = gate_value;
+  float u = up_value;
+
+  if (weighted) {
+    if (g > 10.0f) {
+      g = 10.0f;
+    }
+
+    if (u < -10.0f) {
+      u = -10.0f;
+    } else if (u > 10.0f) {
+      u = 10.0f;
+    }
+  }
+
+  const float sig = sigmoid_f32_strict(g);
+  const float silu = __fmul_rn(g, sig);
+
   const float dh32 = static_cast<float>(dh[idx]);
 
   const float weighted_dh =
@@ -182,45 +190,45 @@ __global__ void clamp_swiglu_weighted_backward_kernel(
           : dh32;
 
   const float one_minus_sig =
-      __fadd_rn(1.0f, -sig[idx]);
+      __fadd_rn(1.0f, -sig);
 
   const float derivative_inner =
       __fadd_rn(
           1.0f,
-          __fmul_rn(g[idx], one_minus_sig));
+          __fmul_rn(g, one_minus_sig));
 
   const float d_silu =
-      __fmul_rn(sig[idx], derivative_inner);
+      __fmul_rn(sig, derivative_inner);
 
   const float gate_mask =
-      (!weighted || gate[idx] < 10.0f)
+      (!weighted || gate_value < 10.0f)
           ? 1.0f
           : 0.0f;
 
   const float up_mask =
       (!weighted ||
-       (up[idx] > -10.0f && up[idx] < 10.0f))
+       (up_value > -10.0f && up_value < 10.0f))
           ? 1.0f
           : 0.0f;
 
   d_gate[idx] =
       __fmul_rn(
           __fmul_rn(
-              __fmul_rn(weighted_dh, u[idx]),
+              __fmul_rn(weighted_dh, u),
               d_silu),
           gate_mask);
 
   d_up[idx] =
       __fmul_rn(
-          __fmul_rn(weighted_dh, silu[idx]),
+          __fmul_rn(weighted_dh, silu),
           up_mask);
 }
 
 template <typename scalar_t>
 __global__ void clamp_swiglu_weighted_dp_s_kernel(
     const scalar_t* __restrict__ dh,
-    const float* __restrict__ silu,
-    const float* __restrict__ u,
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
     float* __restrict__ dp_s,
     const int64_t rows,
     const int64_t width) {
@@ -238,12 +246,28 @@ __global__ void clamp_swiglu_weighted_dp_s_kernel(
   for (int64_t column = 0; column < width; ++column) {
     const int64_t idx = row_offset + column;
 
+    float g = gate[idx];
+    float u = up[idx];
+
+    if (g > 10.0f) {
+      g = 10.0f;
+    }
+
+    if (u < -10.0f) {
+      u = -10.0f;
+    } else if (u > 10.0f) {
+      u = 10.0f;
+    }
+
+    const float sig = sigmoid_f32_strict(g);
+    const float silu = __fmul_rn(g, sig);
+
     const float term =
         __fmul_rn(
             __fmul_rn(
                 static_cast<float>(dh[idx]),
-                silu[idx]),
-            u[idx]);
+                silu),
+            u);
 
     acc = __fadd_rn(acc, term);
   }
@@ -328,7 +352,7 @@ static void check_same_device(
       rhs.device());
 }
 
-static void check_cuda_contig_fp32( // new
+static void check_cuda_contig_fp32(
     const torch::Tensor& t,
     const char* name) {
   TORCH_CHECK(
@@ -584,7 +608,7 @@ std::vector<torch::Tensor> swiglu_packed_backward_cuda(
   return {d_gate, d_up};
 }
 
-std::vector<torch::Tensor> clamp_swiglu_weighted_forward_cuda( // new
+std::vector<torch::Tensor> clamp_swiglu_weighted_forward_cuda(
     torch::Tensor gate,
     torch::Tensor up,
     torch::optional<torch::Tensor> p_s) {
@@ -601,15 +625,10 @@ std::vector<torch::Tensor> clamp_swiglu_weighted_forward_cuda( // new
           gate.sizes(),
           gate.options().dtype(torch::kBFloat16));
 
-  auto g = torch::empty_like(gate);
-  auto u = torch::empty_like(up);
-  auto sig = torch::empty_like(gate);
-  auto silu = torch::empty_like(gate);
-
   const int64_t n = gate.numel();
 
   if (n == 0) {
-    return {h, g, u, sig, silu};
+    return {h};
   }
 
   int threads = 0;
@@ -627,49 +646,29 @@ std::vector<torch::Tensor> clamp_swiglu_weighted_forward_cuda( // new
               ? p_s->data_ptr<float>()
               : nullptr,
           h.data_ptr<at::BFloat16>(),
-          g.data_ptr<float>(),
-          u.data_ptr<float>(),
-          sig.data_ptr<float>(),
-          silu.data_ptr<float>(),
           n,
           gate.size(1),
           p_s.has_value());
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  return {h, g, u, sig, silu};
+  return {h};
 }
 
 std::vector<torch::Tensor> clamp_swiglu_weighted_backward_cuda(
     torch::Tensor dh,
     torch::Tensor gate,
     torch::Tensor up,
-    torch::Tensor g,
-    torch::Tensor u,
-    torch::Tensor sig,
-    torch::Tensor silu,
     torch::optional<torch::Tensor> p_s) {
   check_cuda_contig(dh, "dh");
   check_cuda_contig_fp32(gate, "gate");
   check_cuda_contig_fp32(up, "up");
-  check_cuda_contig_fp32(g, "g");
-  check_cuda_contig_fp32(u, "u");
-  check_cuda_contig_fp32(sig, "sig");
-  check_cuda_contig_fp32(silu, "silu");
 
   check_same_device(dh, gate, "dh", "gate");
   check_same_device(gate, up, "gate", "up");
-  check_same_device(gate, g, "gate", "g");
-  check_same_device(gate, u, "gate", "u");
-  check_same_device(gate, sig, "gate", "sig");
-  check_same_device(gate, silu, "gate", "silu");
 
   check_same_shape_2d(gate, up, "gate", "up");
   check_same_shape_2d(gate, dh, "gate", "dh");
-  check_same_shape_2d(gate, g, "gate", "g");
-  check_same_shape_2d(gate, u, "gate", "u");
-  check_same_shape_2d(gate, sig, "gate", "sig");
-  check_same_shape_2d(gate, silu, "gate", "silu");
 
   check_route_weights(p_s, gate);
 
@@ -711,10 +710,6 @@ std::vector<torch::Tensor> clamp_swiglu_weighted_backward_cuda(
                 dh.data_ptr<scalar_t>(),
                 gate.data_ptr<float>(),
                 up.data_ptr<float>(),
-                g.data_ptr<float>(),
-                u.data_ptr<float>(),
-                sig.data_ptr<float>(),
-                silu.data_ptr<float>(),
                 p_s.has_value()
                     ? p_s->data_ptr<float>()
                     : nullptr,
@@ -736,8 +731,8 @@ std::vector<torch::Tensor> clamp_swiglu_weighted_backward_cuda(
           clamp_swiglu_weighted_dp_s_kernel<scalar_t>
               <<<dp_blocks, dp_threads, 0, stream>>>(
                   dh.data_ptr<scalar_t>(),
-                  silu.data_ptr<float>(),
-                  u.data_ptr<float>(),
+                  gate.data_ptr<float>(),
+                  up.data_ptr<float>(),
                   dp_s.data_ptr<float>(),
                   gate.size(0),
                   gate.size(1));
