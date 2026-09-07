@@ -366,7 +366,66 @@ class StrictRocmAiterCKAttentionCore:
     ) -> DeterministicAttentionCoreResult:
         """Run single-token no-grad decode directly into a caller buffer."""
 
-        self._validate_inputs(q, k, v, None)
+        return self._forward_decode_with_lse_into(
+            q,
+            k,
+            v,
+            out=out,
+            scale=scale,
+            output_dtype=output_dtype,
+            logical_group_batch=False,
+        )
+
+    def forward_grouped_decode_with_lse_into(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        out: torch.Tensor,
+        scale: float | None = None,
+        output_dtype: torch.dtype | None = None,
+    ) -> DeterministicAttentionCoreResult:
+        """Run independent one-KV-group decode rows in one AITER launch.
+
+        Every AITER batch row still contains exactly one logical KV group. The
+        batching only removes duplicate host dispatches; it does not combine
+        heads or alter the per-row reduction tree.
+        """
+
+        return self._forward_decode_with_lse_into(
+            q,
+            k,
+            v,
+            out=out,
+            scale=scale,
+            output_dtype=output_dtype,
+            logical_group_batch=True,
+        )
+
+    def _forward_decode_with_lse_into(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        out: torch.Tensor,
+        scale: float | None,
+        output_dtype: torch.dtype | None,
+        logical_group_batch: bool,
+    ) -> DeterministicAttentionCoreResult:
+        """Shared direct-output implementation for scalar and grouped decode."""
+
+        if logical_group_batch:
+            self._validate_inputs(
+                q,
+                k,
+                v,
+                None,
+                allow_logical_group_batch=True,
+            )
+        else:
+            self._validate_inputs(q, k, v, None)
         self._validate_direct_output(out, q, k, v)
         resolved_dtype = q.dtype if output_dtype is None else output_dtype
         if resolved_dtype != q.dtype:
@@ -402,7 +461,12 @@ class StrictRocmAiterCKAttentionCore:
             resolved_dtype,
             extra_provenance={
                 "output_buffer_reused": True,
-                "core_output_staging": "aiter_direct_caller_group",
+                "core_output_staging": (
+                    "aiter_direct_caller_group_batch"
+                    if logical_group_batch
+                    else "aiter_direct_caller_group"
+                ),
+                "logical_group_batch_size": q.size(0),
             },
         )
 
@@ -505,6 +569,8 @@ class StrictRocmAiterCKAttentionCore:
         k: torch.Tensor,
         v: torch.Tensor,
         key_padding_mask: torch.Tensor | None,
+        *,
+        allow_logical_group_batch: bool = False,
     ) -> None:
         if torch.version.hip is None:
             raise StrictRocmAttentionUnavailable("strict AITER CK core requires ROCm PyTorch")
@@ -512,8 +578,15 @@ class StrictRocmAiterCKAttentionCore:
             raise ValueError("strict AITER CK core materializes each unpadded logical row")
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError("q/k/v must be 4-D [B,H,S,D]")
-        if q.size(0) != 1 or k.size(0) != 1 or v.size(0) != 1:
+        if (
+            not allow_logical_group_batch
+            and (q.size(0) != 1 or k.size(0) != 1 or v.size(0) != 1)
+        ):
             raise ValueError("strict AITER CK core executes one logical batch row at a time")
+        if q.size(0) <= 0 or k.size(0) != q.size(0) or v.size(0) != q.size(0):
+            raise ValueError("q/k/v must carry the same positive batch size")
+        if allow_logical_group_batch and k.size(1) != 1:
+            raise ValueError("grouped strict decode requires one KV group per AITER batch row")
         if k.shape != v.shape or q.size(-1) != k.size(-1):
             raise ValueError("k/v shapes and q/k/v head dimensions must match")
         if q.size(1) % k.size(1) != 0:

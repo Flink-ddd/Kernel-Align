@@ -628,6 +628,7 @@ class StrictRocmAttentionRuntime:
             )
         group_size = q.size(1) // local_kv_heads
         direct_output = q
+        grouped_decode = False
         if direct_core_out:
             if out is None or causal or q.size(2) != 1:
                 raise RuntimeError("direct ROCm core output is only valid for paged decode")
@@ -638,6 +639,55 @@ class StrictRocmAttentionRuntime:
                 raise RuntimeError("direct ROCm core output requires disabled gradient mode")
             if not callable(getattr(self._core, "forward_decode_with_lse_into", None)):
                 raise RuntimeError("strict ROCm core has no direct decode output entry point")
+            grouped_decode = local_kv_heads > 1 and callable(
+                getattr(self._core, "forward_grouped_decode_with_lse_into", None)
+            )
+
+        if grouped_decode:
+            batch_size, _query_heads, query_length, head_dim = q.shape
+            key_length = k.size(2)
+            grouped_q = q.reshape(
+                batch_size,
+                local_kv_heads,
+                group_size,
+                query_length,
+                head_dim,
+            ).reshape(batch_size * local_kv_heads, group_size, query_length, head_dim)
+            grouped_k = k.reshape(batch_size * local_kv_heads, 1, key_length, head_dim)
+            grouped_v = v.reshape(batch_size * local_kv_heads, 1, key_length, head_dim)
+            grouped_out = direct_output.reshape(
+                batch_size,
+                local_kv_heads,
+                group_size,
+                query_length,
+                head_dim,
+            ).reshape(batch_size * local_kv_heads, group_size, query_length, head_dim)
+            result = self._core.forward_grouped_decode_with_lse_into(
+                grouped_q,
+                grouped_k,
+                grouped_v,
+                out=grouped_out,
+                scale=scale,
+                output_dtype=output_dtype,
+            )
+            if result.out.data_ptr() != grouped_out.data_ptr():
+                raise RuntimeError("strict ROCm grouped core did not write to its output view")
+            grouped_lse = result.lse.reshape(
+                batch_size,
+                local_kv_heads,
+                group_size,
+                query_length,
+            )
+            return (
+                direct_output,
+                grouped_lse.reshape(
+                    batch_size,
+                    local_kv_heads * group_size,
+                    query_length,
+                ),
+                dict(result.provenance),
+                1,
+            )
 
         row_outs: list[torch.Tensor] = []
         row_lses: list[torch.Tensor] = []
