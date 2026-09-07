@@ -26,7 +26,7 @@ from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
     DeterministicAttentionCoreResult,
     RLKernelDeterministicAttentionCore,
 )
-from rl_engine.utils.logger import logge
+from rl_engine.utils.logger import logger
 
 _MAX_TESTED_ROCM_TRITON_HEAD_DIM = 512
 _AITER_API_SOURCE = "aiter.ops.mha"
@@ -146,7 +146,7 @@ def _validate_aiter_schema(
 
 
 def _load_aiter_ck_ops() -> tuple[
-    Callable[..., Any], Callable[..., Any], Callable[..., Any], st
+    Callable[..., Any], Callable[..., Any], Callable[..., Any], str
 ]:
     try:
         module = importlib.import_module(_AITER_API_SOURCE)

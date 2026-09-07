@@ -41,7 +41,7 @@ from rl_engine.integrations.linear_logp import (
 )
 from rl_engine.integrations.state import get_active_integration, set_active_integration
 from rl_engine.integrations.vllm import VllmIntegration
-from rl_engine.kernels.ops.pytorch.ffn.ffn import register_packed_inference_observe
+from rl_engine.kernels.ops.pytorch.ffn.ffn import register_packed_inference_observer
 from rl_engine.kernels.ops.pytorch.norm.rms_norm import strict_add_rms_norm, strict_rms_norm
 
 _PATCH_MARKER = "__rl_kernel_original_forward__"
@@ -77,8 +77,8 @@ _VLLM_LAYER_DIAGNOSTIC_ACTIVE_LAYER: int | None = None
 
 @dataclass
 class _LmHeadWeightCacheState:
-    source: torch.Tenso
-    weight_t: torch.Tenso
+    source: torch.Tensor
+    weight_t: torch.Tensor
     source_data_ptr: int
     source_shape: tuple[int, ...]
     source_stride: tuple[int, ...]
@@ -311,7 +311,7 @@ def _patch_qwen3_layer_alignment_diagnostics() -> None:
 
     if not _alignment_diagnostics_enabled():
         return
-    from vllm.model_executor.models.qwen3 import Qwen3Attention, Qwen3DecoderLaye
+    from vllm.model_executor.models.qwen3 import Qwen3Attention, Qwen3DecoderLayer
 
     from rl_engine.kernels.ops.rocm.attention.strict_runtime import StrictRocmAttentionRuntime
 
@@ -359,7 +359,7 @@ def _patch_qwen3_layer_alignment_diagnostics() -> None:
                 else None
             )
 
-        _VLLM_LAYER_DIAGNOSTIC_ACTIVE_LAYER = laye
+        _VLLM_LAYER_DIAGNOSTIC_ACTIVE_LAYER = layer
         try:
             result = original_forward(instance, positions, hidden_states, residual)
         finally:
@@ -568,7 +568,7 @@ def _patch_qwen_lm_head_padding() -> None:
         )
     padding_size = padded_vocab - real_vocab
     original = ParallelLMHead.__init__
-    original_weight_loader = VocabParallelEmbedding.weight_loade
+    original_weight_loader = VocabParallelEmbedding.weight_loader
     original_tie_weights = getattr(ParallelLMHead, "tie_weights", None)
 
     def strict_weight_loader(instance: Any, param: Any, loaded_weight: torch.Tensor) -> None:
@@ -901,7 +901,7 @@ def _patch_rocm_weight_cache_refresh() -> None:
 
     if torch.version.hip is None:
         return
-    from vllm.v1.worker.gpu_worker import Worke
+    from vllm.v1.worker.gpu_worker import Worker
     from rl_engine.kernels.ops.rocm.matmul.det_gemm import (
         refresh_cached_weight_transposes,
     )
@@ -1008,7 +1008,7 @@ def _patch_qwen3_strict_model(
         rotary_cls = RotaryEmbedding
         linear_method_cls = UnquantizedLinearMethod
         attention_cls = Qwen3Attention
-        row_parallel_cls = RowParallelLinea
+        row_parallel_cls = RowParallelLinear
     assert rms_norm_cls is not None
     assert linear_method_cls is not None
     assert attention_cls is not None
@@ -1278,7 +1278,7 @@ def _patch_qwen3_strict_model(
 
 
 def _patch_sampler(integration: VllmIntegration, *, strict_linear_logp: bool) -> None:
-    from vllm.v1.sample.sampler import Sample
+    from vllm.v1.sample.sampler import Sampler
 
     if hasattr(Sampler, _PATCH_MARKER):
         raise RuntimeError("vLLM Sampler is already RL-Kernel patched")
@@ -1319,7 +1319,7 @@ def _patch_worker_sampler(integration: VllmIntegration, *, strict_linear_logp: b
     """
 
     try:
-        from vllm.v1.worker.gpu.sample.sampler import Sample
+        from vllm.v1.worker.gpu.sample.sampler import Sampler
     except ImportError:
         return
 
@@ -1396,7 +1396,7 @@ def _register_attention_backend(integration: VllmIntegration) -> None:
                     operator.warmup_rocm_decode(self, dtype=dtype)
 
         def _split_kv_cache(
-            self, kv_cache: torch.Tenso
+            self, kv_cache: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
             if torch.version.hip is not None and operator is not None:
                 if (
@@ -1462,7 +1462,7 @@ def _register_attention_backend(integration: VllmIntegration) -> None:
                     raise ValueError("Block size must be a multiple of 16.")
                 # Token-major pages let AITER mha_batch_prefill consume K/V
                 # directly.  The inherited cache-update methods call the
-                # adapter-owned _split_kv_cache above, so no vLLM source o
+                # adapter-owned _split_kv_cache above, so no vLLM source or
                 # cache-update kernel needs to change.
                 return (num_blocks, block_size, num_kv_heads, 2 * head_size)
             return PlatformAttentionBackend.get_kv_cache_shape(
@@ -1479,7 +1479,7 @@ def _register_attention_backend(integration: VllmIntegration) -> None:
 
         @staticmethod
         def get_builder_cls() -> type[Any]:
-            return RlKernelAttentionMetadataBuilde
+            return RlKernelAttentionMetadataBuilder
 
     RlKernelAttentionImpl.__module__ = __name__
     RlKernelAttentionImpl.__qualname__ = "RlKernelAttentionImpl"
@@ -1488,10 +1488,10 @@ def _register_attention_backend(integration: VllmIntegration) -> None:
     RlKernelAttentionBackend.__module__ = __name__
     RlKernelAttentionBackend.__qualname__ = "RlKernelAttentionBackend"
     _RLK_ATTENTION_IMPL = RlKernelAttentionImpl
-    _RLK_ATTENTION_BUILDER = RlKernelAttentionMetadataBuilde
+    _RLK_ATTENTION_BUILDER = RlKernelAttentionMetadataBuilder
     _RLK_ATTENTION_BACKEND = RlKernelAttentionBackend
     globals()["RlKernelAttentionImpl"] = RlKernelAttentionImpl
-    globals()["RlKernelAttentionMetadataBuilder"] = RlKernelAttentionMetadataBuilde
+    globals()["RlKernelAttentionMetadataBuilder"] = RlKernelAttentionMetadataBuilder
     globals()["RlKernelAttentionBackend"] = RlKernelAttentionBackend
     # Override the platform-selected enum so vLLM keeps its native metadata and
     # cache update path while RL-Kernel owns the attention arithmetic call.

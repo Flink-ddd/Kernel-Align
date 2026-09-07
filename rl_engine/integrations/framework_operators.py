@@ -1355,7 +1355,7 @@ class VllmAttentionOperator:
                 dtype=torch.int32,
                 device=block_table.device,
             ) * page_count
-            self._rocm_kv_indptr_cache[indptr_key] = kv_indpt
+            self._rocm_kv_indptr_cache[indptr_key] = kv_indptr
         value = {
             "mode": mode,
             "sequence_count": sequence_count,
@@ -1920,7 +1920,7 @@ class MegatronLogpOperator:
         *,
         linear_logp: LinearLogpWrapper | None = None,
     ) -> None:
-        self._provider = provide
+        self._provider = provider
         self._linear_logp = linear_logp
         self._last_provenance: dict[str, Any] = {}
 
@@ -2052,7 +2052,7 @@ class VllmLogpOperator:
         strict_linear_logp: bool = False,
     ) -> None:
         self._native_forward = native_forward
-        self._worker_sampler = worker_sample
+        self._worker_sampler = worker_sampler
         self._strict_linear_logp = strict_linear_logp
         self._linear_logp = LinearLogpWrapper() if strict_linear_logp else None
         self._last_provenance: dict[str, Any] = {}
