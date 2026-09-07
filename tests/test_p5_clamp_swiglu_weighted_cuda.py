@@ -179,6 +179,89 @@ def test_shared_variant_has_no_weight_no_clamp_and_no_dp_s() -> None:
     assert dp_ref is None
 
 
+@pytest.mark.parametrize(
+    "weighted",
+    [
+        False,
+        True,
+    ],
+)
+@requires_p5_cuda
+def test_packed_layout_is_byte_exact_and_zero_copy(
+    weighted: bool,
+) -> None:
+    provider = ClampSwiGLUWeightedCudaProvider()
+
+    gate, up, p_s = (tensor.cuda() for tensor in fixtures.make_swiglu_boundary_inputs())
+
+    gate_up = torch.cat(
+        (
+            gate,
+            up,
+        ),
+        dim=1,
+    ).contiguous()
+
+    route_weights = p_s if weighted else None
+
+    dh = fixtures.make_grad_output(
+        "swiglu_boundary",
+        tuple(gate.shape),
+    ).cuda()
+
+    h_ref, saved_ref = oracle.clamp_swiglu_weighted_fwd(
+        gate,
+        up,
+        route_weights,
+    )
+
+    grads_ref = oracle.clamp_swiglu_weighted_bwd(
+        dh,
+        saved_ref,
+    )
+
+    h_got, saved_got = provider.clamp_swiglu_weighted_packed_fwd(
+        gate_up,
+        route_weights,
+    )
+
+    grads_got = provider.clamp_swiglu_weighted_packed_bwd(
+        dh,
+        saved_got,
+    )
+
+    _assert_exact(
+        h_got,
+        h_ref,
+    )
+
+    expected_saved_keys = {
+        "gate_up32",
+    }
+
+    if route_weights is not None:
+        expected_saved_keys.add("p_s")
+
+    assert set(saved_got) == expected_saved_keys
+
+    assert gate_up.dtype == torch.float32
+    assert saved_got["gate_up32"].data_ptr() == gate_up.data_ptr()
+
+    for got, want in zip(
+        grads_got,
+        grads_ref,
+        strict=True,
+    ):
+        if want is None:
+            assert got is None
+        else:
+            assert got is not None
+            _assert_exact(
+                got,
+                want,
+            )
+
+
 @requires_p5_cuda
 def test_repeated_runs_are_byte_exact() -> None:
     provider = ClampSwiGLUWeightedCudaProvider()

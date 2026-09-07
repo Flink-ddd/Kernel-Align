@@ -93,6 +93,10 @@ __global__ void swiglu_backward_kernel(
   d_gate[idx] = static_cast<scalar_t>(dyv * uv * silu_grad_f32(gv));
 }
 
+#if defined(__USE_FAST_MATH__)
+#error "P5 clamp_swiglu_weighted requires precise FP32 math; disable --use_fast_math"
+#endif
+
 __device__ __forceinline__ float sigmoid_f32_strict(float x) {
   const float denominator = __fadd_rn(1.0f, expf(-x));
   return 1.0f / denominator;
@@ -105,6 +109,7 @@ __global__ void clamp_swiglu_weighted_forward_kernel(
     at::BFloat16* __restrict__ h,
     const int64_t n,
     const int64_t width,
+    const int64_t input_stride,
     const bool weighted) {
   const int64_t idx =
       blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
@@ -113,8 +118,12 @@ __global__ void clamp_swiglu_weighted_forward_kernel(
     return;
   }
 
-  const float gate_value = gate[idx];
-  const float up_value = up[idx];
+      const int64_t row = idx / width;
+      const int64_t column = idx - row * width;
+      const int64_t input_offset = row * input_stride + column;
+
+      const float gate_value = gate[input_offset];
+      const float up_value = up[input_offset];
 
   float g = gate_value;
   float u = up_value;
@@ -137,7 +146,7 @@ __global__ void clamp_swiglu_weighted_forward_kernel(
 
   const float h32 =
       weighted
-          ? __fmul_rn(product, p_s[idx / width])
+          ? __fmul_rn(product, p_s[row])
           : product;
 
   h[idx] = static_cast<at::BFloat16>(h32);
@@ -153,6 +162,7 @@ __global__ void clamp_swiglu_weighted_backward_kernel(
     float* __restrict__ d_up,
     const int64_t n,
     const int64_t width,
+    const int64_t input_stride,
     const bool weighted) {
   const int64_t idx =
       blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
@@ -161,8 +171,12 @@ __global__ void clamp_swiglu_weighted_backward_kernel(
     return;
   }
 
-  const float gate_value = gate[idx];
-  const float up_value = up[idx];
+    const int64_t row = idx / width;
+    const int64_t column = idx - row * width;
+    const int64_t input_offset = row * input_stride + column;
+
+    const float gate_value = gate[input_offset];
+    const float up_value = up[input_offset];
 
   float g = gate_value;
   float u = up_value;
@@ -186,7 +200,7 @@ __global__ void clamp_swiglu_weighted_backward_kernel(
 
   const float weighted_dh =
       weighted
-          ? __fmul_rn(dh32, p_s[idx / width])
+          ? __fmul_rn(dh32, p_s[row])
           : dh32;
 
   const float one_minus_sig =
@@ -231,7 +245,8 @@ __global__ void clamp_swiglu_weighted_dp_s_kernel(
     const float* __restrict__ up,
     float* __restrict__ dp_s,
     const int64_t rows,
-    const int64_t width) {
+    const int64_t width,
+    const int64_t input_stride) {
   const int64_t row =
       blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
 
@@ -240,14 +255,17 @@ __global__ void clamp_swiglu_weighted_dp_s_kernel(
   }
 
   float acc = 0.0f;
-  const int64_t row_offset = row * width;
+
+  const int64_t input_row_offset = row * input_stride;
+  const int64_t output_row_offset = row * width;
 
 #pragma unroll 1
   for (int64_t column = 0; column < width; ++column) {
-    const int64_t idx = row_offset + column;
+    const int64_t input_idx = input_row_offset + column;
+    const int64_t output_idx = output_row_offset + column;
 
-    float g = gate[idx];
-    float u = up[idx];
+    float g = gate[input_idx];
+    float u = up[input_idx];
 
     if (g > 10.0f) {
       g = 10.0f;
@@ -265,7 +283,7 @@ __global__ void clamp_swiglu_weighted_dp_s_kernel(
     const float term =
         __fmul_rn(
             __fmul_rn(
-                static_cast<float>(dh[idx]),
+                static_cast<float>(dh[output_idx]),
                 silu),
             u);
 
@@ -648,6 +666,7 @@ std::vector<torch::Tensor> clamp_swiglu_weighted_forward_cuda(
           h.data_ptr<at::BFloat16>(),
           n,
           gate.size(1),
+          gate.size(1),
           p_s.has_value());
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -717,6 +736,7 @@ std::vector<torch::Tensor> clamp_swiglu_weighted_backward_cuda(
                 d_up.data_ptr<float>(),
                 n,
                 gate.size(1),
+                gate.size(1),
                 p_s.has_value());
 
         if (p_s.has_value()) {
@@ -735,7 +755,165 @@ std::vector<torch::Tensor> clamp_swiglu_weighted_backward_cuda(
                   up.data_ptr<float>(),
                   dp_s.data_ptr<float>(),
                   gate.size(0),
+                  gate.size(1),
                   gate.size(1));
+        }
+      });
+
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  return {d_gate, d_up, dp_s};
+}
+
+std::vector<torch::Tensor> clamp_swiglu_weighted_packed_forward_cuda(
+    torch::Tensor gate_up,
+    torch::optional<torch::Tensor> p_s) {
+  check_cuda_contig_fp32(gate_up, "gate_up");
+
+  TORCH_CHECK(
+      gate_up.dim() == 2,
+      "gate_up must be 2D [rows, 2 * width]");
+
+  TORCH_CHECK(
+      gate_up.size(1) % 2 == 0,
+      "gate_up width must be even");
+
+  check_route_weights(p_s, gate_up);
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(gate_up));
+
+  const int64_t rows = gate_up.size(0);
+  const int64_t width = gate_up.size(1) / 2;
+
+  auto h = torch::empty(
+      {rows, width},
+      gate_up.options().dtype(torch::kBFloat16));
+
+  const int64_t n = h.numel();
+
+  if (n == 0) {
+    return {h};
+  }
+
+  int threads = 0;
+  int64_t blocks = 0;
+  launch_1d(n, threads, blocks);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  const float* gate_ptr = gate_up.data_ptr<float>();
+  const float* up_ptr = gate_ptr + width;
+
+  clamp_swiglu_weighted_forward_kernel
+      <<<blocks, threads, 0, stream>>>(
+          gate_ptr,
+          up_ptr,
+          p_s.has_value()
+              ? p_s->data_ptr<float>()
+              : nullptr,
+          h.data_ptr<at::BFloat16>(),
+          n,
+          width,
+          2 * width,
+          p_s.has_value());
+
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  return {h};
+}
+
+std::vector<torch::Tensor> clamp_swiglu_weighted_packed_backward_cuda(
+    torch::Tensor dh,
+    torch::Tensor gate_up,
+    torch::optional<torch::Tensor> p_s) {
+  check_cuda_contig(dh, "dh");
+  check_cuda_contig_fp32(gate_up, "gate_up");
+  check_same_device(dh, gate_up, "dh", "gate_up");
+
+  TORCH_CHECK(
+      gate_up.dim() == 2,
+      "gate_up must be 2D [rows, 2 * width]");
+
+  TORCH_CHECK(
+      gate_up.size(1) % 2 == 0,
+      "gate_up width must be even");
+
+  const int64_t rows = gate_up.size(0);
+  const int64_t width = gate_up.size(1) / 2;
+
+  TORCH_CHECK(
+      dh.dim() == 2 &&
+          dh.size(0) == rows &&
+          dh.size(1) == width,
+      "dh must have shape [rows, width]");
+
+  check_route_weights(p_s, gate_up);
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(gate_up));
+
+  auto d_gate = torch::empty(
+      {rows, width},
+      gate_up.options());
+
+  auto d_up = torch::empty(
+      {rows, width},
+      gate_up.options());
+
+  auto dp_s =
+      p_s.has_value()
+          ? torch::zeros({rows}, gate_up.options())
+          : torch::empty({0}, gate_up.options());
+
+  const int64_t n = dh.numel();
+
+  if (n == 0) {
+    return {d_gate, d_up, dp_s};
+  }
+
+  int threads = 0;
+  int64_t blocks = 0;
+  launch_1d(n, threads, blocks);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  const float* gate_ptr = gate_up.data_ptr<float>();
+  const float* up_ptr = gate_ptr + width;
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      dh.scalar_type(),
+      "clamp_swiglu_weighted_packed_backward_cuda",
+      [&] {
+        clamp_swiglu_weighted_backward_kernel<scalar_t>
+            <<<blocks, threads, 0, stream>>>(
+                dh.data_ptr<scalar_t>(),
+                gate_ptr,
+                up_ptr,
+                p_s.has_value()
+                    ? p_s->data_ptr<float>()
+                    : nullptr,
+                d_gate.data_ptr<float>(),
+                d_up.data_ptr<float>(),
+                n,
+                width,
+                2 * width,
+                p_s.has_value());
+
+        if (p_s.has_value()) {
+          int dp_threads = 0;
+          int64_t dp_blocks = 0;
+          launch_1d(rows, dp_threads, dp_blocks);
+
+          clamp_swiglu_weighted_dp_s_kernel<scalar_t>
+              <<<dp_blocks, dp_threads, 0, stream>>>(
+                  dh.data_ptr<scalar_t>(),
+                  gate_ptr,
+                  up_ptr,
+                  dp_s.data_ptr<float>(),
+                  rows,
+                  width,
+                  2 * width);
         }
       });
 

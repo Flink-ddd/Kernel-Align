@@ -14,6 +14,8 @@ from rl_engine.moe.provider import ReferenceProvider
 
 _FORWARD_SYMBOL = "clamp_swiglu_weighted_forward"
 _BACKWARD_SYMBOL = "clamp_swiglu_weighted_backward"
+_PACKED_FORWARD_SYMBOL = "clamp_swiglu_weighted_packed_forward"
+_PACKED_BACKWARD_SYMBOL = "clamp_swiglu_weighted_packed_backward"
 
 _SUPPORTED_DTYPES = (
     torch.float16,
@@ -33,7 +35,14 @@ def _require_cuda_extension() -> None:
             "ClampSwiGLUWeightedCudaProvider requires the compiled " "rl_engine._C extension."
         )
 
-    missing = [name for name in (_FORWARD_SYMBOL, _BACKWARD_SYMBOL) if not hasattr(_C, name)]
+    required_symbols = (
+        _FORWARD_SYMBOL,
+        _BACKWARD_SYMBOL,
+        _PACKED_FORWARD_SYMBOL,
+        _PACKED_BACKWARD_SYMBOL,
+    )
+
+    missing = [name for name in required_symbols if not hasattr(_C, name)]
 
     if missing:
         raise RuntimeError(
@@ -57,6 +66,20 @@ def _validate_matrix(
         raise TypeError(f"{name} must have dtype fp16, bf16, or fp32, " f"got {x.dtype}.")
 
 
+def _validate_packed_matrix(
+    gate_up: torch.Tensor,
+) -> None:
+    _validate_matrix(
+        gate_up,
+        "gate_up",
+    )
+
+    if gate_up.shape[1] % 2 != 0:
+        raise ValueError(
+            "gate_up must have shape [rows, 2 * width], " f"got shape {tuple(gate_up.shape)}."
+        )
+
+
 class ClampSwiGLUWeightedCudaProvider(ReferenceProvider):
     """P5-2 CUDA provider with deterministic FP32 computation."""
 
@@ -71,6 +94,7 @@ class ClampSwiGLUWeightedCudaProvider(ReferenceProvider):
             "backend": "cuda",
             "delivered_ops": ["clamp_swiglu_weighted"],
             "geometry": ["one-row", "packed"],
+            "layouts": ["separate", "gate-up-packed"],
             "devices": ["cuda"],
         }
 
@@ -174,6 +198,92 @@ class ClampSwiGLUWeightedCudaProvider(ReferenceProvider):
             dh.contiguous(),
             gate32,
             saved["up32"],
+            p_s,
+        )
+
+        return (
+            dgate,
+            dup,
+            dp_s if p_s is not None else None,
+        )
+
+    def clamp_swiglu_weighted_packed_fwd(
+        self,
+        gate_up: torch.Tensor,
+        p_s: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        _validate_packed_matrix(gate_up)
+
+        if p_s is not None:
+            if p_s.device != gate_up.device:
+                raise RuntimeError(
+                    "p_s and gate_up must share a CUDA device, "
+                    f"got {p_s.device} and {gate_up.device}."
+                )
+
+            if p_s.dtype != torch.float32:
+                raise TypeError(f"p_s must have dtype fp32, got {p_s.dtype}.")
+
+            if p_s.shape != (gate_up.shape[0],):
+                raise ValueError(
+                    f"p_s must have shape ({gate_up.shape[0]},), " f"got {tuple(p_s.shape)}."
+                )
+
+        gate_up32 = gate_up.float().contiguous()
+        p_s32 = None if p_s is None else p_s.contiguous()
+
+        (h,) = getattr(
+            _C,
+            _PACKED_FORWARD_SYMBOL,
+        )(
+            gate_up32,
+            p_s32,
+        )
+
+        saved = {
+            "gate_up32": gate_up32,
+        }
+
+        if p_s32 is not None:
+            saved["p_s"] = p_s32
+
+        return h, saved
+
+    def clamp_swiglu_weighted_packed_bwd(
+        self,
+        dh: torch.Tensor,
+        saved: dict[str, torch.Tensor],
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
+        if "gate_up32" not in saved:
+            raise KeyError("saved state is missing: gate_up32")
+
+        _validate_matrix(dh, "dh")
+
+        gate_up32 = saved["gate_up32"]
+        rows = gate_up32.shape[0]
+        width = gate_up32.shape[1] // 2
+
+        if dh.device != gate_up32.device:
+            raise RuntimeError(
+                "dh and gate_up32 must share a CUDA device, "
+                f"got {dh.device} and {gate_up32.device}."
+            )
+
+        if dh.shape != (rows, width):
+            raise ValueError(f"dh must have shape ({rows}, {width}), " f"got {tuple(dh.shape)}.")
+
+        p_s = saved.get("p_s")
+
+        dgate, dup, dp_s = getattr(
+            _C,
+            _PACKED_BACKWARD_SYMBOL,
+        )(
+            dh.contiguous(),
+            gate_up32,
             p_s,
         )
 
