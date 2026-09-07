@@ -469,15 +469,17 @@ def test_vllm_attention_routes_paged_cache_to_rocm_runtime(monkeypatch):
     assert output.shape == (1, 16)
     assert len(runtime_calls) == 1
     assert runtime_calls[0][0].shape == (1, 2, 1, 8)
-    assert runtime_calls[0][3]["cached_lengths"] == (1,)
+    assert torch.equal(runtime_calls[0][3]["cu_seqlens_q"], torch.tensor([0, 1]))
+    assert torch.equal(runtime_calls[0][3]["kv_indptr"], torch.tensor([0, 1]))
     assert adapter.provenance["execution"]["runtime_platform"] == "rocm"
     assert (
         adapter.provenance["execution"]["materialization"]
-        == "logical_paged_kv_to_aiter_ck_dense"
+        == "direct_vllm_paged_kv_to_aiter_batch_prefill_ck"
     )
+    assert adapter.provenance["execution"]["dense_kv_materialized"] is False
 
 
-def test_vllm_rocm_host_lengths_are_materialized_once_across_layers(monkeypatch):
+def test_vllm_rocm_metadata_stays_on_device_and_is_reused_across_layers(monkeypatch):
     original_tolist = torch.Tensor.tolist
     tolist_calls = 0
 
@@ -505,7 +507,6 @@ def test_vllm_rocm_host_lengths_are_materialized_once_across_layers(monkeypatch)
         block_size=8,
         num_actual=2,
         cache_owner=first_layer,
-        include_host_lengths=True,
     )
     second, summary = adapter._materialization_groups(
         metadata,
@@ -514,12 +515,13 @@ def test_vllm_rocm_host_lengths_are_materialized_once_across_layers(monkeypatch)
         block_size=8,
         num_actual=2,
         cache_owner=second_layer,
-        include_host_lengths=True,
     )
 
     assert first is second
-    assert first[0]["cached_lengths"] == (3, 5)
-    assert tolist_calls == 1
+    assert torch.equal(first[0]["seqused_k"], torch.tensor([3, 5], dtype=torch.int32))
+    assert torch.equal(first[0]["cu_seqlens_q"], torch.tensor([0, 1, 2], dtype=torch.int32))
+    assert torch.equal(first[0]["kv_indptr"], torch.tensor([0, 1, 2], dtype=torch.int32))
+    assert tolist_calls == 0
     assert summary["metadata_reused_across_layers"] is True
 
 
@@ -548,6 +550,25 @@ def test_vllm_rocm_native_kv_cache_with_two_heads_is_not_treated_as_pair_axis():
     assert value.shape == (3, 4, 2, 5)
     assert torch.equal(key, cache.transpose(1, 2)[..., :5])
     assert torch.equal(value, cache.transpose(1, 2)[..., 5:])
+
+
+def test_vllm_rocm_rlkernel_token_major_kv_cache_is_zero_copy():
+    cache = torch.arange(3 * 4 * 2 * 10).reshape(3, 4, 2, 10)
+
+    key, value = _vllm_kv_cache_views(
+        cache,
+        head_size=5,
+        num_kv_heads=2,
+        platform="rocm",
+    )
+
+    assert key.shape == (3, 4, 2, 5)
+    assert value.shape == (3, 4, 2, 5)
+    assert key.data_ptr() == cache.data_ptr()
+    assert value.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
+    assert torch.equal(key, cache[..., :5])
+    assert torch.equal(value, cache[..., 5:])
+    assert key.stride(1) >= key.size(2) * key.stride(2)
 
 
 def test_vllm_rocm_kv_cache_pair_axis_is_materialized():

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import socket
 import threading
+from collections.abc import Iterable
 from types import TracebackType
 from typing import Any
 
@@ -17,6 +18,7 @@ _PACKED_REDUCE_SCATTER_MAX_BYTES = 8 * 1024 * 1024
 _ROCM_IPC_DIRECT_ALL_REDUCE_MAX_BYTES = 768 * 1024
 _ROCM_IPC_SHARDED_ALL_REDUCE_MIN_BYTES = 2176 * 1024
 _ROCM_IPC_ALL_GATHER_MAX_BYTES = 256 * 1024
+_ROCM_IPC_CONTROL_BYTES = 256
 _REDUCTION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 class TorchDistributedDeterministicCollective:
@@ -652,6 +654,9 @@ class RCCLDeterministicCollective(TorchDistributedDeterministicCollective):
             )
         self._ipc_handle = 0
         self._ipc_staging: torch.Tensor | None = None
+        self._direct_staging_views: dict[
+            tuple[tuple[int, ...], torch.dtype], torch.Tensor
+        ] = {}
         self._initialize_ipc_transport()
 
     @property
@@ -674,6 +679,8 @@ class RCCLDeterministicCollective(TorchDistributedDeterministicCollective):
             "deterministic_collective_rocm_ipc_synchronize",
             "deterministic_collective_rocm_ipc_destroy",
             "deterministic_collective_rocm_ipc_stage",
+            "deterministic_collective_rocm_ipc_prepare_staged",
+            "deterministic_collective_rocm_ipc_all_reduce_staged",
             "deterministic_collective_rocm_ipc_all_reduce",
             "deterministic_collective_rocm_ipc_all_reduce_input",
             "deterministic_collective_rocm_ipc_reduce_scatter",
@@ -704,6 +711,49 @@ class RCCLDeterministicCollective(TorchDistributedDeterministicCollective):
             )
         )
         self._ipc_staging = staging
+        self._handle = self._ipc_handle
+
+    def prepare_direct_staging_views(
+        self,
+        shapes: Iterable[tuple[int, ...]],
+        *,
+        dtype: torch.dtype,
+    ) -> None:
+        staging = self._ipc_staging
+        if not self._ipc_handle or staging is None:
+            return
+        if dtype not in _REDUCTION_DTYPES:
+            raise TypeError(f"unsupported direct-staging dtype {dtype}")
+        element_size = torch.empty((), dtype=dtype).element_size()
+        for raw_shape in shapes:
+            shape = tuple(int(dim) for dim in raw_shape)
+            numel = 1
+            for dim in shape:
+                if dim < 0:
+                    raise ValueError(
+                        f"direct-staging dimensions must be non-negative, got {shape}"
+                    )
+                numel *= dim
+            size_bytes = numel * element_size
+            if size_bytes > min(
+                self.max_size_bytes,
+                _ROCM_IPC_DIRECT_ALL_REDUCE_MAX_BYTES,
+            ):
+                continue
+            payload = staging.narrow(
+                0,
+                _ROCM_IPC_CONTROL_BYTES,
+                size_bytes,
+            )
+            self._direct_staging_views[(shape, dtype)] = payload.view(dtype).view(shape)
+
+    def direct_staging_view(
+        self,
+        shape: tuple[int, ...],
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        return self._direct_staging_views.get((tuple(int(dim) for dim in shape), dtype))
 
     def _direct_all_reduce(self, input: torch.Tensor, output: torch.Tensor) -> bool:
         handle = self._ipc_handle
@@ -795,6 +845,8 @@ class RCCLDeterministicCollective(TorchDistributedDeterministicCollective):
             _C.deterministic_collective_rocm_ipc_synchronize(handle)
             torch.cuda.synchronize(self.device)
             self._ipc_handle = 0
+            self._handle = 0
             _C.deterministic_collective_rocm_ipc_destroy(handle)
             self._ipc_staging = None
+            self._direct_staging_views.clear()
         super().close()

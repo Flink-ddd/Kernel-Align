@@ -18,6 +18,8 @@ import pytest
 from rl_engine.kernels.ops.rocm.attention.flash_attn import (
     _AITER_BWD_POSITIONAL_CONTRACT,
     _AITER_BWD_REQUIRED_KEYWORDS,
+    _AITER_BATCH_PREFILL_POSITIONAL_CONTRACT,
+    _AITER_BATCH_PREFILL_REQUIRED_KEYWORDS,
     _AITER_FWD_POSITIONAL_CONTRACT,
     _AITER_FWD_REQUIRED_KEYWORDS,
     StrictRocmAttentionUnavailable,
@@ -78,6 +80,11 @@ def test_installed_aiter_satisfies_the_strict_contract() -> None:
         "mha_bwd",
         _AITER_BWD_POSITIONAL_CONTRACT,
         required_keywords=_AITER_BWD_REQUIRED_KEYWORDS,
+    )
+    _validate_aiter_schema(
+        "mha_batch_prefill",
+        _AITER_BATCH_PREFILL_POSITIONAL_CONTRACT,
+        required_keywords=_AITER_BATCH_PREFILL_REQUIRED_KEYWORDS,
     )
 
 

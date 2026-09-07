@@ -24,6 +24,12 @@ _AUTO_BACKEND = "auto"
 _TRITON_BACKEND = "triton"
 _ROUTE_REPORTED = False
 _ROUTE_REPORT_LOCK = Lock()
+_WEIGHT_TRANSPOSE_CACHE: dict[
+    tuple[int, str, tuple[int, ...], torch.dtype], tuple[int, torch.Tensor]
+] = {}
+_WEIGHT_TRANSPOSE_CACHE_LIMIT = 256
+_DIRECT_STAGING_BY_SLOT: dict[int, tuple[int, torch.Tensor]] = {}
+_DIRECT_STAGING_SLOT_BY_HANDLE: dict[int, int] = {}
 
 
 def _requested_det_gemm_backend() -> str:
@@ -54,6 +60,49 @@ def det_gemm_backend_id() -> str:
     return "rlkernel.det_gemm.triton_tree_rocm.v1"
 
 
+def _cached_weight_transpose(weight: torch.Tensor) -> torch.Tensor:
+    """Reuse inference-only transposed weights until the parameter is updated."""
+
+    # Training must retain the original autograd graph and therefore cannot
+    # retain a detached transpose in a process-global cache.
+    if torch.is_grad_enabled():
+        return weight.t().contiguous()
+    key = (weight.data_ptr(), str(weight.device), tuple(weight.shape), weight.dtype)
+    version = int(getattr(weight, "_version", 0))
+    cached = _WEIGHT_TRANSPOSE_CACHE.get(key)
+    if cached is not None:
+        if cached[0] != version:
+            # Preserve the allocation captured by HIP Graph while refreshing
+            # its contents after an in-place framework weight update.
+            cached[1].copy_(weight.t())
+            _WEIGHT_TRANSPOSE_CACHE[key] = (version, cached[1])
+        return cached[1]
+    transposed = weight.t().contiguous()
+    if len(_WEIGHT_TRANSPOSE_CACHE) >= _WEIGHT_TRANSPOSE_CACHE_LIMIT:
+        _WEIGHT_TRANSPOSE_CACHE.pop(next(iter(_WEIGHT_TRANSPOSE_CACHE)))
+    _WEIGHT_TRANSPOSE_CACHE[key] = (version, transposed)
+    return transposed
+
+
+@torch.inference_mode()
+def refresh_cached_weight_transposes(weights: object) -> int:
+    """Refresh graph-captured transpose buffers after an IPC weight update."""
+
+    refreshed = 0
+    for weight in weights:
+        if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+            continue
+        key = (weight.data_ptr(), str(weight.device), tuple(weight.shape), weight.dtype)
+        cached = _WEIGHT_TRANSPOSE_CACHE.get(key)
+        if cached is None:
+            continue
+        cached[1].copy_(weight.t())
+        version = int(getattr(weight, "_version", 0))
+        _WEIGHT_TRANSPOSE_CACHE[key] = (version, cached[1])
+        refreshed += 1
+    return refreshed
+
+
 def _report_strict_route_once() -> None:
     global _ROUTE_REPORTED
     if torch._dynamo.is_compiling() or not route_report_enabled():
@@ -80,7 +129,125 @@ def det_gemm_linear(
     """Apply a native [N,K] weight through the strict ROCm backend."""
 
     del native_op
-    return _triton_tree_gemm(a, weight.t().contiguous(), out=out)
+    return _triton_tree_gemm(a, _cached_weight_transpose(weight), out=out)
+
+
+@torch.library.custom_op("rl_kernel::rocm_det_gemm_linear_inference", mutates_args=())
+def _det_gemm_linear_inference(
+    a: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    return det_gemm_linear(a, weight)
+
+
+@_det_gemm_linear_inference.register_fake
+def _det_gemm_linear_inference_fake(
+    a: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    return a.new_empty((a.shape[0], weight.shape[0]))
+
+
+@torch.library.custom_op(
+    "rl_kernel::rocm_det_gemm_linear_inference_out",
+    mutates_args={"out"},
+)
+def _det_gemm_linear_inference_out(
+    a: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    det_gemm_linear(a, weight, out=out)
+
+
+@_det_gemm_linear_inference_out.register_fake
+def _det_gemm_linear_inference_out_fake(
+    a: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    del a, weight, out
+
+
+@torch.library.custom_op(
+    "rl_kernel::rocm_det_gemm_linear_all_reduce_inference",
+    mutates_args=(),
+)
+def _det_gemm_linear_all_reduce_inference(
+    a: torch.Tensor,
+    weight: torch.Tensor,
+    collective_handle: int,
+) -> torch.Tensor:
+    """Run row-parallel inference without exposing shape dispatch to Dynamo."""
+
+    from rl_engine import _C
+
+    binding = _DIRECT_STAGING_BY_SLOT.get(collective_handle)
+    if binding is None:
+        raise RuntimeError("strict ROCm row-parallel staging handle is not registered")
+    runtime_handle, staging = binding
+    if a.size(0) <= staging.size(0):
+        direct_output = staging.narrow(0, 0, a.size(0))
+        _C.deterministic_collective_rocm_ipc_prepare_staged(
+            runtime_handle,
+            direct_output,
+        )
+        det_gemm_linear(a, weight, out=direct_output)
+        output = torch.empty_like(direct_output)
+        _C.deterministic_collective_rocm_ipc_all_reduce_staged(
+            runtime_handle,
+            direct_output,
+            output,
+        )
+        return output
+
+    output = det_gemm_linear(a, weight)
+    _C.deterministic_collective_rocm_ipc_all_reduce_input(
+        runtime_handle,
+        output,
+        output,
+    )
+    return output
+
+
+@_det_gemm_linear_all_reduce_inference.register_fake
+def _det_gemm_linear_all_reduce_inference_fake(
+    a: torch.Tensor,
+    weight: torch.Tensor,
+    collective_handle: int,
+) -> torch.Tensor:
+    del collective_handle
+    return a.new_empty((a.shape[0], weight.shape[0]))
+
+
+def register_det_gemm_all_reduce_staging(
+    collective_handle: int,
+    staging: torch.Tensor,
+) -> int:
+    if collective_handle <= 0:
+        raise ValueError("collective_handle must be positive")
+    slot = _DIRECT_STAGING_SLOT_BY_HANDLE.get(collective_handle)
+    if slot is None:
+        # Dynamo persists scalar custom-op arguments in its cross-process AOT
+        # cache. Use registration order as the stable graph identity and resolve
+        # the process-local C++ handle only when the custom op executes.
+        slot = len(_DIRECT_STAGING_SLOT_BY_HANDLE) + 1
+        _DIRECT_STAGING_SLOT_BY_HANDLE[collective_handle] = slot
+    _DIRECT_STAGING_BY_SLOT[slot] = (collective_handle, staging)
+    return slot
+
+
+def det_gemm_linear_all_reduce_inference(
+    a: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    collective_handle: int,
+) -> torch.Tensor:
+    return _det_gemm_linear_all_reduce_inference(
+        a,
+        weight,
+        collective_handle,
+    )
 
 
 def prepare_det_gemm_linear_weight(
@@ -238,7 +405,10 @@ class RocmDetGemmOp:
         if out is not None:
             if torch.is_grad_enabled() and (a.requires_grad or weight.requires_grad):
                 raise RuntimeError("direct-output deterministic GEMM is inference-only")
-            return det_gemm_linear(a, weight, out=out)
+            _det_gemm_linear_inference_out(a, weight, out)
+            return out
+        if not torch.is_grad_enabled() or not (a.requires_grad or weight.requires_grad):
+            return _det_gemm_linear_inference(a, weight)
         return _DetLinearFn.apply(a, weight)
 
     def linear_prepared(
@@ -296,4 +466,7 @@ __all__ = [
     "det_gemm_linear_weight_gradient",
     "deterministic_gemm",
     "prepare_det_gemm_linear_weight",
+    "det_gemm_linear_all_reduce_inference",
+    "register_det_gemm_all_reduce_staging",
+    "refresh_cached_weight_transposes",
 ]

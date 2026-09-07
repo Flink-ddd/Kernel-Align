@@ -225,6 +225,20 @@ def deterministic_attention_backward(
     scale: float,
     key_padding_mask: torch.Tensor | None,
 ) -> list[torch.Tensor]: ...
+def deterministic_rope_apply_rocm(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    sin_sign: float,
+) -> torch.Tensor: ...
+def deterministic_rope_apply_token_major_rocm(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    head_dim: int,
+    sin_sign: float,
+) -> torch.Tensor: ...
 def det_gemm_sm90_compiled() -> bool: ...
 def det_gemm_fwd(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor: ...
 def det_gemm_fwd_rhs_transposed(
@@ -270,6 +284,15 @@ def deterministic_collective_rocm_ipc_create(
 def deterministic_collective_rocm_ipc_synchronize(handle: int) -> None: ...
 def deterministic_collective_rocm_ipc_destroy(handle: int) -> None: ...
 def deterministic_collective_rocm_ipc_stage(handle: int, input: torch.Tensor) -> None: ...
+def deterministic_collective_rocm_ipc_prepare_staged(
+    handle: int,
+    input: torch.Tensor,
+) -> None: ...
+def deterministic_collective_rocm_ipc_all_reduce_staged(
+    handle: int,
+    input: torch.Tensor,
+    output: torch.Tensor,
+) -> None: ...
 def deterministic_collective_rocm_ipc_all_reduce(
     handle: int,
     output: torch.Tensor,

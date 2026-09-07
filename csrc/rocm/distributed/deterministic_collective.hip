@@ -30,6 +30,7 @@ constexpr int64_t kIPCControlBytes = 256;
 constexpr int64_t kIPCReadyOffset = 0;
 constexpr int64_t kIPCDoneOffset = 64;
 constexpr int64_t kIPCCloseOffset = 128;
+constexpr int64_t kIPCSequenceOffset = 192;
 
 struct PeerPointers {
   const void* values[kMaxWorldSize];
@@ -39,6 +40,7 @@ struct PeerSignals {
   uint64_t* ready[kMaxWorldSize];
   uint64_t* done[kMaxWorldSize];
   uint64_t* closed[kMaxWorldSize];
+  uint64_t* sequence[kMaxWorldSize];
 };
 
 template <typename scalar_t>
@@ -441,6 +443,124 @@ __global__ void ipc_mark_signal_kernel(uint64_t* signal, uint64_t sequence) {
   }
 }
 
+__global__ void ipc_reserve_sequence_kernel(
+    PeerSignals signals,
+    int64_t rank,
+    int64_t world_size) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  uint64_t sequence = 0;
+  if (rank == 0) {
+    const uint64_t previous = __hip_atomic_load(
+        signals.sequence[0],
+        __ATOMIC_ACQUIRE,
+        __HIP_MEMORY_SCOPE_SYSTEM);
+    for (int peer = 0; peer < world_size; ++peer) {
+      while (__hip_atomic_load(
+                 signals.done[peer],
+                 __ATOMIC_ACQUIRE,
+                 __HIP_MEMORY_SCOPE_SYSTEM) < previous) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    sequence = previous + 1;
+    __hip_atomic_store(
+        signals.sequence[0],
+        sequence,
+        __ATOMIC_RELEASE,
+        __HIP_MEMORY_SCOPE_SYSTEM);
+  } else {
+    const uint64_t previous = __hip_atomic_load(
+        signals.sequence[rank],
+        __ATOMIC_ACQUIRE,
+        __HIP_MEMORY_SCOPE_SYSTEM);
+    do {
+      sequence = __hip_atomic_load(
+          signals.sequence[0],
+          __ATOMIC_ACQUIRE,
+          __HIP_MEMORY_SCOPE_SYSTEM);
+      if (sequence <= previous) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    } while (sequence <= previous);
+    for (int peer = 0; peer < world_size; ++peer) {
+      while (__hip_atomic_load(
+                 signals.done[peer],
+                 __ATOMIC_ACQUIRE,
+                 __HIP_MEMORY_SCOPE_SYSTEM) < sequence - 1) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __hip_atomic_store(
+        signals.sequence[rank],
+        sequence,
+        __ATOMIC_RELEASE,
+        __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+}
+
+__global__ void ipc_mark_ready_and_wait_dynamic_kernel(
+    PeerSignals signals,
+    int64_t rank,
+    int64_t world_size) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  const uint64_t sequence = __hip_atomic_load(
+      signals.sequence[rank],
+      __ATOMIC_ACQUIRE,
+      __HIP_MEMORY_SCOPE_SYSTEM);
+  __hip_atomic_store(
+      signals.ready[rank],
+      sequence,
+      __ATOMIC_RELEASE,
+      __HIP_MEMORY_SCOPE_SYSTEM);
+  for (int peer = 0; peer < world_size; ++peer) {
+    while (__hip_atomic_load(
+               signals.ready[peer],
+               __ATOMIC_ACQUIRE,
+               __HIP_MEMORY_SCOPE_SYSTEM) != sequence) {
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
+}
+
+__global__ void ipc_mark_done_dynamic_kernel(PeerSignals signals, int64_t rank) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    const uint64_t sequence = __hip_atomic_load(
+        signals.sequence[rank],
+        __ATOMIC_ACQUIRE,
+        __HIP_MEMORY_SCOPE_SYSTEM);
+    __hip_atomic_store(
+        signals.done[rank],
+        sequence,
+        __ATOMIC_RELEASE,
+        __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+}
+
+__global__ void ipc_synchronize_dynamic_kernel(
+    PeerSignals signals,
+    int64_t rank,
+    int64_t world_size) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  const uint64_t sequence = __hip_atomic_load(
+      signals.sequence[rank],
+      __ATOMIC_ACQUIRE,
+      __HIP_MEMORY_SCOPE_SYSTEM);
+  for (int peer = 0; peer < world_size; ++peer) {
+    while (__hip_atomic_load(
+               signals.done[peer],
+               __ATOMIC_ACQUIRE,
+               __HIP_MEMORY_SCOPE_SYSTEM) < sequence) {
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
+}
+
 __global__ void ipc_mark_ready_and_wait_kernel(
     PeerSignals signals,
     int64_t rank,
@@ -613,6 +733,72 @@ void launch_mark_ready_and_wait(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void launch_reserve_sequence(
+    const PeerSignals& signals,
+    int64_t rank,
+    int64_t world_size,
+    hipStream_t stream) {
+  hipLaunchKernelGGL(
+      ipc_reserve_sequence_kernel,
+      dim3(1),
+      dim3(1),
+      0,
+      stream,
+      signals,
+      rank,
+      world_size);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void launch_mark_ready_and_wait_dynamic(
+    const PeerSignals& signals,
+    int64_t rank,
+    int64_t world_size,
+    hipStream_t stream) {
+  hipLaunchKernelGGL(
+      ipc_mark_ready_and_wait_dynamic_kernel,
+      dim3(1),
+      dim3(1),
+      0,
+      stream,
+      signals,
+      rank,
+      world_size);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void launch_mark_done_dynamic(
+    const PeerSignals& signals,
+    int64_t rank,
+    hipStream_t stream) {
+  hipLaunchKernelGGL(
+      ipc_mark_done_dynamic_kernel,
+      dim3(1),
+      dim3(1),
+      0,
+      stream,
+      signals,
+      rank);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void launch_synchronize_dynamic(
+    const PeerSignals& signals,
+    int64_t rank,
+    int64_t world_size,
+    hipStream_t stream) {
+  hipLaunchKernelGGL(
+      ipc_synchronize_dynamic_kernel,
+      dim3(1),
+      dim3(1),
+      0,
+      stream,
+      signals,
+      rank,
+      world_size);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void launch_close_and_wait(
     const PeerSignals& signals,
     int64_t rank,
@@ -706,13 +892,7 @@ class ROCmIPCCollectiveState {
     const int64_t input_bytes = input.numel() * input.element_size();
     TORCH_CHECK(input_bytes <= capacity_bytes_,
                 "input exceeds ROCm IPC staging capacity");
-    ++sequence_;
-    launch_wait_signal(
-        signals_,
-        sequence_ - 1,
-        world_size_,
-        true,
-        stream);
+    launch_reserve_sequence(signals_, rank_, world_size_, stream);
     if (input_bytes > 0) {
       C10_HIP_CHECK(hipMemcpyAsync(
           const_cast<void*>(peers_.values[rank_]),
@@ -721,20 +901,42 @@ class ROCmIPCCollectiveState {
           hipMemcpyDeviceToDevice,
           stream));
     }
-    launch_mark_ready_and_wait(
-        signals_,
-        rank_,
-        sequence_,
-        world_size_,
-        stream);
+    launch_mark_ready_and_wait_dynamic(signals_, rank_, world_size_, stream);
     staged_bytes_ = input_bytes;
     staged_type_ = input.scalar_type();
+  }
+
+  void prepare_staged(torch::Tensor input, hipStream_t stream) {
+    check_tensor(input, "direct staging input");
+    const int64_t input_bytes = input.numel() * input.element_size();
+    TORCH_CHECK(input_bytes <= capacity_bytes_,
+                "direct staging input exceeds ROCm IPC capacity");
+    TORCH_CHECK(input.data_ptr() == peers_.values[rank_],
+                "direct staging input must start at the local IPC payload");
+    TORCH_CHECK(!staging_reserved_, "direct staging is already reserved");
+    launch_reserve_sequence(signals_, rank_, world_size_, stream);
+    staged_bytes_ = input_bytes;
+    staged_type_ = input.scalar_type();
+    staging_reserved_ = true;
+  }
+
+  void finish_staged(torch::Tensor input, hipStream_t stream) {
+    check_tensor(input, "direct staging input");
+    TORCH_CHECK(staging_reserved_, "direct staging must be reserved before reduction");
+    TORCH_CHECK(input.data_ptr() == peers_.values[rank_],
+                "direct staging input must start at the local IPC payload");
+    TORCH_CHECK(input.numel() * input.element_size() == staged_bytes_,
+                "direct staging input size changed after reserve");
+    TORCH_CHECK(input.scalar_type() == staged_type_,
+                "direct staging input dtype changed after reserve");
+    launch_mark_ready_and_wait_dynamic(signals_, rank_, world_size_, stream);
+    staging_reserved_ = false;
   }
 
   void all_reduce(torch::Tensor output, hipStream_t stream) const {
     check_reduction_output(output, staged_bytes_, "all_reduce");
     launch(output, 0, output.numel(), stream);
-    launch_mark_signal(signals_.done[rank_], sequence_, stream);
+    launch_mark_done_dynamic(signals_, rank_, stream);
   }
 
   void reduce_scatter(torch::Tensor output, hipStream_t stream) const {
@@ -747,7 +949,7 @@ class ROCmIPCCollectiveState {
         rank_ * output.numel(),
         output.numel(),
         stream);
-    launch_mark_signal(signals_.done[rank_], sequence_, stream);
+    launch_mark_done_dynamic(signals_, rank_, stream);
   }
 
   void reduce_scatter_many(
@@ -775,8 +977,7 @@ class ROCmIPCCollectiveState {
       total_bytes += input_bytes;
     }
 
-    ++sequence_;
-    launch_wait_signal(signals_, sequence_ - 1, world_size_, true, stream);
+    launch_reserve_sequence(signals_, rank_, world_size_, stream);
     int64_t byte_offset = 0;
     for (const auto& input : inputs) {
       const int64_t input_bytes = input.numel() * input.element_size();
@@ -790,12 +991,7 @@ class ROCmIPCCollectiveState {
       }
       byte_offset += input_bytes;
     }
-    launch_mark_ready_and_wait(
-        signals_,
-        rank_,
-        sequence_,
-        world_size_,
-        stream);
+    launch_mark_ready_and_wait_dynamic(signals_, rank_, world_size_, stream);
 
     int64_t element_offset = 0;
     for (size_t index = 0; index < outputs.size(); ++index) {
@@ -808,7 +1004,7 @@ class ROCmIPCCollectiveState {
           stream);
       element_offset += input.numel();
     }
-    launch_mark_signal(signals_.done[rank_], sequence_, stream);
+    launch_mark_done_dynamic(signals_, rank_, stream);
   }
 
   void all_gather(torch::Tensor output, hipStream_t stream) const {
@@ -824,11 +1020,11 @@ class ROCmIPCCollectiveState {
         staged_bytes_,
         world_size_,
         stream);
-    launch_mark_signal(signals_.done[rank_], sequence_, stream);
+    launch_mark_done_dynamic(signals_, rank_, stream);
   }
 
   void synchronize(hipStream_t stream) const {
-    launch_wait_signal(signals_, sequence_, world_size_, true, stream);
+    launch_synchronize_dynamic(signals_, rank_, world_size_, stream);
     launch_close_and_wait(signals_, rank_, world_size_, stream);
   }
 
@@ -838,6 +1034,7 @@ class ROCmIPCCollectiveState {
     signals_.ready[peer] = reinterpret_cast<uint64_t*>(bytes + kIPCReadyOffset);
     signals_.done[peer] = reinterpret_cast<uint64_t*>(bytes + kIPCDoneOffset);
     signals_.closed[peer] = reinterpret_cast<uint64_t*>(bytes + kIPCCloseOffset);
+    signals_.sequence[peer] = reinterpret_cast<uint64_t*>(bytes + kIPCSequenceOffset);
     peers_.values[peer] = bytes + kIPCControlBytes;
   }
 
@@ -923,7 +1120,7 @@ class ROCmIPCCollectiveState {
   int64_t capacity_bytes_;
   int64_t staged_bytes_{0};
   at::ScalarType staged_type_{at::ScalarType::Undefined};
-  uint64_t sequence_{0};
+  bool staging_reserved_{false};
   PeerPointers peers_{};
   PeerSignals signals_{};
   std::array<void*, kMaxWorldSize> imported_bases_{};
@@ -1029,6 +1226,25 @@ void deterministic_collective_rocm_ipc_stage(int64_t handle, torch::Tensor input
   const c10::cuda::CUDAGuard device_guard(input.device());
   const auto stream = at::cuda::getCurrentCUDAStream();
   ipc_state(handle)->stage(input, stream);
+}
+
+void deterministic_collective_rocm_ipc_prepare_staged(
+    int64_t handle,
+    torch::Tensor input) {
+  const c10::cuda::CUDAGuard device_guard(input.device());
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  ipc_state(handle)->prepare_staged(input, stream);
+}
+
+void deterministic_collective_rocm_ipc_all_reduce_staged(
+    int64_t handle,
+    torch::Tensor input,
+    torch::Tensor output) {
+  const c10::cuda::CUDAGuard device_guard(input.device());
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  auto* state = ipc_state(handle);
+  state->finish_staged(input, stream);
+  state->all_reduce(output, stream);
 }
 
 void deterministic_collective_rocm_ipc_all_reduce(

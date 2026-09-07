@@ -821,6 +821,26 @@ def test_paged_decode_keeps_staging_when_output_aliases_an_input() -> None:
     assert result.provenance["core_output_staging"] == "runtime_group_cat"
 
 
+def test_paged_decode_can_skip_unused_lse_assembly() -> None:
+    runtime = _runtime()
+    k_cache = _cache(2)
+    q = torch.zeros(1, 1, 1, _HEAD_DIM, dtype=torch.bfloat16)
+
+    result = runtime.forward_paged_with_lse(
+        q,
+        k_cache,
+        k_cache + 1,
+        page_table=torch.tensor([[0]], dtype=torch.int32),
+        seqused_k=torch.tensor([_PAGE_SIZE], dtype=torch.int32),
+        max_seqlen_k=_PAGE_SIZE,
+        scale=None,
+        return_lse=False,
+    )
+
+    assert result.lse.shape == (0,)
+    assert result.provenance["lse_returned"] is False
+
+
 def test_rocm_registry_does_not_claim_decode_before_a_caller_routes_to_it() -> None:
     """The paged entry point exists, but nothing dispatches to it yet.
 

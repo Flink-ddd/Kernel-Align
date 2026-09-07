@@ -47,6 +47,8 @@ _COLLECTIVE_MIN_CAPACITY_BYTES = 64 * 1024 * 1024
 # Backward-compatible test hook; ownership lives in the shared communication layer.
 _COLLECTIVES = _SHARED_COLLECTIVES
 _PACKED_INFERENCE_OBSERVERS: list[Callable[[], None]] = []
+_PACKED_INFERENCE_STAGING_BY_HANDLE: dict[int, tuple[int, Tensor]] = {}
+_PACKED_INFERENCE_SLOT_BY_RUNTIME_HANDLE: dict[int, int] = {}
 
 
 def register_packed_inference_observer(callback: Callable[[], None]) -> None:
@@ -137,6 +139,70 @@ def _qwen3_ffn_packed_inference_to_staging_fake(
     del rmsnorm_output, fused_gate_up_weight, down_weight, output
 
 
+@torch.library.custom_op(
+    "rl_kernel::qwen3_ffn_packed_tp_inference_rocm",
+    mutates_args=(),
+)
+def _qwen3_ffn_packed_tp_inference_rocm(
+    rmsnorm_output: Tensor,
+    fused_gate_up_weight: Tensor,
+    down_weight: Tensor,
+    collective_handle: int,
+) -> Tensor:
+    """Keep ROCm profile/capture shape selection behind one graph boundary."""
+
+    input_shape = rmsnorm_output.shape
+    rows = rmsnorm_output.numel() // input_shape[-1]
+    binding = _PACKED_INFERENCE_STAGING_BY_HANDLE.get(collective_handle)
+    if binding is None:
+        raise RuntimeError("packed ROCm rollout FFN staging handle is not registered")
+    runtime_handle, staging = binding
+    if rows <= staging.size(0):
+        direct_output = staging.narrow(0, 0, rows)
+        _C.deterministic_collective_rocm_ipc_prepare_staged(
+            runtime_handle,
+            direct_output,
+        )
+        _qwen3_ffn_packed_inference_to_staging(
+            rmsnorm_output,
+            fused_gate_up_weight,
+            down_weight,
+            direct_output,
+        )
+        reduced = torch.empty_like(direct_output)
+        _C.deterministic_collective_rocm_ipc_all_reduce_staged(
+            runtime_handle,
+            direct_output,
+            reduced,
+        )
+        return reduced.reshape(*input_shape[:-1], down_weight.shape[0])
+
+    output = _qwen3_ffn_packed_inference(
+        rmsnorm_output,
+        fused_gate_up_weight,
+        down_weight,
+    )
+    _C.deterministic_collective_rocm_ipc_all_reduce_input(
+        runtime_handle,
+        output,
+        output,
+    )
+    return output
+
+
+@_qwen3_ffn_packed_tp_inference_rocm.register_fake
+def _qwen3_ffn_packed_tp_inference_rocm_fake(
+    rmsnorm_output: Tensor,
+    fused_gate_up_weight: Tensor,
+    down_weight: Tensor,
+    collective_handle: int,
+) -> Tensor:
+    del fused_gate_up_weight, collective_handle
+    return rmsnorm_output.new_empty(
+        (*rmsnorm_output.shape[:-1], down_weight.shape[0])
+    )
+
+
 def qwen3_ffn_packed_inference(
     rmsnorm_output: Tensor,
     fused_gate_up_weight: Tensor,
@@ -154,26 +220,41 @@ def qwen3_ffn_packed_inference(
             fused_gate_up_weight,
             down_weight,
         )
-    if getattr(torch.version, "hip", None) is not None:
-        if collective is None:
-            raise RuntimeError("packed ROCm rollout FFN requires a bound TP collective")
+    if collective_handle <= 0:
+        raise RuntimeError("packed rollout FFN requires a bound TP collective")
+    if (
+        getattr(torch.version, "hip", None) is not None
+        and collective is not None
+        and collective_handle not in _PACKED_INFERENCE_STAGING_BY_HANDLE
+    ):
+        # Eager ROCm does not reserve graph staging.  Keep its established
+        # in-place fixed-tree path; graph-enabled runs register the handle in
+        # prepare_packed_inference and stay behind the opaque custom op below.
         output = _qwen3_ffn_packed_inference(
             rmsnorm_output,
             fused_gate_up_weight,
             down_weight,
         )
         return collective.all_reduce(output, out=output)
-    if collective_handle <= 0:
-        raise RuntimeError("packed rollout FFN requires a bound TP collective")
+    if getattr(torch.version, "hip", None) is not None:
+        return _qwen3_ffn_packed_tp_inference_rocm(
+            rmsnorm_output,
+            fused_gate_up_weight,
+            down_weight,
+            collective_handle,
+        )
     input_shape = rmsnorm_output.shape
     output_shape_2d = (
         rmsnorm_output.numel() // input_shape[-1],
         down_weight.shape[0],
     )
+    direct_staging = None if collective is None else getattr(
+        collective, "direct_staging_view", None
+    )
     direct_output = (
         None
-        if collective is None
-        else collective.direct_staging_view(output_shape_2d, dtype=rmsnorm_output.dtype)
+        if not callable(direct_staging)
+        else direct_staging(output_shape_2d, dtype=rmsnorm_output.dtype)
     )
     if direct_output is not None:
         deterministic_staging_reserve(
@@ -733,18 +814,40 @@ class Qwen3FFNOp:
             tp_group,
             min_size_bytes=min_size_bytes,
         )
-        if getattr(torch.version, "hip", None) is not None:
-            collective_handle = int(collective._handle)
-            self._packed_inference_collectives[collective_handle] = collective
-            return collective_handle, tp_world_size
         max_capture = int(os.getenv("RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE", "0"))
         if max_capture <= 0:
+            if getattr(torch.version, "hip", None) is not None:
+                collective_handle = int(collective._handle)
+                self._packed_inference_collectives[collective_handle] = collective
+                return collective_handle, tp_world_size
             raise RuntimeError("packed rollout FFN requires a positive graph capture size")
         collective.prepare_direct_staging_views(
             ((batch, int(down_weight.shape[0])) for batch in range(1, max_capture + 1)),
             dtype=down_weight.dtype,
         )
-        collective_handle = int(collective._handle)
+        runtime_handle = int(collective._handle)
+        collective_handle = runtime_handle
+        if getattr(torch.version, "hip", None) is not None:
+            staging = collective.direct_staging_view(
+                (max_capture, int(down_weight.shape[0])),
+                dtype=down_weight.dtype,
+            )
+            if staging is None:
+                raise RuntimeError("packed ROCm rollout FFN staging allocation failed")
+            collective_handle = _PACKED_INFERENCE_SLOT_BY_RUNTIME_HANDLE.get(
+                runtime_handle, 0
+            )
+            if collective_handle == 0:
+                # Keep the AOT graph identity stable across worker processes;
+                # resolve its process-local C++ handle inside the custom op.
+                collective_handle = len(_PACKED_INFERENCE_SLOT_BY_RUNTIME_HANDLE) + 1
+                _PACKED_INFERENCE_SLOT_BY_RUNTIME_HANDLE[runtime_handle] = (
+                    collective_handle
+                )
+            _PACKED_INFERENCE_STAGING_BY_HANDLE[collective_handle] = (
+                runtime_handle,
+                staging,
+            )
         self._packed_inference_collectives[collective_handle] = collective
         return collective_handle, tp_world_size
 

@@ -47,6 +47,7 @@ from rl_engine.kernels.ops.cuda.attention.cp_comm import (
 )
 from rl_engine.kernels.ops.cuda.attention.strict_runtime import StrictCUDAAttentionRuntime
 from rl_engine.kernels.ops.rocm.attention.flash_attn import StrictRocmAiterCKAttentionCore
+from rl_engine.kernels.ops.rocm.attention.paged_gather import fused_paged_kv_gather_bhsd
 
 # The sequence reorder and the position validation are platform-neutral tensor
 # bookkeeping. They are bound from the CUDA runtime rather than reimplemented
@@ -207,16 +208,34 @@ class StrictRocmAttentionRuntime:
             v_sorted = _gather_sequence(global_v, k_sort)
             _validate_global_positions(q_positions_sorted, k_positions_sorted, causal)
 
-        out_sorted, lse_sorted, core_provenance, launches = self._run_core(
-            q_sorted,
-            k_sorted,
-            v_sorted,
-            causal=causal,
-            scale=scale,
-            query_position_ids=q_positions_sorted,
-            key_position_ids=k_positions_sorted,
-            output_dtype=q.dtype,
-        )
+        paged_schedule = bool(getattr(self._core, "supports_paged_schedule", False))
+        if paged_schedule:
+            core_result = self._core.forward_with_lse(
+                q_sorted,
+                k_sorted,
+                v_sorted,
+                causal=causal,
+                scale=scale,
+                key_padding_mask=None,
+                query_position_ids=q_positions_sorted,
+                key_position_ids=k_positions_sorted,
+                output_dtype=q.dtype,
+            )
+            out_sorted = core_result.out
+            lse_sorted = core_result.lse
+            core_provenance = dict(core_result.provenance)
+            launches = 1
+        else:
+            out_sorted, lse_sorted, core_provenance, launches = self._run_core(
+                q_sorted,
+                k_sorted,
+                v_sorted,
+                causal=causal,
+                scale=scale,
+                query_position_ids=q_positions_sorted,
+                key_position_ids=k_positions_sorted,
+                output_dtype=q.dtype,
+            )
 
         if cp_world_size > 1:
             if q_sort is None:
@@ -254,17 +273,111 @@ class StrictRocmAttentionRuntime:
                 "reference_only": False,
                 "split_kv": "disabled",
                 "framework_position_reorder": True,
-                # Unlike the CUDA runtime's single full-sequence launch, the
-                # query schedule here is one launch per (batch row, KV group).
-                "query_schedule": "one_batch_row_one_kv_group",
+                "query_schedule": (
+                    "one_local_gqa_batch_paged_ck"
+                    if paged_schedule
+                    else "one_batch_row_one_kv_group"
+                ),
                 "backward_schedule": "aiter_ck_deterministic_per_kv_group",
-                "launch_granularity": "one_batch_row_one_kv_group",
+                "launch_granularity": (
+                    "one_local_gqa_batch" if paged_schedule else "one_batch_row_one_kv_group"
+                ),
                 "tp_degree_invariant": True,
                 "invariance_mechanism": "one_kv_group_per_launch",
                 "core_row_count": q_sorted.size(0) * q_sorted.size(2),
                 "core_launch_count": launches,
                 "core_batch_size": q_sorted.size(0),
                 "core_query_length": q_sorted.size(2),
+                "core_actual_backends": [] if backend is None else [str(backend)],
+                "core": core_provenance,
+            },
+        )
+
+    def forward_paged_varlen_with_lse(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        page_table: torch.Tensor,
+        seqused_k: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        causal: bool,
+        scale: float | None,
+        out: torch.Tensor | None = None,
+        return_lse: bool = False,
+        page_table_validated: bool = False,
+    ) -> StrictRocmAttentionResult:
+        """Run packed prefill/decode directly from vLLM's paged KV cache."""
+
+        self._require_rocm(q)
+        direct = getattr(self._core, "forward_paged_varlen_with_lse", None)
+        if not callable(direct) or not bool(
+            getattr(self._core, "supports_paged_schedule", False)
+        ):
+            raise RuntimeError("strict ROCm direct paged-varlen CK is unavailable")
+        if q.ndim != 3:
+            raise ValueError("packed paged Q must use [tokens, heads, head_dim]")
+        if not page_table_validated:
+            bounds_ok = torch.all((page_table >= 0) & (page_table < k_cache.size(0)))
+            torch._assert_async(bounds_ok, "page_table entries are outside the KV cache")
+            valid_lengths = torch.all((seqused_k > 0) & (seqused_k <= max_seqlen_k))
+            torch._assert_async(
+                valid_lengths,
+                "seqused_k entries must be positive and within max_seqlen_k",
+            )
+        core_result = direct(
+            q,
+            k_cache,
+            v_cache,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            cu_seqlens_q=cu_seqlens_q,
+            kv_indptr=kv_indptr,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            causal=causal,
+            scale=scale,
+            out=out,
+            return_lse=return_lse,
+        )
+        core_provenance = dict(core_result.provenance)
+        backend = (
+            core_provenance.get("attention_backend")
+            or core_provenance.get("actual_backend")
+            or getattr(self._core, "backend_id", None)
+        )
+        self.communication_executed = False
+        return StrictRocmAttentionResult(
+            out=core_result.out,
+            lse=core_result.lse,
+            provenance={
+                "strict_core_id": self.core_id,
+                "strict_schedule": self.strict_schedule,
+                "actual_backend": self.backend_id,
+                "communication_backend": "none",
+                "communication_executed": False,
+                "native_attention_arithmetic": True,
+                "production_ready": True,
+                "fallback": False,
+                "fallback_reason": None,
+                "reference_only": False,
+                "split_kv": "disabled",
+                "query_schedule": "paged_varlen_batch",
+                "paged_execution": "direct_vllm_pages_to_aiter_batch_prefill_ck",
+                "paged_kernel": "aiter_mha_batch_prefill_non_split_ck",
+                "dense_kv_materialized": False,
+                "lse_returned": bool(return_lse),
+                "launch_granularity": "one_local_gqa_batch",
+                "tp_degree_invariant": True,
+                "invariance_mechanism": "matched_train_and_rollout_paged_ck_schedule",
+                "core_row_count": q.size(0),
+                "core_launch_count": 1,
+                "core_batch_size": page_table.size(0),
+                "core_query_length": max_seqlen_q,
                 "core_actual_backends": [] if backend is None else [str(backend)],
                 "core": core_provenance,
             },
@@ -283,6 +396,10 @@ class StrictRocmAttentionRuntime:
         out: torch.Tensor | None = None,
         cached_lengths: Sequence[int] | None = None,
         page_bounds_epoch: object | None = None,
+        return_lse: bool = True,
+        page_table_validated: bool = False,
+        cu_seqlens_q: torch.Tensor | None = None,
+        kv_indptr: torch.Tensor | None = None,
     ) -> StrictRocmAttentionResult:
         """Run strict decode Attention over a paged KV cache.
 
@@ -335,6 +452,79 @@ class StrictRocmAttentionRuntime:
             )
         )
 
+        direct_paged = callable(getattr(self._core, "forward_paged_with_lse", None)) and bool(
+            getattr(self._core, "supports_paged_schedule", False)
+        )
+        if direct_paged:
+            if not page_table_validated:
+                valid_lengths = torch.all((seqused_k > 0) & (seqused_k <= max_seqlen_k))
+                torch._assert_async(
+                    valid_lengths,
+                    "seqused_k entries must be positive and within max_seqlen_k",
+                )
+                bounds_ok = torch.all((page_table >= 0) & (page_table < k_cache.size(0)))
+                torch._assert_async(bounds_ok, "page_table entries are outside the KV cache")
+            if cu_seqlens_q is None:
+                cu_seqlens_q = torch.arange(
+                    q.size(0) + 1, dtype=torch.int32, device=q.device
+                )
+            if kv_indptr is None:
+                kv_indptr = torch.arange(
+                    q.size(0) + 1, dtype=torch.int32, device=q.device
+                ) * page_table.size(1)
+            core_result = self._core.forward_paged_with_lse(
+                q,
+                k_cache,
+                v_cache,
+                page_table=page_table,
+                seqused_k=seqused_k,
+                cu_seqlens_q=cu_seqlens_q,
+                kv_indptr=kv_indptr,
+                max_seqlen_k=max_seqlen_k,
+                causal=False,
+                scale=scale,
+                out=out,
+                return_lse=return_lse,
+            )
+            core_provenance = dict(core_result.provenance)
+            backend = (
+                core_provenance.get("attention_backend")
+                or core_provenance.get("actual_backend")
+                or getattr(self._core, "backend_id", None)
+            )
+            self.communication_executed = False
+            return StrictRocmAttentionResult(
+                out=core_result.out,
+                lse=core_result.lse,
+                provenance={
+                    "strict_core_id": self.core_id,
+                    "strict_schedule": self.strict_schedule,
+                    "actual_backend": self.backend_id,
+                    "communication_backend": "none",
+                    "communication_executed": False,
+                    "native_attention_arithmetic": True,
+                    "production_ready": True,
+                    "fallback": False,
+                    "fallback_reason": None,
+                    "reference_only": False,
+                    "split_kv": "disabled",
+                    "query_schedule": "paged_single_query_batch",
+                    "paged_execution": "direct_vllm_pages_to_aiter_batch_prefill_ck",
+                    "paged_kernel": "aiter_mha_batch_prefill_non_split_ck",
+                    "dense_kv_materialized": False,
+                    "lse_returned": bool(return_lse),
+                    "launch_granularity": "one_local_gqa_batch",
+                    "tp_degree_invariant": True,
+                    "invariance_mechanism": "matched_train_and_rollout_paged_ck_schedule",
+                    "core_row_count": q.size(0) * q.size(2),
+                    "core_launch_count": 1,
+                    "core_batch_size": q.size(0),
+                    "core_query_length": q.size(2),
+                    "core_actual_backends": [] if backend is None else [str(backend)],
+                    "core": core_provenance,
+                },
+            )
+
         if cached_lengths is None:
             cached_lengths = tuple(int(value) for value in seqused_k.tolist())
         else:
@@ -354,6 +544,7 @@ class StrictRocmAttentionRuntime:
             and not any(tensor.requires_grad for tensor in (q, k_cache, v_cache))
             and cached_lengths == tuple(range(1, q.size(0) + 1))
         )
+        use_fused_gather = False
 
         resolved_epoch: _PageBoundsEpoch | None
         if page_bounds_epoch is None:
@@ -389,7 +580,7 @@ class StrictRocmAttentionRuntime:
 
         if causal_prefill:
             required_pages = (cached_lengths[-1] + k_cache.size(1) - 1) // k_cache.size(1)
-            if not bounds_reused:
+            if not (page_table_validated or bounds_reused):
                 page_rows_equal = torch.all(
                     page_table[:, :required_pages] == page_table[-1:, :required_pages]
                 )
@@ -405,7 +596,7 @@ class StrictRocmAttentionRuntime:
                 v_cache,
                 page_table[-1],
                 cached_lengths[-1],
-                validate_bounds=not bounds_reused,
+                validate_bounds=not (page_table_validated or bounds_reused),
             )
             q_sequence = q.squeeze(2).permute(1, 0, 2).unsqueeze(0)
             positions = self._causal_prefill_positions(q.size(0), q.device)
@@ -418,6 +609,7 @@ class StrictRocmAttentionRuntime:
                 query_position_ids=positions,
                 key_position_ids=positions,
                 output_dtype=q.dtype,
+                collect_lse=return_lse,
             )
             reordered_out = sequence_out.permute(2, 1, 0, 3)
             if out is None:
@@ -425,7 +617,11 @@ class StrictRocmAttentionRuntime:
             else:
                 out.copy_(reordered_out)
                 result_out = out
-            result_lse = sequence_lse.permute(2, 1, 0).contiguous()
+            result_lse = (
+                sequence_lse.permute(2, 1, 0).contiguous()
+                if return_lse
+                else torch.empty((0,), dtype=torch.float32, device=q.device)
+            )
         else:
             row_outs: list[torch.Tensor] = []
             row_lses: list[torch.Tensor] = []
@@ -437,7 +633,7 @@ class StrictRocmAttentionRuntime:
                     v_cache,
                     page_table[row],
                     cached_length,
-                    validate_bounds=not bounds_reused,
+                    validate_bounds=not (page_table_validated or bounds_reused),
                 )
                 # Decode attends over the whole cached prefix, so neither the mask
                 # nor the AITER call consumes position IDs. Avoid allocating two
@@ -453,10 +649,12 @@ class StrictRocmAttentionRuntime:
                     output_dtype=q.dtype,
                     out=None if out is None else out[row : row + 1],
                     direct_core_out=direct_core_out,
+                    collect_lse=return_lse,
                 )
                 if out is None:
                     row_outs.append(row_out)
-                row_lses.append(row_lse)
+                if return_lse:
+                    row_lses.append(row_lse)
                 launches += row_launches
                 if core_provenance is None:
                     core_provenance = row_provenance
@@ -467,8 +665,12 @@ class StrictRocmAttentionRuntime:
             result_out = out if out is not None else torch.cat(row_outs, dim=0)
             result_lse = (
                 row_lses[0]
-                if direct_core_out and len(row_lses) == 1
-                else torch.cat(row_lses, dim=0)
+                if return_lse and direct_core_out and len(row_lses) == 1
+                else (
+                    torch.cat(row_lses, dim=0)
+                    if return_lse
+                    else torch.empty((0,), dtype=torch.float32, device=q.device)
+                )
             )
         self.communication_executed = False
         if resolved_epoch is not None and not bounds_reused:
@@ -505,8 +707,15 @@ class StrictRocmAttentionRuntime:
                 ),
                 # The dense core runs; the pages are gathered first. Recorded so
                 # a reader never mistakes this for a native paged kernel.
-                "paged_execution": "logical_kv_gather_then_dense_core",
-                "paged_kernel": "none",
+                "paged_execution": (
+                    "fused_paged_kv_gather_to_aiter_ck_bshd"
+                    if use_fused_gather
+                    else "logical_kv_gather_then_dense_core"
+                ),
+                "paged_kernel": (
+                    "triton_fused_kv_gather_bhsd" if use_fused_gather else "none"
+                ),
+                "lse_returned": bool(return_lse),
                 "launch_granularity": "one_batch_row_one_kv_group",
                 "tp_degree_invariant": True,
                 "invariance_mechanism": "one_kv_group_per_launch",
@@ -596,6 +805,89 @@ class StrictRocmAttentionRuntime:
 
         return _gather(k_cache), _gather(v_cache)
 
+    def _gather_paged_rows_fused_bhsd(
+        self,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_rows: torch.Tensor,
+        page_count: int,
+        *,
+        validate_bounds: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pages = page_rows[:, :page_count]
+        flat_pages = pages.reshape(-1)
+        if validate_bounds:
+            bounds_ok = torch.all((flat_pages >= 0) & (flat_pages < k_cache.size(0)))
+            torch._assert_async(bounds_ok, "page_table entries are outside the KV cache")
+        rows = pages.size(0)
+        shape = (
+            rows,
+            k_cache.size(2),
+            page_count * k_cache.size(1),
+            k_cache.size(3),
+        )
+        key = (
+            k_cache.device.type,
+            k_cache.device.index,
+            k_cache.dtype,
+            *shape,
+        )
+        buffers = self._paged_bhsd_workspaces.get(key)
+        if buffers is None:
+            if len(self._paged_bhsd_workspaces) >= 128:
+                self._paged_bhsd_workspaces.pop(next(iter(self._paged_bhsd_workspaces)))
+            buffers = (
+                torch.empty(shape, dtype=k_cache.dtype, device=k_cache.device),
+                torch.empty(shape, dtype=v_cache.dtype, device=v_cache.device),
+            )
+            self._paged_bhsd_workspaces[key] = buffers
+        return fused_paged_kv_gather_bhsd(
+            k_cache,
+            v_cache,
+            pages,
+            page_count,
+            k_out=buffers[0],
+            v_out=buffers[1],
+        )
+
+    @staticmethod
+    def _gather_paged_rows_by_page_count(
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_rows: torch.Tensor,
+        page_count: int,
+        *,
+        validate_bounds: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Gather one page-count group with shared index-selects.
+
+        if page_count <= 0 or page_rows.ndim != 2:
+            raise ValueError("page_rows must be 2-D with a positive page count")
+        if page_rows.size(1) < page_count:
+            raise ValueError("page_table rows are shorter than the requested page count")
+        pages = page_rows[:, :page_count]
+        flat_pages = pages.reshape(-1)
+        if validate_bounds:
+            bounds_ok = torch.all((flat_pages >= 0) & (flat_pages < k_cache.size(0)))
+            if flat_pages.is_cuda:
+                torch._assert_async(bounds_ok, "page_table entries are outside the KV cache")
+            elif not bool(bounds_ok.item()):
+                raise ValueError("page_table entries are outside the KV cache")
+
+        rows = pages.size(0)
+        page_size = k_cache.size(1)
+        def _gather(cache: torch.Tensor) -> torch.Tensor:
+            selected = cache.index_select(0, flat_pages)
+            flat = selected.reshape(
+                rows,
+                page_count * page_size,
+                cache.size(2),
+                cache.size(3),
+            )
+            return flat.permute(0, 2, 1, 3).contiguous()
+
+        return _gather(k_cache), _gather(v_cache)
+
     @staticmethod
     def _page_bounds_signature(
         page_table: torch.Tensor,
@@ -672,6 +964,66 @@ class StrictRocmAttentionRuntime:
         if max_seqlen_k <= 0 or max_seqlen_k > page_table.size(1) * k_cache.size(1):
             raise ValueError("max_seqlen_k exceeds the page table capacity")
 
+    def _run_paged_core_bshd(
+        self,
+        q: torch.Tensor,
+        k_bhsd: torch.Tensor,
+        v_bhsd: torch.Tensor,
+        *,
+        scale: float | None,
+        output_dtype: torch.dtype,
+        out: torch.Tensor | None,
+        collect_lse: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], int]:
+        """Launch strict CK from fused group-major KV without layout copies."""
+
+        if output_dtype != q.dtype:
+            raise ValueError("strict paged Attention output dtype must match Q")
+        local_kv_heads = k_bhsd.size(1)
+        if local_kv_heads <= 0 or q.size(1) % local_kv_heads:
+            raise RuntimeError("paged Q heads must be divisible by local KV heads")
+        group_size = q.size(1) // local_kv_heads
+        group_outs: list[torch.Tensor] = []
+        group_lses: list[torch.Tensor] = []
+        core_provenance: dict[str, Any] | None = None
+        direct = getattr(self._core, "forward_bshd_with_lse")
+        for group in range(local_kv_heads):
+            q_lo, q_hi = group * group_size, (group + 1) * group_size
+            q_bshd = q[:, q_lo:q_hi].transpose(1, 2)
+            k_group_bshd = k_bhsd[:, group : group + 1].transpose(1, 2)
+            v_group_bshd = v_bhsd[:, group : group + 1].transpose(1, 2)
+            if not q_bshd.is_contiguous():
+                q_bshd = q_bshd.contiguous()
+            if not k_group_bshd.is_contiguous() or not v_group_bshd.is_contiguous():
+                raise RuntimeError("fused paged gather did not produce group-contiguous KV")
+            group_out = None if out is None else out[:, q_lo:q_hi]
+            result = direct(
+                q_bshd,
+                k_group_bshd,
+                v_group_bshd,
+                causal=False,
+                scale=scale,
+                out=group_out,
+            )
+            if out is None:
+                group_outs.append(result.out)
+            if collect_lse:
+                group_lses.append(result.lse)
+            if core_provenance is None:
+                core_provenance = dict(result.provenance)
+        if core_provenance is None:
+            raise RuntimeError("strict ROCm paged Attention executed no CK launch")
+        return (
+            out if out is not None else torch.cat(group_outs, dim=1),
+            (
+                torch.cat(group_lses, dim=1)
+                if collect_lse
+                else torch.empty((0,), dtype=torch.float32, device=q.device)
+            ),
+            core_provenance,
+            local_kv_heads,
+        )
+
     def _run_core(
         self,
         q: torch.Tensor,
@@ -685,6 +1037,7 @@ class StrictRocmAttentionRuntime:
         output_dtype: torch.dtype,
         out: torch.Tensor | None = None,
         direct_core_out: bool = False,
+        collect_lse: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], int]:
         """Launch the core once per ``(batch row, KV group)`` and concatenate.
 
@@ -743,19 +1096,23 @@ class StrictRocmAttentionRuntime:
             )
             if result.out.data_ptr() != grouped_out.data_ptr():
                 raise RuntimeError("strict ROCm grouped core did not write to its output view")
-            grouped_lse = result.lse.reshape(
-                batch_size,
-                local_kv_heads,
-                group_size,
-                query_length,
-            )
-            return (
-                direct_output,
-                grouped_lse.reshape(
+            grouped_lse = (
+                result.lse.reshape(
+                    batch_size,
+                    local_kv_heads,
+                    group_size,
+                    query_length,
+                ).reshape(
                     batch_size,
                     local_kv_heads * group_size,
                     query_length,
-                ),
+                )
+                if collect_lse
+                else torch.empty((0,), dtype=torch.float32, device=q.device)
+            )
+            return (
+                direct_output,
+                grouped_lse,
                 dict(result.provenance),
                 1,
             )
@@ -802,7 +1159,8 @@ class StrictRocmAttentionRuntime:
                     group_outs.append(result.out)
                 elif result.out.data_ptr() != group_out.data_ptr():
                     raise RuntimeError("strict ROCm core did not write to its output slice")
-                group_lses.append(result.lse)
+                if collect_lse:
+                    group_lses.append(result.lse)
                 launches += 1
                 if core_provenance is None:
                     core_provenance = dict(result.provenance)
@@ -810,17 +1168,26 @@ class StrictRocmAttentionRuntime:
                 row_outs.append(torch.cat(group_outs, dim=1))
             elif not direct_core_out:
                 torch.cat(group_outs, dim=1, out=out[row : row + 1])
-            row_lses.append(
-                group_lses[0]
-                if direct_core_out and len(group_lses) == 1
-                else torch.cat(group_lses, dim=1)
-            )
+            if collect_lse:
+                row_lses.append(
+                    group_lses[0]
+                    if direct_core_out and len(group_lses) == 1
+                    else torch.cat(group_lses, dim=1)
+                )
 
         if core_provenance is None:
             raise RuntimeError("strict ROCm Attention runtime executed no core launch")
         return (
             out if out is not None else torch.cat(row_outs, dim=0),
-            (row_lses[0] if direct_core_out and len(row_lses) == 1 else torch.cat(row_lses, dim=0)),
+            (
+                row_lses[0]
+                if collect_lse and direct_core_out and len(row_lses) == 1
+                else (
+                    torch.cat(row_lses, dim=0)
+                    if collect_lse
+                    else torch.empty((0,), dtype=torch.float32, device=q.device)
+                )
+            ),
             core_provenance,
             launches,
         )

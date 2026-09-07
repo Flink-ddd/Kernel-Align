@@ -10,7 +10,66 @@ import torch
 from torch import Tensor
 
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
-from rl_engine.kernels.ops.cuda.rotary_embedding.rope import _restore_rope, _rope_table
+from rl_engine.kernels.ops.cuda.rotary_embedding.rope import (
+    _build_cos_sin,
+    _restore_rope,
+    _rope_table,
+)
+
+
+@torch.library.custom_op("rl_kernel::deterministic_rope_apply_rocm", mutates_args=())
+def _deterministic_rope_apply_rocm(
+    x: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    direction: float,
+) -> Tensor:
+    return _C.deterministic_rope_apply_rocm(x, cos, sin, direction)
+
+
+@_deterministic_rope_apply_rocm.register_fake
+def _deterministic_rope_apply_rocm_fake(
+    x: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    direction: float,
+) -> Tensor:
+    del cos, sin, direction
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op(
+    "rl_kernel::deterministic_rope_apply_token_major_rocm", mutates_args=()
+)
+def _deterministic_rope_apply_token_major_rocm(
+    x: Tensor,
+    positions: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    head_dim: int,
+    direction: float,
+) -> Tensor:
+    return _C.deterministic_rope_apply_token_major_rocm(
+        x,
+        positions,
+        cos,
+        sin,
+        head_dim,
+        direction,
+    )
+
+
+@_deterministic_rope_apply_token_major_rocm.register_fake
+def _deterministic_rope_apply_token_major_rocm_fake(
+    x: Tensor,
+    positions: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    head_dim: int,
+    direction: float,
+) -> Tensor:
+    del positions, cos, sin, head_dim, direction
+    return torch.empty(x.shape, dtype=x.dtype, device=x.device)
 
 
 def _forward_rope_pair(
@@ -65,7 +124,7 @@ class _RocmRoPEFunction(torch.autograd.Function):
         ctx.save_for_backward(cos, sin)
         ctx.x_shape = tuple(x.shape)
         ctx.pos_dim = positions.dim()
-        out_2d = _C.deterministic_rope_apply_rocm(x_2d, cos, sin, 1.0)
+        out_2d = _deterministic_rope_apply_rocm(x_2d, cos, sin, 1.0)
         return _restore_rope(out_2d, x, positions)
 
     @staticmethod
@@ -75,7 +134,7 @@ class _RocmRoPEFunction(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             if ctx.pos_dim == 2 and len(ctx.x_shape) == 4:
                 g_2d = grad_out.permute(1, 0, 2, 3).contiguous().reshape(-1, ctx.x_shape[-1])
-                out_2d = _C.deterministic_rope_apply_rocm(g_2d, cos, sin, -1.0)
+                out_2d = _deterministic_rope_apply_rocm(g_2d, cos, sin, -1.0)
                 heads, batch, seq, dim = (
                     ctx.x_shape[1],
                     ctx.x_shape[0],
@@ -85,7 +144,7 @@ class _RocmRoPEFunction(torch.autograd.Function):
                 grad_x = out_2d.reshape(heads, batch, seq, dim).permute(1, 0, 2, 3).contiguous()
             else:
                 g_2d = grad_out.contiguous().reshape(-1, grad_out.shape[-1])
-                grad_x = _C.deterministic_rope_apply_rocm(g_2d, cos, sin, -1.0).reshape(
+                grad_x = _deterministic_rope_apply_rocm(g_2d, cos, sin, -1.0).reshape(
                     grad_out.shape
                 )
         return grad_x, None, None
@@ -136,7 +195,13 @@ class RocmDeterministicRoPEOp:
     def __init__(self) -> None:
         if torch.version.hip is None:
             raise RuntimeError("RocmDeterministicRoPEOp requires a ROCm PyTorch build")
-        if not _EXT_AVAILABLE or not hasattr(_C, "deterministic_rope_apply_rocm"):
+        if not _EXT_AVAILABLE or not all(
+            hasattr(_C, symbol)
+            for symbol in (
+                "deterministic_rope_apply_rocm",
+                "deterministic_rope_apply_token_major_rocm",
+            )
+        ):
             raise RuntimeError(
                 "ROCm deterministic RoPE is unavailable; rebuild rl_engine._C for ROCm"
             )
@@ -230,6 +295,45 @@ class RocmDeterministicRoPEOp:
             raise RuntimeError("ROCm deterministic RoPE requires a GPU tensor")
         if x.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("ROCm deterministic RoPE requires FP16 or BF16")
+
+    @staticmethod
+    def build_position_table(
+        max_positions: int,
+        head_dim: int,
+        *,
+        device: torch.device,
+        theta: float,
+    ) -> tuple[Tensor, Tensor]:
+        """Build the training-identical FP32 table once before graph capture."""
+
+        if max_positions <= 0 or head_dim <= 0 or head_dim % 2:
+            raise ValueError("ROCm RoPE table dimensions must be positive and even")
+        positions = torch.arange(max_positions, dtype=torch.int64, device=device)
+        return _build_cos_sin(positions, head_dim // 2, float(theta), device)
+
+    @staticmethod
+    def forward_token_major(
+        x: Tensor,
+        positions: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        *,
+        head_dim: int,
+    ) -> Tensor:
+        """Rotate vLLM's strided token-major Q/K without layout copies."""
+
+        if x.ndim != 2 or x.stride(1) != 1:
+            raise ValueError("token-major ROCm RoPE requires unit inner stride")
+        if positions.ndim != 1 or positions.numel() != x.size(0):
+            raise ValueError("token-major ROCm RoPE positions must match token rows")
+        return _deterministic_rope_apply_token_major_rocm(
+            x,
+            positions,
+            cos,
+            sin,
+            head_dim,
+            1.0,
+        )
 
 
 __all__ = ["RocmDeterministicRoPEOp"]

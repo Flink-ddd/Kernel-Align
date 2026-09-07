@@ -35,6 +35,7 @@ set -euo pipefail
 : "${RLK_ABLATION_ROLLOUT_SEED:?}"
 : "${RLK_ABLATION_RAY_PORT:?}"
 : "${RLK_ABLATION_RAY_DASHBOARD_PORT:?}"
+: "${RLK_ABLATION_RAY_DASHBOARD_AGENT_PORT:?}"
 : "${RL_KERNEL_READBACK_DIR:?}"
 : "${RL_KERNEL_MISMATCH_SIDECAR_DIR:?}"
 : "${RL_KERNEL_VLLM_REAL_VOCAB_SIZE:?}"
@@ -135,6 +136,7 @@ export VLLM_ROCM_USE_AITER=1
 # the optional shuffled physical layout.
 export VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=0
 export VLLM_ATTENTION_BACKEND=ROCM_AITER_FA
+export RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE="${RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE:-32}"
 export MIOPEN_DEBUG_CONV_DIRECT="${MIOPEN_DEBUG_CONV_DIRECT:-0}"
 
 mkdir -p \
@@ -188,6 +190,7 @@ names = [
     "VLLM_ROCM_USE_AITER",
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT",
     "VLLM_ATTENTION_BACKEND",
+    "RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE",
     "MIOPEN_DEBUG_CONV_DIRECT",
     "RL_KERNEL_ATTENTION_CASE",
     "RL_KERNEL_FFN_CASE",
@@ -221,14 +224,31 @@ ray start --head \
   --num-gpus="${RLK_ABLATION_NUM_GPUS}" \
   --disable-usage-stats \
   --dashboard-host=127.0.0.1 \
-  --dashboard-port="${RLK_ABLATION_RAY_DASHBOARD_PORT}"
+  --dashboard-port="${RLK_ABLATION_RAY_DASHBOARD_PORT}" \
+  --dashboard-agent-listen-port="${RLK_ABLATION_RAY_DASHBOARD_AGENT_PORT}"
 ray_started=1
 
-# Correctness first: eager mode is frozen across all four arms.  The strict
-# ROCm projection collective performs Python/lock bookkeeping and is not a
-# valid vLLM fullgraph capture target yet.
+ray_job_address="http://127.0.0.1:${RLK_ABLATION_RAY_DASHBOARD_PORT}"
+ray_job_agent_ready=0
+for _attempt in {1..60}; do
+  if ray job list --address="${ray_job_address}" >/dev/null 2>&1; then
+    ray_job_agent_ready=1
+    break
+  fi
+  sleep 1
+done
+if [[ "${ray_job_agent_ready}" != "1" ]]; then
+  echo "Ray job agent did not become ready within 60 seconds" >&2
+  exit 5
+fi
+# The dashboard endpoint can answer before the local node's job agent has
+# finished registering. Give that registration a bounded stabilization window.
+sleep 10
+
+# The RL-Kernel paged CK path and device-sequenced IPC collectives are captured
+# by vLLM's HIP graph runtime after adapter-owned warmup.
 ray job submit \
-  --address="http://127.0.0.1:${RLK_ABLATION_RAY_DASHBOARD_PORT}" \
+  --address="${ray_job_address}" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
   --working-dir="${RLK_ABLATION_VIME_ROOT}" \
   -- python3 "${RLK_ABLATION_VIME_ROOT}/train.py" \
@@ -282,8 +302,9 @@ ray job submit \
   --router-policy "${RLK_ABLATION_ROUTER_POLICY}" \
   --rollout-num-gpus-per-engine "${RLK_ABLATION_ROLLOUT_TP_SIZE}" \
   --vllm-gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.4}" \
+  --vllm-max-cudagraph-capture-size \
+  "${RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE}" \
   --vllm-attention-backend ROCM_AITER_FA \
-  --vllm-enforce-eager \
   --vllm-disable-custom-all-reduce \
   --attention-dropout 0 \
   --hidden-dropout 0 \

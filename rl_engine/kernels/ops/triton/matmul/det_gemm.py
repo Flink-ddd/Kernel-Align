@@ -252,7 +252,7 @@ def _device_tree_plan(k_size: int, device: torch.device) -> _DeviceTreePlan:
 
 if _TRITON_AVAILABLE:
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["M"])
     def _det_gemm_tree_leaf_kernel(
         a_ptr,
         b_ptr,
@@ -260,7 +260,7 @@ if _TRITON_AVAILABLE:
         leaf_starts_ptr,
         leaf_lengths_ptr,
         leaf_nodes_ptr,
-        M: tl.constexpr,
+        M,
         N: tl.constexpr,
         K: tl.constexpr,
         stride_am: tl.constexpr,
@@ -322,13 +322,13 @@ if _TRITON_AVAILABLE:
     # more descriptive implementation name used by the optimized tree path.
     _det_gemm_kernel = _det_gemm_tree_leaf_kernel
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["M"])
     def _det_gemm_tree_reduce_kernel(
         workspace_ptr,
         lower_nodes_ptr,
         upper_nodes_ptr,
         output_nodes_ptr,
-        M: tl.constexpr,
+        M,
         N: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
