@@ -25,10 +25,10 @@ _TRITON_BACKEND = "triton"
 _ROUTE_REPORTED = False
 _ROUTE_REPORT_LOCK = Lock()
 _WEIGHT_TRANSPOSE_CACHE: dict[
-    tuple[int, str, tuple[int, ...], torch.dtype], tuple[int, torch.Tensor]
+    tuple[int, str, tuple[int, ...], torch.dtype], tuple[int | None, torch.Tensor]
 ] = {}
 _WEIGHT_TRANSPOSE_CACHE_LIMIT = 256
-_DIRECT_STAGING_BY_SLOT: dict[int, tuple[int, torch.Tensor]] = {}
+_DIRECT_STAGING_BY_SLOT: dict[int, tuple[int, torch.Tensor, torch.Tensor]] = {}
 _DIRECT_STAGING_SLOT_BY_HANDLE: dict[int, int] = {}
 
 
@@ -60,6 +60,17 @@ def det_gemm_backend_id() -> str:
     return "rlkernel.det_gemm.triton_tree_rocm.v1"
 
 
+def _tensor_version(tensor: torch.Tensor) -> int | None:
+    """Return the mutation version when the tensor tracks one."""
+
+    try:
+        return int(tensor._version)
+    except RuntimeError:
+        # Inference tensors intentionally omit version counters. Their cached
+        # transposes are refreshed explicitly after every IPC weight update.
+        return None
+
+
 def _cached_weight_transpose(weight: torch.Tensor) -> torch.Tensor:
     """Reuse inference-only transposed weights until the parameter is updated."""
 
@@ -68,7 +79,7 @@ def _cached_weight_transpose(weight: torch.Tensor) -> torch.Tensor:
     if torch.is_grad_enabled():
         return weight.t().contiguous()
     key = (weight.data_ptr(), str(weight.device), tuple(weight.shape), weight.dtype)
-    version = int(getattr(weight, "_version", 0))
+    version = _tensor_version(weight)
     cached = _WEIGHT_TRANSPOSE_CACHE.get(key)
     if cached is not None:
         if cached[0] != version:
@@ -97,7 +108,7 @@ def refresh_cached_weight_transposes(weights: object) -> int:
         if cached is None:
             continue
         cached[1].copy_(weight.t())
-        version = int(getattr(weight, "_version", 0))
+        version = _tensor_version(weight)
         _WEIGHT_TRANSPOSE_CACHE[key] = (version, cached[1])
         refreshed += 1
     return refreshed
@@ -185,23 +196,25 @@ def _det_gemm_linear_all_reduce_inference(
     binding = _DIRECT_STAGING_BY_SLOT.get(collective_handle)
     if binding is None:
         raise RuntimeError("strict ROCm row-parallel staging handle is not registered")
-    runtime_handle, staging = binding
+    runtime_handle, staging, stable_output = binding
     if a.size(0) <= staging.size(0):
-        direct_output = staging.narrow(0, 0, a.size(0))
+        # A piecewise HIP graph replays against capture-time addresses. Return
+        # the registered allocation for graph-eligible token counts so that
+        # the following captured partition always sees the same input address.
+        direct_input = staging.narrow(0, 0, a.size(0))
+        output = stable_output.narrow(0, 0, a.size(0))
         _C.deterministic_collective_rocm_ipc_prepare_staged(
             runtime_handle,
-            direct_output,
+            direct_input,
         )
-        det_gemm_linear(a, weight, out=direct_output)
-        output = torch.empty_like(direct_output)
+        det_gemm_linear(a, weight, out=direct_input)
         _C.deterministic_collective_rocm_ipc_all_reduce_staged(
-            runtime_handle,
-            direct_output,
-            output,
+            runtime_handle, direct_input, output
         )
         return output
-
-    output = det_gemm_linear(a, weight)
+    else:
+        # Profiling and uncaptured prefill can exceed the decode capture bound.
+        output = det_gemm_linear(a, weight)
     _C.deterministic_collective_rocm_ipc_all_reduce_input(
         runtime_handle,
         output,
@@ -233,7 +246,9 @@ def register_det_gemm_all_reduce_staging(
         # the process-local C++ handle only when the custom op executes.
         slot = len(_DIRECT_STAGING_SLOT_BY_HANDLE) + 1
         _DIRECT_STAGING_SLOT_BY_HANDLE[collective_handle] = slot
-    _DIRECT_STAGING_BY_SLOT[slot] = (collective_handle, staging)
+    binding = _DIRECT_STAGING_BY_SLOT.get(slot)
+    stable_output = torch.empty_like(staging) if binding is None else binding[2]
+    _DIRECT_STAGING_BY_SLOT[slot] = (collective_handle, staging, stable_output)
     return slot
 
 

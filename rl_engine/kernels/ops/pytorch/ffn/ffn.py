@@ -47,7 +47,7 @@ _COLLECTIVE_MIN_CAPACITY_BYTES = 64 * 1024 * 1024
 # Backward-compatible test hook; ownership lives in the shared communication layer.
 _COLLECTIVES = _SHARED_COLLECTIVES
 _PACKED_INFERENCE_OBSERVERS: list[Callable[[], None]] = []
-_PACKED_INFERENCE_STAGING_BY_HANDLE: dict[int, tuple[int, Tensor]] = {}
+_PACKED_INFERENCE_STAGING_BY_HANDLE: dict[int, tuple[int, Tensor, Tensor]] = {}
 _PACKED_INFERENCE_SLOT_BY_RUNTIME_HANDLE: dict[int, int] = {}
 
 
@@ -149,45 +149,46 @@ def _qwen3_ffn_packed_tp_inference_rocm(
     down_weight: Tensor,
     collective_handle: int,
 ) -> Tensor:
-    """Keep ROCm profile/capture shape selection behind one graph boundary."""
+    """Keep the ROCm TP FFN behind one eager graph-partition boundary."""
 
-    input_shape = rmsnorm_output.shape
-    rows = rmsnorm_output.numel() // input_shape[-1]
     binding = _PACKED_INFERENCE_STAGING_BY_HANDLE.get(collective_handle)
     if binding is None:
         raise RuntimeError("packed ROCm rollout FFN staging handle is not registered")
-    runtime_handle, staging = binding
+    runtime_handle, staging, stable_output = binding
+    input_shape = rmsnorm_output.shape
+    rows = rmsnorm_output.numel() // input_shape[-1]
     if rows <= staging.size(0):
-        direct_output = staging.narrow(0, 0, rows)
+        # Keep the output address stable across piecewise HIP-graph capture and
+        # replay so the next captured partition reads the current invocation.
+        direct_input = staging.narrow(0, 0, rows)
+        output = stable_output.narrow(0, 0, rows)
         _C.deterministic_collective_rocm_ipc_prepare_staged(
             runtime_handle,
-            direct_output,
+            direct_input,
         )
         _qwen3_ffn_packed_inference_to_staging(
             rmsnorm_output,
             fused_gate_up_weight,
             down_weight,
-            direct_output,
+            direct_input,
         )
-        reduced = torch.empty_like(direct_output)
         _C.deterministic_collective_rocm_ipc_all_reduce_staged(
-            runtime_handle,
-            direct_output,
-            reduced,
+            runtime_handle, direct_input, output
         )
-        return reduced.reshape(*input_shape[:-1], down_weight.shape[0])
-
-    output = _qwen3_ffn_packed_inference(
-        rmsnorm_output,
-        fused_gate_up_weight,
-        down_weight,
-    )
+        return output.reshape(*input_shape[:-1], down_weight.shape[0])
+    else:
+        # Profiling and uncaptured prefill can exceed the decode capture bound.
+        output = _qwen3_ffn_packed_inference(
+            rmsnorm_output,
+            fused_gate_up_weight,
+            down_weight,
+        )
     _C.deterministic_collective_rocm_ipc_all_reduce_input(
         runtime_handle,
         output,
         output,
     )
-    return output
+    return output.reshape(*input_shape[:-1], down_weight.shape[0])
 
 
 @_qwen3_ffn_packed_tp_inference_rocm.register_fake
@@ -844,9 +845,14 @@ class Qwen3FFNOp:
                 _PACKED_INFERENCE_SLOT_BY_RUNTIME_HANDLE[runtime_handle] = (
                     collective_handle
                 )
+            binding = _PACKED_INFERENCE_STAGING_BY_HANDLE.get(collective_handle)
+            stable_output = (
+                torch.empty_like(staging) if binding is None else binding[2]
+            )
             _PACKED_INFERENCE_STAGING_BY_HANDLE[collective_handle] = (
                 runtime_handle,
                 staging,
+                stable_output,
             )
         self._packed_inference_collectives[collective_handle] = collective
         return collective_handle, tp_world_size

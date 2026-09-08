@@ -73,6 +73,11 @@ _RLK_O_PROJ_COLLECTIVE_BACKEND: str | None = None
 _VLLM_LAYER_DIAGNOSTIC_BUFFER: dict[str, Any] | None = None
 _VLLM_LAYER_DIAGNOSTIC_CALLS = 0
 _VLLM_LAYER_DIAGNOSTIC_ACTIVE_LAYER: int | None = None
+_ROCM_STATEFUL_GRAPH_SPLITTING_OPS = (
+    DETERMINISTIC_ALL_REDUCE_OP,
+    "rl_kernel::rocm_det_gemm_linear_all_reduce_inference",
+    "rl_kernel::qwen3_ffn_packed_tp_inference_rocm",
+)
 
 
 @dataclass
@@ -821,8 +826,18 @@ def _patch_strict_rocm_rotary_embedding(rotary_cls: type[Any]) -> None:
             device=device,
             theta=theta,
         )
-        instance._rl_kernel_rope_cos_fp32 = cos
-        instance._rl_kernel_rope_sin_fp32 = sin
+        def register_table(name: str, table: torch.Tensor) -> None:
+            if isinstance(instance, torch.nn.Module):
+                buffers = instance._buffers
+                if name in buffers:
+                    buffers[name] = table
+                else:
+                    instance.register_buffer(name, table, persistent=False)
+            else:
+                setattr(instance, name, table)
+
+        register_table("_rl_kernel_rope_cos_fp32", cos)
+        register_table("_rl_kernel_rope_sin_fp32", sin)
         instance._rl_kernel_rope_table_key = key
         return cos, sin
 
@@ -877,7 +892,7 @@ def _patch_strict_rocm_rotary_embedding(rotary_cls: type[Any]) -> None:
 
 
 def _configure_strict_ffn_compilation(vllm_config: Any | None = None) -> None:
-    """Keep the graph-safe TP reduction inside vLLM CUDA graphs."""
+    """Keep stateful ROCm TP reductions outside replayed HIP graph segments."""
 
     if vllm_config is None:
         from vllm.config import get_current_vllm_config_or_none
@@ -890,10 +905,24 @@ def _configure_strict_ffn_compilation(vllm_config: Any | None = None) -> None:
     splitting_ops = compilation.splitting_ops
     if splitting_ops is None:
         raise RuntimeError("vLLM splitting operators were not finalized before model init")
-    # Older strict runtimes split this op because their host-owned sequence
-    # value was frozen at graph capture. Sequence allocation is now device
-    # owned, so remove stale entries and preserve the user's graph mode.
-    splitting_ops[:] = [op for op in splitting_ops if op != DETERMINISTIC_ALL_REDUCE_OP]
+    if torch.version.hip is None:
+        # Preserve the CUDA full-graph path introduced by PR 377.
+        splitting_ops[:] = [
+            op for op in splitting_ops if op != DETERMINISTIC_ALL_REDUCE_OP
+        ]
+        return
+
+    from vllm.config import CUDAGraphMode
+
+    compilation.cudagraph_mode = CUDAGraphMode.PIECEWISE
+    # The IPC transport owns peer-visible sequence and staging state that is
+    # advanced once per invocation. Replaying the transport inside a captured
+    # graph can reuse capture-time state and stale peer payloads. Keep just
+    # these opaque reductions eager while vLLM captures the pure compute around
+    # them as piecewise HIP graphs.
+    for op in _ROCM_STATEFUL_GRAPH_SPLITTING_OPS:
+        if op not in splitting_ops:
+            splitting_ops.append(op)
 
 
 def _patch_rocm_weight_cache_refresh() -> None:
