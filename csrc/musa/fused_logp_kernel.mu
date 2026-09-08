@@ -100,6 +100,44 @@ __global__ void fused_logp_kernel(
     }
 }
 
+template <typename scalar_t>
+__global__ void fused_logp_backward_kernel(
+    const scalar_t* __restrict__ logits,
+    const int64_t* __restrict__ token_ids,
+    const scalar_t* __restrict__ grad_output,
+    scalar_t* __restrict__ grad_logits,
+    int rows,
+    int vocab) {
+    const int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    const scalar_t* row_logits = logits + static_cast<size_t>(row) * vocab;
+    scalar_t* row_grad = grad_logits + static_cast<size_t>(row) * vocab;
+
+    float row_max = -FLT_MAX;
+    for (int col = threadIdx.x; col < vocab; col += blockDim.x) {
+        row_max = fmaxf(row_max, static_cast<float>(row_logits[col]));
+    }
+    row_max = block_reduce_max(row_max);
+
+    float row_sum = 0.0f;
+    for (int col = threadIdx.x; col < vocab; col += blockDim.x) {
+        row_sum += expf(static_cast<float>(row_logits[col]) - row_max);
+    }
+    row_sum = block_reduce_sum(row_sum);
+
+    const float upstream = static_cast<float>(grad_output[row]);
+    const int64_t target = token_ids[row];
+    for (int col = threadIdx.x; col < vocab; col += blockDim.x) {
+        const float probability =
+            expf(static_cast<float>(row_logits[col]) - row_max) / row_sum;
+        const float one_hot = col == target ? 1.0f : 0.0f;
+        row_grad[col] = static_cast<scalar_t>(upstream * (one_hot - probability));
+    }
+}
+
 }  // namespace
 
 torch::Tensor fused_logp_forward_musa(torch::Tensor logits, torch::Tensor token_ids) {
@@ -126,4 +164,34 @@ torch::Tensor fused_logp_forward_musa(torch::Tensor logits, torch::Tensor token_
         });
     C10_MUSA_KERNEL_LAUNCH_CHECK();
     return output;
+}
+
+torch::Tensor fused_logp_backward_musa(
+    torch::Tensor logits,
+    torch::Tensor token_ids,
+    torch::Tensor grad_output) {
+    auto grad_logits = torch::empty_like(logits);
+    const int rows = static_cast<int>(logits.size(0));
+    const int vocab = static_cast<int>(logits.size(1));
+    if (rows == 0) {
+        return grad_logits;
+    }
+    auto stream = at::musa::getCurrentMUSAStream();
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        logits.scalar_type(),
+        "musa_fused_logp_backward",
+        [&] {
+            fused_logp_backward_kernel<scalar_t><<<rows, kBlockSize, 0, stream>>>(
+                logits.data_ptr<scalar_t>(),
+                token_ids.data_ptr<int64_t>(),
+                grad_output.data_ptr<scalar_t>(),
+                grad_logits.data_ptr<scalar_t>(),
+                rows,
+                vocab);
+        });
+    C10_MUSA_KERNEL_LAUNCH_CHECK();
+    return grad_logits;
 }
