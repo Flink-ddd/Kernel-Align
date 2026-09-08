@@ -79,6 +79,11 @@ _ROCM_STATEFUL_GRAPH_SPLITTING_OPS = (
     "rl_kernel::qwen3_ffn_packed_tp_inference_rocm",
 )
 _ROCM_FULL_GRAPH_CACHE_NAMESPACE = "rl_kernel_rocm_full_graph_v1"
+_ROCM_GRAPH_ROUTE_ENVIRONMENT = (
+    "RL_KERNEL_ATTENTION_CASE",
+    "RL_KERNEL_FFN_CASE",
+    "RL_KERNEL_LOGP_CASE",
+)
 
 
 @dataclass
@@ -916,13 +921,18 @@ def _configure_strict_ffn_compilation(vllm_config: Any | None = None) -> None:
     from vllm import envs as vllm_envs
     from vllm.config import CUDAGraphMode
 
+    route_key = "_".join(
+        re.sub(r"[^a-z0-9]+", "-", os.getenv(name, "unset").lower()).strip("-")
+        for name in _ROCM_GRAPH_ROUTE_ENVIRONMENT
+    )
+    cache_namespace = f"{_ROCM_FULL_GRAPH_CACHE_NAMESPACE}_{route_key}"
     cache_root = os.path.normpath(os.fspath(vllm_envs.VLLM_CACHE_ROOT))
-    if os.path.basename(cache_root) != _ROCM_FULL_GRAPH_CACHE_NAMESPACE:
+    if os.path.basename(cache_root) != cache_namespace:
         # vLLM's AOT key cannot see implementations behind torch custom ops.
         # Keep its normal config/code/compiler hashing under an RL-Kernel ABI
         # namespace so an older custom-op artifact cannot be replayed silently.
         os.environ["VLLM_CACHE_ROOT"] = os.path.join(
-            cache_root, _ROCM_FULL_GRAPH_CACHE_NAMESPACE
+            cache_root, cache_namespace
         )
     compilation.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
     # ROCm IPC generations are allocated and consumed on device. Replayed
