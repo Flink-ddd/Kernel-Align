@@ -39,6 +39,7 @@ from rl_engine.integrations.runtime import FrameworkOperatorIntegration
 from rl_engine.integrations.state import clear_active_integration
 from rl_engine.integrations.vllm_runtime import (
     _patch_qwen3_strict_model,
+    _patch_strict_rocm_rotary_embedding,
     _register_attention_backend,
     configure_vllm_environment,
 )
@@ -468,11 +469,60 @@ def test_vllm_attention_routes_paged_cache_to_rocm_runtime(monkeypatch):
     assert output.shape == (1, 16)
     assert len(runtime_calls) == 1
     assert runtime_calls[0][0].shape == (1, 2, 1, 8)
+    assert torch.equal(runtime_calls[0][3]["cu_seqlens_q"], torch.tensor([0, 1]))
+    assert torch.equal(runtime_calls[0][3]["kv_indptr"], torch.tensor([0, 1]))
     assert adapter.provenance["execution"]["runtime_platform"] == "rocm"
     assert (
         adapter.provenance["execution"]["materialization"]
-        == "logical_paged_kv_to_aiter_ck_dense"
+        == "direct_vllm_paged_kv_to_aiter_batch_prefill_ck"
     )
+    assert adapter.provenance["execution"]["dense_kv_materialized"] is False
+
+
+def test_vllm_rocm_metadata_stays_on_device_and_is_reused_across_layers(monkeypatch):
+    original_tolist = torch.Tensor.tolist
+    tolist_calls = 0
+
+    def counting_tolist(tensor):
+        nonlocal tolist_calls
+        tolist_calls += 1
+        return original_tolist(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "tolist", counting_tolist)
+    query = torch.zeros(2, 2, 8, dtype=torch.bfloat16)
+    block_table = torch.tensor([[0], [1]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([3, 5], dtype=torch.int32),
+        max_seq_len=5,
+    )
+    adapter = VllmAttentionOperator()
+    first_layer = object()
+    second_layer = object()
+
+    first, _ = adapter._materialization_groups(
+        metadata,
+        query=query,
+        block_table=block_table,
+        block_size=8,
+        num_actual=2,
+        cache_owner=first_layer,
+    )
+    second, summary = adapter._materialization_groups(
+        metadata,
+        query=query,
+        block_table=block_table,
+        block_size=8,
+        num_actual=2,
+        cache_owner=second_layer,
+    )
+
+    assert first is second
+    assert torch.equal(first[0]["seqused_k"], torch.tensor([3, 5], dtype=torch.int32))
+    assert torch.equal(first[0]["cu_seqlens_q"], torch.tensor([0, 1, 2], dtype=torch.int32))
+    assert torch.equal(first[0]["kv_indptr"], torch.tensor([0, 1, 2], dtype=torch.int32))
+    assert tolist_calls == 0
+    assert summary["metadata_reused_across_layers"] is True
 
 
 def test_vllm_current_flash_attention_kv_cache_layout_is_materialized():
@@ -500,6 +550,25 @@ def test_vllm_rocm_native_kv_cache_with_two_heads_is_not_treated_as_pair_axis():
     assert value.shape == (3, 4, 2, 5)
     assert torch.equal(key, cache.transpose(1, 2)[..., :5])
     assert torch.equal(value, cache.transpose(1, 2)[..., 5:])
+
+
+def test_vllm_rocm_rlkernel_token_major_kv_cache_is_zero_copy():
+    cache = torch.arange(3 * 4 * 2 * 10).reshape(3, 4, 2, 10)
+
+    key, value = _vllm_kv_cache_views(
+        cache,
+        head_size=5,
+        num_kv_heads=2,
+        platform="rocm",
+    )
+
+    assert key.shape == (3, 4, 2, 5)
+    assert value.shape == (3, 4, 2, 5)
+    assert key.data_ptr() == cache.data_ptr()
+    assert value.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
+    assert torch.equal(key, cache[..., :5])
+    assert torch.equal(value, cache[..., 5:])
+    assert key.stride(1) >= key.size(2) * key.stride(2)
 
 
 def test_vllm_rocm_kv_cache_pair_axis_is_materialized():
@@ -710,6 +779,48 @@ def test_vllm_qwen3_strict_model_installs_without_debug_environment(monkeypatch)
         norm.forward_cuda(value),
         torch.nn.functional.rms_norm(value, (2,), norm.weight, 1e-6),
     )
+
+
+def test_vllm_rocm_rotary_reuses_one_table_for_query_and_key(monkeypatch):
+    calls = []
+
+    class FakeOperator:
+        def __call__(self, value, positions):
+            calls.append(("single", tuple(value.shape), positions.clone()))
+            return value + 1
+
+        def forward_pair(self, query, key, positions):
+            calls.append(("pair", tuple(query.shape), tuple(key.shape), positions.clone()))
+            return query + 2, key + 3
+
+    class Rotary:
+        head_size = 4
+        rotary_dim = 4
+
+        def forward_cuda(self, positions, query, key=None):
+            return query, key
+
+    monkeypatch.setattr(torch.version, "hip", "test")
+    monkeypatch.setattr(
+        "rl_engine.kernels.ops.rocm.rotary_embedding.rope.RocmDeterministicRoPEOp",
+        FakeOperator,
+    )
+    _patch_strict_rocm_rotary_embedding(Rotary)
+    rotary = Rotary()
+    positions = torch.tensor([7, 2])
+    query = torch.arange(24, dtype=torch.float32).reshape(2, 12)
+    key = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    query_out, key_out = rotary.forward_cuda(positions, query, key)
+    assert torch.equal(query_out, query + 2)
+    assert torch.equal(key_out, key + 3)
+    assert calls[0][0] == "pair"
+    assert calls[0][1:3] == ((3, 2, 4), (1, 2, 4))
+
+    query_only, absent_key = rotary.forward_cuda(positions, query)
+    assert torch.equal(query_only, query + 1)
+    assert absent_key is None
+    assert calls[1][0] == "single"
 
 
 def test_vllm_logp_replaces_every_duplicate_sampled_token_column():

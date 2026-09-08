@@ -42,6 +42,7 @@ STRICT_ROCM_CORE_BACKEND_ID = "aiter.rocm.ck_dense_mha"
 STRICT_ROCM_CORE_ID = "rlkernel.attention.rocm.aiter_ck_dense_mha.v1"
 STRICT_ROCM_SCHEDULE_ID = "single_batch_aiter_ck_dense_mha_no_splitkv"
 ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID = "rlkernel.rocm.triton_det_gemm"
+ROCM_PAGED_ATTENTION_BACKEND_ID = "aiter_mha_batch_prefill_non_split_ck"
 ROCM_DETERMINISTIC_COLLECTIVE_BACKEND_ID = "rocm_ipc_fixed_tree"
 ROCM_FFN_BACKEND_ID = "rlkernel.rocm.det_gemm_swiglu"
 STRICT_FFN_BACKEND_ID = "rlkernel.ffn.qwen3.deterministic.v1"
@@ -173,6 +174,7 @@ def validate_launch_manifest(path: Path, case_id: str) -> dict[str, Any]:
         "VLLM_ATTENTION_BACKEND": "ROCM_AITER_FA",
         "VLLM_ROCM_USE_AITER": "1",
         "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": "0",
+        "RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE": "32",
     }
     for name, expected in expected_environment.items():
         if environment.get(name) != expected:
@@ -297,19 +299,30 @@ def _validate_rlkernel_record(
             f"{ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID!r}"
         )
 
-    # Triton is permitted only for the declared deterministic QKV/O projection.
-    # The Attention core itself must remain the native AITER/CK implementation.
+    # Triton is permitted for deterministic QKV/O projection. Paged Attention
+    # arithmetic and page-table reads remain inside native AITER/CK.
+    allowed_triton_backends = {
+        ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID,
+    }
     for key, item in _walk_key_values(provenance):
         if key in _TRITON_KEYS and item is True:
             continue
         if isinstance(item, str) and "triton" in item.lower():
-            if item != ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID:
+            if item not in allowed_triton_backends:
                 errors.append(f"{label} reported an unapproved Triton backend {item!r}")
 
     if framework == "vllm":
         layouts = _values_for_keys(provenance, {"framework_layout"})
         if "vllm_paged_kv" not in layouts:
             errors.append(f"{label} did not prove the vLLM paged-KV execution boundary")
+        if not _has_exact_value(
+            provenance,
+            {"paged_kernel"},
+            ROCM_PAGED_ATTENTION_BACKEND_ID,
+        ):
+            errors.append(f"{label} did not prove direct non-Split-K paged CK execution")
+        if any(_values_for_keys(provenance, {"dense_kv_materialized"})):
+            errors.append(f"{label} materialized dense KV during paged decode")
         tp_values = _values_for_keys(provenance, {"tp_world_size"})
         try:
             tp_world_size = max(int(value) for value in tp_values)
@@ -389,8 +402,11 @@ def _validate_strict_dense_record(
         errors.append(f"{label} did not execute the fixed R/R route")
     if record.get("backend_id") != expected_backend:
         errors.append(f"{label} reported backend {record.get('backend_id')!r}")
-    if record.get("execution_mode", "eager") != "eager":
-        errors.append(f"{label} did not execute in frozen eager mode")
+    expected_mode = (
+        "compiled_hip_graph" if framework == "vllm" and module == "ffn" else "eager"
+    )
+    if record.get("execution_mode", "eager") != expected_mode:
+        errors.append(f"{label} did not execute in {expected_mode} mode")
     if int(record.get("call_count", 0)) <= 0:
         errors.append(f"{label} had zero executed calls")
     if _runtime_platform(provenance) != "rocm":
@@ -479,8 +495,12 @@ def validate_attention_readbacks(
             backend_ids.add(str(record.get("backend_id", "")))
             if record.get("case_id") != normalized_case:
                 errors.append(f"{record_label} record has the wrong case_id")
-            if record.get("execution_mode", "eager") != "eager":
-                errors.append(f"{record_label} did not execute in frozen eager mode")
+            execution_mode = record.get("execution_mode", "eager")
+            if framework == "vllm":
+                if execution_mode not in {"eager", "compiled_hip_graph"}:
+                    errors.append(f"{record_label} has invalid HIP execution mode")
+            elif execution_mode != "eager":
+                errors.append(f"{record_label} did not execute in eager mode")
             if record.get("implementation") != expected_implementation:
                 errors.append(
                     f"{record_label} implementation={record.get('implementation')!r}, "

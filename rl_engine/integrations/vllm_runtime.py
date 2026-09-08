@@ -10,6 +10,7 @@ import os
 import pathlib
 import re
 import sys
+from dataclasses import dataclass
 from types import MethodType
 from typing import Any
 
@@ -52,10 +53,19 @@ _STRICT_ATTENTION_RMS_NORM_MARKER = "__rl_kernel_strict_attention_rms_norm__"
 _STRICT_ROTARY_INIT_MARKER = "__rl_kernel_original_strict_rotary_init__"
 _STRICT_ROCM_ROPE_PATCH_MARKER = "__rl_kernel_original_strict_rocm_rope_forward__"
 _STRICT_LM_HEAD_LINEAR_PATCH_MARKER = "__rl_kernel_original_lm_head_linear_apply__"
+_STRICT_LM_HEAD_PROCESS_PATCH_MARKER = "__rl_kernel_original_lm_head_process_weights__"
+_STRICT_LM_HEAD_TIE_PATCH_MARKER = "__rl_kernel_original_lm_head_tie_weights__"
+_STRICT_LM_HEAD_CACHE_BUFFER = "_rl_kernel_lm_head_weight_t"
+_STRICT_LM_HEAD_CACHE_STATE = "_rl_kernel_lm_head_weight_cache_state"
+_STRICT_LM_HEAD_CACHE_HOOK = "_rl_kernel_lm_head_weight_cache_state_dict_hook"
+_STRICT_LM_HEAD_TIED = "_rl_kernel_lm_head_tied_weight"
 _STRICT_O_PROJ_COLLECTIVE_MARKER = "__rl_kernel_o_proj_collective__"
+_STRICT_O_PROJ_FUSED_ALL_REDUCE_MARKER = "__rl_kernel_o_proj_fused_all_reduce__"
+_STRICT_O_PROJ_COMPILED_COLLECTIVE_SLOT = "__rl_kernel_o_proj_compiled_collective_slot__"
 _STRICT_ROW_PARALLEL_PATCH_MARKER = "__rl_kernel_original_row_parallel_forward__"
 _STRICT_DIRECT_STAGING_MARKER = "__rl_kernel_direct_staging_active__"
 _STRICT_LAYER_DIAGNOSTIC_PATCH_MARKER = "__rl_kernel_original_layer_diagnostic_forward__"
+_STRICT_WEIGHT_CACHE_REFRESH_MARKER = "__rl_kernel_original_finish_weight_update__"
 _RLK_ATTENTION_BACKEND: type[Any] | None = None
 _RLK_ATTENTION_IMPL: type[Any] | None = None
 _RLK_ATTENTION_BUILDER: type[Any] | None = None
@@ -63,6 +73,223 @@ _RLK_O_PROJ_COLLECTIVE_BACKEND: str | None = None
 _VLLM_LAYER_DIAGNOSTIC_BUFFER: dict[str, Any] | None = None
 _VLLM_LAYER_DIAGNOSTIC_CALLS = 0
 _VLLM_LAYER_DIAGNOSTIC_ACTIVE_LAYER: int | None = None
+_ROCM_STATEFUL_GRAPH_SPLITTING_OPS = (
+    DETERMINISTIC_ALL_REDUCE_OP,
+    "rl_kernel::rocm_det_gemm_linear_all_reduce_inference",
+    "rl_kernel::qwen3_ffn_packed_tp_inference_rocm",
+)
+
+
+@dataclass
+class _LmHeadWeightCacheState:
+    source: torch.Tensor
+    weight_t: torch.Tensor
+    source_data_ptr: int
+    source_shape: tuple[int, ...]
+    source_stride: tuple[int, ...]
+    source_dtype: torch.dtype
+    source_device: torch.device
+    source_version: int | None
+    cache_data_ptr: int
+    cache_version: int | None
+    generation: int
+    valid: bool
+    refresh_pending: bool
+
+
+def _tracked_tensor_version(value: torch.Tensor) -> int | None:
+    try:
+        return int(value._version)
+    except RuntimeError:
+        # Tensors created in inference mode do not carry a version counter.
+        return None
+
+
+def _invalidate_lm_head_weight_cache(weight: Any) -> None:
+    state = getattr(weight, _STRICT_LM_HEAD_CACHE_STATE, None)
+    if isinstance(state, _LmHeadWeightCacheState):
+        state.valid = False
+        state.refresh_pending = False
+
+
+def _mark_lm_head_weight_cache_refreshable(weight: Any) -> None:
+    state = getattr(weight, _STRICT_LM_HEAD_CACHE_STATE, None)
+    if isinstance(state, _LmHeadWeightCacheState):
+        state.refresh_pending = True
+
+
+def _keep_lm_head_cache_non_persistent(layer: Any, *_args: Any) -> None:
+    buffers = getattr(layer, "_buffers", {})
+    non_persistent = getattr(layer, "_non_persistent_buffers_set", None)
+    if _STRICT_LM_HEAD_CACHE_BUFFER in buffers and isinstance(non_persistent, set):
+        non_persistent.add(_STRICT_LM_HEAD_CACHE_BUFFER)
+
+
+def _record_lm_head_weight_cache_refresh(
+    state: _LmHeadWeightCacheState,
+    weight: torch.Tensor,
+) -> None:
+    state.source_data_ptr = int(weight.data_ptr())
+    state.source_shape = tuple(int(dim) for dim in weight.shape)
+    state.source_stride = tuple(int(stride) for stride in weight.stride())
+    state.source_dtype = weight.dtype
+    state.source_device = weight.device
+    state.source_version = _tracked_tensor_version(weight)
+    state.cache_data_ptr = int(state.weight_t.data_ptr())
+    state.cache_version = _tracked_tensor_version(state.weight_t)
+    state.generation += 1
+    state.valid = True
+    state.refresh_pending = False
+
+
+def _refresh_lm_head_weight_cache(
+    layer: Any,
+    prepare_weight: Any,
+) -> _LmHeadWeightCacheState:
+    weight = getattr(layer, "weight", None)
+    if not isinstance(weight, torch.Tensor):
+        raise RuntimeError("strict ROCm LM-head cache requires a tensor weight")
+    if bool(getattr(layer, _STRICT_LM_HEAD_TIED, False)):
+        raise RuntimeError("strict ROCm LM-head cache does not support tied embeddings")
+
+    state = getattr(layer, _STRICT_LM_HEAD_CACHE_STATE, None)
+    if state is None:
+        weight_t = prepare_weight(weight)
+        register_buffer = getattr(layer, "register_buffer", None)
+        if callable(register_buffer):
+            register_buffer(
+                _STRICT_LM_HEAD_CACHE_BUFFER,
+                weight_t,
+                persistent=False,
+            )
+        else:
+            # Kept for lightweight integration adapters used outside nn.Module.
+            setattr(layer, _STRICT_LM_HEAD_CACHE_BUFFER, weight_t)
+        register_state_dict_pre_hook = getattr(layer, "register_state_dict_pre_hook", None)
+        if callable(register_state_dict_pre_hook) and not hasattr(
+            layer, _STRICT_LM_HEAD_CACHE_HOOK
+        ):
+            handle = register_state_dict_pre_hook(_keep_lm_head_cache_non_persistent)
+            setattr(layer, _STRICT_LM_HEAD_CACHE_HOOK, handle)
+        state = _LmHeadWeightCacheState(
+            source=weight,
+            weight_t=weight_t,
+            source_data_ptr=0,
+            source_shape=(),
+            source_stride=(),
+            source_dtype=weight.dtype,
+            source_device=weight.device,
+            source_version=None,
+            cache_data_ptr=int(weight_t.data_ptr()),
+            cache_version=None,
+            generation=0,
+            valid=False,
+            refresh_pending=False,
+        )
+        setattr(layer, _STRICT_LM_HEAD_CACHE_STATE, state)
+    else:
+        if not isinstance(state, _LmHeadWeightCacheState):
+            raise RuntimeError("strict ROCm LM-head cache state has an invalid type")
+        if (
+            state.source is not weight
+            or getattr(layer, _STRICT_LM_HEAD_CACHE_BUFFER, None) is not state.weight_t
+        ):
+            # Checkpoint-format layerwise reload temporarily replaces every
+            # Parameter (and may remove derived buffers) before post-load
+            # processing, then copies the canonical weight back into the
+            # original stable storage.  Defer the transpose until the first
+            # forward observes that stable source again.  This also avoids
+            # depending on vLLM copying a non-persistent derived buffer.
+            state.valid = False
+            state.refresh_pending = True
+            return state
+        state.valid = False
+        state.refresh_pending = False
+        cache_data_ptr = int(state.weight_t.data_ptr())
+        refreshed = prepare_weight(weight, out=state.weight_t)
+        if refreshed is not state.weight_t or int(refreshed.data_ptr()) != cache_data_ptr:
+            raise RuntimeError("strict ROCm LM-head refresh replaced stable cache storage")
+        _record_lm_head_weight_cache_refresh(state, weight)
+
+    if state.generation == 0:
+        _record_lm_head_weight_cache_refresh(state, weight)
+    setattr(weight, _STRICT_LM_HEAD_CACHE_STATE, state)
+    return state
+
+
+def _validated_lm_head_weight_cache(
+    layer: Any,
+    prepare_weight: Any | None = None,
+) -> torch.Tensor:
+    weight = getattr(layer, "weight", None)
+    if bool(getattr(layer, _STRICT_LM_HEAD_TIED, False)):
+        raise RuntimeError("strict ROCm LM-head cache does not support tied embeddings")
+    _keep_lm_head_cache_non_persistent(layer)
+    if not isinstance(weight, torch.Tensor):
+        raise RuntimeError("strict ROCm LM-head cache was not prepared after model loading")
+    state_value = getattr(layer, _STRICT_LM_HEAD_CACHE_STATE, None)
+    if not isinstance(state_value, _LmHeadWeightCacheState):
+        raise RuntimeError("strict ROCm LM-head cache was not prepared after model loading")
+    state: _LmHeadWeightCacheState = state_value
+    cached_weight = state.weight_t
+    if not isinstance(cached_weight, torch.Tensor):
+        raise RuntimeError("strict ROCm LM-head cache state has an invalid weight")
+    if (
+        state.source is not weight
+        or getattr(weight, _STRICT_LM_HEAD_CACHE_STATE, None) is not state
+    ):
+        raise RuntimeError("strict ROCm LM-head cache is not bound to the active weight")
+    if getattr(layer, _STRICT_LM_HEAD_CACHE_BUFFER, None) is not cached_weight:
+        raise RuntimeError("strict ROCm LM-head cache buffer was replaced")
+
+    current_source = (
+        int(weight.data_ptr()),
+        tuple(int(dim) for dim in weight.shape),
+        tuple(int(stride) for stride in weight.stride()),
+        weight.dtype,
+        weight.device,
+        _tracked_tensor_version(weight),
+    )
+    expected_source = (
+        state.source_data_ptr,
+        state.source_shape,
+        state.source_stride,
+        state.source_dtype,
+        state.source_device,
+        state.source_version,
+    )
+    if current_source[:-1] != expected_source[:-1]:
+        state.valid = False
+        state.refresh_pending = False
+        raise RuntimeError("strict ROCm LM-head weight storage changed without a cache refresh")
+    if not cached_weight.is_contiguous() or int(cached_weight.data_ptr()) != state.cache_data_ptr:
+        state.valid = False
+        state.refresh_pending = False
+        raise RuntimeError("strict ROCm LM-head cache storage changed after refresh")
+    if state.valid:
+        if current_source[-1] != expected_source[-1]:
+            state.valid = False
+            state.refresh_pending = False
+            raise RuntimeError("strict ROCm LM-head weight changed without a cache refresh")
+        if _tracked_tensor_version(cached_weight) != state.cache_version:
+            state.valid = False
+            state.refresh_pending = False
+            raise RuntimeError("strict ROCm LM-head cache bytes changed after refresh")
+        return cached_weight
+
+    if not state.refresh_pending or prepare_weight is None:
+        raise RuntimeError("strict ROCm LM-head cache is invalid during weight update")
+    cache_data_ptr = int(cached_weight.data_ptr())
+    try:
+        refreshed = prepare_weight(weight, out=cached_weight)
+    except Exception:
+        state.refresh_pending = False
+        raise
+    if refreshed is not cached_weight or int(refreshed.data_ptr()) != cache_data_ptr:
+        state.refresh_pending = False
+        raise RuntimeError("strict ROCm LM-head refresh replaced stable cache storage")
+    _record_lm_head_weight_cache_refresh(state, weight)
+    return cached_weight
 
 
 def _alignment_diagnostics_enabled() -> bool:
@@ -90,6 +317,7 @@ def _patch_qwen3_layer_alignment_diagnostics() -> None:
     if not _alignment_diagnostics_enabled():
         return
     from vllm.model_executor.models.qwen3 import Qwen3Attention, Qwen3DecoderLayer
+
     from rl_engine.kernels.ops.rocm.attention.strict_runtime import StrictRocmAttentionRuntime
 
     if hasattr(Qwen3DecoderLayer, _STRICT_LAYER_DIAGNOSTIC_PATCH_MARKER):
@@ -178,9 +406,7 @@ def _patch_qwen3_layer_alignment_diagnostics() -> None:
             "outputs": torch.stack(buffer["outputs"]).cpu(),
         }
         if "layer0" in buffer:
-            payload["layer0"] = {
-                name: value.cpu() for name, value in buffer["layer0"].items()
-            }
+            payload["layer0"] = {name: value.cpu() for name, value in buffer["layer0"].items()}
         _VLLM_LAYER_DIAGNOSTIC_BUFFER = None
         root = os.getenv("RL_KERNEL_ALIGNMENT_DIAGNOSTICS_DIR", "").strip()
         if root:
@@ -188,11 +414,7 @@ def _patch_qwen3_layer_alignment_diagnostics() -> None:
             output_dir.mkdir(parents=True, exist_ok=True)
             torch.save(
                 payload,
-                output_dir
-                / (
-                    f"vllm-pid{os.getpid()}-rank{rank:05d}-"
-                    f"call{call_index:08d}.pt"
-                ),
+                output_dir / (f"vllm-pid{os.getpid()}-rank{rank:05d}-" f"call{call_index:08d}.pt"),
             )
         return result
 
@@ -215,15 +437,17 @@ def _patch_qwen3_layer_alignment_diagnostics() -> None:
         q, k = instance.rotary_emb(positions, q, k)
         attention_core = instance.attn(q, k, v)
         output, _ = instance.o_proj(attention_core)
-        buffer.setdefault("layer0", {}).update({
-            "attention_norm": hidden_states.detach(),
-            "qkv": qkv.detach(),
-            "query": q.view(*q.shape[:-1], -1, instance.head_dim).detach(),
-            "key": k.view(*k.shape[:-1], -1, instance.head_dim).detach(),
-            "value": v.view(*v.shape[:-1], -1, instance.head_dim).detach(),
-            "attention_core": attention_core.detach(),
-            "attention_output": output.detach(),
-        })
+        buffer.setdefault("layer0", {}).update(
+            {
+                "attention_norm": hidden_states.detach(),
+                "qkv": qkv.detach(),
+                "query": q.view(*q.shape[:-1], -1, instance.head_dim).detach(),
+                "key": k.view(*k.shape[:-1], -1, instance.head_dim).detach(),
+                "value": v.view(*v.shape[:-1], -1, instance.head_dim).detach(),
+                "attention_core": attention_core.detach(),
+                "attention_output": output.detach(),
+            }
+        )
         return output
 
     def gather_paged_row_wrapped(
@@ -231,12 +455,15 @@ def _patch_qwen3_layer_alignment_diagnostics() -> None:
         v_cache: torch.Tensor,
         page_row: torch.Tensor,
         cached_length: int,
+        *,
+        validate_bounds: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         key, value = original_gather_paged_row(
             k_cache,
             v_cache,
             page_row,
             cached_length,
+            validate_bounds=validate_bounds,
         )
         buffer = _VLLM_LAYER_DIAGNOSTIC_BUFFER
         if buffer is not None and _VLLM_LAYER_DIAGNOSTIC_ACTIVE_LAYER == 0:
@@ -347,8 +574,14 @@ def _patch_qwen_lm_head_padding() -> None:
     padding_size = padded_vocab - real_vocab
     original = ParallelLMHead.__init__
     original_weight_loader = VocabParallelEmbedding.weight_loader
+    original_tie_weights = getattr(ParallelLMHead, "tie_weights", None)
 
     def strict_weight_loader(instance: Any, param: Any, loaded_weight: torch.Tensor) -> None:
+        # vLLM loaders write through ``param.data``, which does not reliably
+        # advance the Parameter version counter.  Explicitly invalidate before
+        # any write so a failed or incomplete hot update cannot reuse old
+        # prepared LM-head bytes.
+        _invalidate_lm_head_weight_cache(param)
         strict_real_vocab = getattr(instance, "_rl_kernel_real_vocab_size", None)
         output_dim = getattr(param, "output_dim", None)
         packed_dim = getattr(param, "packed_dim", None)
@@ -368,8 +601,10 @@ def _patch_qwen_lm_head_padding() -> None:
                 param[available:shard_size].data.fill_(0)
             if shard_size < param.shape[0]:
                 param[shard_size:].data.fill_(0)
+            _mark_lm_head_weight_cache_refreshable(param)
             return
         original_weight_loader(instance, param, loaded_weight)
+        _mark_lm_head_weight_cache_refreshable(param)
 
     def wrapped(instance: Any, *args: Any, **kwargs: Any) -> None:
         if args:
@@ -382,6 +617,7 @@ def _patch_qwen_lm_head_padding() -> None:
         kwargs["padding_size"] = padding_size
         original(instance, *args, **kwargs)
         instance._rl_kernel_real_vocab_size = real_vocab
+        setattr(instance, _STRICT_PROJECTION_MARKER, "lm_head")
         if (
             int(getattr(instance, "org_vocab_size", -1)) != padded_vocab
             or int(getattr(instance, "num_embeddings_padded", -1)) != padded_vocab
@@ -392,6 +628,21 @@ def _patch_qwen_lm_head_padding() -> None:
             )
 
     setattr(ParallelLMHead, _PATCH_MARKER, original)
+    if callable(original_tie_weights) and not hasattr(
+        ParallelLMHead, _STRICT_LM_HEAD_TIE_PATCH_MARKER
+    ):
+
+        def strict_tie_weights(instance: Any, embed_tokens: Any) -> Any:
+            result = original_tie_weights(instance, embed_tokens)
+            setattr(instance, _STRICT_LM_HEAD_TIED, True)
+            return result
+
+        setattr(
+            ParallelLMHead,
+            _STRICT_LM_HEAD_TIE_PATCH_MARKER,
+            original_tie_weights,
+        )
+        setattr(ParallelLMHead, "tie_weights", strict_tie_weights)
     if not hasattr(VocabParallelEmbedding, "__rl_kernel_original_weight_loader__"):
         setattr(
             VocabParallelEmbedding,
@@ -425,6 +676,14 @@ def _patch_qwen_compute_logits(integration: VllmIntegration) -> None:
             lm_head = getattr(instance, "lm_head", None)
             if lm_head is None:
                 raise RuntimeError("strict rollout linear_logp requires a Qwen LM-head")
+            model = getattr(instance, "model", None)
+            if (
+                torch.version.hip is not None
+                and model is not None
+                and lm_head is getattr(model, "embed_tokens", None)
+            ):
+                setattr(lm_head, _STRICT_LM_HEAD_TIED, True)
+                raise RuntimeError("strict ROCm LM-head cache does not support tied embeddings")
             setattr(lm_head, _STRICT_PROJECTION_MARKER, "lm_head")
             logits = _original(instance, hidden_states)
             if not get_pp_group().is_last_rank:
@@ -459,6 +718,7 @@ def _patch_strict_lm_head_linear(
     *,
     linear_method_cls: type[Any] | None = None,
     det_gemm: Any | None = None,
+    prepare_weight: Any | None = None,
 ) -> None:
     """Route vLLM's existing LM-head projection through RL-Kernel det_gemm."""
 
@@ -473,6 +733,38 @@ def _patch_strict_lm_head_linear(
         from rl_engine.kernels.ops.matmul.det_gemm import DetGemmOp
 
         det_gemm = DetGemmOp()
+    if torch.version.hip is not None and prepare_weight is None:
+        from rl_engine.kernels.ops.rocm.matmul.det_gemm import prepare_det_gemm_linear_weight
+
+        prepare_weight = prepare_det_gemm_linear_weight
+
+    if not hasattr(linear_method_cls, _STRICT_LM_HEAD_PROCESS_PATCH_MARKER):
+        previous_process_weights = linear_method_cls.process_weights_after_loading
+
+        def process_weights_after_loading(
+            method: Any,
+            layer: Any,
+        ) -> Any:
+            result = previous_process_weights(method, layer)
+            if (
+                torch.version.hip is not None
+                and getattr(layer, _STRICT_PROJECTION_MARKER, None) == "lm_head"
+            ):
+                if prepare_weight is None:
+                    raise RuntimeError("strict ROCm LM-head weight preparation is unavailable")
+                _refresh_lm_head_weight_cache(layer, prepare_weight)
+            return result
+
+        setattr(
+            linear_method_cls,
+            _STRICT_LM_HEAD_PROCESS_PATCH_MARKER,
+            previous_process_weights,
+        )
+        setattr(
+            linear_method_cls,
+            "process_weights_after_loading",
+            process_weights_after_loading,
+        )
 
     def wrapped(
         method: Any,
@@ -483,7 +775,16 @@ def _patch_strict_lm_head_linear(
         if getattr(layer, _STRICT_PROJECTION_MARKER, None) != "lm_head":
             return previous_apply(method, layer, x, bias)
         x_2d = x.reshape(-1, x.shape[-1])
-        output_2d = det_gemm.linear(x_2d, layer.weight)
+        if torch.version.hip is not None:
+            linear_prepared = getattr(det_gemm, "linear_prepared", None)
+            if not callable(linear_prepared):
+                raise RuntimeError("strict ROCm LM-head prepared GEMM is unavailable")
+            output_2d = linear_prepared(
+                x_2d,
+                _validated_lm_head_weight_cache(layer, prepare_weight),
+            )
+        else:
+            output_2d = det_gemm.linear(x_2d, layer.weight)
         output = output_2d.reshape(*x.shape[:-1], layer.weight.size(0))
         return output if bias is None else output + bias
 
@@ -505,6 +806,41 @@ def _patch_strict_rocm_rotary_embedding(rotary_cls: type[Any]) -> None:
     operator = RocmDeterministicRoPEOp()
     original = rotary_cls.forward_cuda
 
+    def prepare_tables(instance: Any, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        head_size = int(getattr(instance, "head_size", 0))
+        max_positions = int(getattr(instance, "max_position_embeddings", 0))
+        theta = float(getattr(instance, "base", 1_000_000.0))
+        key = (device.type, device.index, head_size, max_positions, theta)
+        if getattr(instance, "_rl_kernel_rope_table_key", None) == key:
+            cos = getattr(instance, "_rl_kernel_rope_cos_fp32", None)
+            sin = getattr(instance, "_rl_kernel_rope_sin_fp32", None)
+            if isinstance(cos, torch.Tensor) and isinstance(sin, torch.Tensor):
+                return cos, sin
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "strict ROCm RoPE FP32 table must be initialized before HIP Graph capture"
+            )
+        cos, sin = operator.build_position_table(
+            max_positions,
+            head_size,
+            device=device,
+            theta=theta,
+        )
+        def register_table(name: str, table: torch.Tensor) -> None:
+            if isinstance(instance, torch.nn.Module):
+                buffers = instance._buffers
+                if name in buffers:
+                    buffers[name] = table
+                else:
+                    instance.register_buffer(name, table, persistent=False)
+            else:
+                setattr(instance, name, table)
+
+        register_table("_rl_kernel_rope_cos_fp32", cos)
+        register_table("_rl_kernel_rope_sin_fp32", sin)
+        instance._rl_kernel_rope_table_key = key
+        return cos, sin
+
     def strict_forward_cuda(
         instance: Any,
         positions: torch.Tensor,
@@ -518,12 +854,19 @@ def _patch_strict_rocm_rotary_embedding(rotary_cls: type[Any]) -> None:
                 "strict ROCm Qwen3 RoPE requires full-dimension rotation: "
                 f"rotary_dim={rotary_dim}, head_size={head_size}"
             )
-        if positions.ndim not in (1, 2) or positions.numel() != query.shape[0]:
+        if positions.ndim not in (1, 2):
             raise RuntimeError(
                 "strict ROCm vLLM RoPE positions must align with flattened query rows: "
                 f"positions={tuple(positions.shape)}, query={tuple(query.shape)}"
             )
+        torch._check(
+            positions.numel() == query.shape[0],
+            lambda: "strict ROCm vLLM RoPE positions must align with query rows",
+        )
         flat_positions = positions.reshape(-1).to(device=query.device, dtype=torch.int64)
+        if not flat_positions.is_contiguous():
+            flat_positions = flat_positions.contiguous()
+        cos, sin = prepare_tables(instance, query.device)
 
         def apply(value: torch.Tensor | None) -> torch.Tensor | None:
             if value is None:
@@ -532,24 +875,24 @@ def _patch_strict_rocm_rotary_embedding(rotary_cls: type[Any]) -> None:
                 raise RuntimeError(
                     "strict ROCm vLLM RoPE expects flattened [tokens, heads*head_dim] tensors"
                 )
-            tokens = value.shape[0]
-            heads = value.shape[1] // head_size
-            # The HIP kernel indexes one position table across rows. A
-            # head-major view avoids duplicating the table for every head and
-            # keeps the dispatch to one deterministic launch per Q/K tensor.
-            head_major = value.view(tokens, heads, head_size).permute(1, 0, 2).contiguous()
-            rotated = operator(head_major, flat_positions)
-            return rotated.permute(1, 0, 2).reshape_as(value).contiguous()
+            return operator.forward_token_major(
+                value,
+                flat_positions,
+                cos,
+                sin,
+                head_dim=head_size,
+            )
 
         return apply(query), apply(key)
 
     strict_forward_cuda.__name__ = getattr(original, "__name__", "forward_cuda")
+    setattr(rotary_cls, "_rl_kernel_prepare_strict_rocm_tables", prepare_tables)
     setattr(rotary_cls, _STRICT_ROCM_ROPE_PATCH_MARKER, original)
     rotary_cls.forward_cuda = strict_forward_cuda
 
 
 def _configure_strict_ffn_compilation(vllm_config: Any | None = None) -> None:
-    """Keep the graph-safe TP reduction inside vLLM CUDA graphs."""
+    """Keep stateful ROCm TP reductions outside replayed HIP graph segments."""
 
     if vllm_config is None:
         from vllm.config import get_current_vllm_config_or_none
@@ -562,10 +905,47 @@ def _configure_strict_ffn_compilation(vllm_config: Any | None = None) -> None:
     splitting_ops = compilation.splitting_ops
     if splitting_ops is None:
         raise RuntimeError("vLLM splitting operators were not finalized before model init")
-    # Older strict runtimes split this op because their host-owned sequence
-    # value was frozen at graph capture. Sequence allocation is now device
-    # owned, so remove stale entries and preserve the user's graph mode.
-    splitting_ops[:] = [op for op in splitting_ops if op != DETERMINISTIC_ALL_REDUCE_OP]
+    if torch.version.hip is None:
+        # Preserve the CUDA full-graph path introduced by PR 377.
+        splitting_ops[:] = [
+            op for op in splitting_ops if op != DETERMINISTIC_ALL_REDUCE_OP
+        ]
+        return
+
+    from vllm.config import CUDAGraphMode
+
+    compilation.cudagraph_mode = CUDAGraphMode.PIECEWISE
+    # The IPC transport owns peer-visible sequence and staging state that is
+    # advanced once per invocation. Replaying the transport inside a captured
+    # graph can reuse capture-time state and stale peer payloads. Keep just
+    # these opaque reductions eager while vLLM captures the pure compute around
+    # them as piecewise HIP graphs.
+    for op in _ROCM_STATEFUL_GRAPH_SPLITTING_OPS:
+        if op not in splitting_ops:
+            splitting_ops.append(op)
+
+
+def _patch_rocm_weight_cache_refresh() -> None:
+    """Refresh stable transpose buffers after vLLM IPC weight transfer."""
+
+    if torch.version.hip is None:
+        return
+    from vllm.v1.worker.gpu_worker import Worker
+    from rl_engine.kernels.ops.rocm.matmul.det_gemm import (
+        refresh_cached_weight_transposes,
+    )
+
+    if hasattr(Worker, _STRICT_WEIGHT_CACHE_REFRESH_MARKER):
+        return
+    original_finish = Worker.finish_weight_update
+
+    def finish_weight_update_wrapped(instance: Any) -> None:
+        original_finish(instance)
+        model = instance.model_runner.get_model()
+        refresh_cached_weight_transposes(model.parameters())
+
+    setattr(Worker, _STRICT_WEIGHT_CACHE_REFRESH_MARKER, original_finish)
+    Worker.finish_weight_update = finish_weight_update_wrapped
 
 
 def _patch_qwen_ffn(integration: VllmIntegration) -> None:
@@ -591,7 +971,7 @@ def _patch_qwen_ffn(integration: VllmIntegration) -> None:
             _handle, tp_world_size = operator.bind_packed_inference(instance)
             if not compiled_evidence_armed:
                 execution_mode = (
-                    "eager" if getattr(torch.version, "hip", None) is not None
+                    "compiled_hip_graph" if getattr(torch.version, "hip", None) is not None
                     else "compiled_cuda_graph"
                 )
                 register_packed_inference_observer(
@@ -600,7 +980,7 @@ def _patch_qwen_ffn(integration: VllmIntegration) -> None:
                     )
                 )
                 compiled_evidence_armed = True
-            if tp_world_size > 1 and getattr(torch.version, "hip", None) is None:
+            if tp_world_size > 1:
                 _configure_strict_ffn_compilation()
 
         setattr(Qwen2MLP, _STRICT_FFN_INIT_MARKER, original_init)
@@ -665,6 +1045,16 @@ def _patch_qwen3_strict_model(
         _patch_strict_rocm_rotary_embedding(rotary_cls)
     if det_gemm is None:
         det_gemm = _strict_attention_projection_op()
+    rocm_linear_all_reduce = None
+    register_rocm_linear_staging = None
+    if torch.version.hip is not None:
+        from rl_engine.kernels.ops.rocm.matmul.det_gemm import (
+            det_gemm_linear_all_reduce_inference,
+            register_det_gemm_all_reduce_staging,
+        )
+
+        rocm_linear_all_reduce = det_gemm_linear_all_reduce_inference
+        register_rocm_linear_staging = register_det_gemm_all_reduce_staging
 
     attention_init = attention_cls.__init__
     unquantized_apply = linear_method_cls.apply
@@ -681,13 +1071,19 @@ def _patch_qwen3_strict_model(
         x_2d = x.reshape(-1, x.shape[-1])
         linear = getattr(det_gemm, "linear", None)
         collective = getattr(layer, _STRICT_O_PROJ_COLLECTIVE_MARKER, None)
+        if collective is not None and torch.version.hip is not None:
+            if bias is not None or rocm_linear_all_reduce is None:
+                raise RuntimeError("strict ROCm o_proj fusion requires a bias-free linear")
+            output_2d = rocm_linear_all_reduce(
+                x_2d,
+                layer.weight,
+                collective_handle=int(
+                    getattr(layer, _STRICT_O_PROJ_COMPILED_COLLECTIVE_SLOT)
+                ),
+            )
+            return output_2d.reshape(*x.shape[:-1], layer.weight.shape[0])
         direct_output = None
-        if (
-            torch.version.hip is None
-            and collective is not None
-            and bias is None
-            and linear is not None
-        ):
+        if collective is not None and bias is None and linear is not None:
             direct_output = collective.direct_staging_view(
                 (x_2d.size(0), layer.weight.shape[0]),
                 dtype=x.dtype,
@@ -720,28 +1116,23 @@ def _patch_qwen3_strict_model(
             raise RuntimeError("strict Attention Q/K RMSNorm requires a weight")
         return strict_rms_norm(x, weight, eps=instance.variance_epsilon)
 
-    def require_rocm_eager_runtime() -> None:
+    def require_rocm_graph_runtime() -> None:
         if not production_classes or torch.version.hip is None:
             return
-        from vllm.config import (
-            CUDAGraphMode,
-            CompilationMode,
-            get_current_vllm_config_or_none,
-        )
+        from vllm.config import CompilationMode, CUDAGraphMode, get_current_vllm_config_or_none
 
         config = get_current_vllm_config_or_none()
         model_config = None if config is None else config.model_config
         compilation_config = None if config is None else config.compilation_config
         if (
             model_config is None
-            or model_config.enforce_eager is not True
+            or model_config.enforce_eager is True
             or compilation_config is None
-            or compilation_config.mode != CompilationMode.NONE
-            or compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            or compilation_config.mode == CompilationMode.NONE
+            or compilation_config.cudagraph_mode == CUDAGraphMode.NONE
         ):
             raise RuntimeError(
-                "strict ROCm vLLM Attention requires enforce_eager with compilation "
-                "and CUDA/HIP graph capture disabled"
+                "strict ROCm rollout requires compilation and HIP graph capture enabled"
             )
 
     def bind_attention_rms_norm(attention: Any, name: str) -> None:
@@ -794,8 +1185,6 @@ def _patch_qwen3_strict_model(
         if not isinstance(backend_id, str) or not backend_id.strip():
             raise RuntimeError("strict rollout o_proj collective has no backend identity")
         _RLK_O_PROJ_COLLECTIVE_BACKEND = backend_id.strip()
-        if torch.version.hip is not None:
-            return
         max_capture = int(os.getenv("RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE", "0"))
         if max_capture <= 0:
             raise RuntimeError(
@@ -805,6 +1194,20 @@ def _patch_qwen3_strict_model(
             ((batch, int(module.weight.shape[0])) for batch in range(1, max_capture + 1)),
             dtype=module.weight.dtype,
         )
+        if torch.version.hip is not None and production_classes:
+            staging = collective.direct_staging_view(
+                (max_capture, int(module.weight.shape[0])),
+                dtype=module.weight.dtype,
+            )
+            if staging is None:
+                raise RuntimeError("strict ROCm o_proj staging allocation failed")
+            if register_rocm_linear_staging is None:
+                raise RuntimeError("strict ROCm o_proj staging registry is unavailable")
+            compiled_slot = register_rocm_linear_staging(
+                int(collective._handle), staging
+            )
+            setattr(module, _STRICT_O_PROJ_COMPILED_COLLECTIVE_SLOT, compiled_slot)
+            setattr(module, _STRICT_O_PROJ_FUSED_ALL_REDUCE_MARKER, True)
 
     if row_parallel_cls is not None and not hasattr(
         row_parallel_cls, _STRICT_ROW_PARALLEL_PATCH_MARKER
@@ -830,8 +1233,10 @@ def _patch_qwen3_strict_model(
             output_parallel = instance.quant_method.apply(instance, input_parallel, bias_)
 
             if instance.reduce_results and instance.tp_size > 1:
-                if torch.version.hip is not None:
-                    output = collective.all_reduce(output_parallel)
+                if bool(
+                    getattr(instance, _STRICT_O_PROJ_FUSED_ALL_REDUCE_MARKER, False)
+                ):
+                    output = output_parallel
                 elif bool(getattr(instance, _STRICT_DIRECT_STAGING_MARKER, False)):
                     output = deterministic_all_reduce_staged(
                         output_parallel,
@@ -871,6 +1276,14 @@ def _patch_qwen3_strict_model(
         def rotary_init_wrapped(instance: Any, *args: Any, **kwargs: Any) -> None:
             rotary_init(instance, *args, **kwargs)
             instance._forward_method = instance.forward_cuda
+            cache = getattr(instance, "cos_sin_cache", None)
+            prepare = getattr(instance, "_rl_kernel_prepare_strict_rocm_tables", None)
+            if (
+                isinstance(cache, torch.Tensor)
+                and cache.is_cuda
+                and callable(prepare)
+            ):
+                prepare(cache.device)
 
         setattr(rotary_cls, _STRICT_ROTARY_INIT_MARKER, rotary_init)
         rotary_cls.__init__ = rotary_init_wrapped
@@ -879,7 +1292,7 @@ def _patch_qwen3_strict_model(
         return
 
     def attention_init_wrapped(instance: Any, *args: Any, **kwargs: Any) -> None:
-        require_rocm_eager_runtime()
+        require_rocm_graph_runtime()
         attention_init(instance, *args, **kwargs)
         setattr(instance.qkv_proj, _STRICT_PROJECTION_MARKER, "qkv")
         setattr(instance.o_proj, _STRICT_PROJECTION_MARKER, "o_proj")
@@ -994,9 +1407,7 @@ def _register_attention_backend(integration: VllmIntegration) -> None:
 
     operator: VllmAttentionOperator | None = None
     if integration.plan.implementation_for("attention", "rollout") is Implementation.RL_KERNEL:
-        operator = VllmAttentionOperator(
-            projection_collective_backend=_o_proj_collective_backend
-        )
+        operator = VllmAttentionOperator(projection_collective_backend=_o_proj_collective_backend)
         integration.install_operator("attention", operator)
 
     class RlKernelAttentionImpl(PlatformAttentionImpl):
@@ -1004,6 +1415,30 @@ def _register_attention_backend(integration: VllmIntegration) -> None:
             super().__init__(*args, **kwargs)
             if operator is not None:
                 operator.bind_inference()
+            if torch.version.hip is not None and operator is not None:
+                from vllm.config import get_current_vllm_config_or_none
+
+                config = get_current_vllm_config_or_none()
+                model_config = None if config is None else config.model_config
+                dtype = None if model_config is None else model_config.dtype
+                if dtype in (torch.float16, torch.bfloat16):
+                    operator.warmup_rocm_decode(self, dtype=dtype)
+
+        def _split_kv_cache(
+            self, kv_cache: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            if torch.version.hip is not None and operator is not None:
+                if (
+                    kv_cache.ndim != 4
+                    or kv_cache.size(2) != int(self.num_kv_heads)
+                    or kv_cache.size(-1) != 2 * int(self.head_size)
+                ):
+                    raise RuntimeError(
+                        "RL-Kernel ROCm KV cache must use "
+                        "[blocks, block, heads, 2 * head_size]"
+                    )
+                return kv_cache.split(int(self.head_size), dim=-1)
+            return super()._split_kv_cache(kv_cache)
 
         def forward(self, *args: Any, **kwargs: Any) -> Any:
             active = get_active_integration("vllm")
@@ -1016,9 +1451,57 @@ def _register_attention_backend(integration: VllmIntegration) -> None:
             return integration.execute("attention", native, self, *args, **kwargs)
 
     class RlKernelAttentionMetadataBuilder(PlatformAttentionMetadataBuilder):
-        pass
+        def build(
+            self,
+            common_prefix_len: int,
+            common_attn_metadata: Any,
+            fast_build: bool = False,
+        ) -> Any:
+            metadata = super().build(
+                common_prefix_len,
+                common_attn_metadata,
+                fast_build=fast_build,
+            )
+            # The ROCm RL-Kernel adapter can reuse vLLM's exact CPU snapshot
+            # for pure decode scheduling. Keep this private metadata on the
+            # adapter-owned object; native vLLM code remains untouched.
+            if torch.version.hip is not None:
+                # attn_utils reconstructs CommonAttentionMetadata without the
+                # deprecated private CPU cache. Its upper-bound snapshot is
+                # exact for prefill, which is the only path consuming it here.
+                host_lengths = getattr(common_attn_metadata, "seq_lens_cpu_upper_bound", None)
+                if isinstance(host_lengths, torch.Tensor) and host_lengths.device.type == "cpu":
+                    setattr(metadata, "_rlk_seq_lens_cpu", host_lengths)
+                starts = getattr(common_attn_metadata, "query_start_loc_cpu", None)
+                if isinstance(starts, torch.Tensor) and starts.device.type == "cpu":
+                    setattr(metadata, "_rlk_query_start_loc_cpu", starts)
+            return metadata
 
     class RlKernelAttentionBackend(PlatformAttentionBackend):
+        @staticmethod
+        def get_kv_cache_shape(
+            num_blocks: int,
+            block_size: int,
+            num_kv_heads: int,
+            head_size: int,
+            cache_dtype_str: str = "auto",
+        ) -> tuple[int, ...]:
+            if torch.version.hip is not None and operator is not None:
+                if block_size % 16 != 0:
+                    raise ValueError("Block size must be a multiple of 16.")
+                # Token-major pages let AITER mha_batch_prefill consume K/V
+                # directly.  The inherited cache-update methods call the
+                # adapter-owned _split_kv_cache above, so no vLLM source or
+                # cache-update kernel needs to change.
+                return (num_blocks, block_size, num_kv_heads, 2 * head_size)
+            return PlatformAttentionBackend.get_kv_cache_shape(
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_size,
+                cache_dtype_str,
+            )
+
         @staticmethod
         def get_impl_cls() -> type[Any]:
             return RlKernelAttentionImpl
@@ -1069,6 +1552,7 @@ def install_vllm_integration(plan: IntegrationPlan) -> VllmIntegration:
     strict_attention = plan.implementation_for("attention", "rollout") is Implementation.RL_KERNEL
     if strict_attention:
         _patch_qwen3_strict_model()
+        _patch_rocm_weight_cache_refresh()
     _patch_qwen3_layer_alignment_diagnostics()
     if strict_linear_logp:
         _patch_qwen_lm_head_padding()
@@ -1092,8 +1576,7 @@ def install_vllm_integration(plan: IntegrationPlan) -> VllmIntegration:
         )
         integration.record_installed_hook(
             "logp",
-            "vllm.model_executor.models.qwen3.Qwen3ForCausalLM.compute_logits,"
-            f"{sampler_hook}",
+            "vllm.model_executor.models.qwen3.Qwen3ForCausalLM.compute_logits," f"{sampler_hook}",
         )
     return integration
 

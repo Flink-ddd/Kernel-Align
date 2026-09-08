@@ -174,6 +174,13 @@ int64_t deterministic_collective_rocm_ipc_create(
 void deterministic_collective_rocm_ipc_synchronize(int64_t handle);
 void deterministic_collective_rocm_ipc_destroy(int64_t handle);
 void deterministic_collective_rocm_ipc_stage(int64_t handle, torch::Tensor input);
+void deterministic_collective_rocm_ipc_prepare_staged(
+    int64_t handle,
+    torch::Tensor input);
+void deterministic_collective_rocm_ipc_all_reduce_staged(
+    int64_t handle,
+    torch::Tensor input,
+    torch::Tensor output);
 void deterministic_collective_rocm_ipc_all_reduce(
     int64_t handle,
     torch::Tensor output);
@@ -408,6 +415,13 @@ torch::Tensor deterministic_rope_apply_rocm(
     torch::Tensor cos,
     torch::Tensor sin,
     double sin_sign);
+torch::Tensor deterministic_rope_apply_token_major_rocm(
+    torch::Tensor x,
+    torch::Tensor positions,
+    torch::Tensor cos,
+    torch::Tensor sin,
+    int64_t head_dim,
+    double sin_sign);
 #endif
 
 #if !defined(USE_ROCM)
@@ -613,6 +627,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deterministic_collective_rocm_ipc_stage",
           &deterministic_collective_rocm_ipc_stage,
           "Stage an input for ROCm IPC deterministic collectives");
+    m.def("deterministic_collective_rocm_ipc_prepare_staged",
+          &deterministic_collective_rocm_ipc_prepare_staged,
+          "Reserve the direct-output ROCm IPC payload");
+    m.def("deterministic_collective_rocm_ipc_all_reduce_staged",
+          &deterministic_collective_rocm_ipc_all_reduce_staged,
+          "Reduce a result already resident in the ROCm IPC payload");
     m.def("deterministic_collective_rocm_ipc_all_reduce",
           &deterministic_collective_rocm_ipc_all_reduce,
           "Run a direct ROCm IPC fixed-tree all-reduce");
@@ -692,6 +712,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "deterministic_rope_apply_rocm",
         &deterministic_rope_apply_rocm,
         "Deterministic GPT-NeoX RoPE apply for ROCm");
+    m.def(
+        "deterministic_rope_apply_token_major_rocm",
+        &deterministic_rope_apply_token_major_rocm,
+        "Deterministic GPT-NeoX token-major RoPE apply for ROCm");
 #endif
 #endif
 }

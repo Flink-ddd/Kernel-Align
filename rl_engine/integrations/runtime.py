@@ -156,7 +156,7 @@ class FrameworkOperatorIntegration:
         execution_mode: str = "eager",
         execution_provenance: Mapping[str, Any] | None = None,
     ) -> None:
-        """Record one eager or custom-op execution outside Dynamo tracing."""
+        """Record one eager or captured custom-op execution outside Dynamo tracing."""
 
         normalized = module.strip().lower()
         implementation = self.plan.implementation_for(normalized, self.target)
@@ -167,7 +167,7 @@ class FrameworkOperatorIntegration:
                 f"{self.framework} {normalized} execution evidence did not use "
                 "the installed RL-Kernel operator"
             )
-        if execution_mode not in {"eager", "compiled_cuda_graph"}:
+        if execution_mode not in {"eager", "compiled_cuda_graph", "compiled_hip_graph"}:
             raise ValueError(f"unknown execution mode {execution_mode!r}")
         backend_id = getattr(selected, "backend_id", None)
         if not isinstance(backend_id, str) or not backend_id.strip():

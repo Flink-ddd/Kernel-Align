@@ -31,7 +31,12 @@ def _deterministic_all_reduce_(input: torch.Tensor, collective_handle: int) -> N
 
     from rl_engine import _C
 
-    _C.deterministic_collective_all_reduce_fused(collective_handle, input, input)
+    if torch.version.hip is not None:
+        _C.deterministic_collective_rocm_ipc_all_reduce_input(
+            collective_handle, input, input
+        )
+    else:
+        _C.deterministic_collective_all_reduce_fused(collective_handle, input, input)
 
 
 @_deterministic_all_reduce_.register_fake
@@ -59,7 +64,12 @@ def _deterministic_staging_reserve_(staging: torch.Tensor, collective_handle: in
 
     from rl_engine import _C
 
-    _C.deterministic_collective_prepare_staged(collective_handle, staging)
+    if torch.version.hip is not None:
+        _C.deterministic_collective_rocm_ipc_prepare_staged(
+            collective_handle, staging
+        )
+    else:
+        _C.deterministic_collective_prepare_staged(collective_handle, staging)
 
 
 @_deterministic_staging_reserve_.register_fake
@@ -80,7 +90,12 @@ def _deterministic_staged_all_reduce(
     from rl_engine import _C
 
     output = torch.empty_like(staging)
-    _C.deterministic_collective_all_reduce_staged(collective_handle, staging, output)
+    if torch.version.hip is not None:
+        _C.deterministic_collective_rocm_ipc_all_reduce_staged(
+            collective_handle, staging, output
+        )
+    else:
+        _C.deterministic_collective_all_reduce_staged(collective_handle, staging, output)
     return output
 
 

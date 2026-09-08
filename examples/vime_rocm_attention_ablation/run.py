@@ -211,7 +211,8 @@ class MatrixConfig:
                 # declares unsupported.  The R route owns its deterministic
                 # per-row schedule; the P route remains the native baseline.
                 "vllm_batch_invariant": False,
-                "enforce_eager": True,
+                "enforce_eager": False,
+                "execution_mode": "compiled_hip_graph",
                 "custom_all_reduce": False,
                 "attention_backend": "ROCM_AITER_FA",
                 "shuffle_kv_cache_layout": False,
@@ -501,6 +502,7 @@ def build_arm_environment(
             "VLLM_ROCM_USE_AITER": "1",
             "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": "0",
             "VLLM_ATTENTION_BACKEND": "ROCM_AITER_FA",
+            "RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE": "32",
             "RL_KERNEL_ATTENTION_CASE": case_id,
             "RL_KERNEL_FFN_CASE": "R/R",
             "RL_KERNEL_LOGP_CASE": "R/R",
@@ -541,6 +543,9 @@ def build_arm_environment(
             "RLK_ABLATION_RAY_DASHBOARD_PORT": str(
                 config.ray_dashboard_port + arm_index
             ),
+            "RLK_ABLATION_RAY_DASHBOARD_AGENT_PORT": str(
+                config.ray_dashboard_port + arm_index + 10_000
+            ),
         }
     )
     return env
@@ -560,6 +565,7 @@ def public_arm_environment(environment: Mapping[str, str]) -> dict[str, str]:
         "RL_KERNEL_MISMATCH_SIDECAR_DIR",
         "RL_KERNEL_READBACK_DIR",
         "RL_KERNEL_VLLM_INTEGRATION",
+        "RL_KERNEL_VLLM_CUDAGRAPH_MAX_CAPTURE_SIZE",
         "VLLM_ROCM_USE_AITER",
         "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT",
         "VLLM_ATTENTION_BACKEND",

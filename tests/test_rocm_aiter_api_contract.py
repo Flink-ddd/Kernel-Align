@@ -18,7 +18,10 @@ import pytest
 from rl_engine.kernels.ops.rocm.attention.flash_attn import (
     _AITER_BWD_POSITIONAL_CONTRACT,
     _AITER_BWD_REQUIRED_KEYWORDS,
+    _AITER_BATCH_PREFILL_POSITIONAL_CONTRACT,
+    _AITER_BATCH_PREFILL_REQUIRED_KEYWORDS,
     _AITER_FWD_POSITIONAL_CONTRACT,
+    _AITER_FWD_REQUIRED_KEYWORDS,
     StrictRocmAttentionUnavailable,
     _validate_aiter_schema,
 )
@@ -59,6 +62,7 @@ def test_positional_contract_matches_the_strict_call_sites() -> None:
         "return_softmax_lse",
         "return_dropout_randval",
     )
+    assert "out" in _AITER_FWD_REQUIRED_KEYWORDS
     # The backward pins determinism positionally, so its slot must not move.
     assert _AITER_BWD_POSITIONAL_CONTRACT[-1] == "deterministic"
     assert _AITER_BWD_POSITIONAL_CONTRACT.index("softmax_lse") == 5
@@ -67,11 +71,20 @@ def test_positional_contract_matches_the_strict_call_sites() -> None:
 
 @requires_aiter
 def test_installed_aiter_satisfies_the_strict_contract() -> None:
-    _validate_aiter_schema("mha_fwd", _AITER_FWD_POSITIONAL_CONTRACT)
+    _validate_aiter_schema(
+        "mha_fwd",
+        _AITER_FWD_POSITIONAL_CONTRACT,
+        required_keywords=_AITER_FWD_REQUIRED_KEYWORDS,
+    )
     _validate_aiter_schema(
         "mha_bwd",
         _AITER_BWD_POSITIONAL_CONTRACT,
         required_keywords=_AITER_BWD_REQUIRED_KEYWORDS,
+    )
+    _validate_aiter_schema(
+        "mha_batch_prefill",
+        _AITER_BATCH_PREFILL_POSITIONAL_CONTRACT,
+        required_keywords=_AITER_BATCH_PREFILL_REQUIRED_KEYWORDS,
     )
 
 
