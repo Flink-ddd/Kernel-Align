@@ -52,7 +52,6 @@ from rl_engine.kernels.ops.rocm.attention.paged_gather import fused_paged_kv_gat
 # The sequence reorder and the position validation are platform-neutral tensor
 # bookkeeping. They are bound from the CUDA runtime rather than reimplemented
 # so the two runtimes cannot drift into two different global orderings.
-_sort_by_position = StrictCUDAAttentionRuntime._sort_by_position
 _gather_sequence = StrictCUDAAttentionRuntime._gather_sequence
 _validate_local_positions = StrictCUDAAttentionRuntime._validate_local_positions
 _validate_global_positions = StrictCUDAAttentionRuntime._validate_global_positions
@@ -148,6 +147,86 @@ class StrictRocmAttentionRuntime:
         self._page_bounds_epoch_owner = object()
         self._page_bounds_validation: _PageBoundsValidation | None = None
         self._causal_prefill_position_cache: tuple[torch.device, int, torch.Tensor] | None = None
+        self._position_plan_cache: dict[
+            tuple[int, int, int, bool],
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ],
+        ] = {}
+
+    def _position_plan(
+        self,
+        query_position_ids: torch.Tensor,
+        key_position_ids: torch.Tensor,
+        *,
+        plan: AttentionCPCommunicationPlan | None,
+        cp_world_size: int,
+        causal: bool,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Cache immutable CP position transport and reorder indices across layers."""
+
+        key = (id(query_position_ids), id(key_position_ids), cp_world_size, causal)
+        cached = self._position_plan_cache.get(key)
+        if (
+            cached is not None
+            and cached[0] is query_position_ids
+            and cached[1] is key_position_ids
+        ):
+            return cached[2:]
+
+        if cp_world_size == 1:
+            global_query_positions = query_position_ids
+            global_key_positions = key_position_ids
+        else:
+            if plan is None:
+                raise RuntimeError("CP Attention position plan requires a communication plan")
+            global_query_positions, global_key_positions = (
+                self._communication.all_gather_position_ids(
+                    query_position_ids,
+                    key_position_ids,
+                    plan,
+                )
+            )
+        query_sort = torch.argsort(global_query_positions, dim=1)
+        if global_key_positions is global_query_positions:
+            key_sort = query_sort
+        else:
+            key_sort = torch.argsort(global_key_positions, dim=1)
+        query_positions_sorted = torch.gather(
+            global_query_positions, 1, query_sort
+        )
+        key_positions_sorted = torch.gather(global_key_positions, 1, key_sort)
+        _validate_global_positions(
+            query_positions_sorted,
+            key_positions_sorted,
+            causal,
+        )
+        inverse_query_sort = torch.argsort(query_sort, dim=1)
+        value = (
+            query_position_ids,
+            key_position_ids,
+            query_positions_sorted,
+            key_positions_sorted,
+            query_sort,
+            key_sort,
+            inverse_query_sort,
+        )
+        if len(self._position_plan_cache) >= 16:
+            self._position_plan_cache.pop(next(iter(self._position_plan_cache)))
+        self._position_plan_cache[key] = value
+        return value[2:]
 
     def new_page_bounds_epoch(self) -> object:
         """Issue a proof scope while its page table and lengths remain immutable.
@@ -180,19 +259,12 @@ class StrictRocmAttentionRuntime:
         plan = None
         if cp_world_size == 1:
             global_q, global_k, global_v = q, k, v
-            global_q_positions = query_position_ids
-            global_k_positions = key_position_ids
             communication_backend = "none"
             self.communication_executed = False
         else:
             plan = self._communication_plan(contract, q.size(2), k.size(2))
             global_q = self._communication.all_gather_query(q, plan)
             global_k, global_v = self._communication.all_gather_kv(k, v, plan)
-            global_q_positions, global_k_positions = self._communication.all_gather_position_ids(
-                query_position_ids,
-                key_position_ids,
-                plan,
-            )
             communication_backend = self.communication_backend_id
             self.communication_executed = True
 
@@ -200,13 +272,26 @@ class StrictRocmAttentionRuntime:
             if cp_world_size != 1:
                 raise RuntimeError("pre-sorted Attention positions are supported only at CP=1")
             q_sorted, k_sorted, v_sorted = global_q, global_k, global_v
-            q_positions_sorted, k_positions_sorted = global_q_positions, global_k_positions
+            q_positions_sorted, k_positions_sorted = query_position_ids, key_position_ids
             q_sort = None
+            inverse_q_sort = None
         else:
-            q_sorted, q_positions_sorted, q_sort = _sort_by_position(global_q, global_q_positions)
-            k_sorted, k_positions_sorted, k_sort = _sort_by_position(global_k, global_k_positions)
+            (
+                q_positions_sorted,
+                k_positions_sorted,
+                q_sort,
+                k_sort,
+                inverse_q_sort,
+            ) = self._position_plan(
+                query_position_ids,
+                key_position_ids,
+                plan=plan,
+                cp_world_size=cp_world_size,
+                causal=causal,
+            )
+            q_sorted = _gather_sequence(global_q, q_sort)
+            k_sorted = _gather_sequence(global_k, k_sort)
             v_sorted = _gather_sequence(global_v, k_sort)
-            _validate_global_positions(q_positions_sorted, k_positions_sorted, causal)
 
         paged_schedule = bool(getattr(self._core, "supports_paged_schedule", False))
         if paged_schedule:
@@ -238,9 +323,8 @@ class StrictRocmAttentionRuntime:
             )
 
         if cp_world_size > 1:
-            if q_sort is None:
+            if q_sort is None or inverse_q_sort is None:
                 raise RuntimeError("CP Attention requires a framework position reorder")
-            inverse_q_sort = torch.argsort(q_sort, dim=1)
             out_rank_packed = _gather_sequence(out_sorted, inverse_q_sort)
             lse_rank_packed = _gather_sequence(lse_sorted, inverse_q_sort)
             shard = self._communication.reduce_scatter_strict_result(
