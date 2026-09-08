@@ -10,6 +10,11 @@ This is an operator-only MI300X report. It does not load or benchmark a model ch
 
 ## Environment
 
+This table describes the MI300X distributed rerun. The preserved single-GPU
+and dtype observations come from `caef501101a3906c733076f31f3b5a9870169d16`
+with Transformers 5.10.4; their values and figures are unchanged. Per-series
+provenance is recorded in `results.json:measurement_sources`.
+
 | Field | Value |
 |---|---|
 | NCCL_IB_DISABLE | 1 |
@@ -17,14 +22,14 @@ This is an operator-only MI300X report. It does not load or benchmark a model ch
 | deterministic_compute | ROCm-native Triton |
 | deterministic_transport | fixed-tree HIP IPC with RCCL fallback on ROCm |
 | distributed_speed_comparison | four same-topology H100/MI300X paths |
-| git_commit | caef501101a3906c733076f31f3b5a9870169d16 |
+| git_commit | 98dcd38fb635e1e0eab9035aa4c4b40483cc36b8 |
 | gpu | AMD Instinct MI300X |
 | gpu_count | 8 |
 | hip | 7.14.60850 |
 | python | 3.12.3 |
 | single_gpu_speed_context | Hugging Face Transformers Qwen3MLP, TP=1 |
 | torch | 2.12.0+rocm7.14.0a20260608 |
-| transformers | 5.10.4 |
+| transformers | 5.13.1 |
 
 ## Methodology
 
@@ -39,17 +44,42 @@ This is an operator-only MI300X report. It does not load or benchmark a model ch
 - Implementation note: the current ROCm deterministic communication operator is adopted from PR #357. This changes the implementation under test, not the benchmark comparison contract.
 - Single-GPU timing: GPU events, median and p95; distributed timing: synchronized wall clock, slowest rank/sample.
 - Distributed workers: one NUMA-local CPU per GPU rank to reduce host-scheduler noise in synchronized wall-clock samples.
-- 10 warmups, 50 measured forward samples, and 20 measured forward+backward samples.
+- MI300X distributed: 10 forward warmups and 50 forward samples; the script halves the training warmup to 5, followed by 20 forward+backward samples.
+- H100 official distributed: user-supplied measurements at `98dcd38fb635e1e0eab9035aa4c4b40483cc36b8`, NVIDIA H100 80GB, PyTorch 2.13.0+cu130 / CUDA 13.0. All world sizes use 5 warmups, 20 forward samples, and 10 forward+backward samples. Shape, BF16 dtype, topology, and synchronized slowest-rank wall-clock timing match the ROCm run. Sample counts differ; p95, particularly with 10 training samples, should be interpreted cautiously.
+- H100 official uses same-topology `F.linear` + NCCL. The submitted settings include `NCCL_NVLS_ENABLE=0`, `NCCL_IB_DISABLE=1`, and `RL_KERNEL_DET_GEMM_BACKEND=sm90`. Commands are retained in `cuda_cpu_comparison.json:source.official_h100_update`. The user discarded H100 10/50/20 reruns affected by competing workloads on GPUs 0–3.
+- H100 CUDA values remain the historical measurements at `8576fa4bf449734ae99e9b50be8756bb282a8916`, as requested. The four plotted series do not all come from one commit or sampling configuration. Ratios below are recomputed from the displayed columns; they are not the ratios in the newly supplied CUDA tables and do not isolate the cost of determinism in a controlled same-commit experiment.
+- The MI300X server was shared: another process held about 180 GiB on GPU 7. All layouts completed successfully, but the results are not exclusive-node measurements.
 - `NCCL_IB_DISABLE=1` keeps the distributed run on intra-node XGMI. Median, p95, min, and max values are available in `results.json`.
 
-Reproduce from the repository root:
+Reproduce the ROCm measurement from commit `98dcd38` into a separate output directory:
 
 ```bash
-python benchmarks/benchmark_rocm_ffn.py \
+NCCL_IB_DISABLE=1 OMP_NUM_THREADS=1 python benchmarks/benchmark_rocm_ffn.py \
   --warmup 10 \
   --samples 50 \
   --training-samples 20 \
-  --output-dir benchmarks/results/pr325_rocm_mi300x
+  --output-dir benchmarks/results/pr325_rocm_mi300x_reproduction
+```
+
+This combined artifact preserves historical single-GPU and H100 CUDA data;
+a new benchmark run alone does not recreate those historical sections.
+Regenerate the figures directly from the synchronized JSON, without rerunning
+measurements:
+
+```bash
+python - <<'PY'
+import json
+import runpy
+from pathlib import Path
+
+directory = Path("benchmarks/results/pr325_rocm_mi300x")
+benchmark = runpy.run_path("benchmarks/benchmark_rocm_ffn.py")
+benchmark["_write_figures"](
+    json.loads((directory / "results.json").read_text()),
+    directory,
+    json.loads((directory / "cuda_cpu_comparison.json").read_text()),
+)
+PY
 ```
 
 ## Results summary
@@ -57,8 +87,8 @@ python benchmarks/benchmark_rocm_ffn.py \
 - TP=1 exactness baseline: **0 mismatched elements** across topology forward outputs, training outputs, dHidden, and dWeights.
 - Repeat mismatch: **0**; training/inference forward mismatch: **0**.
 - Single-GPU deterministic Triton packed-cache latency is **3.92-7.64x** the official Qwen3MLP TP=1 latency across M=1/8/32 and forward/training.
-- MI300X deterministic Triton latency is **0.14-0.38x** the H100 deterministic CUDA latency for the same distributed layouts. Both official distributed paths are reported alongside them.
-- Versus the previous deterministic MI300X benchmark, PR #357 improves **16/16** rows, with a mean latency reduction of **22.1%**.
+- MI300X deterministic Triton latency is **0.12-0.32x** the H100 deterministic CUDA latency for the same distributed layouts. Both official distributed paths are reported alongside them.
+- Versus the historical MI300X timings embedded in the script, this rerun is faster in **16/16** rows, with a mean latency reduction of **36.1%**. This is historical context, not a controlled attribution to PR #357.
 - The separate official-Qwen3MLP FP16 versus FP32 observation has relative-L2 error **6.544e-04** for (M,H,I)=(8,4096,12288).
 
 ## Single-GPU FFN speed
@@ -80,45 +110,73 @@ Every row compares the same distributed topology and direction. No TP=1 latency 
 
 | Parallel layout | Direction | H100 official distributed (ms) | H100 deterministic CUDA (ms) | MI300X official distributed (ms) | MI300X deterministic Triton (ms) | H100 det / official | MI300X det / official |
 |---|---|---:|---:|---:|---:|---:|---:|
-| tp2 | forward | 0.1552 | 2.7896 | 0.2323 | 0.8759 | 17.97x | 3.77x |
-| tp2 | train_fwd_bwd | 0.6301 | 7.8125 | 0.6984 | 2.0802 | 12.40x | 2.98x |
-| tp2_sp | forward | 0.1552 | 3.3310 | 0.3066 | 0.8885 | 21.46x | 2.90x |
-| tp2_sp | train_fwd_bwd | 0.6301 | 11.7695 | 1.4217 | 2.5187 | 18.68x | 1.77x |
-| tp4 | forward | 0.1530 | 2.1687 | 0.2380 | 0.8324 | 14.17x | 3.50x |
-| tp4 | train_fwd_bwd | 0.5714 | 9.3954 | 0.8280 | 2.2969 | 16.44x | 2.77x |
-| tp2_cp2 | forward | 0.1530 | 2.8261 | 0.2317 | 0.7562 | 18.47x | 3.26x |
-| tp2_cp2 | train_fwd_bwd | 0.5714 | 16.1722 | 4.4830 | 2.5281 | 28.30x | 0.56x |
-| tp2_cp2_sp | forward | 0.1530 | 3.5814 | 0.3262 | 0.8067 | 23.41x | 2.47x |
-| tp2_cp2_sp | train_fwd_bwd | 0.5714 | 16.7894 | 4.5870 | 2.5462 | 29.38x | 0.56x |
-| tp8 | forward | 0.1537 | 2.3206 | 0.2075 | 0.7065 | 15.10x | 3.41x |
-| tp8 | train_fwd_bwd | 0.5006 | 10.1375 | 0.8685 | 2.0507 | 20.25x | 2.36x |
-| tp4_cp2 | forward | 0.1537 | 2.2141 | 0.2424 | 0.8306 | 14.41x | 3.43x |
-| tp4_cp2 | train_fwd_bwd | 0.5006 | 16.5617 | 3.0071 | 2.4620 | 33.08x | 0.82x |
-| tp4_cp2_sp | forward | 0.1537 | 3.2972 | 0.3153 | 0.7618 | 21.45x | 2.42x |
-| tp4_cp2_sp | train_fwd_bwd | 0.5006 | 17.1457 | 2.9346 | 2.4232 | 34.25x | 0.83x |
+| tp2 | forward | 0.1653 | 2.7896 | 0.2164 | 0.6669 | 16.88x | 3.08x |
+| tp2 | train_fwd_bwd | 0.6347 | 7.8125 | 0.6532 | 1.6757 | 12.31x | 2.57x |
+| tp2_sp | forward | 0.1974 | 3.3310 | 0.2825 | 0.7038 | 16.87x | 2.49x |
+| tp2_sp | train_fwd_bwd | 0.7162 | 11.7695 | 0.8634 | 1.7942 | 16.43x | 2.08x |
+| tp4 | forward | 0.1742 | 2.1687 | 0.2240 | 0.6677 | 12.45x | 2.98x |
+| tp4 | train_fwd_bwd | 0.6460 | 9.3954 | 0.6778 | 1.6612 | 14.54x | 2.45x |
+| tp2_cp2 | forward | 0.1600 | 2.8261 | 0.2261 | 0.6825 | 17.66x | 3.02x |
+| tp2_cp2 | train_fwd_bwd | 1.2175 | 16.1722 | 4.0314 | 1.9632 | 13.28x | 0.49x |
+| tp2_cp2_sp | forward | 0.2425 | 3.5814 | 0.2989 | 0.7069 | 14.77x | 2.36x |
+| tp2_cp2_sp | train_fwd_bwd | 1.5878 | 16.7894 | 4.2115 | 1.9622 | 10.57x | 0.47x |
+| tp8 | forward | 0.3962 | 2.3206 | 0.2006 | 0.6680 | 5.86x | 3.33x |
+| tp8 | train_fwd_bwd | 1.2062 | 10.1375 | 0.6640 | 1.7631 | 8.40x | 2.66x |
+| tp4_cp2 | forward | 0.3806 | 2.2141 | 0.2377 | 0.6979 | 5.82x | 2.94x |
+| tp4_cp2 | train_fwd_bwd | 1.5640 | 16.5617 | 2.4378 | 2.0162 | 10.59x | 0.83x |
+| tp4_cp2_sp | forward | 0.5009 | 3.2972 | 0.3100 | 0.7566 | 6.58x | 2.44x |
+| tp4_cp2_sp | train_fwd_bwd | 1.7319 | 17.1457 | 2.8061 | 1.9804 | 9.90x | 0.71x |
 
-### PR #357 latency change versus the previous benchmark
+### H100 official timing distributions
 
-This comparison changes only the deterministic ROCm communication implementation. It is not included as another series in the main four-path figure.
+User-supplied values in milliseconds, retained at their supplied precision. The chart uses the median column.
+
+| Parallel layout | Direction | Median | p95 | Min | Max |
+|---|---|---:|---:|---:|---:|
+| tp2 | forward | 0.1653 | 0.2055 | 0.1420 | 0.3013 |
+| tp2 | train_fwd_bwd | 0.6347 | 0.6955 | 0.5826 | 0.6997 |
+| tp2_sp | forward | 0.1974 | 0.2161 | 0.1807 | 0.2273 |
+| tp2_sp | train_fwd_bwd | 0.7162 | 1.0543 | 0.6713 | 1.2747 |
+| tp4 | forward | 0.1742 | 0.8594 | 0.1545 | 1.4339 |
+| tp4 | train_fwd_bwd | 0.6460 | 0.7029 | 0.5959 | 0.7232 |
+| tp2_cp2 | forward | 0.1600 | 0.8807 | 0.1411 | 1.4457 |
+| tp2_cp2 | train_fwd_bwd | 1.2175 | 2.2282 | 1.1868 | 2.2589 |
+| tp2_cp2_sp | forward | 0.2425 | 0.2821 | 0.2271 | 0.3538 |
+| tp2_cp2_sp | train_fwd_bwd | 1.5878 | 1.6838 | 1.4295 | 1.7189 |
+| tp8 | forward | 0.3962 | 1.1780 | 0.3521 | 1.2054 |
+| tp8 | train_fwd_bwd | 1.2062 | 1.4400 | 1.1445 | 1.4588 |
+| tp4_cp2 | forward | 0.3806 | 1.4873 | 0.3540 | 2.5012 |
+| tp4_cp2 | train_fwd_bwd | 1.5640 | 2.7782 | 1.4680 | 2.9183 |
+| tp4_cp2_sp | forward | 0.5009 | 0.5523 | 0.4745 | 0.5670 |
+| tp4_cp2_sp | train_fwd_bwd | 1.7319 | 1.9220 | 1.7104 | 1.9283 |
+
+The same statistics are embedded in `results.json:distributed_platform_comparison.rows[].h100_official_distributed_summary_ms`. MI300X median/p95/min/max are in `results.json:distributed_ffn[]` under `official_distributed` and `triton`.
+
+### Historical MI300X latency context
+
+The previous values are constants from an older benchmark; they were not rerun
+in this session. Implementation and run conditions differ, so these changes
+cannot be attributed solely to PR #357. They are not included as another series
+in the main figure.
 
 | Parallel layout | Direction | Previous (ms) | Current (ms) | Latency reduction |
 |---|---|---:|---:|---:|
-| tp2 | forward | 0.9040 | 0.8759 | 3.1% |
-| tp2 | train_fwd_bwd | 2.6997 | 2.0802 | 22.9% |
-| tp2_sp | forward | 1.0561 | 0.8885 | 15.9% |
-| tp2_sp | train_fwd_bwd | 2.9646 | 2.5187 | 15.0% |
-| tp4 | forward | 0.8359 | 0.8324 | 0.4% |
-| tp4 | train_fwd_bwd | 2.6999 | 2.2969 | 14.9% |
-| tp2_cp2 | forward | 0.9016 | 0.7562 | 16.1% |
-| tp2_cp2 | train_fwd_bwd | 3.5606 | 2.5281 | 29.0% |
-| tp2_cp2_sp | forward | 1.1296 | 0.8067 | 28.6% |
-| tp2_cp2_sp | train_fwd_bwd | 3.9929 | 2.5462 | 36.2% |
-| tp8 | forward | 1.0860 | 0.7065 | 34.9% |
-| tp8 | train_fwd_bwd | 2.5620 | 2.0507 | 20.0% |
-| tp4_cp2 | forward | 1.0536 | 0.8306 | 21.2% |
-| tp4_cp2 | train_fwd_bwd | 3.2599 | 2.4620 | 24.5% |
-| tp4_cp2_sp | forward | 1.1928 | 0.7618 | 36.1% |
-| tp4_cp2_sp | train_fwd_bwd | 3.7498 | 2.4232 | 35.4% |
+| tp2 | forward | 0.9040 | 0.6669 | 26.2% |
+| tp2 | train_fwd_bwd | 2.6997 | 1.6757 | 37.9% |
+| tp2_sp | forward | 1.0561 | 0.7038 | 33.4% |
+| tp2_sp | train_fwd_bwd | 2.9646 | 1.7942 | 39.5% |
+| tp4 | forward | 0.8359 | 0.6677 | 20.1% |
+| tp4 | train_fwd_bwd | 2.6999 | 1.6612 | 38.5% |
+| tp2_cp2 | forward | 0.9016 | 0.6825 | 24.3% |
+| tp2_cp2 | train_fwd_bwd | 3.5606 | 1.9632 | 44.9% |
+| tp2_cp2_sp | forward | 1.1296 | 0.7069 | 37.4% |
+| tp2_cp2_sp | train_fwd_bwd | 3.9929 | 1.9622 | 50.9% |
+| tp8 | forward | 1.0860 | 0.6680 | 38.5% |
+| tp8 | train_fwd_bwd | 2.5620 | 1.7631 | 31.2% |
+| tp4_cp2 | forward | 1.0536 | 0.6979 | 33.8% |
+| tp4_cp2 | train_fwd_bwd | 3.2599 | 2.0162 | 38.2% |
+| tp4_cp2_sp | forward | 1.1928 | 0.7566 | 36.6% |
+| tp4_cp2_sp | train_fwd_bwd | 3.7498 | 1.9804 | 47.2% |
 
 ## CUDA GPU and CPU performance context
 
@@ -144,7 +202,10 @@ The same-H100 CUDA/Triton ratio is the hardware-matched comparison. CPU and MI30
 | M=32, forward | 8.5392 | 0.1311 | 2.2529 | 4.0277 | 1.79x | 0.1146 | 0.8761 |
 | M=32, forward+backward | 65.9689 | 0.7842 | 5.4261 | 9.1635 | 1.69x | 0.4182 | 2.3188 |
 
-Both H100 columns used in the main distributed table are the user-supplied distributed timings. They are joined directly with MI300X rows of the same topology and direction; TP=1 values are excluded from all four columns.
+The main distributed table combines the updated user-supplied H100 official
+measurements with preserved historical H100 CUDA measurements, joined to the
+MI300X rerun by topology and direction. TP=1 latency is excluded from all four
+columns. The single-GPU/CPU table above retains its original measurements.
 
 ## Topology exactness versus Triton TP=1
 
