@@ -78,6 +78,12 @@ _ROCM_STATEFUL_GRAPH_SPLITTING_OPS = (
     "rl_kernel::rocm_det_gemm_linear_all_reduce_inference",
     "rl_kernel::qwen3_ffn_packed_tp_inference_rocm",
 )
+_ROCM_FULL_GRAPH_CACHE_NAMESPACE = "rl_kernel_rocm_full_graph_v1"
+_ROCM_GRAPH_ROUTE_ENVIRONMENT = (
+    "RL_KERNEL_ATTENTION_CASE",
+    "RL_KERNEL_FFN_CASE",
+    "RL_KERNEL_LOGP_CASE",
+)
 
 
 @dataclass
@@ -892,7 +898,7 @@ def _patch_strict_rocm_rotary_embedding(rotary_cls: type[Any]) -> None:
 
 
 def _configure_strict_ffn_compilation(vllm_config: Any | None = None) -> None:
-    """Keep stateful ROCm TP reductions outside replayed HIP graph segments."""
+    """Keep device-sequenced TP reductions inside replayed accelerator graphs."""
 
     if vllm_config is None:
         from vllm.config import get_current_vllm_config_or_none
@@ -912,17 +918,29 @@ def _configure_strict_ffn_compilation(vllm_config: Any | None = None) -> None:
         ]
         return
 
+    from vllm import envs as vllm_envs
     from vllm.config import CUDAGraphMode
 
-    compilation.cudagraph_mode = CUDAGraphMode.PIECEWISE
-    # The IPC transport owns peer-visible sequence and staging state that is
-    # advanced once per invocation. Replaying the transport inside a captured
-    # graph can reuse capture-time state and stale peer payloads. Keep just
-    # these opaque reductions eager while vLLM captures the pure compute around
-    # them as piecewise HIP graphs.
-    for op in _ROCM_STATEFUL_GRAPH_SPLITTING_OPS:
-        if op not in splitting_ops:
-            splitting_ops.append(op)
+    route_key = "_".join(
+        re.sub(r"[^a-z0-9]+", "-", os.getenv(name, "unset").lower()).strip("-")
+        for name in _ROCM_GRAPH_ROUTE_ENVIRONMENT
+    )
+    cache_namespace = f"{_ROCM_FULL_GRAPH_CACHE_NAMESPACE}_{route_key}"
+    cache_root = os.path.normpath(os.fspath(vllm_envs.VLLM_CACHE_ROOT))
+    if os.path.basename(cache_root) != cache_namespace:
+        # vLLM's AOT key cannot see implementations behind torch custom ops.
+        # Keep its normal config/code/compiler hashing under an RL-Kernel ABI
+        # namespace so an older custom-op artifact cannot be replayed silently.
+        os.environ["VLLM_CACHE_ROOT"] = os.path.join(
+            cache_root, cache_namespace
+        )
+    compilation.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    # ROCm IPC generations are allocated and consumed on device. Replayed
+    # reductions therefore advance their generation instead of reusing the
+    # capture-time payload, so these ops can remain in the full HIP graph.
+    splitting_ops[:] = [
+        op for op in splitting_ops if op not in _ROCM_STATEFUL_GRAPH_SPLITTING_OPS
+    ]
 
 
 def _patch_rocm_weight_cache_refresh() -> None:
