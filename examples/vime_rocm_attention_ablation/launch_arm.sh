@@ -201,7 +201,11 @@ names = [
     "RL_KERNEL_READBACK_DIR",
     "RL_KERNEL_MISMATCH_SIDECAR_DIR",
 ]
-print(json.dumps({"env_vars": {name: os.environ[name] for name in names}}))
+env_vars = {name: os.environ[name] for name in names}
+for name in ("RL_KERNEL_ROCM_FIXED_PAGED_TILE", "RL_KERNEL_ROCM_PAGED_KV_MAX_TOKENS"):
+    if name in os.environ:
+        env_vars[name] = os.environ[name]
+print(json.dumps({"env_vars": env_vars}))
 PY
 )"
 

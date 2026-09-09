@@ -127,11 +127,12 @@ class MatrixConfig:
             raise ValueError("rollout GPU count must be divisible by rollout TP")
         if self.router_policy != "round_robin":
             raise ValueError("the two-engine strict matrix requires round_robin routing")
-        if self.rollout_batch_size < self.rollout_engines:
-            raise ValueError(
-                "rollout_batch_size must issue at least one request per rollout engine"
-            )
         generated = self.rollout_batch_size * self.samples_per_prompt
+        if generated < self.rollout_engines:
+            raise ValueError(
+                "rollout_batch_size*samples_per_prompt must issue at least one "
+                "request per rollout engine"
+            )
         if self.global_batch_size != generated:
             raise ValueError(
                 "global_batch_size must equal rollout_batch_size*samples_per_prompt "
@@ -558,6 +559,8 @@ def public_arm_environment(environment: Mapping[str, str]) -> dict[str, str]:
         "CUDA_VISIBLE_DEVICES",
         "HIP_VISIBLE_DEVICES",
         "RL_KERNEL_ATTENTION_CASE",
+        "RL_KERNEL_ROCM_FIXED_PAGED_TILE",
+        "RL_KERNEL_ROCM_PAGED_KV_MAX_TOKENS",
         "RL_KERNEL_FFN_CASE",
         "RL_KERNEL_LOGP_CASE",
         "RL_KERNEL_VLLM_REAL_VOCAB_SIZE",

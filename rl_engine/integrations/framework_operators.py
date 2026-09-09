@@ -395,6 +395,24 @@ def _tensor_cache_token(tensor: torch.Tensor) -> tuple[Any, ...]:
     )
 
 
+@lru_cache(maxsize=1)
+def _rocm_paged_kv_max_tokens() -> int | None:
+    """Return an optional workload bound for AITER paged scheduling."""
+
+    value = os.environ.get("RL_KERNEL_ROCM_PAGED_KV_MAX_TOKENS", "").strip()
+    if not value:
+        return None
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise RuntimeError(
+            "RL_KERNEL_ROCM_PAGED_KV_MAX_TOKENS must be an integer"
+        ) from exc
+    if limit <= 0:
+        raise RuntimeError("RL_KERNEL_ROCM_PAGED_KV_MAX_TOKENS must be positive")
+    return limit
+
+
 def _compact_attention_provenance(value: Mapping[str, Any]) -> dict[str, Any]:
     """Keep strict backend identity without retaining one record per token."""
 
@@ -1274,7 +1292,7 @@ class VllmAttentionOperator:
         num_actual: int,
         cache_owner: Any,
     ) -> tuple[dict[str, Any], bool] | None:
-        """Reuse vLLM's sequence-level GPU metadata without token expansion."""
+        """Prepare graph-safe paged metadata once and share it across layers."""
 
         num_decodes = int(getattr(attn_metadata, "num_decodes", 0))
         num_prefills = int(getattr(attn_metadata, "num_prefills", 0))
@@ -1301,9 +1319,16 @@ class VllmAttentionOperator:
             causal = False
         if not isinstance(query_start_loc, torch.Tensor) or max_seqlen_q <= 0:
             return None
-        seq_lens = self._metadata_tensor(attn_metadata, "seq_lens")
+        query_starts_source = query_start_loc
+        seq_lens_source = self._metadata_tensor(attn_metadata, "seq_lens")
         max_seq_len = int(
             getattr(attn_metadata, "max_seq_len", block_table.size(1) * block_size)
+        )
+        configured_kv_limit = _rocm_paged_kv_max_tokens()
+        kernel_max_seqlen_k = (
+            max_seq_len
+            if configured_kv_limit is None
+            else min(max_seq_len, configured_kv_limit)
         )
         page_count = min(
             block_table.size(1),
@@ -1311,13 +1336,14 @@ class VllmAttentionOperator:
         )
         key = (
             mode,
-            _tensor_cache_token(query_start_loc),
-            _tensor_cache_token(seq_lens),
+            _tensor_cache_token(query_starts_source),
+            _tensor_cache_token(seq_lens_source),
             _tensor_cache_token(block_table),
             sequence_count,
             num_actual,
             max_seqlen_q,
             max_seq_len,
+            kernel_max_seqlen_k,
             page_count,
         )
         owner_id = id(cache_owner)
@@ -1329,19 +1355,80 @@ class VllmAttentionOperator:
             self._rocm_paged_metadata_owners.add(owner_id)
             return self._rocm_paged_metadata_value, True
 
-        query_start_loc = query_start_loc[: sequence_count + 1].to(
+        query_start_loc = query_starts_source.to(
             device=block_table.device, dtype=torch.int32
         )
         if not query_start_loc.is_contiguous():
             query_start_loc = query_start_loc.contiguous()
-        seq_lens = seq_lens[:sequence_count].to(
-            device=block_table.device, dtype=torch.int32
-        )
+        seq_lens = seq_lens_source.to(device=block_table.device, dtype=torch.int32)
         if not seq_lens.is_contiguous():
             seq_lens = seq_lens.contiguous()
-        pages = block_table[:sequence_count, :page_count].to(dtype=torch.int32)
+        # Graph metadata is request-level while packed Q is query-token-level.
+        # Expand decode page rows to query rows without materializing KV.
+        if mode == "decode":
+            query_starts = query_start_loc[: sequence_count + 1]
+            query_ends = query_starts[1:]
+            query_indices = torch.arange(
+                num_actual, dtype=torch.int32, device=block_table.device
+            )
+            request_indices = torch.searchsorted(
+                query_ends, query_indices, right=True
+            ).to(dtype=torch.long)
+            request_indices = request_indices.clamp_max(sequence_count - 1)
+            request_query_ends = query_ends.index_select(0, request_indices)
+            request_seq_lens = seq_lens.index_select(0, request_indices)
+            active_queries = query_indices < query_starts[-1]
+            seqused_k = request_seq_lens - (
+                request_query_ends - query_indices
+            ) + 1
+            seqused_k = torch.where(
+                active_queries, seqused_k, torch.ones_like(seqused_k)
+            )
+            pages = block_table.index_select(0, request_indices)[:, :page_count]
+            query_start_loc = torch.arange(
+                num_actual + 1, dtype=torch.int32, device=block_table.device
+            )
+            sequence_count = num_actual
+            max_seqlen_q = 1
+            active_rows = active_queries & (request_seq_lens > 0)
+        else:
+            query_start_loc = query_start_loc[: sequence_count + 1]
+            seq_lens = seq_lens[:sequence_count]
+            active_rows = seq_lens > 0
+            seqused_k = seq_lens
+            pages = block_table[:sequence_count, :page_count]
         if not pages.is_contiguous():
             pages = pages.contiguous()
+        if mode != "decode":
+            active_rows = seqused_k > 0
+        if configured_kv_limit is not None:
+            # Zero-length rows are legal vLLM graph padding.  They must not
+            # trip the bound assertion when a dynamic decode batch shrinks.
+            torch._assert_async(
+                torch.all((seq_lens >= 0) & (seq_lens <= kernel_max_seqlen_k)),
+                "vLLM sequence length exceeds RL_KERNEL_ROCM_PAGED_KV_MAX_TOKENS",
+            )
+        pages = pages.to(dtype=torch.int32)
+        # vLLM CUDA/HIP graphs retain padded request rows after a request
+        # finishes.  Their sequence length is zero and their page-table row
+        # is not guaranteed to contain a valid physical page.  AITER CK does
+        # not accept either state; route inactive rows to page 0 and clamp
+        # their logical length. vLLM ignores outputs for graph-padding rows.
+        # CK looks up complete 128-token KV tiles before applying its logical
+        # mask. Unused columns must be valid even for active request rows.
+        # Reuse the row's first live page so masked loads see initialized KV.
+        safe_page = torch.where(active_rows, pages[:, 0], torch.zeros_like(seqused_k))
+        columns = torch.arange(page_count, dtype=torch.int32, device=pages.device)
+        live_columns = active_rows[:, None] & (
+            columns[None, :] * block_size < seqused_k[:, None]
+        )
+        pages = torch.where(live_columns, pages, safe_page[:, None])
+        tile_pages = max(1, 128 // block_size)
+        guard_columns = (-page_count) % tile_pages
+        if guard_columns:
+            pages = torch.cat((pages, safe_page[:, None].expand(-1, guard_columns)), dim=1)
+            page_count += guard_columns
+        seq_lens_for_kernel = seqused_k.clamp_min(1)
         indptr_key = (
             block_table.device.type,
             block_table.device.index,
@@ -1361,11 +1448,12 @@ class VllmAttentionOperator:
             "sequence_count": sequence_count,
             "page_count": page_count,
             "pages": pages,
-            "seqused_k": seq_lens,
+            "seqused_k": seq_lens_for_kernel,
             "cu_seqlens_q": query_start_loc,
             "kv_indptr": kv_indptr,
             "max_seqlen_q": max_seqlen_q,
-            "max_seqlen_k": page_count * block_size,
+            "max_seqlen_k": kernel_max_seqlen_k,
+            "configured_kv_limit": configured_kv_limit,
             "causal": causal,
         }
         self._rocm_paged_metadata_key = key
@@ -1449,6 +1537,8 @@ class VllmAttentionOperator:
             "attention_phase": metadata["mode"],
             "sequence_count": metadata["sequence_count"],
             "query_token_count": num_actual,
+            "max_seqlen_k": metadata["max_seqlen_k"],
+            "configured_kv_limit": metadata["configured_kv_limit"],
             "launch_group_count": 1,
             "metadata_source": "vllm_gpu_sequence_level",
             "metadata_reused_across_layers": reused,
