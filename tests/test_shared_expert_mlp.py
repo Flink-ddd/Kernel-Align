@@ -21,15 +21,42 @@ PROVIDER_SPECS = {
     "triton": "rl_engine.moe.backends.shared_expert:TritonSharedExpertProvider",
 }
 
+# Performance profiles: deterministic and batch-invariant, close to (but not
+# byte-equal with) the oracle -- the in-GEMM reduction order differs.
+PERF_PROVIDER_SPECS = {
+    "cuda-det": "rl_engine.moe.backends.shared_expert:CudaDetSharedExpertProvider",
+    "triton-det": "rl_engine.moe.backends.shared_expert:TritonDetSharedExpertProvider",
+}
 
-@pytest.fixture(params=sorted(PROVIDER_SPECS))
-def provider(request):
+
+def _resolve_or_skip(label: str, spec: str):
     from rl_engine.moe.provider import resolve_provider
 
     try:
-        return resolve_provider(PROVIDER_SPECS[request.param])
+        return resolve_provider(spec)
     except NotImplementedError as exc:
-        pytest.skip(f"{request.param} backend unavailable: {exc}")
+        pytest.skip(f"{label} backend unavailable: {exc}")
+
+
+@pytest.fixture(params=sorted(PROVIDER_SPECS))
+def provider(request):
+    return _resolve_or_skip(request.param, PROVIDER_SPECS[request.param])
+
+
+@pytest.fixture(params=sorted(PERF_PROVIDER_SPECS))
+def perf_provider(request):
+    return _resolve_or_skip(request.param, PERF_PROVIDER_SPECS[request.param])
+
+
+def _random_batch(t: int, hidden: int, ffn: int, seed: int = 2026):
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    batch = SharedBatch(
+        x=torch.randn(t, hidden, generator=gen).to(torch.bfloat16).cuda(),
+        w_fc1=(torch.randn(2 * ffn, hidden, generator=gen) / hidden**0.5).to(torch.bfloat16).cuda(),
+        w_fc2=(torch.randn(hidden, ffn, generator=gen) / ffn**0.5).to(torch.bfloat16).cuda(),
+    )
+    dy = torch.randn(t, hidden, generator=gen).to(torch.bfloat16).cuda()
+    return batch, dy
 
 
 def _run_oracle(batch: SharedBatch, dy: torch.Tensor):
@@ -146,3 +173,40 @@ def test_fail_closed_on_cpu_input(provider):
     batch = fixtures.make_shared_batch("shared_t1")  # stays on CPU
     with pytest.raises(NotImplementedError):
         provider.shared_expert_mlp_fwd(batch)
+
+
+@requires_cuda
+def test_perf_backend_deterministic(perf_provider):
+    """Two runs of the performance profile are byte-identical."""
+    batch, dy = _random_batch(256, 1024, 512)
+    runs = [_run_provider(perf_provider, batch, dy) for _ in range(2)]
+    (y_a, dx_a), (y_b, dx_b) = runs
+    assert tensor_sha256(y_a) == tensor_sha256(y_b)
+    assert tensor_sha256(dx_a) == tensor_sha256(dx_b)
+
+
+@requires_cuda
+def test_perf_backend_batch_invariance(perf_provider):
+    """fwd(x)[t] == fwd(x[t:t+1]) byte-for-byte also on the performance path."""
+    batch, _ = _random_batch(16, 256, 128)
+    y_full, _ = perf_provider.shared_expert_mlp_fwd(batch)
+    for t in range(batch.x.shape[0]):
+        row_batch = SharedBatch(
+            x=batch.x[t : t + 1].contiguous(),
+            w_fc1=batch.w_fc1,
+            w_fc2=batch.w_fc2,
+        )
+        y_row, _ = perf_provider.shared_expert_mlp_fwd(row_batch)
+        assert tensor_sha256(y_row) == tensor_sha256(y_full[t : t + 1]), f"row {t} diverged"
+
+
+@requires_cuda
+def test_perf_backend_close_to_oracle(perf_provider):
+    """Same round positions, different reduction order: close, not byte-equal."""
+    batch, dy = _random_batch(64, 512, 256)
+    y_gold, saved_gold = oracle.shared_expert_mlp_fwd(batch)
+    dx_gold = oracle.shared_expert_mlp_bwd(dy, batch, saved_gold)
+    y, dx = _run_provider(perf_provider, batch, dy)
+    assert y.dtype == torch.bfloat16 and dx.dtype == torch.float32
+    torch.testing.assert_close(y.float(), y_gold.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(dx, dx_gold, rtol=2e-2, atol=2e-2)

@@ -33,6 +33,11 @@ class _StrictSharedExpertProvider(ReferenceProvider):
 
     name = "shared-expert-strict"
     numeric_profile = ORACLE_PROFILE
+    # Performance profiles keep the contract's round positions but change the
+    # in-GEMM reduction order, so they are not byte-equal to the oracle.
+    # Selecting such a provider by name is the explicit opt-in; it is never a
+    # silent substitute for the strict path (fail-closed rule, P5-6).
+    strict_profile = True
 
     # Backend hooks -------------------------------------------------------
     def _gemm(self, a: torch.Tensor, b: torch.Tensor, trans_b: bool) -> torch.Tensor:
@@ -68,7 +73,7 @@ class _StrictSharedExpertProvider(ReferenceProvider):
 
     def _check_batch(self, batch: SharedBatch) -> None:
         batch.validate()
-        if batch.numeric_profile != ORACLE_PROFILE:
+        if self.strict_profile and batch.numeric_profile != ORACLE_PROFILE:
             raise NotImplementedError(
                 f"{self.name} only implements {ORACLE_PROFILE!r}, "
                 f"got {batch.numeric_profile!r} (fail-closed, no fallback)"
@@ -150,3 +155,61 @@ class TritonSharedExpertProvider(_StrictSharedExpertProvider):
 
     def _swiglu_bwd(self, dh: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         return self._tk.swiglu_shared_bwd(dh, z)
+
+
+class CudaDetSharedExpertProvider(CudaSharedExpertProvider):
+    """Performance CUDA backend: det_gemm (csrc/cuda/gemm/det_gemm_kernel.cu).
+
+    Deterministic and batch-invariant (fixed K order, no split-K; TMA+mma.sync
+    on SM90+, scalar K-tree fallback elsewhere). Round positions match the
+    P5-5 contract (fc1 out and dX stay FP32; y/dh round once to BF16), but the
+    in-GEMM reduction order differs from the oracle, so outputs are close, not
+    byte-equal. SwiGLU stays on the strict CUDA core.
+    """
+
+    name = "shared-expert-cuda-det"
+    numeric_profile = "p5-det-gemm-v1"
+    strict_profile = False
+
+    def _gemm(self, a: torch.Tensor, b: torch.Tensor, trans_b: bool) -> torch.Tensor:
+        if trans_b:  # b is the logical [K, N] operand
+            return self._ext.det_gemm_fwd_out_fp32(a, b)
+        return self._ext.det_gemm_fwd_rhs_transposed_out_fp32(a, b)
+
+    def provenance(self) -> dict[str, Any]:
+        info = super().provenance()
+        info.update(
+            {
+                "split_k": 1,
+                "reduction": "fixed-k-tile-tree (det_gemm)",
+                "rounding": "FP32 accumulate, FMA/MMA inside tiles",
+                "sm90_tensor_core": bool(getattr(self._ext, "det_gemm_sm90_compiled")()),
+            }
+        )
+        return info
+
+
+class TritonDetSharedExpertProvider(TritonSharedExpertProvider):
+    """Performance Triton backend: tl.dot tiles with fixed geometry.
+
+    Same guarantees and caveats as :class:`CudaDetSharedExpertProvider`, with
+    profile ``p5-triton-dot-v1`` (tile reduction order differs per backend).
+    """
+
+    name = "shared-expert-triton-det"
+    numeric_profile = "p5-triton-dot-v1"
+    strict_profile = False
+
+    def _gemm(self, a: torch.Tensor, b: torch.Tensor, trans_b: bool) -> torch.Tensor:
+        return self._tk.det_dot_gemm(a, b, trans_b)
+
+    def provenance(self) -> dict[str, Any]:
+        info = super().provenance()
+        info.update(
+            {
+                "split_k": 1,
+                "reduction": "tl.dot 64x64x32 tiles, ascending-k",
+                "rounding": "FP32 accumulate, MMA inside tiles",
+            }
+        )
+        return info

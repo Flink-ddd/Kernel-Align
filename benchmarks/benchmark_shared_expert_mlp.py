@@ -76,14 +76,17 @@ def main() -> int:
 
     runners: dict[str, object] = {"torch-native": torch_native}
     strict: dict[str, object] = {}
-    for label, spec in (
-        ("triton", "rl_engine.moe.backends.shared_expert:TritonSharedExpertProvider"),
-        ("cuda", "rl_engine.moe.backends.shared_expert:CudaSharedExpertProvider"),
+    for label, spec, is_strict in (
+        ("triton", "rl_engine.moe.backends.shared_expert:TritonSharedExpertProvider", True),
+        ("cuda", "rl_engine.moe.backends.shared_expert:CudaSharedExpertProvider", True),
+        ("triton-det", "rl_engine.moe.backends.shared_expert:TritonDetSharedExpertProvider", False),
+        ("cuda-det", "rl_engine.moe.backends.shared_expert:CudaDetSharedExpertProvider", False),
     ):
         try:
             runner = make_runner(resolve_provider(spec))
             runners[label] = runner
-            strict[label] = runner
+            if is_strict:
+                strict[label] = runner
         except NotImplementedError as exc:
             print(f"[skip] {label}: {exc}")
 

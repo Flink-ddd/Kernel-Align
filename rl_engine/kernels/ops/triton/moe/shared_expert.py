@@ -66,6 +66,47 @@ if TRITON_AVAILABLE:
         tl.store(C + m * N + offs_n, acc, mask=mask_n)
 
     @triton.jit
+    def _det_dot_gemm_kernel(
+        A,
+        B,
+        C,
+        M,
+        N,
+        K,
+        stride_bn,
+        stride_bk,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        # Performance GEMM (profile p5-triton-dot-v1): tensor-core tl.dot with
+        # FP32 accumulators, fixed constexpr tiles, ascending-k tile order and
+        # NO split-K -> deterministic and batch-invariant (a row's product uses
+        # only its own A row plus B; masked padding rows are zero). The
+        # reduction order inside a tile differs from the strict serial path,
+        # so this is NOT byte-equal to oracle-fp32-serial-v1.
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            a = tl.load(
+                A + offs_m[:, None] * K + offs_k[None, :],
+                mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
+                other=0.0,
+            )
+            b = tl.load(
+                B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
+                other=0.0,
+            )
+            acc = tl.dot(a, b, acc)
+        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(C + offs_m[:, None] * N + offs_n[None, :], acc, mask=c_mask)
+
+    @triton.jit
     def _swiglu_shared_fwd_kernel(
         Z,
         SIG,
@@ -158,6 +199,52 @@ def strict_gemm(a: torch.Tensor, b: torch.Tensor, trans_b: bool) -> torch.Tensor
     block_n = min(triton.next_power_of_2(n), 256)
     grid = (m, triton.cdiv(n, block_n))
     _strict_gemm_kernel[grid](a, b, out, k, n, stride_bn, stride_bk, BLOCK_N=block_n)
+    return out
+
+
+def det_dot_gemm(a: torch.Tensor, b: torch.Tensor, trans_b: bool) -> torch.Tensor:
+    """Performance GEMM (p5-triton-dot-v1): tl.dot tiles, FP32 out, no split-K.
+
+    Same signature and round positions as :func:`strict_gemm`; only the
+    reduction order inside a tile differs (tensor-core MMA vs serial).
+    """
+    if not TRITON_AVAILABLE:
+        raise NotImplementedError("triton is not installed (fail-closed, no fallback)")
+    _check_cuda_2d(a, torch.bfloat16, "a")
+    _check_cuda_2d(b, torch.bfloat16, "b")
+    m, k = a.shape
+    if trans_b:
+        bk, n = b.shape
+        stride_bn, stride_bk = 1, n
+    else:
+        n, bk = b.shape
+        stride_bn, stride_bk = k, 1
+    if bk != k:
+        raise ValueError(f"K mismatch: a has K={k}, b has K={bk}")
+    out = torch.empty(m, n, dtype=torch.float32, device=a.device)
+    if out.numel() == 0:
+        return out
+    if k == 0:
+        return out.zero_()
+    # Fixed tiles (no autotune): tuning by shape would change the reduction
+    # tree with batch size and break invariance.
+    block_m, block_n, block_k = 64, 64, 32
+    grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
+    _det_dot_gemm_kernel[grid](
+        a,
+        b,
+        out,
+        m,
+        n,
+        k,
+        stride_bn,
+        stride_bk,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=4,
+        num_stages=3,
+    )
     return out
 
 

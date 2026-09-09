@@ -115,6 +115,8 @@ void deterministic_collective_all_gather_fused(
 bool det_gemm_sm90_compiled();
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
 torch::Tensor det_gemm_fwd_rhs_transposed(torch::Tensor a, torch::Tensor bt);
+torch::Tensor det_gemm_fwd_out_fp32(torch::Tensor a, torch::Tensor b);
+torch::Tensor det_gemm_fwd_rhs_transposed_out_fp32(torch::Tensor a, torch::Tensor bt);
 torch::Tensor det_gemm_da(torch::Tensor dc, torch::Tensor b);
 torch::Tensor det_gemm_db(torch::Tensor a, torch::Tensor dc);
 torch::Tensor det_gemm_db_transposed(torch::Tensor a, torch::Tensor dc);
@@ -481,6 +483,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "det_gemm_fwd_rhs_transposed",
         &det_gemm_fwd_rhs_transposed,
         "Batch-invariant deterministic GEMM with physical Bt[N,K] (C=A@Bt^T)");
+    m.def(
+        "det_gemm_fwd_out_fp32",
+        &det_gemm_fwd_out_fp32,
+        "det_gemm_fwd storing the FP32 accumulator (no final BF16 round)");
+    m.def(
+        "det_gemm_fwd_rhs_transposed_out_fp32",
+        &det_gemm_fwd_rhs_transposed_out_fp32,
+        "det_gemm_fwd_rhs_transposed storing the FP32 accumulator");
     m.def("det_gemm_da", &det_gemm_da, "Batch-invariant deterministic GEMM backward dA (dC@B^T)");
     m.def("det_gemm_db", &det_gemm_db, "Batch-invariant deterministic GEMM backward dB (A^T@dC)");
     m.def(
