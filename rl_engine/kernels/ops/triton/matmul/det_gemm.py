@@ -358,12 +358,15 @@ if _TRITON_AVAILABLE:
         )
 
     @triton.jit
-    def _det_gemm_tree_reduce_to_output_kernel(
+    def _det_gemm_tree_reduce_to_output_rocm_kernel(
         workspace_ptr,
         output_ptr,
         lower_nodes_ptr,
         upper_nodes_ptr,
-        M: tl.constexpr,
+        # M is runtime-sized so decode batch changes reuse one compiled
+        # reduction kernel instead of triggering a Triton JIT per batch size.
+        # The reduction order and BF16 store boundary are unchanged.
+        M,
         N: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
@@ -644,7 +647,9 @@ def _triton_tree_gemm(
             raise RuntimeError("the final deterministic GEMM tree level must contain one root")
         if write_final_output:
             grid = (triton.cdiv(m_size * n_size, reduction_block),)
-            _det_gemm_tree_reduce_to_output_kernel[grid](
+            # direct_root_output is true only for gfx942; CUDA retains its
+            # established constexpr-M reduction and root-copy path.
+            _det_gemm_tree_reduce_to_output_rocm_kernel[grid](
                 workspace,
                 result,
                 lower,
