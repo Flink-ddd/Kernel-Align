@@ -78,11 +78,13 @@ _ROCM_STATEFUL_GRAPH_SPLITTING_OPS = (
     "rl_kernel::rocm_det_gemm_linear_all_reduce_inference",
     "rl_kernel::qwen3_ffn_packed_tp_inference_rocm",
 )
-_ROCM_FULL_GRAPH_CACHE_NAMESPACE = "rl_kernel_rocm_full_graph_v1"
+_ROCM_FULL_GRAPH_CACHE_NAMESPACE = "rl_kernel_rocm_full_graph_v4"
 _ROCM_GRAPH_ROUTE_ENVIRONMENT = (
     "RL_KERNEL_ATTENTION_CASE",
     "RL_KERNEL_FFN_CASE",
     "RL_KERNEL_LOGP_CASE",
+    "RL_KERNEL_ROCM_PAGED_KV_MAX_TOKENS",
+    "RL_KERNEL_ROCM_FIXED_PAGED_TILE",
 )
 
 

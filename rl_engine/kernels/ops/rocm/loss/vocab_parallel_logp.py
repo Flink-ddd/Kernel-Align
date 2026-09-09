@@ -21,6 +21,7 @@ entropy gradient needs the full probability tensor anyway.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Any
 
 import torch
@@ -29,7 +30,6 @@ from rl_engine.kernels.logprob_contract import LogprobContract, LogprobContractE
 from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import (
     DEFAULT_NUM_VOCAB_TILES,
     VocabParallelLogprobOp,
-    _gather_target_logit,
     _gather_tile_stats,
     _merge_tile_partials,
     _preflight_cross_rank_agreement,
@@ -39,6 +39,102 @@ from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import (
 )
 
 BACKEND_ID = "rocm-vocab-parallel-logp-ws2"
+
+# These tensors are immutable metadata.  Vime's logprob requests normally use
+# an all-active mask and repeat the same token count/sharding on every forward;
+# recreating them from Python tuples showed up as synchronous ``aten::to`` /
+# ``aten::copy_`` activity in the ROCm trace.  Keep the cache bounded because
+# sequence packing can expose many token counts over a long run.
+_METADATA_CACHE_LIMIT = 32
+_ACTIVE_MASK_CACHE: OrderedDict[tuple[Any, ...], torch.Tensor] = OrderedDict()
+_SHARD_START_CACHE: OrderedDict[tuple[Any, ...], torch.Tensor] = OrderedDict()
+
+
+def _device_key(device: torch.device) -> tuple[str, int | None]:
+    return device.type, device.index
+
+
+def _cached_active_mask(
+    contract: LogprobContract, device: torch.device
+) -> tuple[torch.Tensor, bool]:
+    values = contract.mask.active_mask
+    all_active = all(values)
+    # The all-active case is by far the common path; avoid hashing/copying the
+    # complete mask tuple for that case.
+    signature: Any = ("all", len(values)) if all_active else ("mask", values)
+    key = (_device_key(device), signature)
+    cached = _ACTIVE_MASK_CACHE.get(key)
+    if cached is None:
+        cached = (
+            torch.ones((len(values),), dtype=torch.bool, device=device)
+            if all_active
+            else torch.tensor(values, dtype=torch.bool, device=device)
+        )
+        _ACTIVE_MASK_CACHE[key] = cached
+        if len(_ACTIVE_MASK_CACHE) > _METADATA_CACHE_LIMIT:
+            _ACTIVE_MASK_CACHE.popitem(last=False)
+    else:
+        _ACTIVE_MASK_CACHE.move_to_end(key)
+    return cached, all_active
+
+
+def _cached_shard_starts(
+    bounds: tuple[tuple[int, int], ...], device: torch.device
+) -> torch.Tensor:
+    key = (_device_key(device), bounds)
+    cached = _SHARD_START_CACHE.get(key)
+    if cached is None:
+        cached = torch.tensor(
+            [start for start, _ in bounds], dtype=torch.long, device=device
+        )
+        _SHARD_START_CACHE[key] = cached
+        if len(_SHARD_START_CACHE) > _METADATA_CACHE_LIMIT:
+            _SHARD_START_CACHE.popitem(last=False)
+    else:
+        _SHARD_START_CACHE.move_to_end(key)
+    return cached
+
+
+def _gather_target_logit_cached(
+    z_masked: torch.Tensor,
+    safe_target: torch.Tensor,
+    contract: LogprobContract,
+    tp_group: Any,
+) -> torch.Tensor:
+    """ROCm copy of the exact owner gather with cached immutable metadata."""
+
+    sharding = contract.sharding
+    n = z_masked.shape[0]
+    start = sharding.local_vocab_start
+    local_vocab = sharding.local_vocab_size
+    local_idx = (safe_target - start).clamp(0, max(local_vocab - 1, 0))
+    owns = (safe_target >= start) & (safe_target < sharding.local_vocab_end)
+    rows = torch.arange(n, device=z_masked.device)
+    local_contrib = torch.where(
+        owns,
+        z_masked[rows, local_idx],
+        torch.zeros_like(safe_target, dtype=z_masked.dtype),
+    ).contiguous()
+
+    if sharding.tp_world_size == 1:
+        stacked = local_contrib.unsqueeze(0)
+    else:
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
+            raise LogprobContractError(
+                "vocab-parallel logprob requires initialized torch.distributed"
+            )
+        gathered = [
+            torch.empty_like(local_contrib) for _ in range(sharding.tp_world_size)
+        ]
+        torch.distributed.all_gather(gathered, local_contrib, group=tp_group)
+        stacked = torch.stack(gathered, dim=0)
+
+    starts = _cached_shard_starts(sharding.vocab_shard_bounds, safe_target.device)
+    owner = torch.bucketize(safe_target, starts, right=True) - 1
+    return stacked[owner, rows]
 
 
 def _native_backward_available() -> bool:
@@ -80,7 +176,9 @@ class _RocmVocabParallelLogprobFunction(torch.autograd.Function):
     """ROCm tile statistics and backward with the shared WS2 merge contract."""
 
     @staticmethod
-    def forward(ctx, local_logits, target_1d, active_mask, contract, tp_group, tile):
+    def forward(
+        ctx, local_logits, target_1d, active_mask, contract, tp_group, tile, all_active
+    ):
         sharding = contract.sharding
         shard = local_logits.contiguous()
         local_tiles = sharding.local_vocab_size // tile
@@ -102,18 +200,25 @@ class _RocmVocabParallelLogprobFunction(torch.autograd.Function):
             tp_group,
             tile_counts,
         )
-        safe_target = torch.where(active_mask, target_1d, torch.zeros_like(target_1d))
-        target_logit = _gather_target_logit(
+        safe_target = (
+            target_1d
+            if all_active
+            else torch.where(active_mask, target_1d, torch.zeros_like(target_1d))
+        )
+        target_logit = _gather_target_logit_cached(
             shard, safe_target, contract, tp_group
         ).float()
         lse = _merge_tile_partials(m_all, s_all)
-        selected_logp = torch.where(
-            active_mask, target_logit - lse, torch.zeros_like(lse)
+        selected_logp = (
+            target_logit - lse
+            if all_active
+            else torch.where(active_mask, target_logit - lse, torch.zeros_like(lse))
         )
 
         ctx.save_for_backward(shard, lse, safe_target, active_mask)
         ctx.local_vocab_start = sharding.local_vocab_start
         ctx.real_vocab_size = sharding.real_vocab_size
+        ctx.all_active = all_active
         ctx.set_materialize_grads(False)
         return selected_logp, lse
 
@@ -126,13 +231,15 @@ class _RocmVocabParallelLogprobFunction(torch.autograd.Function):
         start = ctx.local_vocab_start
         if grad_logp is not None:
             coef_logp = (
-                torch.where(active_mask, grad_logp, torch.zeros_like(grad_logp))
+                grad_logp.float().contiguous()
+                if ctx.all_active
+                else torch.where(active_mask, grad_logp, torch.zeros_like(grad_logp))
                 .float()
                 .contiguous()
             )
             owns = (safe_target >= start) & (safe_target < start + local_vocab)
             target_local = torch.where(
-                owns & active_mask,
+                owns if ctx.all_active else owns & active_mask,
                 safe_target - start,
                 torch.full_like(safe_target, -1),
             ).contiguous()
@@ -157,7 +264,7 @@ class _RocmVocabParallelLogprobFunction(torch.autograd.Function):
             ctx.real_vocab_size,
             has_lse_grad,
         )
-        return grad, None, None, None, None, None
+        return grad, None, None, None, None, None, None
 
 
 def _apply_with_kernels(
@@ -177,11 +284,7 @@ def _apply_with_kernels(
     target_1d = target_ids.reshape(-1).to(
         device=local_logits.device, dtype=torch.long
     )
-    active_mask = torch.tensor(
-        contract.mask.active_mask,
-        dtype=torch.bool,
-        device=local_logits.device,
-    )
+    active_mask, all_active = _cached_active_mask(contract, local_logits.device)
     if validate:
         _validate_active_targets(
             target_1d, active_mask, contract.sharding.real_vocab_size
@@ -192,7 +295,7 @@ def _apply_with_kernels(
             )
 
     selected_logp, lse = _RocmVocabParallelLogprobFunction.apply(
-        local_logits, target_1d, active_mask, contract, tp_group, tile
+        local_logits, target_1d, active_mask, contract, tp_group, tile, all_active
     )
     if validate and bool((~torch.isfinite(lse) & active_mask).any().item()):
         raise LogprobContractError(

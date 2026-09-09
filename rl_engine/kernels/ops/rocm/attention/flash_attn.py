@@ -8,13 +8,11 @@ import importlib
 import inspect
 import math
 import os
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
 import torch
-from torch.autograd import Function
-from torch.autograd.function import once_differentiable
-
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_ROCM_PRODUCTION_CORE_ID,
     STRICT_ATTENTION_ROCM_SCHEDULE_ID,
@@ -27,6 +25,8 @@ from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
     RLKernelDeterministicAttentionCore,
 )
 from rl_engine.utils.logger import logger
+from torch.autograd import Function
+from torch.autograd.function import once_differentiable
 
 _MAX_TESTED_ROCM_TRITON_HEAD_DIM = 512
 _AITER_API_SOURCE = "aiter.ops.mha"
@@ -145,14 +145,12 @@ def _validate_aiter_schema(
         )
 
 
-def _load_aiter_ck_ops() -> tuple[
-    Callable[..., Any], Callable[..., Any], Callable[..., Any], str
-]:
+def _load_aiter_ck_ops() -> tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any], str]:
     try:
         module = importlib.import_module(_AITER_API_SOURCE)
-        mha_fwd = getattr(module, "mha_fwd")
-        mha_bwd = getattr(module, "mha_bwd")
-        mha_batch_prefill = getattr(module, "mha_batch_prefill")
+        mha_fwd = module.mha_fwd
+        mha_bwd = module.mha_bwd
+        mha_batch_prefill = module.mha_batch_prefill
     except (AttributeError, ImportError, OSError, RuntimeError) as exc:
         raise StrictRocmAttentionUnavailable(
             "strict ROCm Attention requires AITER dense backward and batch-prefill CK ops"
@@ -301,9 +299,14 @@ class _AiterCKPagedAttentionFn(Function):
             )
             v_cache = v_padded.reshape_as(k_cache)
 
-        block_table = torch.arange(
-            batch * page_count, dtype=torch.int32, device=q.device
-        ).reshape(batch, page_count)
+        block_table = torch.arange(batch * page_count, dtype=torch.int32, device=q.device).reshape(
+            batch, page_count
+        )
+        # CK fetches page IDs for a complete 128-token tile before masking.
+        # Page 0 contains valid, initialized training KV for the unused columns.
+        guard_columns = (-page_count) % (128 // _AiterCKPagedAttentionFn.page_size)
+        if guard_columns:
+            block_table = torch.nn.functional.pad(block_table, (0, guard_columns), value=0)
         cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * q_len
         kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * page_count
         seqlen_k = torch.full((batch,), kv_len, dtype=torch.int32, device=q.device)
@@ -427,6 +430,24 @@ class StrictRocmAiterCKAttentionCore:
             mha_bwd = _mha_bwd
             mha_batch_prefill = _mha_batch_prefill
             source_sha256 = "test-double" if _source_sha256 is None else _source_sha256
+        self._fixed_paged_tile = 0
+        fixed_tile = os.environ.get("RL_KERNEL_ROCM_FIXED_PAGED_TILE", "0")
+        if _mha_fwd is None and fixed_tile != "0":
+            if fixed_tile not in ("64", "128"):
+                raise ValueError("RL_KERNEL_ROCM_FIXED_PAGED_TILE must be 0, 64 or 128")
+            from .fixed_paged_ck import fixed_paged_prefill
+
+            self._fixed_paged_tile = int(fixed_tile)
+            mha_batch_prefill = partial(fixed_paged_prefill, tile_m=self._fixed_paged_tile)
+            source_digest = hashlib.sha256(source_sha256.encode())
+            source_digest.update(Path(inspect.getsourcefile(fixed_paged_prefill)).read_bytes())
+            source_digest.update(
+                (
+                    Path(__file__).resolve().parents[5] / "csrc/rocm/attention/strict_paged_ck.cu"
+                ).read_bytes()
+            )
+            source_digest.update(fixed_tile.encode())
+            source_sha256 = source_digest.hexdigest()
         if not callable(mha_fwd) or not callable(mha_bwd):
             raise StrictRocmAttentionUnavailable("AITER CK MHA entry points are not callable")
         self.split_kv = requested
@@ -487,7 +508,11 @@ class StrictRocmAiterCKAttentionCore:
                 self._mha_batch_prefill,
                 self._mha_bwd,
             )
-            forward_entrypoint = "mha_batch_prefill"
+            forward_entrypoint = (
+                f"rl_kernel_fixed_paged_ck_m{self._fixed_paged_tile}"
+                if self._fixed_paged_tile
+                else "mha_batch_prefill"
+            )
             kv_layout = "sequential_linear_pages"
         expected_lse_shape = (q.size(0), q.size(1), q.size(2))
         if out.shape != q.shape or out.dtype != resolved_dtype:
@@ -568,8 +593,7 @@ class StrictRocmAiterCKAttentionCore:
         if cu_seqlens_q.shape != (batch + 1,) or kv_indptr.shape != (batch + 1,):
             raise ValueError("paged indptr tensors must carry batch + 1 entries")
         if any(
-            tensor.device != q.device
-            for tensor in (page_table, seqused_k, cu_seqlens_q, kv_indptr)
+            tensor.device != q.device for tensor in (page_table, seqused_k, cu_seqlens_q, kv_indptr)
         ):
             raise ValueError("paged metadata must be on the Q device")
         if not q.is_contiguous() or not page_table.is_contiguous():
@@ -644,7 +668,11 @@ class StrictRocmAiterCKAttentionCore:
                 "gpu_arch": gpu_arch,
                 "aiter_api_source": self.api_source,
                 "aiter_source_sha256": self.source_sha256,
-                "forward_entrypoint": "mha_batch_prefill",
+                "forward_entrypoint": (
+                    f"rl_kernel_fixed_paged_ck_m{self._fixed_paged_tile}"
+                    if self._fixed_paged_tile
+                    else "mha_batch_prefill"
+                ),
                 "kv_layout": "vllm_linear_paged",
                 "dense_kv_materialized": False,
                 "num_splits": self.num_splits,
@@ -740,7 +768,11 @@ class StrictRocmAiterCKAttentionCore:
             raise ValueError("paged q/k/v layouts must be BHSD and page-linear BSHD")
         if q.size(1) % k.size(2) or q.size(3) != k.size(3):
             raise ValueError("paged Q/K head counts or dimensions are incompatible")
-        if q.dtype not in (torch.float16, torch.bfloat16) or k.dtype != q.dtype or v.dtype != q.dtype:
+        if (
+            q.dtype not in (torch.float16, torch.bfloat16)
+            or k.dtype != q.dtype
+            or v.dtype != q.dtype
+        ):
             raise ValueError("paged q/k/v must share FP16 or BF16 dtype")
         if not (q.is_cuda and k.is_cuda and v.is_cuda) or not (q.device == k.device == v.device):
             raise ValueError("paged q/k/v must share one ROCm device")
@@ -787,6 +819,33 @@ class StrictRocmAiterCKAttentionCore:
             out_bshd = out.transpose(1, 2)
             if not out_bshd.is_contiguous():
                 raise ValueError("strict BSHD decode output must expose a contiguous AITER view")
+
+        if self._fixed_paged_tile:
+            # Keep the same arithmetic if a caller already materialized BSHD
+            # inputs (e.g. a mixed prefill/decode fallback).
+            fixed_out, fixed_lse = _AiterCKPagedAttentionFn.apply(
+                q_bshd.transpose(1, 2),
+                k_bshd.transpose(1, 2),
+                v_bshd.transpose(1, 2),
+                bool(causal),
+                resolved_scale,
+                self._mha_batch_prefill,
+                self._mha_bwd,
+            )
+            if out is not None:
+                out.copy_(fixed_out)
+                fixed_out = out
+            return DeterministicAttentionCoreResult(
+                out=fixed_out,
+                lse=fixed_lse,
+                provenance={
+                    "actual_backend": self.backend_id,
+                    "forward_entrypoint": f"rl_kernel_fixed_paged_ck_m{self._fixed_paged_tile}",
+                    "aiter_source_sha256": self.source_sha256,
+                    "dense_kv_materialized": True,
+                    "fallback": False,
+                },
+            )
 
         result = self._mha_fwd(
             q_bshd,
